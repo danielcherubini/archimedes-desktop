@@ -1,3 +1,5 @@
+pub mod sessions;
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
