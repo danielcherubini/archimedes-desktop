@@ -196,7 +196,7 @@ impl Db {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u128::from(d.as_millis()) as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 

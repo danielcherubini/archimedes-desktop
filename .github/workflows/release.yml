@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release-macos:
+    name: macOS (Developer ID + notarization)
+    runs-on: macos-latest
+    env:
+      # Notarization credentials (macOS ships signed + notarized from day one).
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # tauri build signs the updater artifacts (.sig) at build time.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # tauri-action runs `pnpm tauri build` (which signs the .sig
+      # artifacts via TAURI_SIGNING_PRIVATE_KEY) and publishes the
+      # artifacts to the GitHub Release, including latest.json for the
+      # updater.
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Archimedes Desktop v${{ github.ref_name }}"
+          releaseBody: |
+            Archimedes Desktop v${{ github.ref_name }} — macOS (Developer ID signed + notarized).
+          releaseDraft: true
+          includeUpdaterJson: true
+
+  release-windows:
+    name: Windows (unsigned for v1)
+    runs-on: windows-latest
+    env:
+      # No code-signing for v1 — SmartScreen warnings are the category
+      # norm. Updater artifacts are still minisign-signed.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Archimedes Desktop v${{ github.ref_name }}"
+          releaseBody: |
+            Archimedes Desktop v${{ github.ref_name }} — Windows (unsigned for v1).
+          releaseDraft: true
+          includeUpdaterJson: true
+
+  release-linux:
+    name: Linux (AppImage + deb)
+    runs-on: ubuntu-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Tauri's Linux prerequisites.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Archimedes Desktop v${{ github.ref_name }}"
+          releaseBody: |
+            Archimedes Desktop v${{ github.ref_name }} — Linux (AppImage + deb).
+          releaseDraft: true
+          includeUpdaterJson: true

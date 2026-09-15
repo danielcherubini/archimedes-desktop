@@ -1,4 +1,6 @@
 import { useEffect } from "react";
+import { ask, message } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import {
   listenPermissionRequest,
   listenSessionClosed,
@@ -6,6 +8,7 @@ import {
   listenTerminalOutput,
   listSessions,
 } from "./lib/tauri";
+import { checkForUpdate, installUpdate } from "./lib/updater";
 import { useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
 import SessionList from "./components/SessionList";
@@ -60,6 +63,32 @@ function App() {
     listSessions()
       .then((rows) => useSessions.getState().setHistorySessions(rows))
       .catch((err) => console.error("failed to load stored sessions", err));
+  }, []);
+
+  // The "Check for updates" menu item (Rust side) emits this event; the
+  // updater plugin runs in the JS context, so the check happens here.
+  useEffect(() => {
+    const pending = listen("update-check-requested", async () => {
+      try {
+        const { available, version, currentVersion } = await checkForUpdate();
+        if (!available) {
+          await message(`You're up to date (v${currentVersion ?? "unknown"}).`);
+          return;
+        }
+        const ok = await ask(
+          `Version ${version} is available (you have v${currentVersion ?? "?"}). Install now?`,
+          { title: "Update available", kind: "info" },
+        );
+        if (!ok) return;
+        await installUpdate();
+        await message("Update installed — restart the app to run the new version.");
+      } catch (err) {
+        console.error("update check failed", err);
+      }
+    });
+    return () => {
+      pending.then((unlisten) => unlisten()).catch(() => {});
+    };
   }, []);
 
   return (
