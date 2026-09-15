@@ -9,12 +9,18 @@
 //! *driver task* that owns the closure for the whole session. `close_session`
 //! flips a `watch` flag that makes the closure return, which drops the
 //! connection and — on Unix — terminates the agent's process group.
+//!
+//! The same driver is used for `session/new` (start) and `session/load`
+//! (resume): only the *establisher* — the future that turns a fresh
+//! connection into an established session — differs.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
+use agent_client_protocol::Error as ProtocolError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{oneshot, watch, Mutex};
@@ -25,8 +31,8 @@ use agent_client_protocol::schema::v1::{
     KillTerminalResponse, NewSessionRequest, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    SessionUpdate, StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
+    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -40,6 +46,7 @@ use crate::acp::fs_backend::FsBackend;
 use crate::acp::permission::{self, PendingPermissions};
 use crate::acp::terminal::TerminalManager;
 use crate::config::{ConfigError, Registry};
+use crate::storage::Db;
 
 /// Sink for outbound events (session updates, session-closed, …).
 ///
@@ -91,7 +98,7 @@ pub struct SessionInfo {
 /// A live, in-memory session handle.
 ///
 /// `session_id`, `cwd`, and `agent_id` are carried for diagnostics and for
-/// Task 3 (permission bridge / resume); they are not read in Task 2.
+/// resume; they are not read by the prompt path.
 #[derive(Debug)]
 #[allow(dead_code)]
 struct LiveSession {
@@ -119,6 +126,9 @@ pub struct SessionManager {
     pending_permissions: PendingPermissions,
     registry: Registry,
     config_dir: PathBuf,
+    /// The app's SQLite database (Task 5); `None` in tests that do not
+    /// attach one.
+    db: Option<Arc<Db>>,
 }
 
 impl SessionManager {
@@ -130,7 +140,13 @@ impl SessionManager {
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             registry,
             config_dir,
+            db: None,
         })
+    }
+
+    /// Attach the persistence database. Persistence is a no-op without it.
+    pub fn attach_db(&mut self, db: Arc<Db>) {
+        self.db = Some(db);
     }
 
     /// The configured config directory (useful for tests and diagnostics).
@@ -144,10 +160,7 @@ impl SessionManager {
     /// `send_prompt`, whose turn can span a user-paced permission prompt)
     /// use this to grab the connection, drop the lock, and then drive the
     /// request.
-    pub async fn connection(
-        &self,
-        session_id: &str,
-    ) -> Result<ConnectionTo<Agent>, AcpError> {
+    pub async fn connection(&self, session_id: &str) -> Result<ConnectionTo<Agent>, AcpError> {
         let sid = SessionId::new(session_id);
         self.sessions
             .lock()
@@ -164,6 +177,13 @@ impl SessionManager {
         self.sessions.lock().await.len()
     }
 
+    /// Record a session in the persistence layer (no-op without a database).
+    fn record_session(&self, info: &SessionInfo) {
+        if let Some(db) = &self.db {
+            let _ = db.record_session(info);
+        }
+    }
+
     /// Spawn an agent, initialize it, create a session, and register it.
     ///
     /// Returns the [`SessionInfo`] once the session is established. The
@@ -178,7 +198,9 @@ impl SessionManager {
         let entry = self
             .registry
             .get(agent_id)
-            .ok_or_else(|| AcpError::UnknownAgent { agent_id: agent_id.to_string() })?;
+            .ok_or_else(|| AcpError::UnknownAgent {
+                agent_id: agent_id.to_string(),
+            })?;
 
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
@@ -187,10 +209,158 @@ impl SessionManager {
         );
         let hint = spawn_hint(&entry.command);
 
+        let agent_id_owned = agent_id.to_string();
+        let cwd_owned = cwd.clone();
+
+        let info = self
+            .drive_session(agent, agent_id, hint, cwd, sink, move |cx| async move {
+                let init = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::default()
+                                .fs(FileSystemCapabilities::default()
+                                    .read_text_file(true)
+                                    .write_text_file(true))
+                                .terminal(true),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+
+                let new_session = cx
+                    .send_request(NewSessionRequest::new(cwd_owned.clone()))
+                    .block_task()
+                    .await?;
+
+                Ok((
+                    new_session.session_id.clone(),
+                    SessionInfo {
+                        session_id: new_session.session_id.clone(),
+                        agent_id: agent_id_owned,
+                        cwd: cwd_owned,
+                        capabilities: init.agent_capabilities,
+                    },
+                ))
+            })
+            .await?;
+
+        self.record_session(&info);
+        Ok(info)
+    }
+
+    /// Resume a stored session: spawn a fresh agent for `agent_id`,
+    /// initialize it (same client capabilities as a new session), then
+    /// `session/load` the given session id — the two-argument form
+    /// (`session_id` + `cwd`) — and consume the returned
+    /// `RestoreSessionBuilder` exactly like the session builder
+    /// (`.block_task().start_session().await`).
+    ///
+    /// The driver-task lifecycle is shared verbatim with
+    /// [`Self::start_session`] (same [`LiveSession`] storage, same
+    /// `select!` on close / agent death, same cleanup and `session-closed`
+    /// emit); only the `NewSessionRequest` is replaced by `session/load`.
+    ///
+    /// If the agent does not advertise `agent_capabilities.load_session`,
+    /// this returns [`AcpError::NotResumable`] and the caller should fall
+    /// back to history-only viewing.
+    pub async fn resume_session(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+    ) -> Result<SessionInfo, AcpError> {
+        let entry = self
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| AcpError::UnknownAgent {
+                agent_id: agent_id.to_string(),
+            })?;
+
+        let agent = AcpAgent::new(
+            AcpAgentConfig::new(entry.command.clone())
+                .args(entry.args.clone())
+                .envs(entry.env.clone()),
+        );
+        let hint = spawn_hint(&entry.command);
+
+        let sid = SessionId::new(session_id);
+        let agent_id_owned = agent_id.to_string();
+        let cwd_owned = cwd.clone();
+
+        let info = self
+            .drive_session(agent, agent_id, hint, cwd, sink, move |cx| async move {
+                let init = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::default()
+                                .fs(FileSystemCapabilities::default()
+                                    .read_text_file(true)
+                                    .write_text_file(true))
+                                .terminal(true),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+
+                if !init.agent_capabilities.load_session {
+                    // Honest resume semantics: an agent that cannot load a
+                    // session must not pretend to. The UI shows the
+                    // history-only banner instead.
+                    return Err(agent_client_protocol::util::internal_error(
+                        "agent does not support session/load",
+                    ));
+                }
+
+                let _restored = cx
+                    .load_session(sid.clone(), cwd_owned.as_path())
+                    .block_task()
+                    .start_session()
+                    .await?;
+
+                Ok((
+                    sid.clone(),
+                    SessionInfo {
+                        session_id: sid,
+                        agent_id: agent_id_owned,
+                        cwd: cwd_owned,
+                        capabilities: init.agent_capabilities,
+                    },
+                ))
+            })
+            .await?;
+
+        self.record_session(&info);
+        Ok(info)
+    }
+
+    /// Shared driver: spawn the agent, register the client-side backends,
+    /// run the *establisher* (initialize + `session/new` or `session/load`),
+    /// then block until the session closes.
+    ///
+    /// `establish` receives the fresh connection and must return the
+    /// established `(session_id, SessionInfo)`. On failure it must return
+    /// `Err` — the error is mapped to an [`AcpError`] (a
+    /// "does not support session/load" marker becomes
+    /// [`AcpError::NotResumable`]).
+    async fn drive_session<F, Fut>(
+        &self,
+        agent: AcpAgent,
+        agent_id: &str,
+        hint: String,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+        establish: F,
+    ) -> Result<SessionInfo, AcpError>
+    where
+        F: FnOnce(ConnectionTo<Agent>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(SessionId, SessionInfo), ProtocolError>> + Send + 'static,
+    {
         // Channels that carry values out of the (long-lived) closure.
         let (ready_tx, ready_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (session_ready_tx, session_ready_rx) = oneshot::channel::<SessionInfo>();
         let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
+        let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
         let (close_tx, mut close_rx) = watch::channel(false);
         // Set by the closure when the user closes the session. The driver task
         // reads it after `connect_with` returns to decide the close reason.
@@ -199,11 +369,17 @@ impl SessionManager {
         let user_closed = Arc::new(AtomicBool::new(false));
         let user_closed_for_closure = user_closed.clone();
 
+        // Per-session transcript accumulators for the persistence hook.
+        let agent_text_acc: Arc<StdMutex<HashMap<String, String>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let tool_call_state: Arc<StdMutex<HashMap<String, Value>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
         let sessions_arc = self.sessions.clone();
         let pending_permissions_arc = self.pending_permissions.clone();
+        let db = self.db.clone();
         let sink = sink.clone();
         let notify_sink = sink.clone();
-        let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
 
         // SPAWN the connection as a driver task. `connect_with` only resolves
@@ -239,6 +415,18 @@ impl SessionManager {
                             "update": payload,
                         });
                         notify_sink.emit("session-update", frame);
+
+                        // The client owns history: upsert the transcript row
+                        // as the update streams in.
+                        if let Some(db) = &db {
+                            persist_update(
+                                db,
+                                &notif.session_id.to_string(),
+                                &notif.update,
+                                &agent_text_acc,
+                                &tool_call_state,
+                            );
+                        }
                         Ok(())
                     },
                     on_receive_notification!(),
@@ -385,33 +573,20 @@ impl SessionManager {
                     let cx2 = cx.clone();
                     ready_tx.send(cx2).ok();
 
-                    let init = cx
-                        .send_request(
-                            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                                ClientCapabilities::default()
-                                    .fs(FileSystemCapabilities::default()
-                                        .read_text_file(true)
-                                        .write_text_file(true))
-                                    .terminal(true),
-                            ),
-                        )
-                        .block_task()
-                        .await?;
+                    // Establish the session (initialize + session/new for a
+                    // new session, initialize + session/load for a resume).
+                    let (session_id, info) = match establish(cx.clone()).await {
+                        Ok(established) => established,
+                        Err(err) => {
+                            // Report the failure to the awaiting command, then
+                            // tear the connection down.
+                            error_tx.send(err).ok();
+                            return Ok(());
+                        }
+                    };
 
-                    let new_session = cx
-                        .send_request(NewSessionRequest::new(cwd_owned.clone()))
-                        .block_task()
-                        .await?;
-
-                    session_id_tx.send(new_session.session_id.clone()).ok();
-                    session_ready_tx
-                        .send(SessionInfo {
-                            session_id: new_session.session_id.clone(),
-                            agent_id: agent_id_owned.clone(),
-                            cwd: cwd_owned.clone(),
-                            capabilities: init.agent_capabilities,
-                        })
-                        .ok();
+                    session_id_tx.send(session_id.clone()).ok();
+                    session_ready_tx.send(info).ok();
 
                     // BLOCK until close_session OR agent death. A clean
                     // incoming EOF does NOT cancel main_fn, so select on both.
@@ -452,16 +627,26 @@ impl SessionManager {
             }
         });
 
-        // Await the connection, then the established session. The session id
-        // only exists after `session/new`, so the store happens after both.
+        // Await the connection, then the established session.
         let cx = ready_rx
             .await
             .map_err(|_| AcpError::SpawnFailed { hint: hint.clone() })?;
-        let info = session_ready_rx
-            .await
-            .map_err(|_| AcpError::InitializeFailed {
-                detail: "agent did not complete initialize/session-new".to_string(),
-            })?;
+        let info = match session_ready_rx.await {
+            Ok(info) => info,
+            Err(_) => {
+                // The closure never delivered an established session: either
+                // the establisher failed (it sent the error first) or the
+                // connection died mid-establish.
+                match error_rx.try_recv() {
+                    Ok(err) => return Err(map_establish_error(agent_id, err)),
+                    Err(_) => {
+                        return Err(AcpError::InitializeFailed {
+                            detail: "agent did not complete initialize/session-new".to_string(),
+                        })
+                    }
+                }
+            }
+        };
 
         let live = LiveSession {
             cx,
@@ -494,15 +679,26 @@ impl SessionManager {
             sessions
                 .get(&sid)
                 .map(|live| live.cx.clone())
-                .ok_or_else(|| AcpError::UnknownSession { session_id: session_id.to_string() })?
+                .ok_or_else(|| AcpError::UnknownSession {
+                    session_id: session_id.to_string(),
+                })?
         };
 
+        // Record the user's message in the transcript (the client owns
+        // history) before the turn begins.
+        if let Some(db) = &self.db {
+            let payload = serde_json::json!({ "text": text });
+            let _ = db.record_message(session_id, "user", None, &payload.to_string());
+        }
+
         let request = PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new(text))]);
-        let response = cx
-            .send_request(request)
-            .block_task()
-            .await
-            .map_err(|err| AcpError::Protocol { message: err.message })?;
+        let response =
+            cx.send_request(request)
+                .block_task()
+                .await
+                .map_err(|err| AcpError::Protocol {
+                    message: err.message,
+                })?;
         Ok(response.stop_reason)
     }
 
@@ -542,12 +738,99 @@ impl SessionManager {
             sessions
                 .get(&sid)
                 .map(|live| live.close_tx.clone())
-                .ok_or_else(|| AcpError::UnknownSession { session_id: session_id.to_string() })?
+                .ok_or_else(|| AcpError::UnknownSession {
+                    session_id: session_id.to_string(),
+                })?
         };
-        close_tx
-            .send(true)
-            .map_err(|_| AcpError::Protocol { message: "session already closed".to_string() })?;
+        close_tx.send(true).map_err(|_| AcpError::Protocol {
+            message: "session already closed".to_string(),
+        })?;
         Ok(())
+    }
+}
+
+/// Map an establisher failure to an [`AcpError`]. The
+/// "does not support session/load" marker becomes [`AcpError::NotResumable`].
+fn map_establish_error(agent_id: &str, err: ProtocolError) -> AcpError {
+    let marker = "agent does not support session/load";
+    let data = err.data.as_ref().and_then(Value::as_str);
+    if data == Some(marker) {
+        AcpError::NotResumable {
+            agent_id: agent_id.to_string(),
+        }
+    } else {
+        AcpError::Protocol {
+            message: err.message,
+        }
+    }
+}
+
+/// Persist one session update into the transcript (see the module docs for
+/// the upsert semantics).
+fn persist_update(
+    db: &Db,
+    session_id: &str,
+    update: &SessionUpdate,
+    agent_text_acc: &StdMutex<HashMap<String, String>>,
+    tool_call_state: &StdMutex<HashMap<String, Value>>,
+) {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                if text.text.is_empty() {
+                    return;
+                }
+                let key = chunk
+                    .message_id
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                let mut acc = agent_text_acc
+                    .lock()
+                    .expect("agent-text accumulator poisoned");
+                let entry = acc.entry(key.clone()).or_default();
+                entry.push_str(&text.text);
+                let payload = serde_json::json!({ "text": entry });
+                let _ =
+                    db.record_message(session_id, "agent-text", Some(&key), &payload.to_string());
+            }
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            let key = tool_call.tool_call_id.to_string();
+            let mut state = tool_call_state.lock().expect("tool-call state poisoned");
+            state.insert(
+                key.clone(),
+                serde_json::to_value(tool_call).unwrap_or(Value::Null),
+            );
+            let _ = db.record_message(
+                session_id,
+                "tool-call",
+                Some(&key),
+                &state[&key].to_string(),
+            );
+        }
+        SessionUpdate::ToolCallUpdate(tool_call_update) => {
+            let key = tool_call_update.tool_call_id.to_string();
+            let mut state = tool_call_state.lock().expect("tool-call state poisoned");
+            let patch = serde_json::to_value(tool_call_update).unwrap_or(Value::Null);
+            let entry = state
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Default::default()));
+            merge_json(entry, &patch);
+            let _ = db.record_message(session_id, "tool-call", Some(&key), &entry.to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Shallow-merge `patch` into `base`: non-null fields of `patch` win.
+fn merge_json(base: &mut Value, patch: &Value) {
+    if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch {
+            if !v.is_null() {
+                base.insert(k.clone(), v.clone());
+            }
+        }
     }
 }
 

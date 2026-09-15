@@ -127,6 +127,25 @@ export interface TerminalOutputPayload {
   data: string;
 }
 
+/** A row from the app's SQLite `messages` table (camelCase over IPC). */
+export interface MessageRow {
+  id: number;
+  sessionId: string;
+  kind: "user" | "agent-text" | "tool-call" | "diff" | (string & {});
+  /** ContentChunk.messageId for agent-text; the tool call id for tool-call. */
+  messageKey: string | null;
+  /** The message body, serialized (camelCase). */
+  payloadJson: string;
+  /** Unix milliseconds. */
+  createdAt: number;
+}
+
+/** The persisted app settings (`settings.json` in the config dir). */
+export interface AppSettings {
+  theme: "dark" | "light";
+  paneLayout: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // Commands (invoke)
 // ---------------------------------------------------------------------------
@@ -155,6 +174,41 @@ export async function respondPermission(
   outcome: PermissionOutcome,
 ): Promise<void> {
   return invoke("respond_permission", { sessionId, requestId, outcome });
+}
+
+export async function resumeSession(
+  agentId: string,
+  sessionId: string,
+  cwd: string,
+): Promise<SessionInfo> {
+  return invoke<SessionInfo>("resume_session", { agentId, sessionId, cwd });
+}
+
+// ---------------------------------------------------------------------------
+// History (SQLite) + settings commands
+// ---------------------------------------------------------------------------
+
+/** All stored sessions, newest first. */
+export async function listSessions(): Promise<SessionInfo[]> {
+  return invoke<SessionInfo[]>("list_sessions");
+}
+
+/** A stored session's transcript, in insertion order. */
+export async function loadHistory(sessionId: string): Promise<MessageRow[]> {
+  return invoke<MessageRow[]>("load_history", { sessionId });
+}
+
+/** Delete a stored session (its messages cascade). */
+export async function deleteSession(sessionId: string): Promise<void> {
+  return invoke("delete_session", { sessionId });
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_settings");
+}
+
+export async function saveSettings(settings: AppSettings): Promise<void> {
+  return invoke("save_settings", { settings });
 }
 
 // ---------------------------------------------------------------------------

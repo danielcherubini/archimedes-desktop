@@ -1,4 +1,6 @@
+pub mod history;
 pub mod sessions;
+pub mod settings;
 
 use serde::Serialize;
 

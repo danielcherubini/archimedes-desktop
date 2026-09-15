@@ -13,6 +13,16 @@ export default function ChatStream() {
     useSessions((s) =>
       s.activeSessionId ? s.messages[s.activeSessionId] : undefined,
     ) ?? [];
+  const liveSession = useSessions((s) =>
+    s.activeSessionId
+      ? s.sessions.find((x) => x.sessionId === s.activeSessionId)
+      : undefined,
+  );
+  const historySession = useSessions((s) =>
+    s.activeSessionId
+      ? s.historySessions.find((x) => x.sessionId === s.activeSessionId)
+      : undefined,
+  );
   const inTurn = useSessions((s) => (s.activeSessionId ? !!s.inTurn[s.activeSessionId] : false));
   const stopReason = useSessions((s) => (s.activeSessionId ? s.stopReasons[s.activeSessionId] : undefined));
   const prompts =
@@ -22,10 +32,19 @@ export default function ChatStream() {
   const addUserMessage = useSessions((s) => s.addUserMessage);
   const beginTurn = useSessions((s) => s.beginTurn);
   const turnCompleted = useSessions((s) => s.turnCompleted);
+  const resumeSession = useSessions((s) => s.resumeSession);
 
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // A stored (non-live) session: its transcript is read-only unless the
+  // agent negotiated `loadSession`, in which case it can be resumed.
+  const isLive = !!liveSession;
+  const isHistoryOnly = !isLive && !!historySession;
+  const canResume =
+    isHistoryOnly && historySession?.capabilities.loadSession === true;
 
   // Auto-scroll to the bottom as new content streams in.
   useEffect(() => {
@@ -44,7 +63,7 @@ export default function ChatStream() {
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || inTurn) return;
+    if (!text || inTurn || !isLive) return;
     setDraft("");
     setError(null);
     addUserMessage(activeSessionId, text);
@@ -58,8 +77,44 @@ export default function ChatStream() {
     }
   };
 
+  const resume = async () => {
+    if (!activeSessionId || resuming) return;
+    setResuming(true);
+    setError(null);
+    try {
+      await resumeSession(activeSessionId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResuming(false);
+    }
+  };
+
   return (
     <main className="flex min-w-0 flex-1 flex-col">
+      {isHistoryOnly && (
+        <div className="flex items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
+          {canResume ? (
+            <p className="text-xs text-neutral-400">
+              This session is stored. Resuming reconnects it to the agent.
+            </p>
+          ) : (
+            <p className="text-xs text-amber-400">
+              History only — continuing starts a new session.
+            </p>
+          )}
+          {canResume && (
+            <button
+              type="button"
+              onClick={() => void resume()}
+              disabled={resuming}
+              className="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+            >
+              {resuming ? "Resuming…" : "Resume"}
+            </button>
+          )}
+        </div>
+      )}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
         {messages.map((message, i) => (
           <MessageBubble key={i} message={message} />
@@ -91,15 +146,15 @@ export default function ChatStream() {
                 void send();
               }
             }}
-            placeholder="Send a prompt…"
+            placeholder={isLive ? "Send a prompt…" : "This session is closed"}
             rows={2}
-            disabled={inTurn}
+            disabled={!isLive || inTurn}
             className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-sky-600 disabled:opacity-50"
           />
           <button
             type="button"
             onClick={() => void send()}
-            disabled={inTurn || draft.trim() === ""}
+            disabled={!isLive || inTurn || draft.trim() === ""}
             className="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
           >
             Send

@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   applySessionUpdate,
   finalizeSessionMessages,
+  rowToMessages,
   type AcpSessionUpdate,
   type Message,
 } from "./sessions";
+import type { MessageRow } from "../lib/tauri";
 
 const chunk = (messageId: string, text: string): AcpSessionUpdate => ({
   sessionUpdate: "agent_message_chunk",
@@ -213,5 +215,76 @@ describe("finalizeSessionMessages (session-closed cleanup)", () => {
       throw new Error("missing tool calls");
     expect(a.status).toBe("completed");
     expect(b.status).toBe("failed");
+  });
+});
+
+describe("rowToMessages (history replay from the database)", () => {
+  const row = (
+    overrides: Partial<MessageRow> & { kind: MessageRow["kind"] },
+  ): MessageRow => ({
+    id: 1,
+    sessionId: "s1",
+    messageKey: null,
+    payloadJson: "{}",
+    createdAt: 1000,
+    ...overrides,
+  });
+
+  it("maps a user row to a user message", () => {
+    const [msg] = rowToMessages(
+      row({ kind: "user", payloadJson: JSON.stringify({ text: "hi" }) }),
+    );
+    expect(msg).toEqual({ kind: "user", text: "hi", at: 1000 });
+  });
+
+  it("maps an agent-text row to an agent-text message with its messageId", () => {
+    const [msg] = rowToMessages(
+      row({
+        kind: "agent-text",
+        messageKey: "m1",
+        payloadJson: JSON.stringify({ text: "hello world" }),
+      }),
+    );
+    expect(msg).toEqual({
+      kind: "agent-text",
+      messageId: "m1",
+      text: "hello world",
+      at: 1000,
+    });
+  });
+
+  it("maps a tool-call row to a tool-call message plus its diff messages", () => {
+    const messages = rowToMessages(
+      row({
+        kind: "tool-call",
+        messageKey: "tc1",
+        payloadJson: JSON.stringify({
+          toolCallId: "tc1",
+          title: "edit file",
+          status: "completed",
+          content: [
+            { type: "diff", path: "/tmp/x.txt", oldText: "a\n", newText: "b\n" },
+          ],
+        }),
+      }),
+    );
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({
+      kind: "tool-call",
+      id: "tc1",
+      title: "edit file",
+      status: "completed",
+    });
+    const diff = messages.find((m) => m.kind === "diff");
+    if (!diff || diff.kind !== "diff") throw new Error("no diff message");
+    expect(diff.path).toBe("/tmp/x.txt");
+    expect(diff.patch).toContain("+b");
+  });
+
+  it("ignores rows with unparseable payloads or unknown kinds", () => {
+    expect(
+      rowToMessages(row({ kind: "user", payloadJson: "not json" })),
+    ).toHaveLength(0);
+    expect(rowToMessages(row({ kind: "mystery" }))).toHaveLength(0);
   });
 });

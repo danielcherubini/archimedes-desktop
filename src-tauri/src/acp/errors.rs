@@ -38,6 +38,12 @@ pub enum AcpError {
     #[error("unknown session: {session_id}")]
     UnknownSession { session_id: String },
 
+    /// The agent did not advertise `agent_capabilities.load_session`, so a
+    /// stored session cannot be resumed. The UI should fall back to
+    /// history-only viewing.
+    #[error("agent {agent_id} does not support session resume")]
+    NotResumable { agent_id: String },
+
     /// The requested path escaped the session's sandbox root (via `..`, a
     /// symlink, or an absolute path outside the root).
     #[error("path escapes the session sandbox: {path}")]

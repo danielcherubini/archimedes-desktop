@@ -78,7 +78,9 @@ impl TerminalManager {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| AcpError::Io { detail: format!("openpty failed: {e}") })?;
+            .map_err(|e| AcpError::Io {
+                detail: format!("openpty failed: {e}"),
+            })?;
 
         let command_line = build_command_line(command, args);
 
@@ -97,15 +99,13 @@ impl TerminalManager {
             cmd.cwd(cwd);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| AcpError::Io { detail: format!("spawn failed: {e}") })?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| AcpError::Io {
+            detail: format!("spawn failed: {e}"),
+        })?;
         let killer = child.clone_killer();
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| AcpError::Io { detail: format!("clone reader failed: {e}") })?;
+        let reader = pair.master.try_clone_reader().map_err(|e| AcpError::Io {
+            detail: format!("clone reader failed: {e}"),
+        })?;
 
         let terminal_id = uuid::Uuid::new_v4().to_string();
         let output = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -4,6 +4,7 @@ import {
   listenSessionClosed,
   listenSessionUpdate,
   listenTerminalOutput,
+  listSessions,
 } from "./lib/tauri";
 import { useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
@@ -51,6 +52,14 @@ function App() {
         p.then((unlisten) => unlisten()).catch(() => {});
       }
     };
+  }, []);
+
+  // On boot, load the stored sessions into the history list (the client
+  // owns history: every session survives a restart).
+  useEffect(() => {
+    listSessions()
+      .then((rows) => useSessions.getState().setHistorySessions(rows))
+      .catch((err) => console.error("failed to load stored sessions", err));
   }, []);
 
   return (

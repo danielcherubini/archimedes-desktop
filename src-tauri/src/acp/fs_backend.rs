@@ -27,7 +27,9 @@ impl FsBackend {
     /// Read a text file, rejecting any path that escapes the sandbox.
     pub fn read(&self, path: &Path) -> Result<String, AcpError> {
         let resolved = self.resolve(path)?;
-        fs::read_to_string(&resolved).map_err(|e| AcpError::Io { detail: e.to_string() })
+        fs::read_to_string(&resolved).map_err(|e| AcpError::Io {
+            detail: e.to_string(),
+        })
     }
 
     /// Write a text file, rejecting any path that escapes the sandbox.
@@ -37,9 +39,13 @@ impl FsBackend {
     pub fn write(&self, path: &Path, content: &str) -> Result<(), AcpError> {
         let resolved = self.resolve(path)?;
         if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent).map_err(|e| AcpError::Io { detail: e.to_string() })?;
+            fs::create_dir_all(parent).map_err(|e| AcpError::Io {
+                detail: e.to_string(),
+            })?;
         }
-        fs::write(&resolved, content).map_err(|e| AcpError::Io { detail: e.to_string() })
+        fs::write(&resolved, content).map_err(|e| AcpError::Io {
+            detail: e.to_string(),
+        })
     }
 
     /// Canonicalize `path` and verify it stays under `root`.
@@ -48,12 +54,9 @@ impl FsBackend {
     /// existing ancestor is canonicalized and the remaining components are
     /// appended, so a brand-new file can still be validated.
     fn resolve(&self, path: &Path) -> Result<PathBuf, AcpError> {
-        let root = self
-            .root
-            .canonicalize()
-            .map_err(|e| AcpError::Io {
-                detail: format!("cannot resolve sandbox root: {e}"),
-            })?;
+        let root = self.root.canonicalize().map_err(|e| AcpError::Io {
+            detail: format!("cannot resolve sandbox root: {e}"),
+        })?;
 
         // Absolute paths are used as-is; relative paths are joined to the root.
         let candidate = if path.is_absolute() {

@@ -19,6 +19,9 @@
 //! - `terminal`: `session/prompt` → `terminal/create` (`echo hello`) →
 //!   `terminal/output` → `terminal/wait_for_exit`, echoing the exit code as an
 //!   `exit:<code>` chunk, then `end_turn`.
+//! - `resume`: `initialize` advertises `loadSession: true`; `session/load`
+//!   replays one chunk (`"resumed"`) and then responds, so the client can
+//!   verify the `session/load` round-trip.
 //!
 //! Wire-format notes: property keys are camelCase (`sessionUpdate`,
 //! `agentCapabilities`, `messageId`, `terminalId`, `optionId`); discriminator
@@ -59,6 +62,7 @@ fn main() -> ExitCode {
 
         match method {
             "initialize" => {
+                let load_session = mode == "resume";
                 let result = serde_json::json!({
                     "protocolVersion": 1,
                     "agentInfo": {
@@ -67,9 +71,16 @@ fn main() -> ExitCode {
                         "version": "0.1.0",
                     },
                     "agentCapabilities": {
-                        "loadSession": false,
+                        "loadSession": load_session,
                     },
                 });
+                write_result(&mut out, &id, &result);
+            }
+            "session/load" => {
+                // Replay one chunk before the response (the client's restore
+                // builder retains notifications that arrive pre-response).
+                write_chunk(&mut out, "m1", "resumed");
+                let result = serde_json::json!({ "sessionId": SESSION_ID });
                 write_result(&mut out, &id, &result);
             }
             "session/new" => {

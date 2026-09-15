@@ -1,11 +1,45 @@
 pub mod acp;
-mod commands;
+pub mod commands;
 pub mod config;
+pub mod storage;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use tauri::Manager;
 use tokio::sync::Mutex;
 
 use crate::acp::SessionManager;
+use crate::storage::Db;
+
+/// The shared app setup: agent registry from `config_dir`, persistence
+/// database in `app_data_dir/archimedes.db`.
+///
+/// Factored out of [`run`] so the real command surface can be exercised in
+/// tests without a GUI (see `tests/ipc.rs`).
+pub fn setup_dirs<R: tauri::Runtime>(
+    app: &tauri::App<R>,
+    config_dir: PathBuf,
+    app_data_dir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The agent registry lives in the app's config directory.
+    let mut manager =
+        SessionManager::new(config_dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    // The persistence database lives in the app data directory.
+    let db = Arc::new(
+        Db::open(&app_data_dir.join("archimedes.db"))
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
+    manager.attach_db(db.clone());
+    // The event sink (TauriSink) is managed state so commands — and the
+    // headless IPC test — can obtain it without an `AppHandle` parameter.
+    app.manage(Arc::new(commands::sessions::TauriSink(
+        app.handle().clone(),
+    )));
+    app.manage(Mutex::new(manager));
+    app.manage(db);
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,18 +51,24 @@ pub fn run() {
             commands::sessions::start_session,
             commands::sessions::send_prompt,
             commands::sessions::close_session,
-            commands::sessions::respond_permission
+            commands::sessions::respond_permission,
+            commands::sessions::resume_session,
+            commands::history::list_sessions,
+            commands::history::load_history,
+            commands::history::delete_session,
+            commands::settings::get_settings,
+            commands::settings::save_settings
         ])
         .setup(|app| {
-            // The agent registry lives in the app's config directory.
             let config_dir = app
                 .path()
                 .config_dir()
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            let manager = SessionManager::new(config_dir)
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            app.manage(Mutex::new(manager));
-            Ok(())
+            setup_dirs(app, config_dir, app_data_dir)
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

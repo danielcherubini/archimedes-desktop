@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{EventSink, PermissionOutcome, SessionManager};
+use archimedes_desktop_lib::acp::{AcpError, EventSink, PermissionOutcome, SessionManager};
+use archimedes_desktop_lib::storage::Db;
 
 /// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).
 const FAKE_SESSION_ID: &str = "fake-session-1";
@@ -196,6 +197,169 @@ async fn full_session_flow_streams_and_cleans_up() {
     );
 
     // Clean up the temp dir (best effort).
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_session_round_trips_the_session_id() {
+    let config_dir = temp_config_dir();
+    write_agents_json_mode(&config_dir, Some("resume"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let manager = SessionManager::new(config_dir.clone()).unwrap();
+    let cwd = config_dir.clone();
+
+    // Resume the stored session id. The fake agent in `resume` mode
+    // advertises `loadSession: true` and answers `session/load`.
+    let info = manager
+        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+        .await
+        .expect("resume_session should succeed");
+    assert_eq!(
+        info.session_id.to_string(),
+        FAKE_SESSION_ID,
+        "the resumed session id must round-trip"
+    );
+    assert!(
+        info.capabilities.load_session,
+        "the fake agent in resume mode advertises load_session"
+    );
+
+    // The agent replays a chunk on load; it must arrive as a session-update.
+    let events = wait_for_events(&rx, 1, Duration::from_secs(5));
+    let text = events
+        .iter()
+        .find(|(event, _)| event == "session-update")
+        .and_then(|(_, p)| session_update_text(p));
+    assert_eq!(
+        text.as_deref(),
+        Some("resumed"),
+        "the load replay chunk should be delivered to the client"
+    );
+
+    // The resumed session lives in the same map and closes the same way.
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
+
+    let events = wait_for_events(&rx, 1, Duration::from_secs(10));
+    let closed = events
+        .iter()
+        .find(|(event, _)| event == "session-closed")
+        .expect("session-closed event should arrive");
+    assert_eq!(closed.1["reason"], "user");
+    assert_eq!(manager.session_count().await, 0);
+
+    assert!(
+        wait_for_process_gone(Duration::from_secs(10)),
+        "fake_agent process should have been reaped after close"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_without_load_session_is_not_resumable() {
+    let config_dir = temp_config_dir();
+    write_agents_json(&config_dir); // default mode: loadSession: false
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let manager = SessionManager::new(config_dir.clone()).unwrap();
+    let cwd = config_dir.clone();
+
+    let err = manager
+        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+        .await
+        .expect_err("resume should fail: the agent does not advertise load_session");
+    assert!(
+        matches!(err, AcpError::NotResumable { .. }),
+        "expected NotResumable, got {err:?}"
+    );
+    assert_eq!(
+        manager.session_count().await,
+        0,
+        "no session should be registered when resume is refused"
+    );
+
+    assert!(
+        wait_for_process_gone(Duration::from_secs(10)),
+        "the spawned agent should be torn down after a refused resume"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transcript_is_persisted_with_upsert_semantics() {
+    let config_dir = temp_config_dir();
+    write_agents_json(&config_dir);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+
+    let cwd = config_dir.clone();
+    let info = manager
+        .start_session("fake", cwd, &sink)
+        .await
+        .expect("start_session should succeed");
+    manager
+        .send_prompt(FAKE_SESSION_ID, "hi".to_string())
+        .await
+        .expect("send_prompt should succeed");
+
+    // Both chunks have been delivered (persistence runs in the same
+    // notification handler, right after the emit, so the rows exist by now).
+    wait_for_events(&rx, 2, Duration::from_secs(5));
+
+    let messages = db
+        .messages_for(FAKE_SESSION_ID)
+        .expect("messages_for should succeed");
+    let kinds: Vec<&str> = messages.iter().map(|m| m.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["user", "agent-text"],
+        "one user row and exactly one agent-text row (two chunks upserted); got {kinds:?}"
+    );
+
+    let user_row = &messages[0];
+    let payload: serde_json::Value = serde_json::from_str(&user_row.payload_json).unwrap();
+    assert_eq!(payload["text"], "hi");
+
+    let agent_row = &messages[1];
+    assert_eq!(agent_row.message_key.as_deref(), Some("m1"));
+    let payload: serde_json::Value = serde_json::from_str(&agent_row.payload_json).unwrap();
+    assert_eq!(
+        payload["text"], "hello world",
+        "the agent-text row must hold the accumulated text"
+    );
+
+    // The session row exists with the negotiated capabilities.
+    let sessions = db.list_sessions().expect("list_sessions should succeed");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, info.session_id.to_string());
+    assert!(sessions[0].capabilities_json.contains("loadSession"));
+
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
+    let events = wait_for_events(&rx, 1, Duration::from_secs(10));
+    assert!(events.iter().any(|(event, _)| event == "session-closed"));
+
+    assert!(
+        wait_for_process_gone(Duration::from_secs(10)),
+        "fake_agent process should have been reaped after close"
+    );
+
     let _ = std::fs::remove_dir_all(&config_dir);
 }
 
