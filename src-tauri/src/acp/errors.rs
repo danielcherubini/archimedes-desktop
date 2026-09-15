@@ -10,8 +10,8 @@ use serde::Serialize;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AcpError {
     /// The requested `agent_id` is not present in the registry.
-    #[error("unknown agent: {0}")]
-    UnknownAgent(String),
+    #[error("unknown agent: {agent_id}")]
+    UnknownAgent { agent_id: String },
 
     /// The agent process could not be spawned. `hint` explains how to fix it
     /// (e.g. install `pi` / `pi-acp`).
@@ -31,19 +31,19 @@ pub enum AcpError {
 
     /// A protocol-level error (the agent returned a JSON-RPC error, or the
     /// connection failed).
-    #[error("protocol error: {0}")]
-    Protocol(String),
+    #[error("protocol error: {message}")]
+    Protocol { message: String },
 
     /// No live session with the given id exists.
-    #[error("unknown session: {0}")]
-    UnknownSession(String),
+    #[error("unknown session: {session_id}")]
+    UnknownSession { session_id: String },
 
     /// The requested path escaped the session's sandbox root (via `..`, a
     /// symlink, or an absolute path outside the root).
-    #[error("path escapes the session sandbox: {0}")]
-    PathEscape(String),
+    #[error("path escapes the session sandbox: {path}")]
+    PathEscape { path: String },
 
     /// A filesystem operation failed (I/O error, permission, encoding, …).
-    #[error("file operation failed: {0}")]
-    Io(String),
+    #[error("file operation failed: {detail}")]
+    Io { detail: String },
 }

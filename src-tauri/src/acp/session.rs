@@ -138,6 +138,27 @@ impl SessionManager {
         &self.config_dir
     }
 
+    /// Clone the (cheap) connection handle of a live session.
+    ///
+    /// Commands that must NOT hold the manager lock across an await (e.g.
+    /// `send_prompt`, whose turn can span a user-paced permission prompt)
+    /// use this to grab the connection, drop the lock, and then drive the
+    /// request.
+    pub async fn connection(
+        &self,
+        session_id: &str,
+    ) -> Result<ConnectionTo<Agent>, AcpError> {
+        let sid = SessionId::new(session_id);
+        self.sessions
+            .lock()
+            .await
+            .get(&sid)
+            .map(|live| live.cx.clone())
+            .ok_or_else(|| AcpError::UnknownSession {
+                session_id: session_id.to_string(),
+            })
+    }
+
     /// Number of live sessions.
     pub async fn session_count(&self) -> usize {
         self.sessions.lock().await.len()
@@ -157,7 +178,7 @@ impl SessionManager {
         let entry = self
             .registry
             .get(agent_id)
-            .ok_or_else(|| AcpError::UnknownAgent(agent_id.to_string()))?;
+            .ok_or_else(|| AcpError::UnknownAgent { agent_id: agent_id.to_string() })?;
 
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
@@ -473,7 +494,7 @@ impl SessionManager {
             sessions
                 .get(&sid)
                 .map(|live| live.cx.clone())
-                .ok_or_else(|| AcpError::UnknownSession(session_id.to_string()))?
+                .ok_or_else(|| AcpError::UnknownSession { session_id: session_id.to_string() })?
         };
 
         let request = PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new(text))]);
@@ -481,7 +502,7 @@ impl SessionManager {
             .send_request(request)
             .block_task()
             .await
-            .map_err(|err| AcpError::Protocol(err.message))?;
+            .map_err(|err| AcpError::Protocol { message: err.message })?;
         Ok(response.stop_reason)
     }
 
@@ -521,11 +542,11 @@ impl SessionManager {
             sessions
                 .get(&sid)
                 .map(|live| live.close_tx.clone())
-                .ok_or_else(|| AcpError::UnknownSession(session_id.to_string()))?
+                .ok_or_else(|| AcpError::UnknownSession { session_id: session_id.to_string() })?
         };
         close_tx
             .send(true)
-            .map_err(|_| AcpError::Protocol("session already closed".to_string()))?;
+            .map_err(|_| AcpError::Protocol { message: "session already closed".to_string() })?;
         Ok(())
     }
 }

@@ -27,7 +27,7 @@ impl FsBackend {
     /// Read a text file, rejecting any path that escapes the sandbox.
     pub fn read(&self, path: &Path) -> Result<String, AcpError> {
         let resolved = self.resolve(path)?;
-        fs::read_to_string(&resolved).map_err(|e| AcpError::Io(e.to_string()))
+        fs::read_to_string(&resolved).map_err(|e| AcpError::Io { detail: e.to_string() })
     }
 
     /// Write a text file, rejecting any path that escapes the sandbox.
@@ -37,9 +37,9 @@ impl FsBackend {
     pub fn write(&self, path: &Path, content: &str) -> Result<(), AcpError> {
         let resolved = self.resolve(path)?;
         if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent).map_err(|e| AcpError::Io(e.to_string()))?;
+            fs::create_dir_all(parent).map_err(|e| AcpError::Io { detail: e.to_string() })?;
         }
-        fs::write(&resolved, content).map_err(|e| AcpError::Io(e.to_string()))
+        fs::write(&resolved, content).map_err(|e| AcpError::Io { detail: e.to_string() })
     }
 
     /// Canonicalize `path` and verify it stays under `root`.
@@ -51,7 +51,9 @@ impl FsBackend {
         let root = self
             .root
             .canonicalize()
-            .map_err(|e| AcpError::Io(format!("cannot resolve sandbox root: {e}")))?;
+            .map_err(|e| AcpError::Io {
+                detail: format!("cannot resolve sandbox root: {e}"),
+            })?;
 
         // Absolute paths are used as-is; relative paths are joined to the root.
         let candidate = if path.is_absolute() {
@@ -90,9 +92,9 @@ impl FsBackend {
                     if !ancestor.pop() {
                         // Reached the filesystem root without finding an
                         // existing ancestor: the path is not under a real dir.
-                        return Err(AcpError::Io(
-                            "path does not exist under the sandbox root".to_string(),
-                        ));
+                        return Err(AcpError::Io {
+                            detail: "path does not exist under the sandbox root".to_string(),
+                        });
                     }
                 }
             }
@@ -104,7 +106,9 @@ impl FsBackend {
         if canon.starts_with(root) {
             Ok(canon.to_path_buf())
         } else {
-            Err(AcpError::PathEscape(canon.display().to_string()))
+            Err(AcpError::PathEscape {
+                path: canon.display().to_string(),
+            })
         }
     }
 }

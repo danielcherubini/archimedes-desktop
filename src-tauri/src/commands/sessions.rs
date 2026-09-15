@@ -7,12 +7,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, TextContent};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
 use crate::acp::{AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager};
-use agent_client_protocol::schema::v1::StopReason;
 
 /// `EventSink` backed by `AppHandle::emit`.
 #[derive(Clone)]
@@ -43,9 +43,25 @@ pub async fn send_prompt(
     state: State<'_, Mutex<SessionManager>>,
     session_id: String,
     text: String,
-) -> Result<StopReason, AcpError> {
-    let manager = state.inner().lock().await;
-    manager.send_prompt(&session_id, text).await
+) -> Result<agent_client_protocol::schema::v1::StopReason, AcpError> {
+    // Grab the connection under the manager lock, then DROP the lock before
+    // awaiting the turn: the turn can block on a user-paced permission
+    // prompt, and `respond_permission` needs this same lock to deliver the
+    // answer. Holding it across the await would deadlock.
+    let cx = {
+        let manager = state.inner().lock().await;
+        manager.connection(&session_id).await?
+    };
+    let request = PromptRequest::new(
+        SessionId::new(session_id.as_str()),
+        vec![ContentBlock::Text(TextContent::new(text))],
+    );
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|err| AcpError::Protocol { message: err.message })?;
+    Ok(response.stop_reason)
 }
 
 #[tauri::command]

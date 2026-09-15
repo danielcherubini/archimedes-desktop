@@ -1,29 +1,64 @@
-import { useEffect, useState } from "react";
-import { getAppInfo } from "./lib/version";
+import { useEffect } from "react";
+import {
+  listenPermissionRequest,
+  listenSessionClosed,
+  listenSessionUpdate,
+  listenTerminalOutput,
+} from "./lib/tauri";
+import { useSessions } from "./store/sessions";
+import { usePermissions } from "./store/permissions";
+import SessionList from "./components/SessionList";
+import ChatStream from "./components/ChatStream";
+import TerminalPane from "./components/TerminalPane";
 
 function App() {
-  const [version, setVersion] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
+  // Register the Tauri event listeners once; dispatch into the stores.
+  // `listen()` is async, so cleanup must await the pending registrations
+  // before unlistening: React StrictMode re-runs the effect in dev, and a
+  // stale listener that never gets unregistered doubles every event.
   useEffect(() => {
-    getAppInfo()
-      .then((info) => setVersion(info.version))
-      .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : String(err)),
-      );
+    const unlistenPromises: Array<Promise<() => void>> = [];
+    unlistenPromises.push(
+      listenSessionUpdate((payload) =>
+        useSessions
+          .getState()
+          .applySessionUpdate(payload.sessionId, payload.update),
+      ),
+    );
+    unlistenPromises.push(
+      listenSessionClosed((payload) => {
+        useSessions
+          .getState()
+          .handleSessionClosed(payload.sessionId, payload.reason);
+      }),
+    );
+    unlistenPromises.push(
+      listenPermissionRequest((payload) =>
+        usePermissions
+          .getState()
+          .addPrompt(payload.sessionId, payload.requestId, payload.request),
+      ),
+    );
+    unlistenPromises.push(
+      listenTerminalOutput((payload) =>
+        useSessions
+          .getState()
+          .appendTerminalOutput(payload.terminalId, payload.data),
+      ),
+    );
+    return () => {
+      for (const p of unlistenPromises) {
+        p.then((unlisten) => unlisten()).catch(() => {});
+      }
+    };
   }, []);
 
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center bg-neutral-900 text-neutral-100">
-      <h1 className="text-2xl font-semibold">Archimedes Desktop</h1>
-      {error ? (
-        <p className="mt-4 text-sm text-red-400">{error}</p>
-      ) : version ? (
-        <p className="mt-4 text-lg">Version {version}</p>
-      ) : (
-        <p className="mt-4 text-sm text-neutral-400">Loading…</p>
-      )}
-    </main>
+    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
+      <SessionList />
+      <ChatStream />
+      <TerminalPane />
+    </div>
   );
 }
 
