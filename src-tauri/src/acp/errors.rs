@@ -37,4 +37,13 @@ pub enum AcpError {
     /// No live session with the given id exists.
     #[error("unknown session: {0}")]
     UnknownSession(String),
+
+    /// The requested path escaped the session's sandbox root (via `..`, a
+    /// symlink, or an absolute path outside the root).
+    #[error("path escapes the session sandbox: {0}")]
+    PathEscape(String),
+
+    /// A filesystem operation failed (I/O error, permission, encoding, …).
+    #[error("file operation failed: {0}")]
+    Io(String),
 }

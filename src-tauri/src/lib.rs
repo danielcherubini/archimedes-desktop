@@ -15,7 +15,8 @@ pub fn run() {
             commands::app_info,
             commands::sessions::start_session,
             commands::sessions::send_prompt,
-            commands::sessions::close_session
+            commands::sessions::close_session,
+            commands::sessions::respond_permission
         ])
         .setup(|app| {
             // The agent registry lives in the app's config directory.

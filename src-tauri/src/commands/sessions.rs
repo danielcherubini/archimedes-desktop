@@ -11,7 +11,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
-use crate::acp::{AcpError, EventSink, SessionInfo, SessionManager};
+use crate::acp::{AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager};
 use agent_client_protocol::schema::v1::StopReason;
 
 /// `EventSink` backed by `AppHandle::emit`.
@@ -56,4 +56,22 @@ pub async fn close_session(
 ) -> Result<(), AcpError> {
     let manager = state.inner().lock().await;
     manager.close_session(&session_id).await
+}
+
+/// Deliver the user's decision on a pending permission prompt to the agent.
+///
+/// `request_id` is the JSON-RPC id of the agent's `session/request_permission`
+/// request (the one carried in the `permission-request` event). If the prompt
+/// is no longer pending, this is a no-op.
+#[tauri::command]
+pub async fn respond_permission(
+    state: State<'_, Mutex<SessionManager>>,
+    session_id: String,
+    request_id: String,
+    outcome: PermissionOutcome,
+) -> Result<(), AcpError> {
+    let manager = state.inner().lock().await;
+    manager
+        .respond_permission(&session_id, &request_id, outcome)
+        .await
 }

@@ -2,19 +2,27 @@
 //!
 //! Plain `std`, no async: reads newline-delimited JSON-RPC 2.0 frames from
 //! stdin and writes them to stdout. It speaks just enough ACP to drive the
-//! `acp_flow` integration test:
+//! `acp_flow` and `terminal_flow` integration tests.
 //!
-//! - `initialize`   → `protocolVersion: 1`, `agentInfo`, `agentCapabilities: { loadSession: false }`
-//! - `session/new`  → a fixed `sessionId`
-//! - `session/prompt` → two `session/update` notifications (`agent_message_chunk`,
-//!   text `"hello"` then `" world"`, same `messageId` `"m1"`) then
-//!   `stopReason: "end_turn"`
+//! The agent's behavior is selected by its first positional argument (the
+//! "mode"):
+//!
+//! - *default* (no arg): `session/prompt` → two `session/update` notifications
+//!   (`agent_message_chunk`, text `"hello"` then `" world"`, same
+//!   `messageId` `"m1"`) then `stopReason: "end_turn"`.
+//! - `permission`: `session/prompt` → a `session/update` chunk (`"pre"`)
+//!   FIRST, then a `session/request_permission` request (one option, id
+//!   `"opt-1"`) and a wait for the client's response. Once the response
+//!   arrives, it echoes the outcome as a chunk (`outcome:selected:opt-1` or
+//!   `outcome:cancelled`), then the two `"hello"`/`" world"` chunks, then
+//!   `end_turn`.
+//! - `terminal`: `session/prompt` → `terminal/create` (`echo hello`) →
+//!   `terminal/output` → `terminal/wait_for_exit`, echoing the exit code as an
+//!   `exit:<code>` chunk, then `end_turn`.
 //!
 //! Wire-format notes: property keys are camelCase (`sessionUpdate`,
-//! `agentCapabilities`, `messageId`); discriminator values are snake_case
-//! (`agent_message_chunk`, `end_turn`).
-//!
-//! Task 3 will extend this fixture (permission requests, file reads, …).
+//! `agentCapabilities`, `messageId`, `terminalId`, `optionId`); discriminator
+//! values are snake_case (`agent_message_chunk`, `end_turn`, `allow_once`).
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -24,13 +32,20 @@ const SESSION_ID: &str = "fake-session-1";
 
 fn main() -> ExitCode {
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
+    let stdout = io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    let mut reader = stdin.lock();
+    let mut out = stdout.lock();
+
+    // Mode is the first positional argument (see the module docs).
+    let mode = std::env::args().nth(1).unwrap_or_default();
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -55,53 +70,181 @@ fn main() -> ExitCode {
                         "loadSession": false,
                     },
                 });
-                write_result(&mut stdout, &id, &result);
+                write_result(&mut out, &id, &result);
             }
             "session/new" => {
                 let result = serde_json::json!({ "sessionId": SESSION_ID });
-                write_result(&mut stdout, &id, &result);
+                write_result(&mut out, &id, &result);
             }
-            "session/prompt" => {
-                write_notification(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "sessionId": SESSION_ID,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": "hello" },
-                            "messageId": "m1",
-                        },
-                    }),
-                );
-                write_notification(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "sessionId": SESSION_ID,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": " world" },
-                            "messageId": "m1",
-                        },
-                    }),
-                );
-                let result = serde_json::json!({ "stopReason": "end_turn" });
-                write_result(&mut stdout, &id, &result);
-            }
+            "session/prompt" => match mode.as_str() {
+                "terminal" => handle_prompt_terminal(&mut reader, &mut out, &id),
+                "permission" => handle_prompt_permission(&mut reader, &mut out, &id),
+                _ => handle_prompt_default(&mut out, &id),
+            },
             _ => {
                 // Unknown method: reply with a JSON-RPC error if the frame
                 // expects a response (has an `id`), otherwise ignore it.
-                if let Some(id_value) = id.clone() {
+                if let Some(id_value) = id {
                     let error = serde_json::json!({
                         "code": -32601,
                         "message": "method not found",
                     });
-                    write_error(&mut stdout, &Some(id_value), &error);
+                    write_error(&mut out, &Some(id_value), &error);
                 }
             }
         }
     }
 
     ExitCode::SUCCESS
+}
+
+/// Default mode: stream two chunks, then end the turn.
+fn handle_prompt_default(out: &mut impl Write, prompt_id: &Option<serde_json::Value>) {
+    write_chunk(out, "m1", "hello");
+    write_chunk(out, "m1", " world");
+    write_result(
+        out,
+        prompt_id,
+        &serde_json::json!({ "stopReason": "end_turn" }),
+    );
+}
+
+/// Permission mode: emit a pre-request chunk, request permission, wait for the
+/// client's response, echo the outcome, then stream the two chunks.
+fn handle_prompt_permission(
+    reader: &mut impl BufRead,
+    out: &mut impl Write,
+    prompt_id: &Option<serde_json::Value>,
+) {
+    // A chunk emitted BEFORE the permission request. If the client's event
+    // loop is blocked while the permission handler is pending, this chunk
+    // would never arrive — so its arrival proves the loop stayed responsive.
+    write_chunk(out, "m1", "pre");
+
+    let perm_id = 100;
+    write_request(
+        out,
+        perm_id,
+        "session/request_permission",
+        &serde_json::json!({
+            "sessionId": SESSION_ID,
+            "toolCall": { "toolCallId": "tc1", "title": "run a tool" },
+            "options": [
+                { "optionId": "opt-1", "name": "Allow", "kind": "allow_once" }
+            ],
+        }),
+    );
+
+    let Some(resp) = read_response(reader, perm_id) else {
+        eprintln!("fake_agent: no response to session/request_permission");
+        return;
+    };
+
+    let outcome = &resp["result"]["outcome"];
+    let outcome_text = if let Some(opt) = outcome.get("optionId").and_then(|o| o.as_str()) {
+        format!("selected:{opt}")
+    } else {
+        "cancelled".to_string()
+    };
+    write_chunk(out, "m1", &format!("outcome:{outcome_text}"));
+
+    write_chunk(out, "m1", "hello");
+    write_chunk(out, "m1", " world");
+    write_result(
+        out,
+        prompt_id,
+        &serde_json::json!({ "stopReason": "end_turn" }),
+    );
+}
+
+/// Terminal mode: create a terminal (`echo hello`), pull its output, wait for
+/// it to exit, and echo the exit code.
+fn handle_prompt_terminal(
+    reader: &mut impl BufRead,
+    out: &mut impl Write,
+    prompt_id: &Option<serde_json::Value>,
+) {
+    let create_id = 100;
+    write_request(
+        out,
+        create_id,
+        "terminal/create",
+        &serde_json::json!({
+            "sessionId": SESSION_ID,
+            "command": "echo",
+            "args": ["hello"],
+        }),
+    );
+    let Some(create_resp) = read_response(reader, create_id) else {
+        eprintln!("fake_agent: no response to terminal/create");
+        return;
+    };
+    let terminal_id = create_resp["result"]["terminalId"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let output_id = 101;
+    write_request(
+        out,
+        output_id,
+        "terminal/output",
+        &serde_json::json!({
+            "sessionId": SESSION_ID,
+            "terminalId": terminal_id,
+        }),
+    );
+    // The output response is read (and discarded here); the test observes the
+    // terminal-output event the client emitted instead.
+    let _ = read_response(reader, output_id);
+
+    let wait_id = 102;
+    write_request(
+        out,
+        wait_id,
+        "terminal/wait_for_exit",
+        &serde_json::json!({
+            "sessionId": SESSION_ID,
+            "terminalId": terminal_id,
+        }),
+    );
+    let Some(wait_resp) = read_response(reader, wait_id) else {
+        eprintln!("fake_agent: no response to terminal/wait_for_exit");
+        return;
+    };
+    let exit_code = wait_resp["result"]["exitCode"].as_u64().unwrap_or(999);
+    write_chunk(out, "m1", &format!("exit:{exit_code}"));
+
+    write_result(
+        out,
+        prompt_id,
+        &serde_json::json!({ "stopReason": "end_turn" }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Frame helpers
+// ---------------------------------------------------------------------------
+
+/// Read the next JSON-RPC frame whose `id` matches `expected_id`, skipping any
+/// intervening frames (e.g. notifications). Returns `None` on EOF.
+fn read_response(reader: &mut impl BufRead, expected_id: i64) -> Option<serde_json::Value> {
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if frame.get("id").and_then(|i| i.as_i64()) == Some(expected_id) {
+            return Some(frame);
+        }
+    }
 }
 
 /// Write a JSON-RPC `result` response carrying `id` and `result`.
@@ -124,17 +267,35 @@ fn write_error(w: &mut impl Write, id: &Option<serde_json::Value>, error: &serde
     write_frame(w, &frame);
 }
 
-/// Write a JSON-RPC `session/update` notification with the given params.
-fn write_notification(w: &mut impl Write, params: &serde_json::Value) {
+/// Write a JSON-RPC request with a numeric `id`, `method`, and `params`.
+fn write_request(w: &mut impl Write, id: i64, method: &str, params: &serde_json::Value) {
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "session/update",
+        "id": id,
+        "method": method,
         "params": params,
     });
     write_frame(w, &frame);
 }
 
-/// Serialize `frame` to one line, write it, and flush so the client sees it
+/// Write a JSON-RPC `session/update` notification with an agent_message_chunk.
+fn write_chunk(w: &mut impl Write, message_id: &str, text: &str) {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text },
+                "messageId": message_id,
+            },
+        },
+    });
+    write_frame(w, &frame);
+}
+
+/// Serialize `frame` to one line, write it, and flush so the peer sees it
 /// immediately (ordering matters: chunks must arrive before the prompt reply).
 fn write_frame(w: &mut impl Write, frame: &serde_json::Value) {
     if let Ok(mut s) = serde_json::to_string(frame) {

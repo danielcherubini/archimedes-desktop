@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{EventSink, SessionManager};
+use archimedes_desktop_lib::acp::{EventSink, PermissionOutcome, SessionManager};
 
 /// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).
 const FAKE_SESSION_ID: &str = "fake-session-1";
@@ -48,13 +48,19 @@ fn temp_config_dir() -> PathBuf {
 }
 
 fn write_agents_json(dir: &Path) {
+    write_agents_json_mode(dir, None);
+}
+
+/// Write an agents.json whose `fake` agent runs the fake agent in the given
+/// mode (e.g. `"permission"`). `None` means default mode (no args).
+fn write_agents_json_mode(dir: &Path, mode: Option<&str>) {
     let json = serde_json::json!({
         "agents": [
             {
                 "id": "fake",
                 "name": "Fake Agent",
                 "command": FAKE_AGENT,
-                "args": [],
+                "args": mode.map(|m| vec![m.to_string()]).unwrap_or_default(),
                 "env": {}
             }
         ]
@@ -223,6 +229,111 @@ async fn agent_death_produces_session_closed() {
         .expect("session-closed event should arrive on agent death");
     assert_eq!(closed.1["reason"], "agent-exited");
     assert_eq!(manager.session_count().await, 0);
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permission_round_trip_is_answerable_and_nonblocking() {
+    let config_dir = temp_config_dir();
+    write_agents_json_mode(&config_dir, Some("permission"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let manager = Arc::new(SessionManager::new(config_dir.clone()).unwrap());
+    let cwd = config_dir.clone();
+
+    let info = manager
+        .start_session("fake", cwd, &sink)
+        .await
+        .expect("start_session should succeed");
+    assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
+
+    // Spawn the prompt; it blocks until the agent finishes, which requires the
+    // user to answer the permission request.
+    let manager2 = Arc::clone(&manager);
+    let prompt_task = tokio::spawn(async move {
+        manager2
+            .send_prompt(FAKE_SESSION_ID, "hi".to_string())
+            .await
+    });
+
+    // Drain events until the agent's permission request reaches the client.
+    // The agent emits a `pre` chunk BEFORE the request; if the permission
+    // handler blocked the event loop, that chunk would never be delivered while
+    // the prompt is open. So its arrival proves the loop stayed responsive.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_permission_request = false;
+    let mut saw_pre_chunk = false;
+    while !saw_permission_request && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((event, payload)) => {
+                if event == "permission-request" {
+                    saw_permission_request = true;
+                }
+                if event == "session-update" {
+                    if let Some(text) = session_update_text(&payload) {
+                        if text == "pre" {
+                            saw_pre_chunk = true;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_permission_request,
+        "a permission-request event should be emitted for the agent's request"
+    );
+    assert!(
+        saw_pre_chunk,
+        "the pre-request chunk must arrive while the prompt is pending - the event loop was not blocked by the permission handler"
+    );
+
+    // Answer the permission prompt with the first option.
+    manager
+        .respond_permission(
+            FAKE_SESSION_ID,
+            "100",
+            PermissionOutcome::Selected {
+                option_id: "opt-1".to_string(),
+            },
+        )
+        .await
+        .expect("respond_permission should succeed");
+
+    // The prompt should now complete with end_turn.
+    let reason = prompt_task
+        .await
+        .unwrap()
+        .expect("send_prompt should succeed");
+    assert_eq!(reason, StopReason::EndTurn);
+
+    // Collect the remaining chunks and assert the outcome + streaming order.
+    let events = wait_for_events(&rx, 3, Duration::from_secs(5));
+    let texts: Vec<String> = events
+        .iter()
+        .filter(|(event, _)| event == "session-update")
+        .filter_map(|(_, p)| session_update_text(p))
+        .collect();
+    // The outcome chunk must reflect the selected option, and the streaming
+    // chunks must follow it (they were emitted after the agent got its answer).
+    assert!(
+        texts.contains(&"outcome:selected:opt-1".to_string()),
+        "agent should report the selected option; got {texts:?}"
+    );
+    assert!(
+        texts.contains(&"hello".to_string()) && texts.contains(&" world".to_string()),
+        "streaming chunks should arrive after the permission answer; got {texts:?}"
+    );
+
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
 
     let _ = std::fs::remove_dir_all(&config_dir);
 }

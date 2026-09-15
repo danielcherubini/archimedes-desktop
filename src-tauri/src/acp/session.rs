@@ -20,9 +20,14 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
-    NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, SessionNotification, StopReason, TextContent,
+    AgentCapabilities, ClientCapabilities, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, KillTerminalRequest,
+    KillTerminalResponse, NewSessionRequest, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
+    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -31,6 +36,9 @@ use agent_client_protocol::{
 };
 
 use crate::acp::errors::AcpError;
+use crate::acp::fs_backend::FsBackend;
+use crate::acp::permission::{self, PendingPermissions};
+use crate::acp::terminal::TerminalManager;
 use crate::config::{ConfigError, Registry};
 
 /// Sink for outbound events (session updates, session-closed, …).
@@ -105,9 +113,10 @@ struct LiveSession {
 pub struct SessionManager {
     /// Shared with driver tasks (the `Arc` is cloned into each `tokio::spawn`).
     sessions: Arc<Mutex<HashMap<SessionId, LiveSession>>>,
-    /// Pending permission requests, keyed by session id. Always empty in
-    /// Task 2 (permissions are auto-cancelled); Task 3 populates it.
-    pending_permissions: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// Pending permission requests, keyed by `"{session_id}/{request_id}"`.
+    /// Populated by the permission bridge (Task 3); the driver-task cleanup
+    /// drains all entries for a closing session.
+    pending_permissions: PendingPermissions,
     registry: Registry,
     config_dir: PathBuf,
 }
@@ -180,6 +189,24 @@ impl SessionManager {
         // when the closure returns (i.e. at session close), so it must never
         // be awaited inline here.
         tokio::spawn(async move {
+            // Client-side backends for this session.
+            let fs_backend = FsBackend {
+                root: cwd_owned.clone(),
+            };
+            let terminals = Arc::new(TerminalManager::new());
+
+            // Cheap clones so each handler closure can own its copy.
+            let fs_read = fs_backend.clone();
+            let fs_write = fs_backend.clone();
+            let term_create = terminals.clone();
+            let term_output = terminals.clone();
+            let term_wait = terminals.clone();
+            let term_kill = terminals.clone();
+            let term_release = terminals.clone();
+            let term_sink = sink.clone();
+            let perm_sink = sink.clone();
+            let perm_pp = pending_permissions_arc.clone();
+
             let builder = Client
                 .builder()
                 .name("archimedes-desktop")
@@ -196,14 +223,136 @@ impl SessionManager {
                     on_receive_notification!(),
                 )
                 .on_receive_request(
-                    async move |_req: RequestPermissionRequest,
-                                responder: Responder<RequestPermissionResponse>,
+                    async move |req: ReadTextFileRequest,
+                                responder: Responder<ReadTextFileResponse>,
                                 _cx: ConnectionTo<Agent>| {
-                        // Task 2: auto-respond Cancelled. Task 3 replaces this
-                        // with the real permission bridge.
-                        responder.respond(RequestPermissionResponse::new(
-                            RequestPermissionOutcome::Cancelled,
-                        ))?;
+                        match fs_read.read(&req.path) {
+                            Ok(content) => {
+                                responder.respond(ReadTextFileResponse::new(content))?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_internal_error(e.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: WriteTextFileRequest,
+                                responder: Responder<WriteTextFileResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        match fs_write.write(&req.path, &req.content) {
+                            Ok(()) => {
+                                responder.respond(WriteTextFileResponse::new())?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_internal_error(e.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: CreateTerminalRequest,
+                                responder: Responder<CreateTerminalResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        let cwd = req.cwd.as_deref();
+                        match term_create.create(&req.command, &req.args, cwd, &term_sink) {
+                            Ok(terminal_id) => {
+                                responder.respond(CreateTerminalResponse::new(terminal_id))?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_internal_error(e.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: TerminalOutputRequest,
+                                responder: Responder<TerminalOutputResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        let tid = req.terminal_id.to_string();
+                        match term_output.output(&tid) {
+                            Some((output, truncated, exit_status)) => {
+                                let mut resp = TerminalOutputResponse::new(output, truncated);
+                                if let Some(status) = exit_status {
+                                    resp = resp.exit_status(status);
+                                }
+                                responder.respond(resp)?;
+                            }
+                            None => {
+                                responder.respond_with_internal_error("unknown terminal")?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: WaitForTerminalExitRequest,
+                                responder: Responder<WaitForTerminalExitResponse>,
+                                cx: ConnectionTo<Agent>| {
+                        let tid = req.terminal_id.to_string();
+                        match term_wait.exit_receiver(&tid) {
+                            Some(mut rx) => {
+                                // Delegate the (potentially long) wait to a
+                                // spawned task so the event loop stays free.
+                                let _ = cx.spawn(async move {
+                                    let status = loop {
+                                        if let Some(status) = rx.borrow_and_update().clone() {
+                                            break status;
+                                        }
+                                        if rx.changed().await.is_err() {
+                                            break TerminalExitStatus::new();
+                                        }
+                                    };
+                                    let _ =
+                                        responder.respond(WaitForTerminalExitResponse::new(status));
+                                    Ok(())
+                                });
+                            }
+                            None => {
+                                let _ = responder.respond_with_internal_error("unknown terminal");
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: KillTerminalRequest,
+                                responder: Responder<KillTerminalResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        let tid = req.terminal_id.to_string();
+                        let _ = term_kill.kill(&tid);
+                        responder.respond(KillTerminalResponse::new())?;
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: ReleaseTerminalRequest,
+                                responder: Responder<ReleaseTerminalResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        let tid = req.terminal_id.to_string();
+                        let _ = term_release.release(&tid);
+                        responder.respond(ReleaseTerminalResponse::new())?;
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: RequestPermissionRequest,
+                                responder: Responder<RequestPermissionResponse>,
+                                cx: ConnectionTo<Agent>| {
+                        permission::handle_permission_request(
+                            &req, responder, &cx, &perm_sink, &perm_pp,
+                        )
+                        .await;
                         Ok(())
                     },
                     on_receive_request!(),
@@ -334,6 +483,29 @@ impl SessionManager {
             .await
             .map_err(|err| AcpError::Protocol(err.message))?;
         Ok(response.stop_reason)
+    }
+
+    /// Deliver the user's answer to a pending permission request.
+    ///
+    /// Looks up the oneshot sender by the compound key
+    /// `"{session_id}/{request_id}"` and sends the outcome through it. If the
+    /// entry is gone (the session closed, or the prompt already resolved), this
+    /// is a silent no-op.
+    pub async fn respond_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        outcome: permission::PermissionOutcome,
+    ) -> Result<(), AcpError> {
+        let key = permission::permission_key(session_id, request_id);
+        let sender = self.pending_permissions.lock().await.remove(&key);
+        // Best-effort: if the receiver is already gone the prompt was
+        // already resolved (timeout / session close), so there is nothing to
+        // do.
+        if let Some(sender) = sender {
+            let _ = sender.send(outcome);
+        }
+        Ok(())
     }
 
     /// Close a live session.
