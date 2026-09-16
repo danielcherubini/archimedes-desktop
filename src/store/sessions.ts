@@ -491,10 +491,21 @@ export const useSessions = create<SessionsState>((set, get) => ({
       historySessions: st.historySessions.filter(
         (s) => s.sessionId !== sessionId,
       ),
-      // Clear the in-memory transcript: the agent's load-replay rebuilds it.
-      messages: { ...st.messages, [sessionId]: [] },
       activeSessionId: st.activeSessionId ?? sessionId,
     }));
+    // ACP `session/load` does not re-stream the transcript — reload it from
+    // the persisted history so the pane shows the conversation on resume.
+    void (async () => {
+      try {
+        const rows = await loadHistory(sessionId);
+        // The user may have switched away while the fetch was in flight.
+        if (get().activeSessionId !== sessionId) return;
+        const messages = rows.flatMap(rowToMessages);
+        set((st) => ({ messages: { ...st.messages, [sessionId]: messages } }));
+      } catch (err) {
+        console.error(`failed to load history for ${sessionId}`, err);
+      }
+    })();
     return info;
   },
 
