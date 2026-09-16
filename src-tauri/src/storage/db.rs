@@ -61,6 +61,17 @@ pub struct MessageRow {
     pub created_at: i64,
 }
 
+/// A row from the `spaces` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceRow {
+    pub path: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub last_opened_at: i64,
+}
+
 /// The app's SQLite database.
 ///
 /// The connection is wrapped in a `std::sync::Mutex` (a raw
@@ -81,6 +92,31 @@ impl Db {
         // Enforce the ON DELETE CASCADE on messages.
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(SCHEMA)?;
+        // One-time backfill for pre-existing databases: give a space row to every
+        // distinct stored session cwd (canonicalized). A vanished folder is skipped
+        // silently — its sessions stay stored, just without a space.
+        // DO NOTHING on conflict: the backfill must NOT refresh last_opened_at on
+        // every open (that would collapse the sidebar's recent-first ordering to a
+        // tie on every restart — recency is refreshed by `upsert_space`, which runs
+        // on real starts/resumes, i.e. Task 3's `record_session` hook).
+        let cwds: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT cwd FROM sessions")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for cwd in cwds {
+            if let Ok(c) = std::fs::canonicalize(&cwd) {
+                let p = c.display().to_string();
+                let now = now_ms();
+                conn.execute(
+                    "INSERT INTO spaces (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
+                     ON CONFLICT(path) DO NOTHING",
+                    params![p, now],
+                )?;
+            }
+        }
         Ok(Self {
             conn: StdMutex::new(conn),
         })
@@ -204,6 +240,62 @@ impl Db {
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         Ok(())
     }
+
+    /// Insert or touch the bookkeeping row for a folder.
+    ///
+    /// `created_at` is preserved on conflict; `last_opened_at` is always
+    /// refreshed (an actual start/resume is a real "open"). No folder
+    /// validation happens here — whether the folder exists is the caller's
+    /// problem (the canonicalizing gate is in `start_session`/`space_for_path`).
+    pub fn upsert_space(&self, path: &str) -> Result<(), DbError> {
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "INSERT INTO spaces (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
+                 ON CONFLICT(path) DO UPDATE SET last_opened_at = excluded.last_opened_at",
+            params![path, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// All spaces, most recently opened first.
+    pub fn list_spaces(&self) -> Result<Vec<SpaceRow>, DbError> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT path, created_at, last_opened_at
+             FROM spaces
+             ORDER BY last_opened_at DESC, path ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SpaceRow {
+                    path: row.get(0)?,
+                    created_at: row.get(1)?,
+                    last_opened_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Look up one space row by exact stored path (`None` if absent).
+    pub fn find_space(&self, path: &str) -> Result<Option<String>, DbError> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = guard.prepare("SELECT path FROM spaces WHERE path = ?1")?;
+        let found = match stmt.query_row(params![path], |row| row.get::<_, String>(0)) {
+            Ok(path) => Some(path),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(found)
+    }
+
+    /// Delete the bookkeeping row only (conversations/messages are NOT touched).
+    pub fn delete_space(&self, path: &str) -> Result<(), DbError> {
+        self.conn
+            .lock()
+            .expect("db mutex poisoned")
+            .execute("DELETE FROM spaces WHERE path = ?1", params![path])?;
+        Ok(())
+    }
 }
 
 /// The current unix time in milliseconds.
@@ -233,4 +325,9 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(session_id, kind, message_key)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE TABLE IF NOT EXISTS spaces (
+    path TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    last_opened_at INTEGER NOT NULL
+);
 "#;

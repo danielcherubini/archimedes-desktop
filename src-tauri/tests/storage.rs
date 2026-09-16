@@ -127,3 +127,153 @@ fn reopens_an_existing_database() {
     assert_eq!(db.messages_for("sess-1").expect("messages_for").len(), 1);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn spaces_upsert_find_delete_and_order() {
+    let path = temp_db_path();
+    let db = Db::open(&path).expect("db should open");
+
+    assert!(
+        db.list_spaces().expect("list_spaces").is_empty(),
+        "a fresh db has no spaces"
+    );
+
+    db.upsert_space("/tmp/pa").expect("upsert_space /tmp/pa");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.upsert_space("/tmp/pb").expect("upsert_space /tmp/pb");
+
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert_eq!(spaces.len(), 2, "exactly two spaces should be stored");
+    assert_eq!(spaces[0].path, "/tmp/pb", "most recently opened first");
+    let pa = spaces
+        .iter()
+        .find(|s| s.path == "/tmp/pa")
+        .expect("a /tmp/pa row should exist");
+    assert!(pa.created_at <= pa.last_opened_at);
+
+    // A re-touch wins the ordering.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.upsert_space("/tmp/pa")
+        .expect("upsert_space /tmp/pa again");
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert_eq!(
+        spaces[0].path, "/tmp/pa",
+        "a re-touch wins the recent-first ordering"
+    );
+
+    assert_eq!(
+        db.find_space("/tmp/pa").expect("find_space /tmp/pa"),
+        Some("/tmp/pa".to_string())
+    );
+    assert_eq!(db.find_space("/nope").expect("find_space /nope"), None);
+
+    db.delete_space("/tmp/pb").expect("delete_space /tmp/pb");
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert_eq!(spaces.len(), 1, "deleting a space leaves the other");
+    assert_eq!(spaces[0].path, "/tmp/pa");
+    let pa_before = spaces[0].clone();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.upsert_space("/tmp/pb")
+        .expect("upsert_space /tmp/pb again");
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert_eq!(
+        spaces.len(),
+        2,
+        "a re-upsert of a deleted space brings it back"
+    );
+    let pb = spaces
+        .iter()
+        .find(|s| s.path == "/tmp/pb")
+        .expect("a /tmp/pb row should exist");
+    assert!(
+        pb.created_at > pa_before.created_at,
+        "a recreated space gets a fresh created_at"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn open_backfills_space_rows_from_existing_sessions() {
+    let base = std::env::temp_dir().join(format!("archimedes-spaces-bk-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("base dir");
+    let cwd_a = base.join("cwd_a");
+    let cwd_b = base.join("cwd_b");
+    // These MUST exist for the backfill's canonicalization.
+    std::fs::create_dir_all(&cwd_a).expect("cwd_a dir");
+    std::fs::create_dir_all(&cwd_b).expect("cwd_b dir");
+    // A folder that is NEVER created: the backfill must skip it without failing.
+    let gone = base.join(format!("gone-{}", uuid::Uuid::new_v4()));
+    let db_path = base.join("archimedes.db");
+
+    let mk_session = |id: &str, cwd: std::path::PathBuf| SessionInfo {
+        session_id: SessionId::new(id),
+        agent_id: "fake".to_string(),
+        cwd,
+        capabilities: AgentCapabilities::default(),
+    };
+
+    let db1 = Db::open(&db_path).expect("db should open");
+    // Two sessions in cwd_a (the `SELECT DISTINCT` must collapse them), one in
+    // cwd_b (an existing folder that got a row through a real session), and
+    // one in the never-created `gone` folder.
+    db1.record_session(&mk_session("sess-a1", cwd_a.clone()))
+        .expect("record a1");
+    db1.record_session(&mk_session("sess-a2", cwd_a.clone()))
+        .expect("record a2");
+    db1.record_session(&mk_session("sess-b1", cwd_b.clone()))
+        .expect("record b1");
+    db1.record_session(&mk_session("sess-g1", gone.clone()))
+        .expect("record g1");
+    // db1 stays open while db2 runs its backfill — that's fine: the backfill
+    // only issues `INSERT ... DO NOTHING`.
+
+    let db2 = Db::open(&db_path).expect("db should reopen");
+    let spaces = db2.list_spaces().expect("list_spaces");
+    assert_eq!(
+        spaces.len(),
+        2,
+        "the backfill creates rows for the canonical existing cwds only; got {spaces:?}"
+    );
+    let canonical_a = std::fs::canonicalize(&cwd_a).expect("canonical cwd_a");
+    let canonical_b = std::fs::canonicalize(&cwd_b).expect("canonical cwd_b");
+    let paths: Vec<String> = spaces.iter().map(|s| s.path.clone()).collect();
+    assert!(
+        paths.contains(&canonical_a.display().to_string()),
+        "a row for the canonical cwd_a"
+    );
+    assert!(
+        paths.contains(&canonical_b.display().to_string()),
+        "a row for the canonical cwd_b"
+    );
+    // The vanished folder: no row, and it did not fail `Db::open`.
+    assert_eq!(
+        db2.find_space(gone.display().to_string().as_str())
+            .expect("find_space gone"),
+        None
+    );
+    assert_eq!(
+        db2.find_space(canonical_a.display().to_string().as_str())
+            .expect("find_space a"),
+        Some(canonical_a.display().to_string())
+    );
+
+    // A third open: the backfill is idempotent (DO NOTHING) — same rows,
+    // timestamps unchanged (a backfill must never refresh recency).
+    let before: Vec<(String, i64, i64)> = spaces
+        .iter()
+        .map(|s| (s.path.clone(), s.created_at, s.last_opened_at))
+        .collect();
+    let db3 = Db::open(&db_path).expect("db should reopen again");
+    let spaces3 = db3.list_spaces().expect("list_spaces");
+    let after: Vec<(String, i64, i64)> = spaces3
+        .iter()
+        .map(|s| (s.path.clone(), s.created_at, s.last_opened_at))
+        .collect();
+    assert_eq!(
+        before, after,
+        "the backfill must not refresh last_opened_at or created_at"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
