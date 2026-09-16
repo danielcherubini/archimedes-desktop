@@ -402,6 +402,204 @@ async fn resume_replaces_stored_transcript() {
     let _ = std::fs::remove_dir_all(&config_dir);
 }
 
+/// Poll a `session-closed` event for `(session_id, reason)` out of a possibly
+/// busy event queue: scan until the exact pair is seen, budget 5 s.
+async fn wait_for_closed(rx: &Receiver<(String, Value)>, session_id: &str, reason: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = false;
+    while !seen && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((event, payload)) if event == "session-closed" => {
+                seen = payload["sessionId"] == session_id && payload["reason"] == reason;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        seen,
+        "a session-closed event for `{session_id}` with reason `{reason}` should arrive within 5s"
+    );
+}
+
+/// Drive the one-live policy (ADR 0002) end to end: a second `start_session`
+/// supersedes the first with the `replaced` close reason, a superseded session
+/// re-resumable, and the superseded processes are all reaped (no leak).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_live_supersede_policy() {
+    let config_dir = temp_config_dir();
+    // Two DISTINCT copies: the teardown-reap assertions discriminate the two
+    // agents by path, which is what makes step 11 a real leak check rather
+    // than a single shared-binary assertion.
+    let bin_a = unique_fake_agent(&config_dir);
+    let bin_b = unique_fake_agent(&config_dir);
+    {
+        let json = serde_json::json!({
+            "agents": [
+                {
+                    "id": "l1",
+                    "name": "L1",
+                    "command": bin_a.to_string_lossy(),
+                    "args": ["resume"],
+                    "env": { "FAKE_SESSION_ID": "s1" }
+                },
+                {
+                    "id": "l2",
+                    "name": "L2",
+                    "command": bin_b.to_string_lossy(),
+                    "args": ["resume"],
+                    "env": { "FAKE_SESSION_ID": "s2" }
+                }
+            ]
+        });
+        std::fs::write(
+            config_dir.join("agents.json"),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // `args: ["resume"]` is deliberate: one mode answers `session/new`,
+    // advertises `loadSession: true`, answers `session/load`, and answers
+    // `session/prompt` — covering both `start_session` and `resume_session`.
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    manager.attach_db(Arc::new(
+        Db::open(&config_dir.join("archimedes.db")).expect("db should open"),
+    ));
+    manager.set_establish_timeout(Duration::from_secs(2));
+
+    let cwd_a = config_dir.join("cwda");
+    let cwd_b = config_dir.join("cwdb");
+    std::fs::create_dir_all(&cwd_a).unwrap();
+    std::fs::create_dir_all(&cwd_b).unwrap();
+
+    // 1. A nonexistent folder is rejected before anything is spawned or
+    //    superseded (early canonicalize in `start_session`).
+    let missing = config_dir.join(format!("nope-{}", uuid::Uuid::new_v4()));
+    let err = manager
+        .start_session("l1", missing, &sink)
+        .await
+        .expect_err("start_session should fail for a missing folder");
+    assert!(
+        matches!(err, AcpError::FolderMissing { .. }),
+        "expected FolderMissing, got {err:?}"
+    );
+    assert_eq!(
+        manager.session_count().await,
+        0,
+        "nothing should be spawned for a missing folder"
+    );
+
+    // 2. The first session starts and is the only live session.
+    manager
+        .start_session("l1", cwd_a.clone(), &sink)
+        .await
+        .expect("start_session l1 should succeed");
+    assert_eq!(manager.session_count().await, 1);
+
+    // 3. A second live session starts: it supersedes s1 (an async flag send
+    //    — the teardown runs concurrently in s1's driver task).
+    manager
+        .start_session("l2", cwd_b.clone(), &sink)
+        .await
+        .expect("start_session l2 should succeed");
+    // Do NOT assert the count right here: s2 is already in the map and s1's
+    // driver cleanup (the map removal) races s2's insertion, so the count
+    // may still read 2 for a short window.
+
+    // 4. s1's close event (`replaced`) arrives. It is emitted AFTER s1 has
+    //    been removed from the sessions map, so observing it guarantees s1
+    //    is gone.
+    wait_for_closed(&rx, "s1", "replaced").await;
+
+    // 5. Now (after the close event, not right after step 3) the map holds
+    //    exactly the one live session.
+    assert_eq!(
+        manager.session_count().await,
+        1,
+        "s1 should be gone and s2 present"
+    );
+
+    // 6. The new live session is fully functional after the supersede
+    //    (the default-mode prompt handler streams two chunks before
+    //    end_turn; the chunk events may arrive interleaved — that is fine).
+    manager
+        .send_prompt("s2", "hi".to_string())
+        .await
+        .expect("send_prompt should succeed on the superseding session");
+
+    // 7. Close s2; wait for its close event BEFORE asserting on counts
+    //    (teardown is an async flag send).
+    manager
+        .close_session("s2")
+        .await
+        .expect("close_session s2 should succeed");
+    wait_for_closed(&rx, "s2", "user").await;
+    assert_eq!(
+        manager.session_count().await,
+        0,
+        "everything should be closed"
+    );
+
+    // 8. A superseded session is re-resumable (loadSession is true in the
+    //    `resume` mode); step 7 closed everything, so this takes the policy's
+    //    no-op branch and s1 establishes cleanly.
+    manager
+        .resume_session("l1", "s1", cwd_a, &sink)
+        .await
+        .expect("resume_session s1 should succeed after a supersede");
+    assert_eq!(manager.session_count().await, 1);
+
+    // 9. `start_session` supersedes a *resumed* session too.
+    manager
+        .start_session("l2", cwd_b.clone(), &sink)
+        .await
+        .expect("start_session l2 should succeed (again)");
+    wait_for_closed(&rx, "s1", "replaced").await;
+    assert_eq!(
+        manager.session_count().await,
+        1,
+        "only the newest session should be live"
+    );
+
+    // 10. Close everything again.
+    manager
+        .close_session("s2")
+        .await
+        .expect("close_session s2 should succeed (again)");
+    wait_for_closed(&rx, "s2", "user").await;
+    assert_eq!(
+        manager.session_count().await,
+        0,
+        "everything should be closed again"
+    );
+
+    // 11. Process teardown proof: poll until BOTH agents are gone (deadline
+    //     10 s; same `pgrep` idiom as the existing reap checks) — the
+    //     superseded/closed processes were actually reaped, none leaked.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline
+        && (find_fake_agent_pid(&bin_a).is_some() || find_fake_agent_pid(&bin_b).is_some())
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        find_fake_agent_pid(&bin_a).is_none(),
+        "agent a should have been reaped (no leak)"
+    );
+    assert!(
+        find_fake_agent_pid(&bin_b).is_none(),
+        "agent b should have been reaped (no leak)"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
 /// Drain events until a `session-closed` event arrives (other events that
 /// are still in the queue do not mask it).
 async fn assert_closed_event(rx: &std::sync::mpsc::Receiver<(String, serde_json::Value)>) {

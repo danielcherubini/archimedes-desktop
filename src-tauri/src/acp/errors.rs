@@ -49,6 +49,10 @@ pub enum AcpError {
     #[error("path escapes the session sandbox: {path}")]
     PathEscape { path: String },
 
+    /// The requested working directory does not exist (or is not a folder).
+    #[error("folder not found: {path}")]
+    FolderMissing { path: String },
+
     /// A filesystem operation failed (I/O error, permission, encoding, …).
     #[error("file operation failed: {detail}")]
     Io { detail: String },

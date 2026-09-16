@@ -30,8 +30,11 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-/// The fixed session id this fake agent reports for every `session/new`.
-const SESSION_ID: &str = "fake-session-1";
+/// Session id this agent reports: an explicit `FAKE_SESSION_ID` env
+/// override, or the default `fake-session-1` (existing tests rely on it).
+fn session_id() -> String {
+    std::env::var("FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-1".to_string())
+}
 
 fn main() -> ExitCode {
     let stdin = io::stdin();
@@ -80,14 +83,14 @@ fn main() -> ExitCode {
                 // Replay one chunk before the response (the client's restore
                 // builder retains notifications that arrive pre-response).
                 write_chunk(&mut out, "m1", "resumed");
-                let result = serde_json::json!({ "sessionId": SESSION_ID });
+                let result = serde_json::json!({ "sessionId": session_id() });
                 write_result(&mut out, &id, &result);
             }
             "session/new" => {
                 // `hang` mode: never answer, to hold the client's
                 // session/new request open forever.
                 if mode != "hang" {
-                    let result = serde_json::json!({ "sessionId": SESSION_ID });
+                    let result = serde_json::json!({ "sessionId": session_id() });
                     write_result(&mut out, &id, &result);
                 }
             }
@@ -136,12 +139,13 @@ fn handle_prompt_permission(
     write_chunk(out, "m1", "pre");
 
     let perm_id = 100;
+    let sid = session_id();
     write_request(
         out,
         perm_id,
         "session/request_permission",
         &serde_json::json!({
-            "sessionId": SESSION_ID,
+            "sessionId": sid,
             "toolCall": { "toolCallId": "tc1", "title": "run a tool" },
             "options": [
                 { "optionId": "opt-1", "name": "Allow", "kind": "allow_once" }
@@ -229,11 +233,12 @@ fn write_request(w: &mut impl Write, id: i64, method: &str, params: &serde_json:
 
 /// Write a JSON-RPC `session/update` notification with an agent_message_chunk.
 fn write_chunk(w: &mut impl Write, message_id: &str, text: &str) {
+    let sid = session_id();
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
-            "sessionId": SESSION_ID,
+            "sessionId": sid,
             "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": text },

@@ -7,8 +7,9 @@
 //! `connect_with` inline in [`SessionManager::start_session`] (it would only
 //! resolve when the session closes). Instead we spawn the connection as a
 //! *driver task* that owns the closure for the whole session. `close_session`
+//! (or the one-live policy's supersede, ADR 0002) records the close kind and
 //! flips a `watch` flag that makes the closure return, which drops the
-//! connection and — on Unix — terminates the agent's process group.
+//! connection and — on Unix — terminates the agent's process group;
 //!
 //! The same driver is used for `session/new` (start) and `session/load`
 //! (resume): only the *establisher* — the future that turns a fresh
@@ -17,7 +18,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -41,7 +41,7 @@ use agent_client_protocol::{
 use crate::acp::errors::AcpError;
 use crate::acp::fs_backend::FsBackend;
 use crate::acp::permission::{self, PendingPermissions};
-use crate::config::{ConfigError, Registry};
+use crate::config::{AgentEntry, ConfigError, Registry};
 use crate::storage::Db;
 
 /// Sink for outbound events (session updates, session-closed, …).
@@ -58,6 +58,8 @@ pub trait EventSink: Send + Sync {
 pub enum ClosedReason {
     /// The user (or the app) closed the session.
     User,
+    /// Closed because another session started (one-live policy).
+    Replaced,
     /// The agent process exited on its own.
     AgentExited,
     /// The connection failed for an unexpected reason.
@@ -69,10 +71,21 @@ impl ClosedReason {
     pub fn as_str(self) -> &'static str {
         match self {
             ClosedReason::User => "user",
+            ClosedReason::Replaced => "replaced",
             ClosedReason::AgentExited => "agent-exited",
             ClosedReason::Error => "error",
         }
     }
+}
+
+/// How a live session was (or was about to be) closed. `None` at
+/// teardown time means the agent process exited on its own.
+#[derive(Debug, Clone, Copy)]
+enum CloseKind {
+    /// An explicit user close (`close_session`).
+    User,
+    /// Closed because another session started (one-live policy, ADR 0002).
+    Replaced,
 }
 
 /// A fully established session, ready to accept prompts.
@@ -106,7 +119,15 @@ struct LiveSession {
     /// Set to `true` to make the driver task's closure return, tearing down
     /// the connection (and the agent's process group on Unix).
     close_tx: watch::Sender<bool>,
+    /// The close kind, decided by `close_session` / `supersede_live_sessions`
+    /// (first-set-wins) and read by the driver task once `connect_with`
+    /// returns.
+    close_kind: Arc<StdMutex<Option<CloseKind>>>,
 }
+
+/// One live session's close plumbing: the flag sender (cheap) and the
+/// shared close kind set by closers when they supersede/close it.
+type LiveClose = (watch::Sender<bool>, Arc<StdMutex<Option<CloseKind>>>);
 
 /// Manages all live ACP sessions.
 ///
@@ -184,10 +205,49 @@ impl SessionManager {
         self.sessions.lock().await.len()
     }
 
+    /// The configured agents (consumed by the `list_agents` command).
+    pub fn agents(&self) -> &[AgentEntry] {
+        &self.registry.agents
+    }
+
+    /// One-live policy (ADR 0002): initiate a `replaced` close of every live
+    /// session (best-effort flag send; the actual teardown runs concurrently
+    /// in the superseded driver tasks). Called at the top of `start_session`
+    /// and `resume_session`, BEFORE the new agent is spawned, so the steady
+    /// state is at most one live session at a time.
+    pub async fn supersede_live_sessions(&self) {
+        // Clone the (cheap) senders and kinds first, then send: the map
+        // lock must not be held across the sends — and it never needs to
+        // be, because the kind mutex is always unlocked when touched and
+        // exports no references into the map.
+        let live: Vec<LiveClose> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|live| (live.close_tx.clone(), live.close_kind.clone()))
+            .collect();
+        for (close_tx, close_kind) in live {
+            // First-set-wins: a kind already present means the close is in
+            // progress, or the reason is already decided.
+            if let Ok(mut kind) = close_kind.lock() {
+                if kind.is_none() {
+                    *kind = Some(CloseKind::Replaced);
+                }
+            }
+            // Ignore `SendError`: the target may already be closing.
+            let _ = close_tx.send(true);
+        }
+    }
+
     /// Record a session in the persistence layer (no-op without a database).
     fn record_session(&self, info: &SessionInfo) {
         if let Some(db) = &self.db {
             let _ = db.record_session(info);
+            // A start/resume updates or creates the space row (and `resume`
+            // re-touches `last_opened_at`): a space is born/touched when a
+            // conversation starts or resumes in it.
+            let _ = db.upsert_space(&info.cwd.display().to_string());
         }
     }
 
@@ -202,12 +262,23 @@ impl SessionManager {
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
     ) -> Result<SessionInfo, AcpError> {
+        // Canonicalize BEFORE the registry lookup and before the space row is
+        // touched: the spaces join key is the canonicalized cwd, so a
+        // `~/x` / symlink spelling must not produce a different row.
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| AcpError::FolderMissing {
+            path: cwd.display().to_string(),
+        })?;
+
         let entry = self
             .registry
             .get(agent_id)
             .ok_or_else(|| AcpError::UnknownAgent {
                 agent_id: agent_id.to_string(),
             })?;
+
+        // One-live policy (ADR 0002): supersede any live session BEFORE
+        // spawning this agent (unconditional — the policy is app-wide).
+        self.supersede_live_sessions().await;
 
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
@@ -277,12 +348,23 @@ impl SessionManager {
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
     ) -> Result<SessionInfo, AcpError> {
+        // Canonicalize BEFORE the registry lookup (same rationale as
+        // `start_session`): everything downstream (the `session/load` cwd,
+        // `SessionInfo.cwd`, the space join key) uses the canonical path.
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| AcpError::FolderMissing {
+            path: cwd.display().to_string(),
+        })?;
+
         let entry = self
             .registry
             .get(agent_id)
             .ok_or_else(|| AcpError::UnknownAgent {
                 agent_id: agent_id.to_string(),
             })?;
+
+        // One-live policy (ADR 0002): supersede any live session BEFORE
+        // spawning this agent (unconditional — the policy is app-wide).
+        self.supersede_live_sessions().await;
 
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
@@ -379,12 +461,16 @@ impl SessionManager {
         let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
         let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
         let (close_tx, mut close_rx) = watch::channel(false);
-        // Set by the closure when the user closes the session. The driver task
-        // reads it after `connect_with` returns to decide the close reason.
-        // (We can't rely on the closure to report the reason: on agent death
-        // the SDK's background actor fails and drops the closure first.)
-        let user_closed = Arc::new(AtomicBool::new(false));
-        let user_closed_for_closure = user_closed.clone();
+        // Set by `close_session` / `supersede_live_sessions` (first-set-wins)
+        // BEFORE their close-flag send. The driver task reads it after
+        // `connect_with` returns to decide the close reason; `None` means the
+        // agent process exited on its own. (The close flag alone cannot carry
+        // the reason: on a user close the agent process may notice the EOF
+        // and exit first, so the reason must be decided by whoever closed.)
+        let close_kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
+        // A clone for the driver task (held by the task until AFTER its kind
+        // read below); the original moves into the `LiveSession` value.
+        let close_kind_for_task = close_kind.clone();
 
         // Per-session transcript accumulators for the persistence hook.
         let agent_text_acc: Arc<StdMutex<HashMap<String, String>>> =
@@ -530,25 +616,30 @@ impl SessionManager {
                     // BLOCK until close_session OR agent death. A clean
                     // incoming EOF does NOT cancel main_fn, so select on both.
                     tokio::select! {
-                        _ = close_rx.changed() => {
-                            user_closed_for_closure.store(true, Ordering::SeqCst);
-                        }
-                        _ = cx.incoming_closed() => {
-                            // Agent exited; leave `user_closed` false.
-                        }
+                        // The close kind was set by the closer before the
+                        // flag send and read by the task after this returns;
+                        // the closure itself does not decide the reason.
+                        _ = close_rx.changed() => {}
+                        // Agent exited; the kind stays whatever the closer
+                        // (if any) already set — `None` means the agent
+                        // process exited on its own.
+                        _ = cx.incoming_closed() => {}
                     }
                     Ok(())
                 })
                 .await;
 
             // Connection returned (closed, agent died, or error): clean up.
-            // The reason is derived from whether the user explicitly closed:
-            // the closure sets the flag on a user close; on agent death the
-            // closure is dropped before it can set it.
-            let reason = if user_closed.load(Ordering::SeqCst) {
-                ClosedReason::User
-            } else {
-                ClosedReason::AgentExited
+            // The reason comes from the close kind the closer recorded: a
+            // kind set before the flag send wins; `None` means the agent
+            // process exited on its own and nobody closed it.
+            let kind = *close_kind_for_task
+                .lock()
+                .expect("close-kind mutex poisoned");
+            let reason = match kind {
+                Some(CloseKind::User) => ClosedReason::User,
+                Some(CloseKind::Replaced) => ClosedReason::Replaced,
+                None => ClosedReason::AgentExited,
             };
             if let Ok(session_id) = session_id_rx.await {
                 sessions_arc.lock().await.remove(&session_id);
@@ -597,6 +688,7 @@ impl SessionManager {
             cwd,
             agent_id: agent_id.to_string(),
             close_tx,
+            close_kind,
         };
         self.sessions
             .lock()
@@ -671,20 +763,32 @@ impl SessionManager {
     /// Close a live session.
     ///
     /// `async` because it must lock the sessions map to find the session.
-    /// Sets the close flag; the driver task performs the map removal and the
+    /// Records the `User` close kind (first-set-wins) and sends the close
+    /// flag; the driver task performs the map removal and the
     /// `session-closed` emit.
     pub async fn close_session(&self, session_id: &str) -> Result<(), AcpError> {
         let sid = SessionId::new(session_id);
-        // Clone just the close flag's sender (it is cheaply cloneable).
-        let close_tx = {
+        // Clone just the close flag's sender and the shared close kind (both
+        // cheaply cloneable).
+        let (close_tx, close_kind) = {
             let sessions = self.sessions.lock().await;
             sessions
                 .get(&sid)
-                .map(|live| live.close_tx.clone())
+                .map(|live| (live.close_tx.clone(), live.close_kind.clone()))
                 .ok_or_else(|| AcpError::UnknownSession {
                     session_id: session_id.to_string(),
                 })?
         };
+        // Decide the kind BEFORE starting the close. First-set-wins: a kind
+        // already present means the close is in progress (another setter won
+        // the race) or the reason is already decided. The kind mutex is never
+        // held by anyone who also holds the close flag's future, so the set
+        // and the send can run safely in this order.
+        if let Ok(mut kind) = close_kind.lock() {
+            if kind.is_none() {
+                *kind = Some(CloseKind::User);
+            }
+        }
         close_tx.send(true).map_err(|_| AcpError::Protocol {
             message: "session already closed".to_string(),
         })?;
