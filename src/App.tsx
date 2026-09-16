@@ -5,7 +5,6 @@ import {
   listenPermissionRequest,
   listenSessionClosed,
   listenSessionUpdate,
-  listenTerminalOutput,
   listSessions,
 } from "./lib/tauri";
 import { checkForUpdate, installUpdate } from "./lib/updater";
@@ -13,7 +12,6 @@ import { useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
 import SessionList from "./components/SessionList";
 import ChatStream from "./components/ChatStream";
-import TerminalPane from "./components/TerminalPane";
 
 function App() {
   // Register the Tauri event listeners once; dispatch into the stores.
@@ -41,13 +39,6 @@ function App() {
         usePermissions
           .getState()
           .addPrompt(payload.sessionId, payload.requestId, payload.request),
-      ),
-    );
-    unlistenPromises.push(
-      listenTerminalOutput((payload) =>
-        useSessions
-          .getState()
-          .appendTerminalOutput(payload.terminalId, payload.data),
       ),
     );
     return () => {
@@ -95,7 +86,6 @@ function App() {
     <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
       <SessionList />
       <ChatStream />
-      <TerminalPane />
     </div>
   );
 }

@@ -182,6 +182,20 @@ impl Db {
         Ok(rows)
     }
 
+    /// Delete a session's messages.
+    ///
+    /// `resume_session` calls this before `session/load`: the agent's
+    /// restored replay is treated as the authoritative history, so a
+    /// replay that reuses (or changes) a `messageId` replaces the stored
+    /// transcript instead of corrupting or duplicating it.
+    pub fn clear_messages_for(&self, session_id: &str) -> Result<(), DbError> {
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     /// Delete a session; its messages are removed by `ON DELETE CASCADE`.
     pub fn delete_session(&self, session_id: &str) -> Result<(), DbError> {
         self.conn

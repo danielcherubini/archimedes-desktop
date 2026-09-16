@@ -1,6 +1,5 @@
 import { create } from "zustand";
 import {
-  decodeBase64,
   deleteSession as deleteSessionCommand,
   loadHistory,
   resumeSession as resumeSessionCommand,
@@ -236,8 +235,6 @@ interface SessionsState {
   inTurn: Record<string, boolean>;
   /** Last stop reason reported for a session's turn. */
   stopReasons: Record<string, StopReason>;
-  /** Accumulated terminal output per terminal id (decoded UTF-8). */
-  terminals: Record<string, string>;
 
   addSession: (info: SessionInfo) => void;
   setActiveSession: (sessionId: string | null) => void;
@@ -261,7 +258,6 @@ interface SessionsState {
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
   handleSessionClosed: (sessionId: string, reason: string) => void;
   turnCompleted: (sessionId: string, stopReason: StopReason) => void;
-  appendTerminalOutput: (terminalId: string, base64Data: string) => void;
 }
 
 export const useSessions = create<SessionsState>((set, get) => ({
@@ -271,7 +267,6 @@ export const useSessions = create<SessionsState>((set, get) => ({
   messages: {},
   inTurn: {},
   stopReasons: {},
-  terminals: {},
 
   addSession: (info) =>
     set((state) => ({
@@ -408,13 +403,5 @@ export const useSessions = create<SessionsState>((set, get) => ({
     set((state) => ({
       inTurn: { ...state.inTurn, [sessionId]: false },
       stopReasons: { ...state.stopReasons, [sessionId]: stopReason },
-    })),
-
-  appendTerminalOutput: (terminalId, base64Data) =>
-    set((state) => ({
-      terminals: {
-        ...state.terminals,
-        [terminalId]: (state.terminals[terminalId] ?? "") + decodeBase64(base64Data),
-      },
     })),
 }));

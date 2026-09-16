@@ -12,8 +12,12 @@ _Avoid_: App, frontend, IDE
 An external ACP-speaking coding agent process (pi, Claude Code, Codex, …), spawned by the Client as a subprocess and communicated with over stdio JSON-RPC.
 _Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project.)
 
+**Space**:
+A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: at most one live **Session** per Space, and at most one app-wide (the one-live policy); stored conversations of a Space survive.
+_Avoid_: Project, workspace, folder, directory, environment
+
 **Session**:
-One live conversation between the Client and one agent process, backed by exactly one spawned subprocess. The unit of process lifecycle, history, and permission state.
+One live conversation between the Client and one agent process, backed by exactly one spawned subprocess. The unit of process lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session.
 _Avoid_: Conversation, chat, thread, run
 
 **Agent registry**:

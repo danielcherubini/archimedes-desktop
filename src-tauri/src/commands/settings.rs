@@ -6,10 +6,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
-use tokio::sync::Mutex;
 
 use crate::acp::SessionManager;
 
@@ -39,8 +40,8 @@ fn settings_path(config_dir: &Path) -> PathBuf {
 
 /// Read the settings, writing the defaults if the file does not exist yet.
 #[tauri::command]
-pub async fn get_settings(state: State<'_, Mutex<SessionManager>>) -> Result<Settings, String> {
-    let config_dir = state.inner().lock().await.config_dir().clone();
+pub async fn get_settings(state: State<'_, Arc<SessionManager>>) -> Result<Settings, String> {
+    let config_dir = state.config_dir().clone();
     let path = settings_path(&config_dir);
     if !path.exists() {
         let settings = Settings::default();
@@ -58,10 +59,10 @@ pub async fn get_settings(state: State<'_, Mutex<SessionManager>>) -> Result<Set
 /// Persist the settings (overwrites the file).
 #[tauri::command]
 pub async fn save_settings(
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     settings: Settings,
 ) -> Result<(), String> {
-    let config_dir = state.inner().lock().await.config_dir().clone();
+    let config_dir = state.config_dir().clone();
     let path = settings_path(&config_dir);
     fs::write(
         &path,

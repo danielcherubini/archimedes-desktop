@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
 
-use crate::acp::SessionManager;
+use crate::acp::{EventSink, SessionManager};
 use crate::storage::Db;
 
 /// The shared app setup: agent registry from `config_dir`, persistence
@@ -34,10 +33,19 @@ pub fn setup_dirs<R: tauri::Runtime>(
     manager.attach_db(db.clone());
     // The event sink (TauriSink) is managed state so commands — and the
     // headless IPC test — can obtain it without an `AppHandle` parameter.
-    app.manage(Arc::new(commands::sessions::TauriSink(
-        app.handle().clone(),
-    )));
-    app.manage(Mutex::new(manager));
+    //
+    // It must be managed under the TRAIT-OBJECT type `Arc<dyn EventSink>`:
+    // the commands resolve it as `State<Arc<dyn EventSink>>` and Tauri's
+    // state registry is keyed by TypeId — managing the concrete
+    // `Arc<TauriSink<R>>` registers a different key, and `start_session`
+    // fails at runtime with "state not managed for field `sink`".
+    // (`Arc::<dyn EventSink>::new` doesn't compile because `dyn EventSink`
+    // is unsized, so the coercion is spelled as an annotated binding.)
+    let sink: Arc<dyn EventSink> = Arc::new(commands::sessions::TauriSink(app.handle().clone()));
+    app.manage(sink);
+    // The manager is `Sync` (its mutable state is `Arc<Mutex<…>>`
+    // internally), so it is shared directly without an outer lock.
+    app.manage(Arc::new(manager));
     app.manage(db);
     Ok(())
 }

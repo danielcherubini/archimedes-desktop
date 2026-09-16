@@ -57,6 +57,14 @@ pub fn permission_key(session_id: &str, request_id: &str) -> String {
     format!("{session_id}/{request_id}")
 }
 
+/// The key prefix of all pending-permission keys that belong to
+/// `session_id`. Keys are `"{session_id}/{request_id}"`, so the prefix
+/// carries the trailing slash: a session id that is a plain prefix of
+/// another ("s1" vs "s10") must not drain the other session's prompts.
+pub fn session_key_prefix(session_id: &str) -> String {
+    format!("{session_id}/")
+}
+
 /// How long a permission prompt stays open before it auto-cancels.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -135,5 +143,37 @@ pub async fn handle_permission_request(
             map.remove(&key);
         }
         eprintln!("archimedes: failed to spawn permission waiter: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_prefix_carries_the_trailing_slash() {
+        assert_eq!(session_key_prefix("s1"), "s1/");
+    }
+
+    #[test]
+    fn closing_s1_does_not_drain_s10_pending_entries() {
+        // Simulate the driver-task cleanup `retain` for closing session
+        // "s1" while a prompt from the longer session "s10" is pending.
+        let mut map: HashMap<String, oneshot::Sender<PermissionOutcome>> = HashMap::new();
+        let (tx_s1, _rx_s1) = oneshot::channel();
+        let (tx_s10, _rx_s10) = oneshot::channel();
+        map.insert(permission_key("s1", "r1"), tx_s1);
+        map.insert(permission_key("s10", "r1"), tx_s10);
+
+        map.retain(|key, _| !key.starts_with(&session_key_prefix("s1")));
+
+        assert!(
+            map.contains_key(&permission_key("s10", "r1")),
+            "closing s1 must not drain s10's pending entry"
+        );
+        assert!(
+            !map.contains_key(&permission_key("s1", "r1")),
+            "s1's own pending entry must be drained"
+        );
     }
 }

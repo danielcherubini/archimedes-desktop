@@ -12,11 +12,10 @@ use std::time::{Duration, Instant};
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::{WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, WebviewWindow, WebviewWindowBuilder};
 
-use archimedes_desktop_lib::acp::{EventSink, SessionManager};
+use archimedes_desktop_lib::acp::EventSink;
 use archimedes_desktop_lib::storage::Db;
-use tokio::sync::Mutex;
 
 /// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).
 const FAKE_SESSION_ID: &str = "fake-session-1";
@@ -28,7 +27,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn write_agents_json(dir: &PathBuf) {
+fn write_agents_json(dir: &std::path::Path) {
     let json = serde_json::json!({
         "agents": [
             {
@@ -62,16 +61,7 @@ fn build_app(
     app_data_dir: PathBuf,
     events: std::sync::mpsc::Sender<(String, serde_json::Value)>,
 ) -> tauri::App<MockRuntime> {
-    // The same state `setup_dirs` manages in the real app — registered
-    // directly on the builder because the mock runtime never runs the
-    // event loop's `Ready` phase (where setup hooks run).
-    let mut manager = SessionManager::new(config_dir.clone()).expect("registry should load");
-    let db =
-        std::sync::Arc::new(Db::open(&app_data_dir.join("archimedes.db")).expect("db should open"));
-    manager.attach_db(db.clone());
-    let sink: std::sync::Arc<dyn EventSink> = std::sync::Arc::new(TestSink(events));
-
-    mock_builder()
+    let app = mock_builder()
         .invoke_handler(tauri::generate_handler![
             archimedes_desktop_lib::commands::app_info,
             archimedes_desktop_lib::commands::sessions::start_session,
@@ -85,11 +75,42 @@ fn build_app(
             archimedes_desktop_lib::commands::settings::get_settings,
             archimedes_desktop_lib::commands::settings::save_settings
         ])
-        .manage(Mutex::new(manager))
-        .manage(db)
-        .manage(sink)
         .build(tauri::generate_context!())
-        .expect("app should build")
+        .expect("app should build");
+
+    // Exercise the REAL setup path: `run()`'s setup closure calls exactly
+    // this function (the mock runtime never runs the event loop's `Ready`
+    // phase, where the setup hook would run, so the test calls it directly
+    // on the built app). This registers the SessionManager, the Db, and
+    // the EventSink exactly as the real app does.
+    archimedes_desktop_lib::setup_dirs(&app, config_dir, app_data_dir)
+        .expect("setup_dirs should succeed");
+
+    // Regression check for the TypeId lesson: the commands resolve the
+    // sink as `State<Arc<dyn EventSink>>`, and Tauri's state registry is
+    // keyed by TypeId. If `setup_dirs` ever manages the CONCRETE
+    // `Arc<TauriSink<R>>` again (the original runtime bug: "state not
+    // managed for field `sink` on command `start_session`), the
+    // trait-object slot is empty and this assertion fails.
+    assert!(
+        app.try_state::<std::sync::Arc<dyn EventSink>>().is_some(),
+        "setup_dirs must manage the sink as Arc<dyn EventSink> (TypeId-keyed)"
+    );
+
+    // Swap the managed sink for the observable test sink (same TypeId
+    // slot, same annotation style as `setup_dirs`). A second `manage()`
+    // of an already-managed type is a no-op in Tauri, so the slot has to
+    // be cleared out first.
+    #[allow(deprecated)] // `unmanage` is the only way to clear the slot in a test
+    let _ = app.unmanage::<std::sync::Arc<dyn EventSink>>();
+    let sink: std::sync::Arc<dyn EventSink> = std::sync::Arc::new(TestSink(events));
+    let swapped = app.manage(sink);
+    assert!(
+        swapped,
+        "test sink should take the same slot the real sink leaves"
+    );
+
+    app
 }
 
 fn invoke(
@@ -172,20 +193,20 @@ fn history_settings_and_resume_commands_round_trip() {
     // but the notification handler may still be draining).
     let db = Db::open(&app_data_dir.join("archimedes.db")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut kinds: Vec<String> = Vec::new();
-    loop {
+    let agent = loop {
         let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
-        kinds = rows.iter().map(|r| r.kind.clone()).collect();
-        if kinds == vec!["user".to_string(), "agent-text".to_string()] {
-            break;
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        if kinds == vec!["user", "agent-text"] {
+            break rows
+                .into_iter()
+                .find(|r| r.kind == "agent-text")
+                .expect("agent-text row");
         }
         if Instant::now() > deadline {
             panic!("transcript rows did not appear; got {kinds:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
-    let agent = rows.iter().find(|r| r.kind == "agent-text").unwrap();
+    };
     let payload: serde_json::Value = serde_json::from_str(&agent.payload_json).unwrap();
     assert_eq!(payload["text"], "hello world");
 

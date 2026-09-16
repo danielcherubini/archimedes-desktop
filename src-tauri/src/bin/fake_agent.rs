@@ -2,7 +2,7 @@
 //!
 //! Plain `std`, no async: reads newline-delimited JSON-RPC 2.0 frames from
 //! stdin and writes them to stdout. It speaks just enough ACP to drive the
-//! `acp_flow` and `terminal_flow` integration tests.
+//! `acp_flow` integration tests.
 //!
 //! The agent's behavior is selected by its first positional argument (the
 //! "mode"):
@@ -16,15 +16,15 @@
 //!   arrives, it echoes the outcome as a chunk (`outcome:selected:opt-1` or
 //!   `outcome:cancelled`), then the two `"hello"`/`" world"` chunks, then
 //!   `end_turn`.
-//! - `terminal`: `session/prompt` → `terminal/create` (`echo hello`) →
-//!   `terminal/output` → `terminal/wait_for_exit`, echoing the exit code as an
-//!   `exit:<code>` chunk, then `end_turn`.
 //! - `resume`: `initialize` advertises `loadSession: true`; `session/load`
 //!   replays one chunk (`"resumed"`) and then responds, so the client can
 //!   verify the `session/load` round-trip.
+//! - `hang`: `initialize` is answered, but `session/new` is ignored forever.
+//!   The client's establishment timeout must fire instead of waiting on the
+//!   agent indefinitely.
 //!
 //! Wire-format notes: property keys are camelCase (`sessionUpdate`,
-//! `agentCapabilities`, `messageId`, `terminalId`, `optionId`); discriminator
+//! `agentCapabilities`, `messageId`, `optionId`); discriminator
 //! values are snake_case (`agent_message_chunk`, `end_turn`, `allow_once`).
 
 use std::io::{self, BufRead, Write};
@@ -84,11 +84,14 @@ fn main() -> ExitCode {
                 write_result(&mut out, &id, &result);
             }
             "session/new" => {
-                let result = serde_json::json!({ "sessionId": SESSION_ID });
-                write_result(&mut out, &id, &result);
+                // `hang` mode: never answer, to hold the client's
+                // session/new request open forever.
+                if mode != "hang" {
+                    let result = serde_json::json!({ "sessionId": SESSION_ID });
+                    write_result(&mut out, &id, &result);
+                }
             }
             "session/prompt" => match mode.as_str() {
-                "terminal" => handle_prompt_terminal(&mut reader, &mut out, &id),
                 "permission" => handle_prompt_permission(&mut reader, &mut out, &id),
                 _ => handle_prompt_default(&mut out, &id),
             },
@@ -161,71 +164,6 @@ fn handle_prompt_permission(
 
     write_chunk(out, "m1", "hello");
     write_chunk(out, "m1", " world");
-    write_result(
-        out,
-        prompt_id,
-        &serde_json::json!({ "stopReason": "end_turn" }),
-    );
-}
-
-/// Terminal mode: create a terminal (`echo hello`), pull its output, wait for
-/// it to exit, and echo the exit code.
-fn handle_prompt_terminal(
-    reader: &mut impl BufRead,
-    out: &mut impl Write,
-    prompt_id: &Option<serde_json::Value>,
-) {
-    let create_id = 100;
-    write_request(
-        out,
-        create_id,
-        "terminal/create",
-        &serde_json::json!({
-            "sessionId": SESSION_ID,
-            "command": "echo",
-            "args": ["hello"],
-        }),
-    );
-    let Some(create_resp) = read_response(reader, create_id) else {
-        eprintln!("fake_agent: no response to terminal/create");
-        return;
-    };
-    let terminal_id = create_resp["result"]["terminalId"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-
-    let output_id = 101;
-    write_request(
-        out,
-        output_id,
-        "terminal/output",
-        &serde_json::json!({
-            "sessionId": SESSION_ID,
-            "terminalId": terminal_id,
-        }),
-    );
-    // The output response is read (and discarded here); the test observes the
-    // terminal-output event the client emitted instead.
-    let _ = read_response(reader, output_id);
-
-    let wait_id = 102;
-    write_request(
-        out,
-        wait_id,
-        "terminal/wait_for_exit",
-        &serde_json::json!({
-            "sessionId": SESSION_ID,
-            "terminalId": terminal_id,
-        }),
-    );
-    let Some(wait_resp) = read_response(reader, wait_id) else {
-        eprintln!("fake_agent: no response to terminal/wait_for_exit");
-        return;
-    };
-    let exit_code = wait_resp["result"]["exitCode"].as_u64().unwrap_or(999);
-    write_chunk(out, "m1", &format!("exit:{exit_code}"));
-
     write_result(
         out,
         prompt_id,

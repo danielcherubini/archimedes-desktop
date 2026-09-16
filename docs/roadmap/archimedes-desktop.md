@@ -458,3 +458,4 @@ Ship installers for all three platforms with a signed-update path. Per the appro
 - Other ACP agents (Claude Code, Codex, Gemini CLI, OpenCode) — registry entries only; no core changes expected
 - pi-archimedes TUI-extension features (todo board, subagent side-by-side) — blocked on ACP exposure
 - Windows MSI, Windows EV code signing, ACP protocol v2 support
+- PTY terminal (ACP terminal/* methods + TerminalPane + xterm)

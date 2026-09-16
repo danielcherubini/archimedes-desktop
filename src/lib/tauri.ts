@@ -7,7 +7,7 @@
  *   parameters),
  * - `SessionInfo` (the `start_session` return value): camelCase
  *   (`sessionId`, `agentId`),
- * - event payloads: camelCase (`sessionId`, `requestId`, `terminalId`),
+ * - event payloads: camelCase (`sessionId`, `requestId`),
  * - ACP update discriminators: snake_case (`agent_message_chunk`, …).
  */
 
@@ -76,8 +76,7 @@ export interface ToolCallDiff {
 
 export type ToolCallContent =
   | { type: "content"; content: ContentBlock }
-  | { type: "diff"; path: string; oldText?: string | null; newText: string }
-  | { type: "terminal"; terminalId: string };
+  | { type: "diff"; path: string; oldText?: string | null; newText: string };
 
 /**
  * A `session/update` notification body. The three update types the desktop
@@ -119,12 +118,6 @@ export interface PermissionRequestPayload {
   sessionId: string;
   requestId: string;
   request: PermissionRequest;
-}
-
-export interface TerminalOutputPayload {
-  terminalId: string;
-  /** base64-encoded terminal bytes */
-  data: string;
 }
 
 /** A row from the app's SQLite `messages` table (camelCase over IPC). */
@@ -237,23 +230,4 @@ export function listenPermissionRequest(
   return listen<PermissionRequestPayload>("permission-request", (event) =>
     callback(event.payload),
   );
-}
-
-export function listenTerminalOutput(
-  callback: (payload: TerminalOutputPayload) => void,
-): Promise<UnlistenFn> {
-  return listen<TerminalOutputPayload>("terminal-output", (event) =>
-    callback(event.payload),
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Decode a base64 terminal-output payload to UTF-8 text. */
-export function decodeBase64(data: string): string {
-  const binary = atob(data);
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
 }

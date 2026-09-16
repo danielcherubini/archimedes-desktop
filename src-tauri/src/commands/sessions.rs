@@ -1,8 +1,11 @@
 //! Tauri commands for the ACP session lifecycle.
 //!
-//! State is `tauri::State<'_, tokio::sync::Mutex<SessionManager>>` — tokio's
-//! Mutex, NOT std's: these are async commands and holding a std lock across
-//! `.await` is a deadlock trap.
+//! State is `tauri::State<'_, Arc<SessionManager>>`: the manager is
+//! `Sync` — its mutable state is `Arc<Mutex<…>>` internally, so each
+//! method locks only its own map, briefly. The old outer tokio-Mutex
+//! held a slow agent spawn + initialize (`start_session` / `resume_session`)
+//! in front of every other session operation, and could hang everything
+//! app-wide forever.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +15,6 @@ use agent_client_protocol::schema::v1::{
 };
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::Mutex;
 
 use crate::acp::{AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager};
 use crate::storage::Db;
@@ -33,31 +35,26 @@ impl<R: tauri::Runtime> EventSink for TauriSink<R> {
 #[tauri::command]
 pub async fn start_session(
     sink: State<'_, Arc<dyn EventSink>>,
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     agent_id: String,
     cwd: String,
 ) -> Result<SessionInfo, AcpError> {
-    let manager = state.inner().lock().await;
-    manager
+    state
         .start_session(&agent_id, PathBuf::from(cwd), sink.inner())
         .await
 }
 
 #[tauri::command]
 pub async fn send_prompt(
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     db: State<'_, Arc<Db>>,
     session_id: String,
     text: String,
 ) -> Result<agent_client_protocol::schema::v1::StopReason, AcpError> {
-    // Grab the connection under the manager lock, then DROP the lock before
-    // awaiting the turn: the turn can block on a user-paced permission
-    // prompt, and `respond_permission` needs this same lock to deliver the
-    // answer. Holding it across the await would deadlock.
-    let cx = {
-        let manager = state.inner().lock().await;
-        manager.connection(&session_id).await?
-    };
+    // Grab the (cheap) connection clone, then drop it before awaiting the
+    // turn: the turn can block on a user-paced permission prompt, and
+    // `respond_permission` must not need any of the same locks.
+    let cx = state.connection(&session_id).await?;
     // The client owns history: record the user's message before the turn.
     // (The `SessionManager::send_prompt` method does the same for direct
     // callers; the command path never goes through that method.)
@@ -79,11 +76,10 @@ pub async fn send_prompt(
 
 #[tauri::command]
 pub async fn close_session(
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     session_id: String,
 ) -> Result<(), AcpError> {
-    let manager = state.inner().lock().await;
-    manager.close_session(&session_id).await
+    state.close_session(&session_id).await
 }
 
 /// Deliver the user's decision on a pending permission prompt to the agent.
@@ -93,13 +89,12 @@ pub async fn close_session(
 /// is no longer pending, this is a no-op.
 #[tauri::command]
 pub async fn respond_permission(
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     session_id: String,
     request_id: String,
     outcome: PermissionOutcome,
 ) -> Result<(), AcpError> {
-    let manager = state.inner().lock().await;
-    manager
+    state
         .respond_permission(&session_id, &request_id, outcome)
         .await
 }
@@ -115,7 +110,7 @@ pub async fn respond_permission(
 #[tauri::command]
 pub async fn resume_session(
     sink: State<'_, Arc<dyn EventSink>>,
-    state: State<'_, Mutex<SessionManager>>,
+    state: State<'_, Arc<SessionManager>>,
     db: State<'_, Arc<Db>>,
     agent_id: String,
     session_id: String,
@@ -135,8 +130,7 @@ pub async fn resume_session(
             }
         }
     }
-    let manager = state.inner().lock().await;
-    manager
+    state
         .resume_session(&agent_id, &session_id, PathBuf::from(cwd), sink.inner())
         .await
 }

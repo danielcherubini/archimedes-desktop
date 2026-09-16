@@ -32,9 +32,7 @@ tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "ti
 thiserror = "2"
 agent-client-protocol = "2"
 uuid = { version = "1", features = ["v4"] }
-portable-pty = "0.8"
 async-trait = "0.1"
-base64 = "0.23"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]

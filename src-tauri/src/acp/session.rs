@@ -19,6 +19,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use agent_client_protocol::Error as ProtocolError;
 use serde::{Deserialize, Serialize};
@@ -26,14 +27,10 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, NewSessionRequest, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
+    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
-    TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    SessionUpdate, StopReason, TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -44,7 +41,6 @@ use agent_client_protocol::{
 use crate::acp::errors::AcpError;
 use crate::acp::fs_backend::FsBackend;
 use crate::acp::permission::{self, PendingPermissions};
-use crate::acp::terminal::TerminalManager;
 use crate::config::{ConfigError, Registry};
 use crate::storage::Db;
 
@@ -114,9 +110,9 @@ struct LiveSession {
 
 /// Manages all live ACP sessions.
 ///
-/// Stored in Tauri state as `tokio::sync::Mutex<SessionManager>` (Tauri wraps
-/// managed state in an `Arc` internally). Commands take it as
-/// `State<'_, tokio::sync::Mutex<SessionManager>>`.
+/// `Sync` — the mutable state is `Arc<Mutex<…>>` internally, so the
+/// manager is managed directly (no outer lock); each method locks only
+/// its own internal maps, briefly.
 pub struct SessionManager {
     /// Shared with driver tasks (the `Arc` is cloned into each `tokio::spawn`).
     sessions: Arc<Mutex<HashMap<SessionId, LiveSession>>>,
@@ -129,6 +125,10 @@ pub struct SessionManager {
     /// The app's SQLite database (Task 5); `None` in tests that do not
     /// attach one.
     db: Option<Arc<Db>>,
+    /// How long the establishment phase (agent spawn + `initialize` +
+    /// `session/new` or `session/load`) may run before it is cancelled.
+    /// Default: 30 s.
+    establish_timeout: Duration,
 }
 
 impl SessionManager {
@@ -141,12 +141,19 @@ impl SessionManager {
             registry,
             config_dir,
             db: None,
+            establish_timeout: Duration::from_secs(30),
         })
     }
 
     /// Attach the persistence database. Persistence is a no-op without it.
     pub fn attach_db(&mut self, db: Arc<Db>) {
         self.db = Some(db);
+    }
+
+    /// Override the establishment timeout (default 30 s; tests shrink it
+    /// so a hanging agent does not make them wait).
+    pub fn set_establish_timeout(&mut self, timeout: Duration) {
+        self.establish_timeout = timeout;
     }
 
     /// The configured config directory (useful for tests and diagnostics).
@@ -221,7 +228,7 @@ impl SessionManager {
                                 .fs(FileSystemCapabilities::default()
                                     .read_text_file(true)
                                     .write_text_file(true))
-                                .terminal(true),
+                                .terminal(false),
                         ),
                     )
                     .block_task()
@@ -287,6 +294,7 @@ impl SessionManager {
         let sid = SessionId::new(session_id);
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
+        let db = self.db.clone();
 
         let info = self
             .drive_session(agent, agent_id, hint, cwd, sink, move |cx| async move {
@@ -297,7 +305,7 @@ impl SessionManager {
                                 .fs(FileSystemCapabilities::default()
                                     .read_text_file(true)
                                     .write_text_file(true))
-                                .terminal(true),
+                                .terminal(false),
                         ),
                     )
                     .block_task()
@@ -310,6 +318,15 @@ impl SessionManager {
                     return Err(agent_client_protocol::util::internal_error(
                         "agent does not support session/load",
                     ));
+                }
+
+                // The restored transcript is replaced by the agent's replay,
+                // which doubles as the authoritative history: clear the
+                // stored rows BEFORE `session/load` so a replay reusing a
+                // known `messageId` overwrites (rather than clobbers) and a
+                // replay under a new id does not duplicate the stored text.
+                if let Some(db) = &db {
+                    let _ = db.clear_messages_for(&sid.to_string());
                 }
 
                 let _restored = cx
@@ -377,6 +394,7 @@ impl SessionManager {
 
         let sessions_arc = self.sessions.clone();
         let pending_permissions_arc = self.pending_permissions.clone();
+        let establish_timeout = self.establish_timeout;
         let db = self.db.clone();
         let sink = sink.clone();
         let notify_sink = sink.clone();
@@ -390,17 +408,10 @@ impl SessionManager {
             let fs_backend = FsBackend {
                 root: cwd_owned.clone(),
             };
-            let terminals = Arc::new(TerminalManager::new());
 
             // Cheap clones so each handler closure can own its copy.
             let fs_read = fs_backend.clone();
             let fs_write = fs_backend.clone();
-            let term_create = terminals.clone();
-            let term_output = terminals.clone();
-            let term_wait = terminals.clone();
-            let term_kill = terminals.clone();
-            let term_release = terminals.clone();
-            let term_sink = sink.clone();
             let perm_sink = sink.clone();
             let perm_pp = pending_permissions_arc.clone();
 
@@ -464,97 +475,6 @@ impl SessionManager {
                     on_receive_request!(),
                 )
                 .on_receive_request(
-                    async move |req: CreateTerminalRequest,
-                                responder: Responder<CreateTerminalResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        let cwd = req.cwd.as_deref();
-                        match term_create.create(&req.command, &req.args, cwd, &term_sink) {
-                            Ok(terminal_id) => {
-                                responder.respond(CreateTerminalResponse::new(terminal_id))?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_internal_error(e.to_string())?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: TerminalOutputRequest,
-                                responder: Responder<TerminalOutputResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        let tid = req.terminal_id.to_string();
-                        match term_output.output(&tid) {
-                            Some((output, truncated, exit_status)) => {
-                                let mut resp = TerminalOutputResponse::new(output, truncated);
-                                if let Some(status) = exit_status {
-                                    resp = resp.exit_status(status);
-                                }
-                                responder.respond(resp)?;
-                            }
-                            None => {
-                                responder.respond_with_internal_error("unknown terminal")?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: WaitForTerminalExitRequest,
-                                responder: Responder<WaitForTerminalExitResponse>,
-                                cx: ConnectionTo<Agent>| {
-                        let tid = req.terminal_id.to_string();
-                        match term_wait.exit_receiver(&tid) {
-                            Some(mut rx) => {
-                                // Delegate the (potentially long) wait to a
-                                // spawned task so the event loop stays free.
-                                let _ = cx.spawn(async move {
-                                    let status = loop {
-                                        if let Some(status) = rx.borrow_and_update().clone() {
-                                            break status;
-                                        }
-                                        if rx.changed().await.is_err() {
-                                            break TerminalExitStatus::new();
-                                        }
-                                    };
-                                    let _ =
-                                        responder.respond(WaitForTerminalExitResponse::new(status));
-                                    Ok(())
-                                });
-                            }
-                            None => {
-                                let _ = responder.respond_with_internal_error("unknown terminal");
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: KillTerminalRequest,
-                                responder: Responder<KillTerminalResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        let tid = req.terminal_id.to_string();
-                        let _ = term_kill.kill(&tid);
-                        responder.respond(KillTerminalResponse::new())?;
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: ReleaseTerminalRequest,
-                                responder: Responder<ReleaseTerminalResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        let tid = req.terminal_id.to_string();
-                        let _ = term_release.release(&tid);
-                        responder.respond(ReleaseTerminalResponse::new())?;
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
                     async move |req: RequestPermissionRequest,
                                 responder: Responder<RequestPermissionResponse>,
                                 cx: ConnectionTo<Agent>| {
@@ -575,12 +495,31 @@ impl SessionManager {
 
                     // Establish the session (initialize + session/new for a
                     // new session, initialize + session/load for a resume).
-                    let (session_id, info) = match establish(cx.clone()).await {
-                        Ok(established) => established,
-                        Err(err) => {
-                            // Report the failure to the awaiting command, then
-                            // tear the connection down.
+                    // Bounded: a slow/hanging agent must not hang the
+                    // establishment indefinitely.
+                    let timeout_detail = format!(
+                        "agent did not answer initialize within {}s",
+                        establish_timeout.as_secs()
+                    );
+                    let (session_id, info) = match tokio::time::timeout(
+                        establish_timeout,
+                        establish(cx.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(established)) => established,
+                        Ok(Err(err)) => {
+                            // Report the failure to the awaiting command,
+                            // then tear the connection down.
                             error_tx.send(err).ok();
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            // The detail text doubles as the mapping
+                            // marker in `map_establish_error`.
+                            let timeout_err =
+                                agent_client_protocol::util::internal_error(&timeout_detail);
+                            error_tx.send(timeout_err).ok();
                             return Ok(());
                         }
                     };
@@ -613,10 +552,14 @@ impl SessionManager {
             };
             if let Ok(session_id) = session_id_rx.await {
                 sessions_arc.lock().await.remove(&session_id);
+                // Keys are `"{session_id}/{request_id}"` — match on the
+                // trailing-slash prefix so closing "s1" does not cancel
+                // the pending prompt of the longer session "s10".
+                let prefix = permission::session_key_prefix(&session_id.to_string());
                 pending_permissions_arc
                     .lock()
                     .await
-                    .retain(|key, _| !key.starts_with(&session_id.to_string()));
+                    .retain(|key, _| !key.starts_with(&prefix));
                 sink.emit(
                     "session-closed",
                     serde_json::json!({
@@ -750,18 +693,22 @@ impl SessionManager {
 }
 
 /// Map an establisher failure to an [`AcpError`]. The
-/// "does not support session/load" marker becomes [`AcpError::NotResumable`].
+/// "does not support session/load" marker becomes [`AcpError::NotResumable`];
+/// the establishment-timeout marker becomes [`AcpError::InitializeFailed`].
 fn map_establish_error(agent_id: &str, err: ProtocolError) -> AcpError {
-    let marker = "agent does not support session/load";
     let data = err.data.as_ref().and_then(Value::as_str);
-    if data == Some(marker) {
-        AcpError::NotResumable {
+    if data == Some("agent does not support session/load") {
+        return AcpError::NotResumable {
             agent_id: agent_id.to_string(),
-        }
-    } else {
-        AcpError::Protocol {
-            message: err.message,
-        }
+        };
+    }
+    if data.is_some_and(|d| d.starts_with("agent did not answer initialize within")) {
+        return AcpError::InitializeFailed {
+            detail: data.unwrap().to_string(),
+        };
+    }
+    AcpError::Protocol {
+        message: err.message,
     }
 }
 

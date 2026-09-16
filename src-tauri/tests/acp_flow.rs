@@ -48,31 +48,6 @@ fn temp_config_dir() -> PathBuf {
     dir
 }
 
-fn write_agents_json(dir: &Path) {
-    write_agents_json_mode(dir, None);
-}
-
-/// Write an agents.json whose `fake` agent runs the fake agent in the given
-/// mode (e.g. `"permission"`). `None` means default mode (no args).
-fn write_agents_json_mode(dir: &Path, mode: Option<&str>) {
-    let json = serde_json::json!({
-        "agents": [
-            {
-                "id": "fake",
-                "name": "Fake Agent",
-                "command": FAKE_AGENT,
-                "args": mode.map(|m| vec![m.to_string()]).unwrap_or_default(),
-                "env": {}
-            }
-        ]
-    });
-    std::fs::write(
-        dir.join("agents.json"),
-        serde_json::to_string_pretty(&json).unwrap(),
-    )
-    .unwrap();
-}
-
 /// Collect up to `count` events from the sink, waiting up to `timeout`.
 fn wait_for_events(
     rx: &Receiver<(String, Value)>,
@@ -101,10 +76,10 @@ fn session_update_text(payload: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Find the pid of the running fake agent, if any.
-fn find_fake_agent_pid() -> Option<i32> {
+/// Find the pid of a running fake agent matching `pattern`, if any.
+fn find_fake_agent_pid(pattern: &Path) -> Option<i32> {
     let out = std::process::Command::new("pgrep")
-        .args(["-f", FAKE_AGENT])
+        .args(["-f", pattern.to_string_lossy().as_ref()])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -123,17 +98,50 @@ fn kill_pid(pid: i32) {
         .status();
 }
 
+/// Write an agents.json pointing at a specific (per-test) agent binary path.
+fn write_agents_json_cmd(cmd: &Path, dir: &Path, mode: Option<&str>) {
+    let json = serde_json::json!({
+        "agents": [
+            {
+                "id": "fake",
+                "name": "Fake Agent",
+                "command": cmd.to_string_lossy(),
+                "args": mode.map(|m| vec![m.to_string()]).unwrap_or_default(),
+                "env": {}
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join("agents.json"),
+        serde_json::to_string_pretty(&json).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Copy the fake agent binary to a unique path.
+///
+/// Tests in this binary run in parallel and all launch the same fake
+/// agent binary; unless each test uses its own copy, a `pgrep` on the
+/// shared path cannot tell whose agent is whose (the `agent_death` test
+/// would kill another test's agent while waiting on its own, which is
+/// gone). The copy lives in `dir`, which each test removes at end.
+fn unique_fake_agent(dir: &Path) -> PathBuf {
+    let path = dir.join(format!("fake_agent-{}", uuid::Uuid::new_v4()));
+    std::fs::copy(FAKE_AGENT, &path).unwrap();
+    path
+}
+
 /// Poll until the fake agent process is gone, or `timeout` elapses.
 /// Returns true if the process was reaped in time.
-fn wait_for_process_gone(timeout: Duration) -> bool {
+fn wait_for_process_gone(pattern: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if find_fake_agent_pid().is_none() {
+        if find_fake_agent_pid(pattern).is_none() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    find_fake_agent_pid().is_none()
+    find_fake_agent_pid(pattern).is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +151,8 @@ fn wait_for_process_gone(timeout: Duration) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_session_flow_streams_and_cleans_up() {
     let config_dir = temp_config_dir();
-    write_agents_json(&config_dir);
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, None);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -192,7 +201,7 @@ async fn full_session_flow_streams_and_cleans_up() {
     // 6. The child process is reaped (the transport task kills the process
     //    group; this happens just after the session-closed emit, so poll).
     assert!(
-        wait_for_process_gone(Duration::from_secs(10)),
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
         "fake_agent process should have been reaped after close"
     );
 
@@ -203,7 +212,8 @@ async fn full_session_flow_streams_and_cleans_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_session_round_trips_the_session_id() {
     let config_dir = temp_config_dir();
-    write_agents_json_mode(&config_dir, Some("resume"));
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("resume"));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -254,7 +264,7 @@ async fn resume_session_round_trips_the_session_id() {
     assert_eq!(manager.session_count().await, 0);
 
     assert!(
-        wait_for_process_gone(Duration::from_secs(10)),
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
         "fake_agent process should have been reaped after close"
     );
 
@@ -262,9 +272,157 @@ async fn resume_session_round_trips_the_session_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn establishment_times_out_when_the_agent_hangs() {
+    let config_dir = temp_config_dir();
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("hang"));
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    // Shrink the (default 30 s) establishment timeout so the test stays
+    // fast; the semantics under test are timing out, not the duration.
+    manager.set_establish_timeout(Duration::from_millis(500));
+    let cwd = config_dir.clone();
+
+    // The agent answers `initialize` but never answers `session/new` —
+    // establishment must time out instead of hanging forever.
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        manager.start_session("fake", cwd, &sink),
+    )
+    .await
+    .expect("start_session must not hang past the establishment timeout");
+    let err = result.expect_err("start_session must fail against a hanging agent");
+    assert!(
+        matches!(err, AcpError::InitializeFailed { .. }),
+        "expected InitializeFailed on establishment timeout, got {err:?}"
+    );
+    assert_eq!(manager.session_count().await, 0);
+
+    assert!(
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
+        "the hanging agent should be torn down after the timeout"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_replaces_stored_transcript() {
+    let config_dir = temp_config_dir();
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("resume"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+    let cwd = config_dir.clone();
+
+    // 1. Start the session and populate the stored transcript.
+    manager
+        .start_session("fake", cwd.clone(), &sink)
+        .await
+        .expect("start_session should succeed");
+    manager
+        .send_prompt(FAKE_SESSION_ID, "hi".to_string())
+        .await
+        .expect("send_prompt should succeed");
+    wait_for_events(&rx, 2, Duration::from_secs(5));
+    let rows = db.messages_for(FAKE_SESSION_ID).expect("messages_for");
+    assert_eq!(
+        rows.len(),
+        2,
+        "user + agent-text rows must exist before the resume"
+    );
+
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
+    assert_closed_event(&rx).await;
+    assert!(
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
+        "first agent should be reaped before the resume spawn"
+    );
+
+    // 2. Resume. The fake agent replays one chunk (`m1`: "resumed") on
+    //    load — the stored transcript must be REPLACED by it, not
+    //    duplicated (no stale `hello world` row, no duplicate `m1` row).
+    manager
+        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+        .await
+        .expect("resume_session should succeed");
+
+    // Poll the DB until the replayed row is persisted (the restore builder
+    // delivers the pre-response chunk right after the load response).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let rows = loop {
+        let rows = db.messages_for(FAKE_SESSION_ID).expect("messages_for");
+        let done = rows.iter().any(|r| {
+            r.kind == "agent-text"
+                && r.message_key.as_deref() == Some("m1")
+                && r.payload_json.contains("resumed")
+        });
+        if done {
+            break rows;
+        }
+        if Instant::now() > deadline {
+            panic!("the resumed replay row was not persisted; got {rows:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one row must remain: the replayed chunk (no duplicate, no stale rows); got {rows:?}"
+    );
+    assert_eq!(rows[0].kind, "agent-text");
+    let payload: serde_json::Value = serde_json::from_str(&rows[0].payload_json).unwrap();
+    assert_eq!(
+        payload["text"], "resumed",
+        "the stored row must hold the replayed text, not the old "
+    );
+
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
+    assert_closed_event(&rx).await;
+    assert!(
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
+        "the resumed agent should be reaped after close"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// Drain events until a `session-closed` event arrives (other events that
+/// are still in the queue do not mask it).
+async fn assert_closed_event(rx: &std::sync::mpsc::Receiver<(String, serde_json::Value)>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = false;
+    while !seen && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((event, _)) if event == "session-closed" => seen = true,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(seen, "a session-closed event should arrive after close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_without_load_session_is_not_resumable() {
     let config_dir = temp_config_dir();
-    write_agents_json(&config_dir); // default mode: loadSession: false
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, None); // default mode: loadSession: false
 
     let (tx, _rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -287,7 +445,7 @@ async fn resume_without_load_session_is_not_resumable() {
     );
 
     assert!(
-        wait_for_process_gone(Duration::from_secs(10)),
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
         "the spawned agent should be torn down after a refused resume"
     );
 
@@ -297,7 +455,8 @@ async fn resume_without_load_session_is_not_resumable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transcript_is_persisted_with_upsert_semantics() {
     let config_dir = temp_config_dir();
-    write_agents_json(&config_dir);
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, None);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -356,7 +515,7 @@ async fn transcript_is_persisted_with_upsert_semantics() {
     assert!(events.iter().any(|(event, _)| event == "session-closed"));
 
     assert!(
-        wait_for_process_gone(Duration::from_secs(10)),
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
         "fake_agent process should have been reaped after close"
     );
 
@@ -366,7 +525,8 @@ async fn transcript_is_persisted_with_upsert_semantics() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_death_produces_session_closed() {
     let config_dir = temp_config_dir();
-    write_agents_json(&config_dir);
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, None);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -381,7 +541,7 @@ async fn agent_death_produces_session_closed() {
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
 
     // Find and kill the fake agent.
-    let pid = find_fake_agent_pid().expect("fake agent should be running");
+    let pid = find_fake_agent_pid(&agent_bin).expect("fake agent should be running");
     kill_pid(pid);
 
     // The driver task should detect the exit, remove the session, and emit
@@ -400,7 +560,8 @@ async fn agent_death_produces_session_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn permission_round_trip_is_answerable_and_nonblocking() {
     let config_dir = temp_config_dir();
-    write_agents_json_mode(&config_dir, Some("permission"));
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("permission"));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
