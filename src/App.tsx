@@ -6,11 +6,12 @@ import {
   listenSessionClosed,
   listenSessionUpdate,
   listSessions,
+  listSpaces,
 } from "./lib/tauri";
 import { checkForUpdate, installUpdate } from "./lib/updater";
 import { useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
-import SessionList from "./components/SessionList";
+import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 
 function App() {
@@ -48,12 +49,19 @@ function App() {
     };
   }, []);
 
-  // On boot, load the stored sessions into the history list (the client
-  // owns history: every session survives a restart).
+  // On boot, load the stored sessions AND spaces (the client owns history:
+  // every session survives a restart). `setSpaces` auto-selects (Task 5)
+  // the recent landing for boot. No listener changes: the `replaced`
+  // reason flows through the existing `handleSessionClosed`).
   useEffect(() => {
-    listSessions()
-      .then((rows) => useSessions.getState().setHistorySessions(rows))
-      .catch((err) => console.error("failed to load stored sessions", err));
+    Promise.all([listSessions(), listSpaces()])
+      .then(([rows, spaces]) => {
+        useSessions.getState().setHistorySessions(rows);
+        useSessions.getState().setSpaces(spaces);
+      })
+      .catch((err) =>
+        console.error("failed to load stored sessions/spaces", err),
+      );
   }, []);
 
   // The "Check for updates" menu item (Rust side) emits this event; the
@@ -84,7 +92,7 @@ function App() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
-      <SessionList />
+      <SpacesList />
       <ChatStream />
     </div>
   );
