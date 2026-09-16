@@ -73,7 +73,11 @@ fn build_app(
             archimedes_desktop_lib::commands::history::load_history,
             archimedes_desktop_lib::commands::history::delete_session,
             archimedes_desktop_lib::commands::settings::get_settings,
-            archimedes_desktop_lib::commands::settings::save_settings
+            archimedes_desktop_lib::commands::settings::save_settings,
+            archimedes_desktop_lib::commands::spaces::list_agents,
+            archimedes_desktop_lib::commands::spaces::list_spaces,
+            archimedes_desktop_lib::commands::spaces::delete_space,
+            archimedes_desktop_lib::commands::spaces::space_for_path
         ])
         .build(tauri::generate_context!())
         .expect("app should build");
@@ -282,6 +286,134 @@ fn history_settings_and_resume_commands_round_trip() {
         serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
     );
     assert!(history.as_array().unwrap().is_empty());
+
+    // Clean up (best effort).
+    drop(app);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&app_data_dir);
+}
+
+#[test]
+fn spaces_and_agents_commands_round_trip() {
+    let config_dir = temp_dir("config");
+    let app_data_dir = temp_dir("data");
+    write_agents_json(&config_dir);
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let app = build_app(config_dir.clone(), app_data_dir.clone(), events_tx);
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview should build");
+
+    // --- the folder the new-space dialog would pick ---
+    let newproj = config_dir.join("newproj");
+    std::fs::create_dir_all(&newproj).unwrap();
+
+    // space_for_path: a fresh, not-yet-a-space folder is canonicalized and
+    // reports isSpace=false (on a symlink-free temp dir canonical == the path;
+    // if the platform symlinked it instead, this still asserts the returned
+    // path is the canonical one — the behaviour we want to observe).
+    let check = invoke(
+        &webview,
+        "space_for_path",
+        serde_json::json!({ "path": newproj.to_string_lossy() }),
+    );
+    assert_eq!(
+        check["canonicalPath"],
+        std::fs::canonicalize(&newproj)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(check["isSpace"], false);
+
+    // list_agents: exactly the registry entries (camelCase keys); default
+    // selection is agents[0] on the frontend.
+    let agents = invoke(&webview, "list_agents", serde_json::json!({}));
+    assert_eq!(
+        agents,
+        serde_json::json!([{ "id": "fake", "name": "Fake Agent" }])
+    );
+
+    // --- start a session in that folder (record_session → upsert_space hook) ---
+    let info = invoke(
+        &webview,
+        "start_session",
+        serde_json::json!({ "agentId": "fake", "cwd": newproj.to_string_lossy() }),
+    );
+    assert_eq!(info["sessionId"], FAKE_SESSION_ID);
+
+    // list_spaces: exactly one row, the canonicalized path.
+    let canonical = std::fs::canonicalize(&newproj)
+        .unwrap()
+        .display()
+        .to_string();
+    let spaces = invoke(&webview, "list_spaces", serde_json::json!({}));
+    let arr = spaces.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], canonical);
+
+    // space_for_path again: the folder is a space now.
+    let check = invoke(
+        &webview,
+        "space_for_path",
+        serde_json::json!({ "path": newproj.to_string_lossy() }),
+    );
+    assert_eq!(check["isSpace"], true);
+
+    // delete_space: drops the bookkeeping row only.
+    invoke(
+        &webview,
+        "delete_space",
+        serde_json::json!({ "path": canonical }),
+    );
+    let spaces = invoke(&webview, "list_spaces", serde_json::json!({}));
+    assert!(spaces.as_array().unwrap().is_empty());
+
+    // The stored session is untouched by deleting the space.
+    let sessions = invoke(&webview, "list_sessions", serde_json::json!({}));
+    let arr = sessions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["sessionId"], FAKE_SESSION_ID);
+
+    // space_for_path on a nonexistent folder: an ERROR, not a None (the
+    // dialog shows the reason inline).
+    let missing = config_dir.join(format!("nope-{}", uuid::Uuid::new_v4()));
+    let err = get_ipc_response(
+        &webview,
+        InvokeRequest {
+            cmd: "space_for_path".into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "path": missing.to_string_lossy()
+            })),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_string(),
+        },
+    )
+    .expect_err("a missing folder must be an error, not a None");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("no such folder"),
+        "expected a 'no such folder' error, got: {err_str}"
+    );
+
+    // --- close the session and wait for the driver task's teardown ---
+    invoke(
+        &webview,
+        "close_session",
+        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match events_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((event, _)) if event == "session-closed" => break,
+            Ok(_) => continue,
+            Err(_) => panic!("session-closed event should arrive after close"),
+        }
+    }
 
     // Clean up (best effort).
     drop(app);

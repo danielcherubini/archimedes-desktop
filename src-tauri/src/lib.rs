@@ -67,7 +67,11 @@ pub fn run() {
             commands::history::load_history,
             commands::history::delete_session,
             commands::settings::get_settings,
-            commands::settings::save_settings
+            commands::settings::save_settings,
+            commands::spaces::list_agents,
+            commands::spaces::list_spaces,
+            commands::spaces::delete_space,
+            commands::spaces::space_for_path
         ])
         .setup(|app| {
             let config_dir = app

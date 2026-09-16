@@ -1,6 +1,7 @@
 pub mod history;
 pub mod sessions;
 pub mod settings;
+pub mod spaces;
 
 use serde::Serialize;
 
