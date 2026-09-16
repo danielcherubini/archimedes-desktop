@@ -26,6 +26,34 @@ export interface SessionInfo {
   capabilities: Record<string, unknown>;
 }
 
+/** A registry entry over IPC (camelCase). */
+export interface AgentEntryDto {
+  id: string;
+  name: string;
+}
+
+/** A space bookkeeping row (camelCase over IPC). */
+export interface SpaceRow {
+  path: string;
+  createdAt: number;
+  lastOpenedAt: number;
+}
+
+/** The folder-check result (camelCase over IPC). */
+export interface SpaceCheck {
+  canonicalPath: string;
+  isSpace: boolean;
+}
+
+/**
+ * Why a session was closed (snake_case strings over the `session-closed`
+ * event). The UI renders close reasons in the paused banner copy —
+ * `"replaced"` is the one-live session policy (a newer session started
+ * with the same cwd). Recorded per session id in the store's
+ * `closeReasons`.
+ */
+export type CloseReasonStr = "user" | "agent-exited" | "error" | "replaced";
+
 /** Why the agent stopped a prompt turn (snake_case strings). */
 export type StopReason =
   | "end_turn"
@@ -111,7 +139,7 @@ export interface SessionUpdatePayload {
 
 export interface SessionClosedPayload {
   sessionId: string;
-  reason: "user" | "agent-exited" | "error";
+  reason: CloseReasonStr;
 }
 
 export interface PermissionRequestPayload {
@@ -202,6 +230,30 @@ export async function getSettings(): Promise<AppSettings> {
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
   return invoke("save_settings", { settings });
+}
+
+// ---------------------------------------------------------------------------
+// Spaces + agents commands (boot, the new-session dialog, "forget this space")
+// ---------------------------------------------------------------------------
+
+/** All configured agents (the dialog's dropdown). */
+export async function listAgents(): Promise<AgentEntryDto[]> {
+  return invoke<AgentEntryDto[]>("list_agents");
+}
+
+/** All spaces, most recently opened first. */
+export async function listSpaces(): Promise<SpaceRow[]> {
+  return invoke<SpaceRow[]>("list_spaces");
+}
+
+/** "Forget this space": delete the bookkeeping row (conversations stay stored). */
+export async function deleteSpace(path: string): Promise<void> {
+  return invoke("delete_space", { path });
+}
+
+/** Canonicalize a folder and say whether a space row already exists for it. */
+export async function spaceForPath(path: string): Promise<SpaceCheck> {
+  return invoke<SpaceCheck>("space_for_path", { path });
 }
 
 // ---------------------------------------------------------------------------

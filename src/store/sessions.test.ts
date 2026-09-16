@@ -1,12 +1,44 @@
 import { describe, expect, it } from "vitest";
 import {
   applySessionUpdate,
+  autoSelectActive,
   finalizeSessionMessages,
   rowToMessages,
+  spaceViewFor,
   type AcpSessionUpdate,
   type Message,
 } from "./sessions";
-import type { MessageRow } from "../lib/tauri";
+import type {
+  CloseReasonStr,
+  MessageRow,
+  SessionInfo,
+  SpaceRow,
+} from "../lib/tauri";
+
+/**
+ * Fixtures use EXACTLY the four `SessionInfo` wire fields — `SessionInfo`
+ * over IPC has NO `createdAt` (see the ordering note in `sessions.ts`), so
+ * the pure helpers must rely on input order, not invented timestamps.
+ */
+const info = (sessionId: string, cwd: string): SessionInfo => ({
+  sessionId,
+  agentId: "clack-1.0",
+  cwd,
+  capabilities: {},
+});
+
+/**
+ * `SpaceRow` carries `createdAt`/`lastOpenedAt` — these are the bookkeeping
+ * timestamps of the `spaces` table itself (not of individual sessions). The
+ * helpers never read `createdAt`, only `path`; the timestamps exist on the
+ * fixture so the shape is full and it'd be obvious if a helper started
+ * sorting on them (it must not — see the ordering note in `sessions.ts`).
+ */
+const row = (path: string, lastOpenedAt: number): SpaceRow => ({
+  path,
+  createdAt: lastOpenedAt - 86_400_000,
+  lastOpenedAt,
+});
 
 const chunk = (messageId: string, text: string): AcpSessionUpdate => ({
   sessionUpdate: "agent_message_chunk",
@@ -188,6 +220,123 @@ describe("applySessionUpdate — tool calls", () => {
       1,
     );
     expect(messages).toHaveLength(0);
+  });
+});
+
+describe("spaceViewFor (per-space grouping, pure)", () => {
+  // Spaces arrive `lastOpenedAt`-desc from `list_spaces`; `historySessions`
+  // newest-first from `list_sessions` — input order is the semantics.
+  const spaces = [
+    row("/workspaces/alpha", 3000),
+    row("/workspaces/bravo", 2000),
+    row("/workspaces/charlie", 1000),
+  ];
+  const sessions = [info("live-alpha", "/workspaces/alpha")];
+  // Passed in a SPECIFIC order to prove no re-sort by a nonexistent field.
+  const historySessions = [
+    info("stored-alpha", "/workspaces/alpha"),
+    info("idX", "/workspaces/bravo"),
+    info("idY", "/workspaces/bravo"),
+  ];
+  const closeReasons: Record<string, CloseReasonStr> = {
+    "live-alpha": "replaced",
+    "stored-alpha": "replaced",
+    idX: "agent-exited",
+  };
+
+  it("groups a space with a live session and a stored session", () => {
+    const view = spaceViewFor(spaces[0], sessions, historySessions, closeReasons);
+    expect(view).toEqual({
+      path: "/workspaces/alpha",
+      title: "alpha",
+      liveSessionId: "live-alpha",
+      storedSessionIds: ["stored-alpha"],
+      // The newest session's reason: the live one — recorded as "replaced"
+      // (the one-live-policy closed it when a newer session started). The
+      // stored session carries the same reason here, so this proves the
+      // lookup does not silently fall through to it.
+      lastReason: "replaced",
+    });
+  });
+
+  it("returns storedSessionIds in the given input order (no re-sort)", () => {
+    const view = spaceViewFor(spaces[1], sessions, historySessions, closeReasons);
+    expect(view).toEqual({
+      path: "/workspaces/bravo",
+      title: "bravo",
+      liveSessionId: null,
+      storedSessionIds: ["idX", "idY"],
+      // No live session: the head of the stored subsequence's reason.
+      lastReason: "agent-exited",
+    });
+  });
+
+  it("returns an empty shape for a space with no sessions", () => {
+    const view = spaceViewFor(spaces[2], sessions, historySessions, closeReasons);
+    expect(view).toEqual({
+      path: "/workspaces/charlie",
+      title: "charlie",
+      liveSessionId: null,
+      storedSessionIds: [],
+      lastReason: undefined,
+    });
+  });
+});
+
+describe("autoSelectActive (boot auto-select, pure)", () => {
+  // `spaces` arrives `lastOpenedAt`-desc — that IS input order; the function
+  // must NOT re-sort.
+  const spaces = [
+    row("/a/space-one", 3000),
+    row("/a/space-two", 2000),
+    row("/a/space-three", 1000),
+    row("/a/space-four", 500),
+  ];
+
+  it("returns null when there is nothing at all", () => {
+    expect(autoSelectActive([], [], [])).toBeNull();
+    expect(autoSelectActive(spaces, [], [])).toBeNull();
+  });
+
+  it("prefers the first space's live session", () => {
+    const live = [info("live-1", "/a/space-one")];
+    const stored = [
+      info("old-1", "/a/space-one"),
+      info("old-2", "/a/space-two"),
+    ];
+    // Even if the other space's stored session is older/newer, the live
+    // session in the most recent space wins.
+    expect(autoSelectActive(spaces, live, stored)).toBe("live-1");
+  });
+
+  it("falls back to the head of the first space's stored subsequence", () => {
+    const stored = [
+      info("newest-1", "/a/space-one"),
+      info("older-1", "/a/space-one"),
+    ];
+    // `historySessions` is newest-first (server order): the head wins.
+    expect(autoSelectActive(spaces, [], stored)).toBe("newest-1");
+  });
+
+  it("skips a space with no sessions and advances to the next", () => {
+    const stored = [
+      info("newest-2", "/a/space-two"),
+      info("older-2", "/a/space-two"),
+    ];
+    expect(autoSelectActive(spaces, [], stored)).toBe("newest-2");
+  });
+
+  it("the first (most recent) space wins over a newer session in another", () => {
+    const stored = [
+      info("head-1", "/a/space-one"),
+      info("brand-new-2", "/a/space-two"), // delivered first in input order
+      info("older-2", "/a/space-two"),
+    ];
+    // Input/recency order wins: the FIRST space's head, even though the
+    // second space's stored session was created more recently. (We cannot
+    // check timestamps — `SessionInfo` has no `createdAt` — so input order
+    // is THE ordering.)
+    expect(autoSelectActive(spaces, [], stored)).toBe("head-1");
   });
 });
 

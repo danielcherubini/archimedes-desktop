@@ -1,15 +1,19 @@
 import { create } from "zustand";
 import {
   deleteSession as deleteSessionCommand,
+  deleteSpace as deleteSpaceCommand,
   loadHistory,
   resumeSession as resumeSessionCommand,
   type AcpSessionUpdate,
   type AcpToolCallStatus,
+  type CloseReasonStr,
   type MessageRow,
   type SessionInfo,
+  type SpaceRow,
   type StopReason,
   type ToolCallContent,
 } from "../lib/tauri";
+import { basenameOfPath } from "../lib/paths";
 import { unifiedPatch } from "../lib/diff";
 import { usePermissions } from "./permissions";
 
@@ -223,12 +227,101 @@ export function rowToMessages(row: MessageRow): Message[] {
   }
 }
 
+/**
+ * The session a fresh boot should land on: the most recently opened
+ * space's newest session, live (in `sessions`) preferred over stored.
+ * `null` when there's nothing.
+ *
+ * **Ordering note:** `SessionInfo` over IPC has NO `createdAt` field (it is
+ * `{ sessionId, agentId, cwd, capabilities }` — the ACP `SessionInfo` struct
+ * has no such field, and the Rust `list_sessions` command drops it when
+ * mapping `SessionRow → SessionInfo`). So we CANNOT sort by `createdAt`.
+ * We rely on SERVER order instead: `Db::list_sessions` returns
+ * `ORDER BY created_at DESC, id DESC` and `Db::list_spaces` returns
+ * `ORDER BY last_opened_at DESC, path ASC`, and the store slices only
+ * `filter`/`map` those rows (preserving order). Therefore "newest-first"
+ * **is** the input order — `spaces[0]` is the most recently opened space,
+ * and within a space the head of its `historySessions` subsequence is its
+ * newest stored session. Do NOT re-sort by a field that doesn't exist.
+ */
+export function autoSelectActive(
+  spaces: SpaceRow[],
+  sessions: SessionInfo[],
+  historySessions: SessionInfo[],
+): string | null {
+  for (const space of spaces) {
+    // At most one live session app-wide; prefer it in this space.
+    const live = sessions.find((s) => s.cwd === space.path);
+    if (live) return live.sessionId;
+    // No re-sort: input order IS newest-first (see the ordering note).
+    const stored = historySessions
+      .filter((s) => s.cwd === space.path)
+      .map((s) => s.sessionId);
+    if (stored.length > 0) return stored[0];
+  }
+  return null;
+}
+
+/**
+ * One per-space group for the UI (used by both this store and the Task 6
+ * components). Built with the same input-order rule as `autoSelectActive`.
+ *
+ * Note: a session without a space is NOT a case here by design — a space is
+ * born at the same time as a session (the `record_session → upsert_space`
+ * hook), and it references a space row on boot after backfill. So there is
+ * no "unknown sessions" group to render.
+ */
+export interface SpaceView {
+  path: string;
+  /** Display label (base name; `""` if the base name is empty — the UI falls back to `path`). */
+  title: string;
+  /** The live session in this space (there is at most one app-wide), or `null`. */
+  liveSessionId: string | null;
+  /** Stored sessions of this space, in `historySessions` order (newest-first as delivered by `list_sessions` — do NOT re-sort). */
+  storedSessionIds: string[];
+  /** Close reason of the space's newest session (live one preferred, else the head of the stored subsequence), if any. */
+  lastReason: CloseReasonStr | undefined;
+}
+
+export function spaceViewFor(
+  space: SpaceRow,
+  sessions: SessionInfo[],
+  historySessions: SessionInfo[],
+  closeReasons: Record<string, CloseReasonStr>,
+): SpaceView {
+  const liveSessionId =
+    sessions.find((s) => s.cwd === space.path)?.sessionId ?? null;
+  // Input order = newest-first from `list_sessions`; NOT re-sorted.
+  const storedSessionIds = historySessions
+    .filter((s) => s.cwd === space.path)
+    .map((s) => s.sessionId);
+  // The newest session's close reason: the live one, else the head of the
+  // stored subsequence; nothing when the space has no sessions.
+  const newestId = liveSessionId ?? storedSessionIds[0];
+  return {
+    path: space.path,
+    title: basenameOfPath(space.path),
+    liveSessionId,
+    storedSessionIds,
+    lastReason:
+      newestId === undefined ? undefined : closeReasons[newestId],
+  };
+}
+
 interface SessionsState {
   /** Live (in-memory) sessions for this app run. */
   sessions: SessionInfo[];
   /** Stored sessions from the database that are not currently live. */
   historySessions: SessionInfo[];
   activeSessionId: string | null;
+  /** Space bookkeeping rows (from `list_spaces` on boot; upserted by `addSpace`). */
+  spaces: SpaceRow[];
+  /**
+   * Close reason recorded on `session-closed`, per session id (for the
+   * "replaced" banner copy). Merge-only: a reason outlives its event, so
+   * keys are never deleted.
+   */
+  closeReasons: Record<string, CloseReasonStr>;
   /** Transcript per session id. Kept after close for history. */
   messages: Record<string, Message[]>;
   /** Whether a prompt turn is in flight for a session. */
@@ -238,6 +331,29 @@ interface SessionsState {
 
   addSession: (info: SessionInfo) => void;
   setActiveSession: (sessionId: string | null) => void;
+  /**
+   * Boot: replace the spaces list (from `list_spaces`, `lastOpenedAt`-desc).
+   * If nothing is active yet, select via `autoSelectActive` (the most recent
+   * space's newest session, live preferred) and load it: `autoSelectActive`
+   * lands on a stored session (live ones never survive a restart), so the
+   * `openSession` call loads its transcript and boot lands on CONTENT, not
+   * an empty chat (no-op for live / already-loaded sessions; the fetch is
+   * self-guarding against a mid-flight switch).
+   */
+  setSpaces: (rows: SpaceRow[]) => void;
+  /**
+   * Single-space upsert after a successful `start_session` (from the dialog):
+   * existing row → refresh `lastOpenedAt`; missing row → append with
+   * `createdAt = lastOpenedAt = Date.now()` (approximate; the next boot's
+   * `list_spaces` corrects reality on the server side).
+   */
+  addSpace: (path: string) => void;
+  /**
+   * "Forget this space": `delete_space` command + local removal. Does NOT
+   * touch `sessions`/`historySessions` (conversations stay stored — design
+   * decision). `activeSessionId` is left alone.
+   */
+  removeSpace: (path: string) => Promise<void>;
   /** Populate the history list from `list_sessions` (boot). */
   setHistorySessions: (rows: SessionInfo[]) => void;
   /**
@@ -256,7 +372,7 @@ interface SessionsState {
   addUserMessage: (sessionId: string, text: string) => void;
   beginTurn: (sessionId: string) => void;
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
-  handleSessionClosed: (sessionId: string, reason: string) => void;
+  handleSessionClosed: (sessionId: string, reason: CloseReasonStr) => void;
   turnCompleted: (sessionId: string, stopReason: StopReason) => void;
 }
 
@@ -264,6 +380,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
   sessions: [],
   historySessions: [],
   activeSessionId: null,
+  spaces: [],
+  closeReasons: {},
   messages: {},
   inTurn: {},
   stopReasons: {},
@@ -277,11 +395,45 @@ export const useSessions = create<SessionsState>((set, get) => ({
       historySessions: state.historySessions.filter(
         (s) => s.sessionId !== info.sessionId,
       ),
-      activeSessionId: state.activeSessionId ?? info.sessionId,
+      // A session that was just *started* (dialog or "new conversation")
+      // is the one the user wants to look at: start flows ALWAYS switch
+      // the view to it. (The live-session handling in `openSession` is
+      // unchanged.)
+      activeSessionId: info.sessionId,
       messages: { ...state.messages, [info.sessionId]: [] },
     })),
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
+
+  setSpaces: (rows) => {
+    const state = get();
+    const selectedId =
+      state.activeSessionId === null
+        ? autoSelectActive(rows, state.sessions, state.historySessions)
+        : state.activeSessionId;
+    set({ spaces: rows, activeSessionId: selectedId });
+    // `autoSelectActive` lands on a stored session (live ones never survive
+    // a restart): load its transcript so boot lands on content, not an
+    // empty chat. (No-op for live / already-loaded sessions.)
+    if (selectedId) get().openSession(selectedId);
+  },
+
+  addSpace: (path) =>
+    set((state) => {
+      const existing = state.spaces.find((s) => s.path === path);
+      const now = Date.now();
+      const spaces = existing
+        ? state.spaces.map((s) =>
+            s.path === path ? { ...s, lastOpenedAt: now } : s,
+          )
+        : [...state.spaces, { path, createdAt: now, lastOpenedAt: now }];
+      return { spaces };
+    }),
+
+  removeSpace: async (path) => {
+    await deleteSpaceCommand(path);
+    set((state) => ({ spaces: state.spaces.filter((s) => s.path !== path) }));
+  },
 
   setHistorySessions: (rows) =>
     set((state) => ({
@@ -372,7 +524,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
       },
     })),
 
-  handleSessionClosed: (sessionId, _reason) => {
+  handleSessionClosed: (sessionId, reason) => {
     // Dismiss the session's permission prompts (auto-cancelled server-side).
     usePermissions.getState().dismissSessionPrompts(sessionId);
     const closedInfo = useSessions
@@ -389,8 +541,14 @@ export const useSessions = create<SessionsState>((set, get) => ({
             closedInfo,
           ]
         : state.historySessions,
-      activeSessionId:
-        state.activeSessionId === sessionId ? null : state.activeSessionId,
+      // A close is a PAUSE, not a discard: the conversation moves to the
+      // history list but STAYS the displayed one, so `ChatStream` renders
+      // its stored/paused banner (including the `replaced` copy) instead of
+      // the `No active session` empty state. (Required for the Task 6
+      // `Pause` behavior.)
+      activeSessionId: state.activeSessionId,
+      // Merge-only: a close reason outlives its event (never delete keys).
+      closeReasons: { ...state.closeReasons, [sessionId]: reason },
       messages: {
         ...state.messages,
         [sessionId]: finalizeSessionMessages(state.messages[sessionId] ?? []),
