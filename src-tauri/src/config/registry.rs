@@ -21,6 +21,12 @@ pub struct AgentEntry {
     /// Optional environment variables for the child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Whether this agent runs the archimedes suite with the bridge enabled.
+    /// When set, the desktop spawns it with the `PI_ARCHIMEDES_BRIDGE_*` env
+    /// vars and listens on a per-spawn peer-verified socket (the bridge,
+    /// ADR 0003). Default `false`; the built-in `pi` entry is `true`.
+    #[serde(default)]
+    pub bridge: bool,
 }
 
 /// The full set of configured agents.
@@ -57,6 +63,7 @@ impl Registry {
                 command: "pi-acp".to_string(),
                 args: Vec::new(),
                 env: BTreeMap::new(),
+                bridge: true,
             }],
         }
     }

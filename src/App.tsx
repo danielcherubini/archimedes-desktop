@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
+  listenBridgeEvent,
+  listenBridgeRequest,
   listenPermissionRequest,
   listenSessionClosed,
   listenSessionUpdate,
@@ -11,6 +13,7 @@ import {
 import { checkForUpdate, installUpdate } from "./lib/updater";
 import { useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
+import { useBridge } from "./store/bridge";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 
@@ -30,6 +33,9 @@ function App() {
     );
     unlistenPromises.push(
       listenSessionClosed((payload) => {
+        // Dismiss the session's bridge state (its pending prompts are
+        // drained as cancelled server-side; the password is never kept).
+        useBridge.getState().dismissSession(payload.sessionId);
         useSessions
           .getState()
           .handleSessionClosed(payload.sessionId, payload.reason);
@@ -41,6 +47,29 @@ function App() {
           .getState()
           .addPrompt(payload.sessionId, payload.requestId, payload.request),
       ),
+    );
+    unlistenPromises.push(
+      listenBridgeRequest((payload) =>
+        useBridge.getState().addRequest(payload.sessionId, payload),
+      ),
+    );
+    unlistenPromises.push(
+      listenBridgeEvent((payload) => {
+        const s = useBridge.getState();
+        // Wire names: the bus `COST_UPDATE` maps to `cost_update` (the
+        // `archimedes:`-prefix-strip lookup), NOT `cost`.
+        if (payload.event === "todos_update") {
+          s.applyTodoUpdate(payload.sessionId, payload.payload);
+        } else if (payload.event === "todos_clear") {
+          s.applyTodoClear(payload.sessionId, payload.payload);
+        } else if (payload.event === "state") {
+          s.applyState(payload.sessionId, payload.payload);
+        } else if (payload.event === "cost_update") {
+          s.applyCost(payload.sessionId, payload.payload);
+        } else if (payload.event === "session") {
+          s.applySession(payload.sessionId, payload.payload);
+        }
+      }),
     );
     return () => {
       for (const p of unlistenPromises) {

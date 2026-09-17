@@ -99,6 +99,26 @@ pub async fn respond_permission(
         .await
 }
 
+/// Deliver the user's answer to a pending bridge request to the agent.
+///
+/// `request_id` is the bridge request's `id` (the one carried in the
+/// `bridge-request` event). `result` is the response `result` `Value`
+/// VERBATIM (no wrapper — for `ask`, the `AskResponsePayload`; for
+/// `confirm`, `{confirmed}`; for `password`, `{password}`); the desktop
+/// writes `{v:1, type:"response", id, result}`. If the request is no longer
+/// pending, this is a no-op.
+#[tauri::command]
+pub async fn respond_bridge_request(
+    state: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    request_id: String,
+    result: Value,
+) -> Result<(), AcpError> {
+    state
+        .respond_bridge_request(&session_id, &request_id, result)
+        .await
+}
+
 /// Resume a stored session: spawn a fresh agent for `agent_id`, initialize
 /// it, then `session/load` the given session id (the two-argument form:
 /// session id + cwd).

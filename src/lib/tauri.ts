@@ -122,6 +122,7 @@ export type AcpSessionUpdate =
       toolCallId: string;
       title?: string;
       status?: AcpToolCallStatus;
+      rawInput?: unknown;
       content?: ToolCallContent[];
     }
   | {
@@ -129,6 +130,7 @@ export type AcpSessionUpdate =
       toolCallId: string;
       title?: string;
       status?: AcpToolCallStatus;
+      rawInput?: unknown;
       content?: ToolCallContent[];
     };
 
@@ -147,6 +149,72 @@ export interface PermissionRequestPayload {
   requestId: string;
   request: PermissionRequest;
 }
+
+// ---------------------------------------------------------------------------
+// Bridge (the delegated interactive UI — Task 4's listener emits these)
+// ---------------------------------------------------------------------------
+
+/**
+ * One question of the ask schema (the `ask` tool's `params.questions` entry,
+ * mirrored structurally — the ask package owns the concrete type).
+ */
+export interface AskQuestionDto {
+  id: string;
+  question: string;
+  description?: string;
+  options: Array<{ label: string }>;
+  multi?: boolean;
+  recommended?: number;
+}
+
+/**
+ * The user's answer to an `ask` bridge request — the `result` of the
+ * response frame, verbatim (one result per question).
+ */
+export interface AskResponsePayload {
+  cancelled: boolean;
+  results: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
+}
+
+/**
+ * A `bridge-request` event payload (camelCase over the wire — the Rust
+ * listener builds it). `sessionId` is the ACP session id (the desktop sets
+ * it on the listener once the ACP id is known; bridge requests only occur
+ * mid-turn, so they always carry it). `params` = the method's params: the
+ * ask schema (`{ questions }`) for `ask`, `{ command, reason }` for
+ * `confirm`/`password`.
+ */
+export interface BridgeRequestPayload {
+  sessionId: string;
+  requestId: string;
+  method: "ask" | "confirm" | "password";
+  source: string;
+  toolCallId?: string;
+  params: Record<string, unknown>;
+}
+
+/**
+ * A `bridge-event` push (camelCase over the wire). `event` is the wire name
+ * (`todos_update` / `todos_clear` / `cost_update` / `state` / `session` —
+ * the bus `COST_UPDATE` maps to `cost_update`, NOT `cost`); `payload` is the
+ * bus payload verbatim.
+ */
+export interface BridgeEventPayload {
+  sessionId: string;
+  seq: number;
+  event: string;
+  payload: unknown;
+}
+
+/**
+ * The `result` to send back via `respond_bridge_request` — for `ask`, the
+ * `AskResponsePayload` verbatim; for `confirm`, `{ confirmed }`; for
+ * `password`, `{ password }` (or `{ password: "" }` for a cancel).
+ */
+export type BridgeResponseDto =
+  | AskResponsePayload
+  | { confirmed: boolean }
+  | { password: string };
 
 /** A row from the app's SQLite `messages` table (camelCase over IPC). */
 export interface MessageRow {
@@ -282,4 +350,34 @@ export function listenPermissionRequest(
   return listen<PermissionRequestPayload>("permission-request", (event) =>
     callback(event.payload),
   );
+}
+
+export function listenBridgeRequest(
+  callback: (payload: BridgeRequestPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<BridgeRequestPayload>("bridge-request", (event) =>
+    callback(event.payload),
+  );
+}
+
+export function listenBridgeEvent(
+  callback: (payload: BridgeEventPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<BridgeEventPayload>("bridge-event", (event) =>
+    callback(event.payload),
+  );
+}
+
+/**
+ * Answer a bridge request. The invoke key is `result` (the Rust command's
+ * `result: serde_json::Value` param — Tauri's camelCase↔snake_case handles
+ * `sessionId`/`requestId` but will not alias `response`↔`result`). The
+ * `result` is written into the response frame verbatim (no wrapper).
+ */
+export async function respondBridgeRequest(
+  sessionId: string,
+  requestId: string,
+  result: BridgeResponseDto,
+): Promise<void> {
+  return invoke("respond_bridge_request", { sessionId, requestId, result });
 }

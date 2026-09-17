@@ -3,8 +3,13 @@ import { closeSession, listAgents, sendPrompt, startSession, type AgentEntryDto 
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
+import { useBridge } from "../store/bridge";
 import MessageBubble from "./MessageBubble";
 import PermissionPrompt from "./PermissionPrompt";
+import AskQuestionCard from "./AskQuestionCard";
+import SudoConfirmModal from "./SudoConfirmModal";
+import SudoPasswordModal from "./SudoPasswordModal";
+import TodoBoardPanel from "./TodoBoardPanel";
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -39,6 +44,35 @@ export default function ChatStream() {
     usePermissions((s) =>
       activeSessionId ? s.prompts[activeSessionId] : undefined,
     ) ?? [];
+  // Bridge surfaces for the ACTIVE session (B3): the store is keyed by the
+  // ACP session id, which matches `activeSessionId`.
+  const bridgeRequests =
+    useBridge((s) =>
+      activeSessionId ? s.requests[activeSessionId] : undefined,
+    ) ?? [];
+  const askRequests = bridgeRequests.filter((r) => r.method === "ask");
+  const confirmRequests = bridgeRequests.filter((r) => r.method === "confirm");
+  const passwordRequests = bridgeRequests.filter(
+    (r) => r.method === "password",
+  );
+  // An `ask` request is ANCHORED when a `tool-call` message with its
+  // `toolCallId` is in the stream (correlated by `(source, toolCallId)` —
+  // only a `main` ask can anchor; the desktop has no ACP `tool_call` frame
+  // for child tool calls). Anchored requests render IN PLACE of the
+  // `ToolCallCard`; the rest stack in the stream (arrival order).
+  const anchoredAskRequestIds = new Set<string>();
+  for (const r of askRequests) {
+    if (
+      r.source === "main" &&
+      r.toolCallId &&
+      messages.some((m) => m.kind === "tool-call" && m.id === r.toolCallId)
+    ) {
+      anchoredAskRequestIds.add(r.requestId);
+    }
+  }
+  const stackedAskRequests = askRequests.filter(
+    (r) => !anchoredAskRequestIds.has(r.requestId),
+  );
   const addUserMessage = useSessions((s) => s.addUserMessage);
   const beginTurn = useSessions((s) => s.beginTurn);
   const turnCompleted = useSessions((s) => s.turnCompleted);
@@ -131,14 +165,20 @@ export default function ChatStream() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, prompts.length]);
+  }, [messages, prompts.length, stackedAskRequests.length]);
 
   if (!activeSessionId) {
     return (
-      <main className="flex flex-1 flex-col items-center justify-center text-neutral-500">
-        <p className="text-lg">No active session</p>
-        <p className="mt-1 text-sm">Open a space from the list on the left.</p>
-      </main>
+      // Both return paths wrap in a flex row for the `TodoBoardPanel`
+      // right rail (M3): a single-path change would leave the rail
+      // missing in one state.
+      <div className="flex min-w-0 flex-1">
+        <main className="flex flex-1 flex-col items-center justify-center text-neutral-500">
+          <p className="text-lg">No active session</p>
+          <p className="mt-1 text-sm">Open a space from the list on the left.</p>
+        </main>
+        <TodoBoardPanel sessionId={null} />
+      </div>
     );
   }
 
@@ -191,7 +231,10 @@ export default function ChatStream() {
     : undefined;
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col">
+    // Flex row: the stream (main) + the `TodoBoardPanel` right rail
+    // (M3 — both return paths are wrapped; see the empty-state path above).
+    <div className="flex min-w-0 flex-1">
+      <main className="flex min-w-0 flex-1 flex-col">
       {view && (
         <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-4 py-2">
           <div className="flex min-w-0 items-center gap-2">
@@ -274,14 +317,40 @@ export default function ChatStream() {
         </div>
       )}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
-        {messages.map((message, i) => (
-          <MessageBubble key={i} message={message} />
-        ))}
+        {messages.map((message, i) => {
+          // The `AskQuestionCard` replaces the pending `ask` `ToolCallCard`
+          // (correlated via `(source, toolCallId)`/`requestId` — a `main`
+          // ask whose `toolCallId` matches this tool-call message).
+          if (message.kind === "tool-call") {
+            const anchored = askRequests.find(
+              (r) => r.source === "main" && r.toolCallId === message.id,
+            );
+            if (anchored) {
+              return (
+                <AskQuestionCard
+                  key={i}
+                  sessionId={activeSessionId}
+                  requestId={anchored.requestId}
+                />
+              );
+            }
+          }
+          return <MessageBubble key={i} message={message} />;
+        })}
         {prompts.map((prompt) => (
           <PermissionPrompt
             key={prompt.requestId}
             sessionId={activeSessionId}
             requestId={prompt.requestId}
+          />
+        ))}
+        {/* Stacked bridge `ask` cards (one per pending request, arrival
+            order — concurrent asks stack vertically in the stream). */}
+        {stackedAskRequests.map((r) => (
+          <AskQuestionCard
+            key={r.requestId}
+            sessionId={activeSessionId}
+            requestId={r.requestId}
           />
         ))}
         {inTurn && (
@@ -325,6 +394,24 @@ export default function ChatStream() {
           </button>
         </div>
       </div>
-    </main>
+      </main>
+      <TodoBoardPanel sessionId={activeSessionId} />
+      {/* Bridge modals (rendered at the `ChatStream` root — `fixed`
+          overlays, NOT inside the scroll region). */}
+      {confirmRequests.map((r) => (
+        <SudoConfirmModal
+          key={r.requestId}
+          sessionId={activeSessionId}
+          requestId={r.requestId}
+        />
+      ))}
+      {passwordRequests.map((r) => (
+        <SudoPasswordModal
+          key={r.requestId}
+          sessionId={activeSessionId}
+          requestId={r.requestId}
+        />
+      ))}
+    </div>
   );
 }

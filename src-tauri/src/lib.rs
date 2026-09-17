@@ -62,6 +62,7 @@ pub fn run() {
             commands::sessions::send_prompt,
             commands::sessions::close_session,
             commands::sessions::respond_permission,
+            commands::sessions::respond_bridge_request,
             commands::sessions::resume_session,
             commands::history::list_sessions,
             commands::history::load_history,

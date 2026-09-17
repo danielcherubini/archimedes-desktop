@@ -1,10 +1,12 @@
 //! ACP session core: spawn an agent, speak ACP, drive the session lifecycle.
 
+pub mod bridge;
 mod errors;
 mod fs_backend;
 mod permission;
 mod session;
 
+pub use bridge::{bridge_key, PendingBridge};
 pub use errors::AcpError;
 pub use fs_backend::FsBackend;
 pub use permission::{permission_key, PendingPermissions, PermissionOutcome};

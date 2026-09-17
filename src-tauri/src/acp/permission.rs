@@ -6,9 +6,9 @@
 //! *user-paced* — the user might take minutes to answer — so the handler must
 //! **not** await it. Instead the handler:
 //!
-//!   1. emits a `permission-request` Tauri event (the UI shows the prompt),
-//!   2. registers a oneshot sender in the manager's `pending_permissions` map
-//!      (keyed by `"{session_id}/{request_id}"`), and
+//!   1. registers a oneshot sender in the manager's `pending_permissions` map
+//!      (keyed by `"{session_id}/{request_id}"`),
+//!   2. emits a `permission-request` Tauri event (the UI shows the prompt), and
 //!   3. `cx.spawn`s a task that owns the responder + oneshot receiver, awaits
 //!      the answer (bounded by a 300 s timeout), and responds to the agent.
 //!
@@ -81,20 +81,30 @@ pub async fn handle_permission_request(
     let session_id = req.session_id.to_string();
     let key = permission_key(&session_id, &request_id);
 
-    // (a) Tell the UI to show the prompt.
+    // (a) Register the oneshot the user's answer will flow through — BEFORE
+    // the event is emitted. The UI (and the acp_flow test) calls
+    // `respond_permission` the instant it sees the event; if the entry were
+    // not in the map yet, that call would miss and be a no-op, and the agent
+    // would block on its response until the 300 s timeout. Registering first
+    // makes the lookup total: by the time the event is observed, the entry
+    // is already there. (This ordering is a load-dependent microsecond race
+    // to test deterministically, so it is verified by running the acp_flow
+    // integration test repeatedly rather than a unit test.)
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut map = pending_permissions.lock().await;
+        map.insert(key.clone(), tx);
+    }
+
+    // (b) Tell the UI to show the prompt — now that the answer path is in
+    // place, so a `respond_permission` racing the emission always finds the
+    // entry.
     let payload = json!({
         "sessionId": session_id,
         "requestId": request_id,
         "request": serde_json::to_value(req).unwrap_or(Value::Null),
     });
     sink.emit("permission-request", payload);
-
-    // (b) Register the oneshot the user's answer will flow through.
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut map = pending_permissions.lock().await;
-        map.insert(key.clone(), tx);
-    }
 
     // (c) Spawn the waiter. It owns the responder and the receiver.
     let key_owned = key.clone();

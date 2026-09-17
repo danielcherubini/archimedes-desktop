@@ -15,7 +15,7 @@
 //! (resume): only the *establisher* — the future that turns a fresh
 //! connection into an established session — differs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -38,6 +38,7 @@ use agent_client_protocol::{
     ConnectionTo, Responder,
 };
 
+use crate::acp::bridge::{self, PendingBridge};
 use crate::acp::errors::AcpError;
 use crate::acp::fs_backend::FsBackend;
 use crate::acp::permission::{self, PendingPermissions};
@@ -141,6 +142,10 @@ pub struct SessionManager {
     /// Populated by the permission bridge (Task 3); the driver-task cleanup
     /// drains all entries for a closing session.
     pending_permissions: PendingPermissions,
+    /// Pending bridge requests, keyed by `"{session_id}/{request_id}"` (the
+    /// `permission` convention). Populated by the bridge listener (Task 4);
+    /// the driver-task cleanup drains all entries for a closing session.
+    pending_bridge: PendingBridge,
     registry: Registry,
     config_dir: PathBuf,
     /// The app's SQLite database (Task 5); `None` in tests that do not
@@ -159,6 +164,7 @@ impl SessionManager {
         Ok(Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            pending_bridge: Arc::new(Mutex::new(HashMap::new())),
             registry,
             config_dir,
             db: None,
@@ -280,10 +286,22 @@ impl SessionManager {
         // spawning this agent (unconditional — the policy is app-wide).
         self.supersede_live_sessions().await;
 
+        // Bridge wiring (ADR 0003): for a bridge agent (on a platform where
+        // the bridge is available — NOT macOS), set the 4 bridge env vars
+        // and pass the (client session id, socket path) to the driver so it
+        // starts the peer-verified listener before the spawn returns. For a
+        // NEW session the client session id is a fresh UUID (the ACP
+        // `session_id` is agent-generated and does not exist yet).
+        let client_session_id = uuid::Uuid::new_v4().to_string();
+        let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id) {
+            Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
+            None => (entry.env.clone(), None),
+        };
+
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
                 .args(entry.args.clone())
-                .envs(entry.env.clone()),
+                .envs(agent_env),
         );
         let hint = spawn_hint(&entry.command);
 
@@ -291,35 +309,43 @@ impl SessionManager {
         let cwd_owned = cwd.clone();
 
         let info = self
-            .drive_session(agent, agent_id, hint, cwd, sink, move |cx| async move {
-                let init = cx
-                    .send_request(
-                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                            ClientCapabilities::default()
-                                .fs(FileSystemCapabilities::default()
-                                    .read_text_file(true)
-                                    .write_text_file(true))
-                                .terminal(false),
-                        ),
-                    )
-                    .block_task()
-                    .await?;
+            .drive_session(
+                agent,
+                agent_id,
+                hint,
+                cwd,
+                sink,
+                bridge_setup,
+                move |cx| async move {
+                    let init = cx
+                        .send_request(
+                            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                                ClientCapabilities::default()
+                                    .fs(FileSystemCapabilities::default()
+                                        .read_text_file(true)
+                                        .write_text_file(true))
+                                    .terminal(false),
+                            ),
+                        )
+                        .block_task()
+                        .await?;
 
-                let new_session = cx
-                    .send_request(NewSessionRequest::new(cwd_owned.clone()))
-                    .block_task()
-                    .await?;
+                    let new_session = cx
+                        .send_request(NewSessionRequest::new(cwd_owned.clone()))
+                        .block_task()
+                        .await?;
 
-                Ok((
-                    new_session.session_id.clone(),
-                    SessionInfo {
-                        session_id: new_session.session_id.clone(),
-                        agent_id: agent_id_owned,
-                        cwd: cwd_owned,
-                        capabilities: init.agent_capabilities,
-                    },
-                ))
-            })
+                    Ok((
+                        new_session.session_id.clone(),
+                        SessionInfo {
+                            session_id: new_session.session_id.clone(),
+                            agent_id: agent_id_owned,
+                            cwd: cwd_owned,
+                            capabilities: init.agent_capabilities,
+                        },
+                    ))
+                },
+            )
             .await?;
 
         self.record_session(&info);
@@ -366,10 +392,18 @@ impl SessionManager {
         // spawning this agent (unconditional — the policy is app-wide).
         self.supersede_live_sessions().await;
 
+        // Bridge wiring (ADR 0003): same as `start_session`, but the client
+        // session id is the STORED `session_id` (a resume re-uses it, so the
+        // agent's `session` push echoes the same id the desktop set).
+        let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, session_id) {
+            Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
+            None => (entry.env.clone(), None),
+        };
+
         let agent = AcpAgent::new(
             AcpAgentConfig::new(entry.command.clone())
                 .args(entry.args.clone())
-                .envs(entry.env.clone()),
+                .envs(agent_env),
         );
         let hint = spawn_hint(&entry.command);
 
@@ -379,54 +413,62 @@ impl SessionManager {
         let db = self.db.clone();
 
         let info = self
-            .drive_session(agent, agent_id, hint, cwd, sink, move |cx| async move {
-                let init = cx
-                    .send_request(
-                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                            ClientCapabilities::default()
-                                .fs(FileSystemCapabilities::default()
-                                    .read_text_file(true)
-                                    .write_text_file(true))
-                                .terminal(false),
-                        ),
-                    )
-                    .block_task()
-                    .await?;
+            .drive_session(
+                agent,
+                agent_id,
+                hint,
+                cwd,
+                sink,
+                bridge_setup,
+                move |cx| async move {
+                    let init = cx
+                        .send_request(
+                            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                                ClientCapabilities::default()
+                                    .fs(FileSystemCapabilities::default()
+                                        .read_text_file(true)
+                                        .write_text_file(true))
+                                    .terminal(false),
+                            ),
+                        )
+                        .block_task()
+                        .await?;
 
-                if !init.agent_capabilities.load_session {
-                    // Honest resume semantics: an agent that cannot load a
-                    // session must not pretend to. The UI shows the
-                    // history-only banner instead.
-                    return Err(agent_client_protocol::util::internal_error(
-                        "agent does not support session/load",
-                    ));
-                }
+                    if !init.agent_capabilities.load_session {
+                        // Honest resume semantics: an agent that cannot load a
+                        // session must not pretend to. The UI shows the
+                        // history-only banner instead.
+                        return Err(agent_client_protocol::util::internal_error(
+                            "agent does not support session/load",
+                        ));
+                    }
 
-                // The restored transcript is replaced by the agent's replay,
-                // which doubles as the authoritative history: clear the
-                // stored rows BEFORE `session/load` so a replay reusing a
-                // known `messageId` overwrites (rather than clobbers) and a
-                // replay under a new id does not duplicate the stored text.
-                if let Some(db) = &db {
-                    let _ = db.clear_messages_for(&sid.to_string());
-                }
+                    // The restored transcript is replaced by the agent's replay,
+                    // which doubles as the authoritative history: clear the
+                    // stored rows BEFORE `session/load` so a replay reusing a
+                    // known `messageId` overwrites (rather than clobbers) and a
+                    // replay under a new id does not duplicate the stored text.
+                    if let Some(db) = &db {
+                        let _ = db.clear_messages_for(&sid.to_string());
+                    }
 
-                let _restored = cx
-                    .load_session(sid.clone(), cwd_owned.as_path())
-                    .block_task()
-                    .start_session()
-                    .await?;
+                    let _restored = cx
+                        .load_session(sid.clone(), cwd_owned.as_path())
+                        .block_task()
+                        .start_session()
+                        .await?;
 
-                Ok((
-                    sid.clone(),
-                    SessionInfo {
-                        session_id: sid,
-                        agent_id: agent_id_owned,
-                        cwd: cwd_owned,
-                        capabilities: init.agent_capabilities,
-                    },
-                ))
-            })
+                    Ok((
+                        sid.clone(),
+                        SessionInfo {
+                            session_id: sid,
+                            agent_id: agent_id_owned,
+                            cwd: cwd_owned,
+                            capabilities: init.agent_capabilities,
+                        },
+                    ))
+                },
+            )
             .await?;
 
         self.record_session(&info);
@@ -442,6 +484,7 @@ impl SessionManager {
     /// `Err` — the error is mapped to an [`AcpError`] (a
     /// "does not support session/load" marker becomes
     /// [`AcpError::NotResumable`]).
+    #[allow(clippy::too_many_arguments)]
     async fn drive_session<F, Fut>(
         &self,
         agent: AcpAgent,
@@ -449,6 +492,7 @@ impl SessionManager {
         hint: String,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
+        bridge_setup: Option<(String, PathBuf)>,
         establish: F,
     ) -> Result<SessionInfo, AcpError>
     where
@@ -461,6 +505,29 @@ impl SessionManager {
         let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
         let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
         let (close_tx, mut close_rx) = watch::channel(false);
+        // Bridge listener (ADR 0003): started BEFORE the driver task spawns
+        // (the push retry window is only ~2 s). The anchor is the desktop's
+        // own pid (`std::process::id()`, always alive). The driver-task
+        // `close_tx` is passed so a session close cancels every in-flight
+        // bridge request. `None` for non-bridge agents / macOS (fail-closed).
+        let bridge_handle = match bridge_setup {
+            Some((client_session_id, socket_path)) => Some(
+                bridge::start_listener(
+                    client_session_id,
+                    &socket_path,
+                    std::process::id(),
+                    sink.clone(),
+                    self.pending_bridge.clone(),
+                    &close_tx,
+                    bridge::DEFAULT_BRIDGE_TIMEOUT,
+                )
+                .await
+                .map_err(|e| AcpError::SpawnFailed {
+                    hint: format!("bridge listener: {e}"),
+                })?,
+            ),
+            None => None,
+        };
         // Set by `close_session` / `supersede_live_sessions` (first-set-wins)
         // BEFORE their close-flag send. The driver task reads it after
         // `connect_with` returns to decide the close reason; `None` means the
@@ -480,6 +547,7 @@ impl SessionManager {
 
         let sessions_arc = self.sessions.clone();
         let pending_permissions_arc = self.pending_permissions.clone();
+        let pending_bridge_arc = self.pending_bridge.clone();
         let establish_timeout = self.establish_timeout;
         let db = self.db.clone();
         let sink = sink.clone();
@@ -500,6 +568,10 @@ impl SessionManager {
             let fs_write = fs_backend.clone();
             let perm_sink = sink.clone();
             let perm_pp = pending_permissions_arc.clone();
+            // A clone for the `connect_with` closure (to call `set_session_id`
+            // once the ACP id is known); the original `bridge_handle` stays
+            // here for the unconditional `teardown` in the cleanup below.
+            let bridge_handle_cx = bridge_handle.clone();
 
             let builder = Client
                 .builder()
@@ -613,6 +685,14 @@ impl SessionManager {
                     session_id_tx.send(session_id.clone()).ok();
                     session_ready_tx.send(info).ok();
 
+                    // Hand the ACP `session_id` to the bridge handle so
+                    // `bridge-request`/`bridge-event` payloads carry the ACP
+                    // id (bridge requests only occur mid-turn, after
+                    // establish, so they always carry the ACP id).
+                    if let Some(h) = &bridge_handle_cx {
+                        h.set_session_id(&session_id.to_string()).await;
+                    }
+
                     // BLOCK until close_session OR agent death. A clean
                     // incoming EOF does NOT cancel main_fn, so select on both.
                     tokio::select! {
@@ -651,6 +731,15 @@ impl SessionManager {
                     .lock()
                     .await
                     .retain(|key, _| !key.starts_with(&prefix));
+                // Drain this session's pending bridge requests too (dropping
+                // the senders cancels the spawned waiters, which write the
+                // terminal `error:"cancelled"` frame). The `session_id` is
+                // only known here, so this drain is nested in the guard.
+                let bridge_prefix = bridge::session_key_prefix(&session_id.to_string());
+                pending_bridge_arc
+                    .lock()
+                    .await
+                    .retain(|key, _| !key.starts_with(&bridge_prefix));
                 sink.emit(
                     "session-closed",
                     serde_json::json!({
@@ -659,6 +748,11 @@ impl SessionManager {
                     }),
                 );
             }
+            // Tear the bridge listener down UNCONDITIONALLY (do NOT nest it
+            // inside the `session_id` guard, or a failed `connect_with` /
+            // `session/new` would leak the listener): stop the accept loop +
+            // unlink the socket (Unix; Windows pipes vanish on last close).
+            bridge::teardown(bridge_handle);
         });
 
         // Await the connection, then the established session.
@@ -756,6 +850,31 @@ impl SessionManager {
         // do.
         if let Some(sender) = sender {
             let _ = sender.send(outcome);
+        }
+        Ok(())
+    }
+
+    /// Deliver the user's answer to a pending bridge request.
+    ///
+    /// Looks up the oneshot sender by the compound key
+    /// `"{session_id}/{request_id}"` and sends the `result` `Value` verbatim
+    /// (no wrapper — for `password`, `{password}`; for `confirm`,
+    /// `{confirmed}`; for `ask`, the `AskResponsePayload`). If the entry is
+    /// gone (the session closed, or the request already resolved), this is a
+    /// silent no-op.
+    pub async fn respond_bridge_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        result: serde_json::Value,
+    ) -> Result<(), AcpError> {
+        let key = bridge::bridge_key(session_id, request_id);
+        let sender = self.pending_bridge.lock().await.remove(&key);
+        // Best-effort: if the receiver is already gone the request was
+        // already resolved (timeout / session close), so there is nothing to
+        // do.
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
         }
         Ok(())
     }
@@ -894,4 +1013,115 @@ fn spawn_hint(command: &str) -> String {
          then retry.",
         command
     )
+}
+
+/// A per-spawn randomized bridge socket path (ADR 0003).
+///
+/// On Linux: a `bridge-<uuid>.sock` under a `0700` dir named
+/// `archimedes-bridge-<uid>` — under `XDG_RUNTIME_DIR` when set (a
+/// per-user, `0700` dir the system manages), else the temp dir.
+/// **Fail-closed:** the dir is verified to be owned by the current uid
+/// (and chmodded `0700`) BEFORE the socket is bound into it — a dir
+/// pre-created by ANOTHER user (a pre-squat of the guessable name in a
+/// shared temp dir) makes the bridge unavailable for this spawn
+/// (`None`) rather than the desktop binding its socket inside an
+/// attacker-owned dir. The uid in the dir name is a hint, not a
+/// guarantee — the ownership check is the gate. A symlinked dir path is
+/// also rejected (chmod/uid checks follow symlinks and would validate
+/// the target instead). On Windows: the bare
+/// name `bridge-<uuid>` (the listener prefixes `\\.\\pipe\\`; the dir is
+/// per-user already). On macOS the bridge is unavailable, so this
+/// returns a placeholder that is never used (`bridge::available()` is
+/// `false`).
+fn bridge_socket_path() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+        let uid = unsafe { libc::getuid() };
+        // Prefer `XDG_RUNTIME_DIR` (per-user, `0700`, managed by the
+        // system) over the shared temp dir when it is set. A relative
+        // `XDG_RUNTIME_DIR` is treated as UNSET (XDG spec) — using it as
+        // is would create the dir relative to the desktop's CWD.
+        let base = std::env::var("XDG_RUNTIME_DIR")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .filter(|p| Path::new(p).is_absolute())
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("archimedes-bridge-{uid}"));
+        // Fail closed on any setup error: the bridge is a per-spawn
+        // convenience — a failed socket dir must not abort the spawn.
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        // `set_permissions` / `metadata` FOLLOW symlinks: a local attacker
+        // who can write the base dir can pre-create `dir` as a symlink to
+        // a victim-owned directory — the chmod + uid check would then pass
+        // against the TARGET (chmodding an attacker-chosen victim-owned
+        // dir to 0700, a local DoS) and the socket would bind inside an
+        // attacker-chosen location. Reject a symlinked path before
+        // trusting the dir (fail-closed).
+        if std::fs::symlink_metadata(&dir)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink())
+        {
+            return None;
+        }
+        if std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .is_err()
+        {
+            // EPERM: the dir pre-exists owned by ANOTHER user (a
+            // pre-squat) — do not bind a socket inside a foreign dir.
+            return None;
+        }
+        // Defense in depth: even after the chmod, verify the dir is
+        // actually owned by us (the real gate against a foreign dir).
+        let meta = std::fs::metadata(&dir).ok()?;
+        if meta.uid() != uid {
+            return None;
+        }
+        Some(dir.join(format!("bridge-{}.sock", uuid::Uuid::new_v4())))
+    }
+    #[cfg(windows)]
+    {
+        Some(PathBuf::from(format!("bridge-{}", uuid::Uuid::new_v4())))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        // macOS (bridge unavailable): a placeholder, never used (the
+        // listener is not started — `bridge::available()` is `false`).
+        Some(std::env::temp_dir().join(format!("bridge-{}.sock", uuid::Uuid::new_v4())))
+    }
+}
+
+/// Build the 4 bridge env vars (ADR 0003) and the `(client session id,
+/// socket path)` the driver uses to start the listener. Returns `None` when
+/// the agent is not a bridge agent OR the bridge is unavailable on this
+/// platform (macOS — fail-closed).
+fn bridge_spawn_setup(
+    entry: &AgentEntry,
+    session_id: &str,
+) -> Option<(BTreeMap<String, String>, String, PathBuf)> {
+    if !entry.bridge || !bridge::available() {
+        return None;
+    }
+    // Fail-closed: the socket dir could not be set up safely (e.g.
+    // pre-squatted by another user) — spawn WITHOUT the bridge.
+    let socket_path = bridge_socket_path()?;
+    let mut env = entry.env.clone();
+    env.insert("PI_ARCHIMEDES_BRIDGE".to_string(), "1".to_string());
+    env.insert(
+        "PI_ARCHIMEDES_BRIDGE_SESSION".to_string(),
+        session_id.to_string(),
+    );
+    env.insert(
+        "PI_ARCHIMEDES_BRIDGE_SERVER_PID".to_string(),
+        std::process::id().to_string(),
+    );
+    env.insert(
+        "PI_ARCHIMEDES_BRIDGE_SOCKET".to_string(),
+        socket_path.to_string_lossy().to_string(),
+    );
+    Some((env, session_id.to_string(), socket_path))
 }

@@ -160,6 +160,72 @@ describe("applySessionUpdate — tool calls", () => {
     expect(messages[0]).toMatchObject({ title: "edit (done)" });
   });
 
+  it("keeps rawInput on the tool-call message (the todo board's rawInput fallback reads it)", () => {
+    const messages = applySessionUpdate(
+      [],
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc1",
+        title: "manage_todo_list",
+        rawInput: { operation: "write", todoList: [{ content: "a", status: "pending" }] },
+      },
+      1,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawInput).toEqual({
+      operation: "write",
+      todoList: [{ content: "a", status: "pending" }],
+    });
+  });
+
+  it("keeps the rawInput from a tool_call_update when the update carries one", () => {
+    let messages = applySessionUpdate(
+      [],
+      { sessionUpdate: "tool_call", toolCallId: "tc1", title: "manage_todo_list" },
+      1,
+    );
+    messages = applySessionUpdate(
+      messages,
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc1",
+        rawInput: { operation: "write", todoList: [{ content: "b", status: "completed" }] },
+      },
+      2,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawInput).toEqual({
+      operation: "write",
+      todoList: [{ content: "b", status: "completed" }],
+    });
+  });
+
+  it("preserves an earlier rawInput when a later update carries none", () => {
+    let messages = applySessionUpdate(
+      [],
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc1",
+        title: "manage_todo_list",
+        rawInput: { operation: "write", todoList: [{ content: "a", status: "pending" }] },
+      },
+      1,
+    );
+    messages = applySessionUpdate(
+      messages,
+      { sessionUpdate: "tool_call_update", toolCallId: "tc1", status: "completed" },
+      2,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawInput).toEqual({
+      operation: "write",
+      todoList: [{ content: "a", status: "pending" }],
+    });
+  });
+
   it("extracts a diff from a tool_call's content into a diff message", () => {
     const messages = applySessionUpdate(
       [],
@@ -428,6 +494,26 @@ describe("rowToMessages (history replay from the database)", () => {
     if (!diff || diff.kind !== "diff") throw new Error("no diff message");
     expect(diff.path).toBe("/tmp/x.txt");
     expect(diff.patch).toContain("+b");
+  });
+
+  it("maps a tool-call row's rawInput onto the message", () => {
+    const [msg] = rowToMessages(
+      row({
+        kind: "tool-call",
+        messageKey: "tc1",
+        payloadJson: JSON.stringify({
+          toolCallId: "tc1",
+          title: "manage_todo_list",
+          status: "completed",
+          rawInput: { operation: "write", todoList: [{ content: "a", status: "pending" }] },
+        }),
+      }),
+    );
+    if (msg?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(msg.rawInput).toEqual({
+      operation: "write",
+      todoList: [{ content: "a", status: "pending" }],
+    });
   });
 
   it("ignores rows with unparseable payloads or unknown kinds", () => {

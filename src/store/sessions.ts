@@ -35,6 +35,8 @@ export type Message =
       title: string;
       status: ToolCallUiStatus;
       diff?: DiffRef;
+      /** The ACP `rawInput` (the tool's raw input) — kept for the todo board's `rawInput` fallback (the latest `manage_todo_list` input). */
+      rawInput?: unknown;
       at: number;
     }
   | { kind: "diff"; path: string; patch: string; at: number };
@@ -115,6 +117,7 @@ export function applySessionUpdate(
         title: update.title ?? update.toolCallId,
         status: mapStatus(update.status),
         diff: diffs[0],
+        rawInput: update.rawInput,
         at,
       };
       return [...messages, msg, ...diffMessages(diffs, at)];
@@ -133,6 +136,7 @@ export function applySessionUpdate(
           title: update.title ?? update.toolCallId,
           status: mapStatus(update.status),
           diff: diffs[0],
+          rawInput: update.rawInput,
           at,
         };
         return [...messages, msg, ...diffMessages(diffs, at)];
@@ -144,6 +148,7 @@ export function applySessionUpdate(
         title: update.title ?? prev.title,
         status: update.status ? mapStatus(update.status) : prev.status,
         diff: diffs[0] ?? prev.diff,
+        rawInput: update.rawInput ?? prev.rawInput,
       };
       const next = [...messages];
       next[index] = updated;
@@ -210,6 +215,7 @@ export function rowToMessages(row: MessageRow): Message[] {
         title,
         status: mapStatus(payload.status as AcpToolCallStatus | undefined),
         diff: diffs[0],
+        rawInput: payload.rawInput,
         at: row.createdAt,
       };
       return [
