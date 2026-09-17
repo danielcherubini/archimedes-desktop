@@ -9,13 +9,20 @@ See [CONTEXT.md](CONTEXT.md) for the project's language and terminology.
 
 ## What it does
 
-- Spawns ACP-speaking agent processes (v1: `pi`) as subprocesses and
-  speaks stdio JSON-RPC with them.
-- Streams the conversation: agent text, tool calls, file diffs, and a
-  PTY-backed terminal pane.
+- Spawns ACP-speaking agent processes as subprocesses and speaks stdio
+  JSON-RPC with them. The default agent is `pi` (via `pi-acp`); the
+  space's folder is the conversation's working directory.
+- Presents **spaces** — each space is a folder; your conversations live
+  inside spaces, and the agent's file access is sandboxed to the space's
+  folder.
+- One conversation is live at a time; starting a conversation in another
+  space pauses the current one (it stays resumable). This sidesteps a
+  known two-session runtime constraint
+  ([docs/decisions/0002](docs/decisions/0002-one-live-acp-session.md)).
+- Streams the conversation: agent text, tool calls, and file diffs.
 - Permission prompts: the agent asks before each tool call; you approve
   or deny in the UI.
-- Sessions survive restarts — history is persisted in a local SQLite
+- Conversations survive restarts — history is persisted in a local SQLite
   database and can be resumed.
 - Auto-update: signed updates (minisign) delivered through GitHub
   Releases; the updater verifies the signature before installing.
