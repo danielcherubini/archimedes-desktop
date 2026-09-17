@@ -27,3 +27,7 @@ _Avoid_: Agent list, agent config, agent profile
 **Permission prompt**:
 The Client's UI response to an ACP `session/request_permission` request from an agent — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
+
+**Bridge**:
+The mechanism by which the archimedes suite (running inside an Agent process managed by the Client) routes its interactive UI primitives (ask picker, confirmations, masked password input) and ambient state (todos, cost, subagent streams, agent state) to the Client over a local channel. Gated by process spawn: the Client sets the bridge env vars on the Agent it spawns; the suite is inert when they are absent. See the pi-archimedes glossary for the suite-side view.
+_Avoid_: Side channel, socket bridge, client mode, host mode
