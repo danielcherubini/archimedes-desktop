@@ -1,6 +1,9 @@
 ---
-status: committed
-done-when: Every checkbox below is ticked after a manual pass in `tauri dev` on Linux with a real `pi` agent running the bridge suite; the downgrade combos are confirmed safe (old desktop + new suite stays inert; new desktop + old suite ignores the env vars).
+status: live
+last-verified: 2026-09-17
+verified-by: src-tauri/tests/bridge_integration.rs (4 scenarios) + the unit suites (both repos) — the manual pass below is the release gate
+---
+
 ---
 
 # Bridge E2E Checklist (manual)
