@@ -5,7 +5,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
+import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
 import { closeSession, sendPrompt } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
@@ -129,6 +129,16 @@ export default function ChatStream() {
   const [error, setError] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow the composer textarea: reset to `auto`, then `scrollHeight`
+  // (min 2 rows via `rows={2}`, max 6 rows via `max-h` + `overflow-y-auto`).
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [draft]);
 
   // A stored (non-live) session: its transcript is read-only unless the
   // agent negotiated `loadSession`, in which case it can be resumed.
@@ -458,41 +468,51 @@ export default function ChatStream() {
         )}
       </div>
 
-      <div className="border-t border-neutral-800 p-3">
-        {(error ?? newConversationError) && (
-          <p className="mb-2 text-xs text-red-400">
-            {error ?? newConversationError}
-          </p>
-        )}
-        <div className="flex gap-2">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-            placeholder={
-              isLive
-                ? "Send a prompt…"
-                : canResume
-                  ? "This space's conversation is paused — Resume to reconnect"
-                  : "This session is closed / history only"
+      {(error ?? newConversationError) && (
+        <p className="mb-2 px-3 text-ui-sm text-destructive">
+          {error ?? newConversationError}
+        </p>
+      )}
+      <div className="m-3 rounded-2xl border-input-border bg-input p-2 hover:border-input-border-hover focus-within:border-input-border-focused">
+        <textarea
+          ref={composerRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void send();
             }
-            rows={2}
-            disabled={!isLive || inTurn}
-            className="flex-1 resize-none rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-sky-600 disabled:opacity-50"
-          />
-          <button
-            type="button"
-            onClick={() => void send()}
-            disabled={!isLive || inTurn || draft.trim() === ""}
-            className="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-          >
-            Send
-          </button>
+          }}
+          placeholder={
+            isLive
+              ? workingOrInTurn
+                ? "Agent is working…"
+                : "Send a prompt…"
+              : canResume
+                ? "Paused — Resume to reconnect"
+                : "This session is closed"
+          }
+          rows={2}
+          disabled={!isLive || workingOrInTurn}
+          className="max-h-32 resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
+        />
+        <div className="mt-1 flex items-center justify-between">
+          <span aria-hidden />
+          <div className="flex items-center gap-2">
+            <span className="text-ui-xs text-foreground-subtlest">
+              {liveSession?.agentId ?? historySession?.agentId}
+            </span>
+            <Button
+              size="icon"
+              aria-label="Send"
+              disabled={!isLive || inTurn || draft.trim() === ""}
+              onClick={() => void send()}
+              className="size-8 rounded-full bg-primary text-primary-foreground"
+            >
+              <ArrowUp className="size-4" />
+            </Button>
+          </div>
         </div>
       </div>
       {/* Bridge modals (rendered at the `ChatStream` root — `fixed`

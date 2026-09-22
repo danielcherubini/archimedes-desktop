@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import ChatStream from "./ChatStream";
+import { sendPrompt } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -53,6 +54,28 @@ function seedLiveSession(): void {
     ],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
     historySessions: [],
+    messages: { s1: [] },
+    inTurn: {},
+    stopReasons: {},
+    closeReasons: {},
+  });
+}
+
+/**
+ * Seed a STORED (non-live) session: `sessions` is empty, the session lives
+ * in `historySessions` (so `isLive` is false). `capabilities` defaults to `{}`
+ * (history-only); pass `{ loadSession: true }` for the resumable case.
+ */
+function seedStoredSession(
+  capabilities: Record<string, unknown> = {},
+): void {
+  useSessions.setState({
+    activeSessionId: "s1",
+    sessions: [],
+    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+    historySessions: [
+      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities },
+    ],
     messages: { s1: [] },
     inTurn: {},
     stopReasons: {},
@@ -201,5 +224,68 @@ describe("ChatStream", () => {
     expect(getSidePaneCollapsed()).toBe(true);
     // …and the button's aria-pressed follows.
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("renders the composer shell (rounded-2xl, bg-input, border-input-border)", () => {
+    seedLiveSession();
+    const { container } = render(<ChatStream />);
+    const shell = container.querySelector(".rounded-2xl");
+    expect(shell).toBeTruthy();
+    expect(shell!.className).toContain("bg-input");
+    expect(shell!.className).toContain("border-input-border");
+  });
+
+  it("shows the composer placeholder 'Send a prompt…' for a live idle session", () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    expect(screen.getByPlaceholderText("Send a prompt…")).toBeTruthy();
+  });
+
+  it("shows the composer placeholder 'Agent is working…' for a live working session", () => {
+    seedLiveSession();
+    useSessions.getState().beginTurn("s1");
+    render(<ChatStream />);
+    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
+  });
+
+  it("shows the composer placeholder 'Paused — Resume to reconnect' for a stored resumable session", () => {
+    seedStoredSession({ loadSession: true });
+    render(<ChatStream />);
+    expect(
+      screen.getByPlaceholderText("Paused — Resume to reconnect"),
+    ).toBeTruthy();
+  });
+
+  it("shows the composer placeholder 'This session is closed' for a history-only session", () => {
+    seedStoredSession();
+    render(<ChatStream />);
+    expect(screen.getByPlaceholderText("This session is closed")).toBeTruthy();
+  });
+
+  it("disables the send button while inTurn and when the draft is empty", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    // Empty draft → disabled.
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    // Non-empty draft, idle → enabled.
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+    // inTurn (working) → disabled again — the textarea too.
+    await act(async () => {
+      useSessions.getState().beginTurn("s1");
+    });
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("calls sendPrompt when Enter is pressed with a draft", () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(sendPrompt).toHaveBeenCalledWith("s1", "hello");
   });
 });
