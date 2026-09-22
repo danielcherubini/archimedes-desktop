@@ -80,8 +80,9 @@ triggers a check.
 
 **First-release steps (before the first tag):**
 
-1. Replace the `<owner>` placeholder in `plugins.updater.endpoints` in
-   `src-tauri/tauri.conf.json` with the real GitHub owner.
+1. ~~Replace the `<owner>` placeholder in `plugins.updater.endpoints` in
+   `src-tauri/tauri.conf.json` with the real GitHub owner.~~ Done — the
+   endpoint points at `https://github.com/danielcherubini/archimedes-desktop/releases/latest/download/latest.json`.
 2. Create the `TAURI_SIGNING_PRIVATE_KEY` (and optional
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) repository secret — the value is
    the minisign private key generated with `pnpm tauri signer generate`
