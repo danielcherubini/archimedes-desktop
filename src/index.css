@@ -2,6 +2,16 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
+/*
+ * Make `dark:` utilities class-driven instead of OS-preference-driven.
+ * Without this, `dark:` rules compile to `@media (prefers-color-scheme: dark)`
+ * and the ported primitives (tabs/dialog/select/dropdown/button) lose their
+ * dark overrides on OS-light machines, since the app is always Zai Dark.
+ * Keying on the `.dark` class (toggled by applyThemeToDocument) makes the
+ * rendering independent of the OS color scheme.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --ui-font-size: 14px;
 }
