@@ -288,4 +288,91 @@ describe("ChatStream", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).toHaveBeenCalledWith("s1", "hello");
   });
+
+  // --- Empty transcript + pending request (the request cards must NOT be
+  // swallowed by the "Send a prompt to start" branch). ---
+
+  it("renders a pending permission prompt on an empty transcript (no fresh-session hint)", () => {
+    seedLiveSession();
+    usePermissions.getState().addPrompt("s1", "req1", {
+      toolCall: { title: "bash" },
+      options: [{ optionId: "allow_once", name: "Allow once" }],
+    });
+    render(<ChatStream />);
+    expect(screen.getByText("bash")).toBeTruthy();
+    expect(screen.getByText("Allow once")).toBeTruthy();
+    expect(screen.queryByText("Send a prompt to start")).toBeNull();
+  });
+
+  it("renders a stacked bridge ask on an empty transcript (no fresh-session hint)", () => {
+    seedLiveSession();
+    // No `toolCallId` → the card is NOT queued (it renders immediately,
+    // unanchored).
+    useBridge.getState().addRequest("s1", {
+      requestId: "req-ask",
+      method: "ask",
+      source: "main",
+      params: {
+        questions: [
+          {
+            id: "q1",
+            question: "Which approach?",
+            options: [{ label: "A" }, { label: "B" }],
+          },
+        ],
+      },
+    });
+    render(<ChatStream />);
+    expect(screen.getByText("Which approach?")).toBeTruthy();
+    expect(screen.queryByText("Send a prompt to start")).toBeNull();
+  });
+
+  it("renders 'Waiting for your input…' on an empty transcript when the bridge agentState is blocked", async () => {
+    seedLiveSession();
+    useBridge.getState().applyState("s1", { state: "blocked" });
+    render(<ChatStream />);
+    await flush();
+    expect(screen.getByText("Waiting for your input…")).toBeTruthy();
+    expect(screen.queryByText("Send a prompt to start")).toBeNull();
+  });
+
+  // --- Composer mismatch states (ONE predicate: `workingOrInTurn`). ---
+
+  it("disables the send button and no-ops send() when the bridge agentState is working (no inTurn)", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    // Idle → enabled (sanity).
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+    // The bridge says working (the `state` push races `turnCompleted`, or
+    // the state latches after a turn) → the composer is dead: button AND
+    // textarea disabled, Enter no-ops.
+    await act(async () => {
+      useBridge.getState().applyState("s1", { state: "working" });
+    });
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(true);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("keeps the composer consistent when the bridge is idle but the store is inTurn", () => {
+    seedLiveSession();
+    useSessions.getState().beginTurn("s1");
+    useBridge.getState().applyState("s1", { state: "idle" });
+    render(<ChatStream />);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    // The unified predicate (agentState present → `agentState ===
+    // "working"` → false): the placeholder says idle, the controls are
+    // enabled, and Enter actually sends — ONE consistent state (the
+    // `inTurn` latch is a store follow-up, not a composer concern).
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(sendPrompt).toHaveBeenCalledWith("s1", "hi");
+  });
 });

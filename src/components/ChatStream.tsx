@@ -131,13 +131,23 @@ export default function ChatStream() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-grow the composer textarea: reset to `auto`, then `scrollHeight`
-  // (min 2 rows via `rows={2}`, max 6 rows via `max-h` + `overflow-y-auto`).
+  // Auto-grow the composer textarea: reset to `auto`, then the
+  // border-box height — `scrollHeight` is the CONTENT height, but
+  // `height` (border-box) must also cover the border (`offsetHeight -
+  // clientHeight` is the border thickness); without it a ~2px deficit
+  // leaves a scrollbar flicker near `max-h-32`. Re-applied on window
+  // resize (a stale height would otherwise linger until the next
+  // keystroke).
   useEffect(() => {
     const el = composerRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    const apply = () => {
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+    };
+    apply();
+    window.addEventListener("resize", apply);
+    return () => window.removeEventListener("resize", apply);
   }, [draft]);
 
   // A stored (non-live) session: its transcript is read-only unless the
@@ -208,7 +218,12 @@ export default function ChatStream() {
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || inTurn || !isLive) return;
+    // The UNIFIED working predicate (the same as the placeholder, the
+    // textarea's `disabled`, and the send button below — `agentState`
+    // when present, else the `inTurn` fallback): sending while the
+    // agent is working is not possible (no `session/cancel` backend —
+    // follow-up).
+    if (!text || workingOrInTurn || !isLive) return;
     setDraft("");
     setError(null);
     addUserMessage(activeSessionId, text);
@@ -297,6 +312,11 @@ export default function ChatStream() {
       (r) =>
         r.method === "ask" || r.method === "confirm" || r.method === "password",
     );
+  // The "Send a prompt to start" hint is hidden when a pending
+  // permission prompt or bridge `ask` (the cards render in the stream
+  // regardless of the transcript's length) or a working/blocked line
+  // is present — otherwise the card would be swallowed by the hint.
+  const hasPendingPromptOrAsk = prompts.length > 0 || askRequests.length > 0;
 
   return (
     <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
@@ -397,74 +417,79 @@ export default function ChatStream() {
         </Button>
       </div>
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
-        {messages.length === 0 ? (
-          <div className="flex h-full items-center justify-center">
-            <p className="text-ui-base text-foreground-subtlest">
-              Send a prompt to start
-            </p>
-          </div>
-        ) : (
-          <>
-            {messages.map((message, i) => {
-              // The `AskQuestionCard` replaces the pending `ask`
-              // `ToolCallCard` (correlated via `(source, toolCallId)`/
-              // `requestId` — a `main` ask whose `toolCallId` matches this
-              // tool-call message).
-              if (message.kind === "tool-call") {
-                const anchored = askRequests.find(
-                  (r) => r.source === "main" && r.toolCallId === message.id,
-                );
-                if (anchored) {
-                  return (
-                    <AskQuestionCard
-                      key={i}
-                      sessionId={activeSessionId}
-                      requestId={anchored.requestId}
-                    />
-                  );
-                }
-              }
-              return <MessageBubble key={i} message={message} />;
-            })}
-            {prompts.map((prompt) => (
-              <PermissionPrompt
-                key={prompt.requestId}
-                sessionId={activeSessionId}
-                requestId={prompt.requestId}
-              />
-            ))}
-            {/* Stacked bridge `ask` cards (one per pending request, arrival
-                order — concurrent asks stack vertically in the stream). */}
-            {stackedAskRequests.map((r) => (
-              <AskQuestionCard
-                key={r.requestId}
-                sessionId={activeSessionId}
-                requestId={r.requestId}
-              />
-            ))}
-            {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
-            {workingOrInTurn && (
-              <div className="flex items-center gap-2">
-                <BrailleLoader
-                  variant="typing"
-                  speed="normal"
-                  fontSize={14}
-                  label="Agent working"
+        {/* The request cards and the working/blocked/stop-reason lines
+            render UNCONDITIONALLY (regardless of the transcript's
+            length — a bridge agent that asks at session start, or the
+            window between `openSession` and `loadHistory` hydration,
+            must not have its request swallowed by the hint). */}
+        {messages.length === 0 &&
+          !hasPendingPromptOrAsk &&
+          !workingOrInTurn &&
+          agentState !== "blocked" && (
+            <div className="flex h-full items-center justify-center">
+              <p className="text-ui-base text-foreground-subtlest">
+                Send a prompt to start
+              </p>
+            </div>
+          )}
+        {messages.map((message, i) => {
+          // The `AskQuestionCard` replaces the pending `ask`
+          // `ToolCallCard` (correlated via `(source, toolCallId)`/
+          // `requestId` — a `main` ask whose `toolCallId` matches this
+          // tool-call message).
+          if (message.kind === "tool-call") {
+            const anchored = askRequests.find(
+              (r) => r.source === "main" && r.toolCallId === message.id,
+            );
+            if (anchored) {
+              return (
+                <AskQuestionCard
+                  key={i}
+                  sessionId={activeSessionId}
+                  requestId={anchored.requestId}
                 />
-                <p className="text-ui-sm text-foreground-subtle">{quip}</p>
-              </div>
-            )}
-            {agentState === "blocked" && (
-              <p className="text-ui-sm text-foreground-subtle">
-                Waiting for your input…
-              </p>
-            )}
-            {!inTurn && stopReason && stopReason !== "end_turn" && (
-              <p className="text-ui-sm text-foreground-subtlest">
-                Turn ended: {stopReason}
-              </p>
-            )}
-          </>
+              );
+            }
+          }
+          return <MessageBubble key={i} message={message} />;
+        })}
+        {prompts.map((prompt) => (
+          <PermissionPrompt
+            key={prompt.requestId}
+            sessionId={activeSessionId}
+            requestId={prompt.requestId}
+          />
+        ))}
+        {/* Stacked bridge `ask` cards (one per pending request, arrival
+            order — concurrent asks stack vertically in the stream). */}
+        {stackedAskRequests.map((r) => (
+          <AskQuestionCard
+            key={r.requestId}
+            sessionId={activeSessionId}
+            requestId={r.requestId}
+          />
+        ))}
+        {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
+        {workingOrInTurn && (
+          <div className="flex items-center gap-2">
+            <BrailleLoader
+              variant="typing"
+              speed="normal"
+              fontSize={14}
+              label="Agent working"
+            />
+            <p className="text-ui-sm text-foreground-subtle">{quip}</p>
+          </div>
+        )}
+        {agentState === "blocked" && (
+          <p className="text-ui-sm text-foreground-subtle">
+            Waiting for your input…
+          </p>
+        )}
+        {!inTurn && stopReason && stopReason !== "end_turn" && (
+          <p className="text-ui-sm text-foreground-subtlest">
+            Turn ended: {stopReason}
+          </p>
         )}
       </div>
 
@@ -506,7 +531,7 @@ export default function ChatStream() {
             <Button
               size="icon"
               aria-label="Send"
-              disabled={!isLive || inTurn || draft.trim() === ""}
+              disabled={!isLive || workingOrInTurn || draft.trim() === ""}
               onClick={() => void send()}
               className="size-8 rounded-full bg-primary text-primary-foreground"
             >
