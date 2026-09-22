@@ -274,14 +274,41 @@ export function rowToMessages(row: MessageRow): Message[] {
  * and within a space the head of its `historySessions` subsequence is its
  * newest stored session. Do NOT re-sort by a field that doesn't exist.
  */
+
+/**
+ * The live session a space "points at" (for the space row's live dot and
+ * boot auto-select).
+ *
+ * **Multi-live (ADR 0002 — the one-live cap is lifted):** a space may hold
+ * MORE than one live session (a second `start_session` / `resume_session`
+ * no longer supersedes the first). `sessions` is in INSERTION order —
+ * `addSession` / `resumeSession` APPEND — so this returns the
+ * MOST-RECENTLY-STARTED live session in the space (the one `addSession`
+ * made `activeSessionId`). That keeps the space row's live dot coherent
+ * with the active chat. With a single live session (the common case) it is
+ * just that session.
+ */
+function mostRecentLiveInSpace(
+  sessions: SessionInfo[],
+  path: string,
+): SessionInfo | undefined {
+  let found: SessionInfo | undefined;
+  for (const s of sessions) {
+    if (s.cwd === path) found = s; // keep the LAST (most recent) match
+  }
+  return found;
+}
+
 export function autoSelectActive(
   spaces: SpaceRow[],
   sessions: SessionInfo[],
   historySessions: SessionInfo[],
 ): string | null {
   for (const space of spaces) {
-    // At most one live session app-wide; prefer it in this space.
-    const live = sessions.find((s) => s.cwd === space.path);
+    // A space may hold MORE than one live session (the one-live cap is
+    // lifted, ADR 0002): `mostRecentLiveInSpace` picks the
+    // most-recently-started one (coherent with `activeSessionId`).
+    const live = mostRecentLiveInSpace(sessions, space.path);
     if (live) return live.sessionId;
     // No re-sort: input order IS newest-first (see the ordering note).
     const stored = historySessions
@@ -305,7 +332,10 @@ export interface SpaceView {
   path: string;
   /** Display label (base name; `""` if the base name is empty — the UI falls back to `path`). */
   title: string;
-  /** The live session in this space (there is at most one app-wide), or `null`. */
+  /**
+   * The space's live session (the most-recently-started one when a space
+   * holds more than one — the one-live cap is lifted, ADR 0002), or `null`.
+   */
   liveSessionId: string | null;
   /** Stored sessions of this space, in `historySessions` order (newest-first as delivered by `list_sessions` — do NOT re-sort). */
   storedSessionIds: string[];
@@ -319,8 +349,11 @@ export function spaceViewFor(
   historySessions: SessionInfo[],
   closeReasons: Record<string, CloseReasonStr>,
 ): SpaceView {
+  // A space may hold MORE than one live session (the one-live cap is
+  // lifted, ADR 0002): show the most-recently-started one (coherent with
+  // `activeSessionId`), not just the first.
   const liveSessionId =
-    sessions.find((s) => s.cwd === space.path)?.sessionId ?? null;
+    mostRecentLiveInSpace(sessions, space.path)?.sessionId ?? null;
   // Input order = newest-first from `list_sessions`; NOT re-sorted.
   const storedSessionIds = historySessions
     .filter((s) => s.cwd === space.path)
@@ -348,7 +381,7 @@ interface SessionsState {
   spaces: SpaceRow[];
   /**
    * Close reason recorded on `session-closed`, per session id (for the
-   * "replaced" banner copy). Merge-only: a reason outlives its event, so
+   * paused banner copy). Merge-only: a reason outlives its event, so
    * keys are never deleted.
    */
   closeReasons: Record<string, CloseReasonStr>;
@@ -584,9 +617,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
         : state.historySessions,
       // A close is a PAUSE, not a discard: the conversation moves to the
       // history list but STAYS the displayed one, so `ChatStream` renders
-      // its stored/paused banner (including the `replaced` copy) instead of
-      // the `No active session` empty state. (Required for the Task 6
-      // `Pause` behavior.)
+      // its stored/paused banner instead of the `No active session` empty
+      // state. (Required for the Task 6 `Pause` behavior.)
       activeSessionId: state.activeSessionId,
       // Merge-only: a close reason outlives its event (never delete keys).
       closeReasons: { ...state.closeReasons, [sessionId]: reason },

@@ -7,13 +7,18 @@
 //! `connect_with` inline in [`SessionManager::start_session`] (it would only
 //! resolve when the session closes). Instead we spawn the connection as a
 //! *driver task* that owns the closure for the whole session. `close_session`
-//! (or the one-live policy's supersede, ADR 0002) records the close kind and
+//! (or a subagent cancel) records the close kind and
 //! flips a `watch` flag that makes the closure return, which drops the
 //! connection and — on Unix — terminates the agent's process group;
 //!
 //! The same driver is used for `session/new` (start) and `session/load`
 //! (resume): only the *establisher* — the future that turns a fresh
 //! connection into an established session — differs.
+//!
+//! Multiple live sessions COEXIST (the one-live cap is lifted, ADR 0002):
+//! `start_session` / `resume_session` do NOT close other live sessions; a
+//! session is torn down only by an explicit `close_session`, a subagent
+//! cancel, or the agent process exiting on its own.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -59,8 +64,6 @@ pub trait EventSink: Send + Sync {
 pub enum ClosedReason {
     /// The user (or the app) closed the session.
     User,
-    /// Closed because another session started (one-live policy).
-    Replaced,
     /// The agent process exited on its own.
     AgentExited,
     /// The connection failed for an unexpected reason.
@@ -72,7 +75,6 @@ impl ClosedReason {
     pub fn as_str(self) -> &'static str {
         match self {
             ClosedReason::User => "user",
-            ClosedReason::Replaced => "replaced",
             ClosedReason::AgentExited => "agent-exited",
             ClosedReason::Error => "error",
         }
@@ -87,10 +89,8 @@ impl ClosedReason {
 /// boundary, so it must be visible to the whole crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseKind {
-    /// An explicit user close (`close_session`).
+    /// An explicit user close (`close_session` or a subagent cancel).
     User,
-    /// Closed because another session started (one-live policy, ADR 0002).
-    Replaced,
 }
 
 /// A fully established session, ready to accept prompts.
@@ -131,15 +131,11 @@ pub(crate) struct LiveSession {
     /// For a subagent session this IS the `ExternalClose`'s sender (a cancel
     /// flips it); for a main session it is the driver's internal flag.
     pub(crate) close_tx: watch::Sender<bool>,
-    /// The close kind, decided by `close_session` / `supersede_live_sessions`
-    /// (first-set-wins) and read by the driver task once `connect_with`
-    /// returns. For a subagent session this IS the `ExternalClose`'s kind.
+    /// The close kind, decided by `close_session` (first-set-wins) and read
+    /// by the driver task once `connect_with` returns. For a subagent session
+    /// this IS the `ExternalClose`'s kind.
     pub(crate) close_kind: Arc<StdMutex<Option<CloseKind>>>,
 }
-
-/// One live session's close plumbing: the flag sender (cheap) and the
-/// shared close kind set by closers when they supersede/close it.
-type LiveClose = (watch::Sender<bool>, Arc<StdMutex<Option<CloseKind>>>);
 
 /// The external-close handle: the subagent cancel path (main sessions pass
 /// `None` to `drive_session`).
@@ -598,7 +594,6 @@ impl SessionDriver {
             let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
             let reason = match kind {
                 Some(CloseKind::User) => ClosedReason::User,
-                Some(CloseKind::Replaced) => ClosedReason::Replaced,
                 None => ClosedReason::AgentExited,
             };
             if let Ok(session_id) = session_id_rx.await {
@@ -699,9 +694,11 @@ async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
 ///
 /// Owns a [`SessionDriver`] (db: attached via [`Self::attach_db`],
 /// captures: `None`, subagent: injected via [`Self::set_subagent_manager`])
-/// plus the agent registry + config dir. The one-live policy, DB
-/// recording, and `record_session` stay here; the shared driver
-/// (`drive_session`) is delegated to.
+/// plus the agent registry + config dir. DB recording and
+/// `record_session` stay here; the shared driver
+/// (`drive_session`) is delegated to. (The one-live policy is LIFTED,
+/// ADR 0002 — sessions coexist; a session is torn down only by an
+/// explicit `close_session`, a subagent cancel, or agent death.)
 ///
 /// `Sync` — the mutable state is `Arc<Mutex<…>>` internally, so the
 /// manager is managed directly (no outer lock); each method locks only
@@ -777,37 +774,6 @@ impl SessionManager {
         &self.registry.agents
     }
 
-    /// One-live policy (ADR 0002): initiate a `replaced` close of every live
-    /// session (best-effort flag send; the actual teardown runs concurrently
-    /// in the superseded driver tasks). Called at the top of `start_session`
-    /// and `resume_session`, BEFORE the new agent is spawned, so the steady
-    /// state is at most one live session at a time.
-    pub async fn supersede_live_sessions(&self) {
-        // Clone the (cheap) senders and kinds first, then send: the map
-        // lock must not be held across the sends — and it never needs to
-        // be, because the kind mutex is always unlocked when touched and
-        // exports no references into the map.
-        let live: Vec<LiveClose> = self
-            .driver
-            .sessions
-            .lock()
-            .await
-            .values()
-            .map(|live| (live.close_tx.clone(), live.close_kind.clone()))
-            .collect();
-        for (close_tx, close_kind) in live {
-            // First-set-wins: a kind already present means the close is in
-            // progress, or the reason is already decided.
-            if let Ok(mut kind) = close_kind.lock() {
-                if kind.is_none() {
-                    *kind = Some(CloseKind::Replaced);
-                }
-            }
-            // Ignore `SendError`: the target may already be closing.
-            let _ = close_tx.send(true);
-        }
-    }
-
     /// Record a session in the persistence layer (no-op without a database).
     fn record_session(&self, info: &SessionInfo) {
         if let Some(db) = &self.driver.db {
@@ -843,10 +809,6 @@ impl SessionManager {
             .ok_or_else(|| AcpError::UnknownAgent {
                 agent_id: agent_id.to_string(),
             })?;
-
-        // One-live policy (ADR 0002): supersede any live session BEFORE
-        // spawning this agent (unconditional — the policy is app-wide).
-        self.supersede_live_sessions().await;
 
         // Bridge wiring (ADR 0003): for a bridge agent (on a platform where
         // the bridge is available — NOT macOS), set the 4 bridge env vars
@@ -951,10 +913,6 @@ impl SessionManager {
             .ok_or_else(|| AcpError::UnknownAgent {
                 agent_id: agent_id.to_string(),
             })?;
-
-        // One-live policy (ADR 0002): supersede any live session BEFORE
-        // spawning this agent (unconditional — the policy is app-wide).
-        self.supersede_live_sessions().await;
 
         // Bridge wiring (ADR 0003): same as `start_session`, but the client
         // session id is the STORED `session_id` (a resume re-uses it, so the

@@ -6,6 +6,15 @@ superseded-by:
 
 # Subagent sessions run on a dedicated worker runtime
 
+> **Context note (2026-09-22):** the worker-runtime decision STANDS
+> independently. The one-live cap (0002) is now LIFTED — the 2026-09-15
+> two-session hang no longer reproduces on the current versions (see 0002's
+> superseded note). But the hang being gone does NOT re-decide this ADR:
+> subagents keep their dedicated worker runtime; the lift only removes the
+> CAP's rationale ("0002 rejected the main runtime on wall-clock evidence").
+> The option-3 follow-up (root-cause + fix) is closed as "no longer
+> reproduces," not as a confirmed fix.
+
 The desktop is capped at one live Session (0002) because two *concurrent* ACP sessions on one tokio runtime hung `send_prompt` 60+ seconds (2026-09-15 repro; suspected cause at the SDK/async-io level — two long-lived per-connection transport tasks sharing one global async-io reactor; root cause never confirmed). Subagent sessions (desktop-spawned ACP sessions that run a task delegated by the main agent via the bridge) are a new concept — not user-facing Sessions — so the one-live policy excludes them by definition. But the *runtime* question is separate: where do their ACP session objects run? We decided: all subagent sessions run on a **dedicated tokio runtime on separate worker threads**; the main Session stays on the existing runtime.
 
 **Considered Options**

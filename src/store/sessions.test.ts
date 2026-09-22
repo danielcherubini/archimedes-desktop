@@ -308,8 +308,8 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
     info("idY", "/workspaces/bravo"),
   ];
   const closeReasons: Record<string, CloseReasonStr> = {
-    "live-alpha": "replaced",
-    "stored-alpha": "replaced",
+    "live-alpha": "user",
+    "stored-alpha": "error",
     idX: "agent-exited",
   };
 
@@ -320,11 +320,10 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       title: "alpha",
       liveSessionId: "live-alpha",
       storedSessionIds: ["stored-alpha"],
-      // The newest session's reason: the live one — recorded as "replaced"
-      // (the one-live-policy closed it when a newer session started). The
-      // stored session carries the same reason here, so this proves the
-      // lookup does not silently fall through to it.
-      lastReason: "replaced",
+      // The newest session's reason: the live one's (`live-alpha` →
+      // `user`), NOT the stored session's (`stored-alpha` → `error`) —
+      // proves the lookup does not fall through to the stored one.
+      lastReason: "user",
     });
   });
 
@@ -349,6 +348,28 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       storedSessionIds: [],
       lastReason: undefined,
     });
+  });
+
+  // The one-live cap is LIFTED (ADR 0002): a space may hold MORE than one
+  // live session. `sessions` is in insertion order (newest appended by
+  // `addSession` / `resumeSession`), so the space row points at the
+  // MOST-RECENTLY-STARTED one.
+  it("a space with TWO coexisting live sessions points at the most-recently-started one (ADR 0002 lift)", () => {
+    const twoLive = [
+      info("first", "/workspaces/alpha"),
+      info("second", "/workspaces/alpha"),
+    ];
+    const view = spaceViewFor(spaces[0], twoLive, historySessions, closeReasons);
+    expect(view.liveSessionId).toBe("second");
+    expect(view.storedSessionIds).toEqual(["stored-alpha"]);
+  });
+
+  it("autoSelectActive prefers the most-recently-started live session in the space (ADR 0002 lift)", () => {
+    const twoLive = [
+      info("first", "/workspaces/alpha"),
+      info("second", "/workspaces/alpha"),
+    ];
+    expect(autoSelectActive(spaces, twoLive, historySessions)).toBe("second");
   });
 });
 

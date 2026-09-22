@@ -483,33 +483,185 @@ async fn wait_for_closed(rx: &Receiver<(String, Value)>, session_id: &str, reaso
     );
 }
 
-/// Drive the one-live policy (ADR 0002) end to end: a second `start_session`
-/// supersedes the first with the `replaced` close reason, a superseded session
-/// re-resumable, and the superseded processes are all reaped (no leak).
+/// Poll up to `timeout` asserting that NO `session-closed` event for
+/// `(session_id, reason)` arrives — the negation of `wait_for_closed`.
+///
+/// Used to prove the one-live cap is LIFTED: with two live sessions
+/// coexisting, the first session must NOT receive a `replaced` close event
+/// when a second starts. A `replaced` event within the window is a hard fail
+/// (the cap is still in place). The event, if it is going to arrive, arrives
+/// well within the budget (the superseded driver reacts to the close flag
+/// within ~100 ms), so a false pass (the event arriving after the budget)
+/// is not a realistic risk.
+async fn assert_no_closed_event_within(
+    rx: &Receiver<(String, Value)>,
+    session_id: &str,
+    reason: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((event, payload)) if event == "session-closed" => {
+                assert!(
+                    !(payload["sessionId"] == session_id && payload["reason"] == reason),
+                    "a session-closed event for `{session_id}` with reason `{reason}` must NOT arrive (the one-live cap is lifted)"
+                );
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Two live sessions coexist (the one-live cap is LIFTED, ADR 0002): starting
+/// a second session does NOT close the first; both answer prompts; both
+/// processes are reaped on close. This is the inverse of
+/// `one_live_supersede_policy`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_live_supersede_policy() {
+async fn two_live_sessions_coexist() {
     let config_dir = temp_config_dir();
     // Two DISTINCT copies: the teardown-reap assertions discriminate the two
-    // agents by path, which is what makes step 11 a real leak check rather
-    // than a single shared-binary assertion.
+    // agents by path (a real leak check, not a shared-binary assertion).
     let bin_a = unique_fake_agent(&config_dir);
     let bin_b = unique_fake_agent(&config_dir);
     {
         let json = serde_json::json!({
             "agents": [
                 {
-                    "id": "l1",
-                    "name": "L1",
+                    "id": "c1",
+                    "name": "C1",
                     "command": bin_a.to_string_lossy(),
                     "args": ["resume"],
-                    "env": { "FAKE_SESSION_ID": "s1" }
+                    "env": { "FAKE_SESSION_ID": "c1" }
                 },
                 {
-                    "id": "l2",
-                    "name": "L2",
+                    "id": "c2",
+                    "name": "C2",
                     "command": bin_b.to_string_lossy(),
                     "args": ["resume"],
-                    "env": { "FAKE_SESSION_ID": "s2" }
+                    "env": { "FAKE_SESSION_ID": "c2" }
+                }
+            ]
+        });
+        std::fs::write(
+            config_dir.join("agents.json"),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    manager.attach_db(Arc::new(
+        Db::open(&config_dir.join("archimedes.db")).expect("db should open"),
+    ));
+    manager.set_establish_timeout(Duration::from_secs(2));
+
+    let cwd_a = config_dir.join("cwda");
+    let cwd_b = config_dir.join("cwdb");
+    std::fs::create_dir_all(&cwd_a).unwrap();
+    std::fs::create_dir_all(&cwd_b).unwrap();
+
+    // 1. The first session starts.
+    start_retrying(&manager, "c1", cwd_a.clone(), &sink)
+        .await
+        .expect("start_session c1 should succeed");
+    assert_eq!(manager.session_count().await, 1);
+
+    // 2. A second session starts (a DIFFERENT cwd): the cap is lifted, so it
+    //    does NOT close the first.
+    start_retrying(&manager, "c2", cwd_b.clone(), &sink)
+        .await
+        .expect("start_session c2 should succeed");
+
+    // 3. The first session did NOT receive a `replaced` close event (the
+    //    second session did not supersede it). Drains the queue for the
+    //    budget, so the map is fully settled before the count assert below.
+    assert_no_closed_event_within(&rx, "c1", "replaced", Duration::from_secs(3)).await;
+
+    // 4. BOTH sessions stay live (the one-live cap is lifted, ADR 0002).
+    assert_eq!(
+        manager.session_count().await,
+        2,
+        "two live sessions coexist (cap lifted)"
+    );
+
+    // 5. Both answer prompts (c1 is still in the map and functional).
+    manager
+        .send_prompt("c1", "hi".to_string())
+        .await
+        .expect("send_prompt should succeed on the FIRST (still-live) session");
+    manager
+        .send_prompt("c2", "hi".to_string())
+        .await
+        .expect("send_prompt should succeed on the second session");
+
+    // 6. Close both, one at a time (so a close event is not consumed by the
+    //    `wait_for_closed` scan of the OTHER session — the helper discards
+    //    non-matching events); both emit a `user` close event; count → 0.
+    manager
+        .close_session("c1")
+        .await
+        .expect("close_session c1 should succeed");
+    wait_for_closed(&rx, "c1", "user").await;
+    manager
+        .close_session("c2")
+        .await
+        .expect("close_session c2 should succeed");
+    wait_for_closed(&rx, "c2", "user").await;
+    assert_eq!(
+        manager.session_count().await,
+        0,
+        "everything should be closed"
+    );
+
+    // 7. Process teardown proof: poll until BOTH agents are gone (no leak).
+    assert!(
+        wait_for_process_gone(&bin_a, Duration::from_secs(10)),
+        "agent a should have been reaped (no leak)"
+    );
+    assert!(
+        wait_for_process_gone(&bin_b, Duration::from_secs(10)),
+        "agent b should have been reaped (no leak)"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// `resume_session` coexists with a live session (the one-live cap is LIFTED,
+/// ADR 0002): resuming a stored session does NOT close a live one. Complements
+/// `two_live_sessions_coexist` (the `start_session` call site) by covering the
+/// `resume_session` call site. The surviving invariants are kept (two live
+/// sessions coexist; both answer prompts; both processes reaped on close); the
+/// invariants that die with the cap (a `replaced` close event, the
+/// supersede-then-resume steps) are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_does_not_supersede_live() {
+    let config_dir = temp_config_dir();
+    // Two DISTINCT copies: the teardown-reap assertions discriminate the two
+    // agents by path (a real leak check, not a shared-binary assertion).
+    let bin_a = unique_fake_agent(&config_dir);
+    let bin_b = unique_fake_agent(&config_dir);
+    {
+        let json = serde_json::json!({
+            "agents": [
+                {
+                    "id": "r1",
+                    "name": "R1",
+                    "command": bin_a.to_string_lossy(),
+                    "args": ["resume"],
+                    "env": { "FAKE_SESSION_ID": "r1" }
+                },
+                {
+                    "id": "r2",
+                    "name": "R2",
+                    "command": bin_b.to_string_lossy(),
+                    "args": ["resume"],
+                    "env": { "FAKE_SESSION_ID": "r2" }
                 }
             ]
         });
@@ -538,106 +690,69 @@ async fn one_live_supersede_policy() {
     std::fs::create_dir_all(&cwd_a).unwrap();
     std::fs::create_dir_all(&cwd_b).unwrap();
 
-    // 1. A nonexistent folder is rejected before anything is spawned or
-    //    superseded (early canonicalize in `start_session`).
-    let missing = config_dir.join(format!("nope-{}", uuid::Uuid::new_v4()));
-    let err = manager
-        .start_session("l1", missing, &sink)
+    // 1. Start r1 (live), then start + close r2 (so r2 is STORED and only
+    //    r1 is live).
+    start_retrying(&manager, "r1", cwd_a.clone(), &sink)
         .await
-        .expect_err("start_session should fail for a missing folder");
-    assert!(
-        matches!(err, AcpError::FolderMissing { .. }),
-        "expected FolderMissing, got {err:?}"
-    );
-    assert_eq!(
-        manager.session_count().await,
-        0,
-        "nothing should be spawned for a missing folder"
-    );
-
-    // 2. The first session starts and is the only live session.
-    start_retrying(&manager, "l1", cwd_a.clone(), &sink)
+        .expect("start_session r1 should succeed");
+    start_retrying(&manager, "r2", cwd_b.clone(), &sink)
         .await
-        .expect("start_session l1 should succeed");
-    assert_eq!(manager.session_count().await, 1);
-
-    // 3. A second live session starts: it supersedes s1 (an async flag send
-    //    — the teardown runs concurrently in s1's driver task).
-    start_retrying(&manager, "l2", cwd_b.clone(), &sink)
+        .expect("start_session r2 should succeed");
+    manager
+        .close_session("r2")
         .await
-        .expect("start_session l2 should succeed");
-    // Do NOT assert the count right here: s2 is already in the map and s1's
-    // driver cleanup (the map removal) races s2's insertion, so the count
-    // may still read 2 for a short window.
-
-    // 4. s1's close event (`replaced`) arrives. It is emitted AFTER s1 has
-    //    been removed from the sessions map, so observing it guarantees s1
-    //    is gone.
-    wait_for_closed(&rx, "s1", "replaced").await;
-
-    // 5. Now (after the close event, not right after step 3) the map holds
-    //    exactly the one live session.
+        .expect("close_session r2 should succeed");
+    wait_for_closed(&rx, "r2", "user").await;
     assert_eq!(
         manager.session_count().await,
         1,
-        "s1 should be gone and s2 present"
+        "only r1 is live (r2 is stored)"
     );
 
-    // 6. The new live session is fully functional after the supersede
-    //    (the default-mode prompt handler streams two chunks before
-    //    end_turn; the chunk events may arrive interleaved — that is fine).
-    manager
-        .send_prompt("s2", "hi".to_string())
+    // 2. Resume r2 (from stored). The cap is lifted, so r1 STAYS LIVE.
+    resume_retrying(&manager, "r2", "r2", cwd_b, &sink)
         .await
-        .expect("send_prompt should succeed on the superseding session");
+        .expect("resume_session r2 should succeed");
 
-    // 7. Close s2; wait for its close event BEFORE asserting on counts
-    //    (teardown is an async flag send).
+    // 3. r1 did NOT receive a `replaced` close event; both are live.
+    assert_no_closed_event_within(&rx, "r1", "replaced", Duration::from_secs(3)).await;
+    assert_eq!(
+        manager.session_count().await,
+        2,
+        "a resumed session coexists with a live one (cap lifted)"
+    );
+
+    // 4. Both answer prompts (r1 is still in the map and functional).
     manager
-        .close_session("s2")
+        .send_prompt("r1", "hi".to_string())
         .await
-        .expect("close_session s2 should succeed");
-    wait_for_closed(&rx, "s2", "user").await;
+        .expect("send_prompt should succeed on the still-live session");
+    manager
+        .send_prompt("r2", "hi".to_string())
+        .await
+        .expect("send_prompt should succeed on the resumed session");
+
+    // 5. Close both, one at a time (so a close event is not consumed by the
+    //    `wait_for_closed` scan of the OTHER session — the helper discards
+    //    non-matching events); both emit a `user` close event; count → 0.
+    manager
+        .close_session("r1")
+        .await
+        .expect("close_session r1 should succeed");
+    wait_for_closed(&rx, "r1", "user").await;
+    manager
+        .close_session("r2")
+        .await
+        .expect("close_session r2 should succeed (again)");
+    wait_for_closed(&rx, "r2", "user").await;
     assert_eq!(
         manager.session_count().await,
         0,
         "everything should be closed"
     );
 
-    // 8. A superseded session is re-resumable (loadSession is true in the
-    //    `resume` mode); step 7 closed everything, so this takes the policy's
-    //    no-op branch and s1 establishes cleanly.
-    resume_retrying(&manager, "l1", "s1", cwd_a, &sink)
-        .await
-        .expect("resume_session s1 should succeed after a supersede");
-    assert_eq!(manager.session_count().await, 1);
-
-    // 9. `start_session` supersedes a *resumed* session too.
-    start_retrying(&manager, "l2", cwd_b.clone(), &sink)
-        .await
-        .expect("start_session l2 should succeed (again)");
-    wait_for_closed(&rx, "s1", "replaced").await;
-    assert_eq!(
-        manager.session_count().await,
-        1,
-        "only the newest session should be live"
-    );
-
-    // 10. Close everything again.
-    manager
-        .close_session("s2")
-        .await
-        .expect("close_session s2 should succeed (again)");
-    wait_for_closed(&rx, "s2", "user").await;
-    assert_eq!(
-        manager.session_count().await,
-        0,
-        "everything should be closed again"
-    );
-
-    // 11. Process teardown proof: poll until BOTH agents are gone (deadline
-    //     10 s; same `pgrep` idiom as the existing reap checks) — the
-    //     superseded/closed processes were actually reaped, none leaked.
+    // 6. Process teardown proof: poll until BOTH agents are gone (deadline
+    //    10 s) — the closed processes were actually reaped, none leaked.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline
         && (find_fake_agent_pid(&bin_a).is_some() || find_fake_agent_pid(&bin_b).is_some())

@@ -120,9 +120,9 @@ export default function ChatStream() {
 
   // `New conversation` in this space: `agentId = live ?? storedMostRecent
   // ?? firstAgentId (registry default)`, `spacePath = view.path` (the
-  // active session's `cwd` by the match above; the backend canonicalizes
-  // and its one-live policy closes a displaced session; its
-  // `session-closed (replaced)` event takes it to stored automatically).
+  // active session's `cwd` by the match above; the backend canonicalizes).
+  // With the one-live cap lifted (ADR 0002) a new conversation does NOT
+  // displace a live one — they coexist.
   const storedMostRecent =
     view !== undefined
       ? historySessions.find(
@@ -140,8 +140,7 @@ export default function ChatStream() {
     try {
       const info = await startSession(newConversationAgentId, view.path);
       // `addSession` switches the view to the new session automatically
-      // (Task 5); the displaced conversation surfaces as stored via its
-      // `replaced` close event. No manual view-switch call.
+      // (Task 5). No manual view-switch call.
       addSession(info);
       addSpace(info.cwd);
     } catch (err) {
@@ -285,9 +284,7 @@ export default function ChatStream() {
         <div className="flex items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
           {canResume ? (
             <p className="text-xs text-neutral-400">
-              {closeReasons[activeSessionId] === "replaced"
-                ? "Paused — a conversation started in another space. Resume to reconnect."
-                : "This session is stored. Resuming reconnects it to the agent."}
+              This session is stored. Resuming reconnects it to the agent.
             </p>
           ) : (
             <p className="text-xs text-amber-400">

@@ -13,8 +13,6 @@ function tooltipForColumn(
 ): string {
   if (live) return `Live — ${agentId}`;
   switch (lastReason) {
-    case "replaced":
-      return "Paused — another space started a conversation";
     case "user":
       return "Paused";
     case "agent-exited":

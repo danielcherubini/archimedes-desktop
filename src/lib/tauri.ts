@@ -47,12 +47,10 @@ export interface SpaceCheck {
 
 /**
  * Why a session was closed (snake_case strings over the `session-closed`
- * event). The UI renders close reasons in the paused banner copy —
- * `"replaced"` is the one-live session policy (a newer session started
- * with the same cwd). Recorded per session id in the store's
- * `closeReasons`.
+ * event). The UI renders close reasons in the paused banner copy.
+ * Recorded per session id in the store's `closeReasons`.
  */
-export type CloseReasonStr = "user" | "agent-exited" | "error" | "replaced";
+export type CloseReasonStr = "user" | "agent-exited" | "error";
 
 /** Why the agent stopped a prompt turn (snake_case strings). */
 export type StopReason =
