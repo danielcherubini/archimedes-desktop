@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { closeSession, listAgents, sendPrompt, startSession, type AgentEntryDto } from "../lib/tauri";
+import { closeSession, sendPrompt } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
+import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import MessageBubble from "./MessageBubble";
 import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
@@ -35,8 +36,6 @@ export default function ChatStream() {
   const historySessions = useSessions((s) => s.historySessions);
   const closeReasons = useSessions((s) => s.closeReasons);
   const openSession = useSessions((s) => s.openSession);
-  const addSession = useSessions((s) => s.addSession);
-  const addSpace = useSessions((s) => s.addSpace);
   const inTurn = useSessions((s) => (s.activeSessionId ? !!s.inTurn[s.activeSessionId] : false));
   const stopReason = useSessions((s) => (s.activeSessionId ? s.stopReasons[s.activeSessionId] : undefined));
   const prompts =
@@ -80,14 +79,7 @@ export default function ChatStream() {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
-  // Registry for the "New conversation" `agentId` fallback (fetched
-  // `useEffect`-style like the dialog; `firstAgentId` is the default).
-  const [agents, setAgents] = useState<AgentEntryDto[] | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    listAgents().then(setAgents).catch(() => setAgents([]));
-  }, []);
 
   // A stored (non-live) session: its transcript is read-only unless the
   // agent negotiated `loadSession`, in which case it can be resumed.
@@ -116,35 +108,15 @@ export default function ChatStream() {
             v.storedSessionIds.includes(activeSessionId),
         );
 
-  // `New conversation` in this space: `agentId = live ?? storedMostRecent
-  // ?? firstAgentId (registry default)`, `spacePath = view.path` (the
-  // active session's `cwd` by the match above; the backend canonicalizes).
-  // With the one-live cap lifted (ADR 0002) a new conversation does NOT
-  // displace a live one — they coexist.
-  const storedMostRecent =
-    view !== undefined
-      ? historySessions.find(
-          (s) => s.sessionId === view.storedSessionIds[0],
-        )
-      : undefined;
-  const firstAgentId = agents?.[0]?.id ?? "";
-  const newConversationAgentId =
-    liveSession?.agentId ?? storedMostRecent?.agentId ?? firstAgentId;
-
-  const startNewConversation = async () => {
-    if (!view || activeSessionId === null || newConversationAgentId === "")
-      return;
-    setError(null);
-    try {
-      const info = await startSession(newConversationAgentId, view.path);
-      // `addSession` switches the view to the new session automatically
-      // (Task 5). No manual view-switch call.
-      addSession(info);
-      addSpace(info.cwd);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
+  // `New conversation` in this space (the extracted hook): `agentId =
+  // live ?? storedMostRecent ?? firstAgentId (registry default)`,
+  // `spacePath = view.path` (the active session's `cwd` by the match
+  // above; the backend canonicalizes). With the one-live cap lifted
+  // (ADR 0002) a new conversation does NOT displace a live one — they
+  // coexist. `view === undefined` → the hook no-ops (the `New Session`
+  // sidebar button routes that case to the Open Space dialog instead).
+  const { startNewConversation, error: newConversationError } =
+    useStartNewConversation(view);
 
   // `Pause`: close the live session. It moves to `historySessions` AND —
   // because a close keeps `activeSessionId` — the pane stays on that
@@ -251,8 +223,7 @@ export default function ChatStream() {
                 <button
                   type="button"
                   onClick={() => void startNewConversation()}
-                  disabled={newConversationAgentId === ""}
-                  className="rounded-md border border-neutral-600 px-3 py-1 text-xs hover:bg-neutral-800 disabled:opacity-50"
+                  className="rounded-md border border-neutral-600 px-3 py-1 text-xs hover:bg-neutral-800"
                 >
                   New conversation
                 </button>
@@ -284,8 +255,7 @@ export default function ChatStream() {
               <button
                 type="button"
                 onClick={() => void startNewConversation()}
-                disabled={newConversationAgentId === ""}
-                className="rounded-md border border-neutral-600 px-3 py-1 text-xs font-medium hover:bg-neutral-800 disabled:opacity-50"
+                className="rounded-md border border-neutral-600 px-3 py-1 text-xs font-medium hover:bg-neutral-800"
               >
                 New conversation
               </button>
@@ -349,7 +319,11 @@ export default function ChatStream() {
       </div>
 
       <div className="border-t border-neutral-800 p-3">
-        {error && <p className="mb-2 text-xs text-red-400">{error}</p>}
+        {(error ?? newConversationError) && (
+          <p className="mb-2 text-xs text-red-400">
+            {error ?? newConversationError}
+          </p>
+        )}
         <div className="flex gap-2">
           <textarea
             value={draft}
