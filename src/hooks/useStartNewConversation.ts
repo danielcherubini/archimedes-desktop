@@ -19,8 +19,10 @@ import { useSessions, type SpaceView } from "../store/sessions";
  * consumed at `ChatStream` (the "…" menu item), `SpacesList` top-level
  * ("New Session"), and once per `SpaceGroup` (the per-space `+`) — ten
  * spaces ⇒ 12 identical `listAgents` IPC round-trips at boot without it.
- * All instances share ONE fetch (`.catch(() => [])` keeps the
- * no-op-on-error behavior).
+ * All instances share ONE fetch; a FAILURE clears the memo (the next
+ * invocation retries — a transient failure does not poison it for the
+ * app's lifetime) while the current callers still resolve to `[]`
+ * (no-op-on-error behavior).
  */
 export function useStartNewConversation(view: SpaceView | undefined): {
   startNewConversation: () => Promise<void>;
@@ -78,10 +80,17 @@ export function useStartNewConversation(view: SpaceView | undefined): {
 
 /**
  * Module-level memoized registry fetch — all hook instances share ONE
- * `listAgents` call. `.catch(() => [])` keeps the no-op-on-error behavior
- * (an empty registry ⇒ `firstAgentId === ""` ⇒ `startNewConversation` no-ops)
- * and poisons the memo with `[]` rather than a rejected promise.
+ * `listAgents` call. The rejection path resolves to `[]` (the no-op-on-
+ * error behavior: an empty registry ⇒ `firstAgentId === ""` ⇒
+ * `startNewConversation` no-ops) AND clears the memo — a transient
+ * failure (e.g. IPC not ready at first boot) does NOT poison it for the
+ * app's lifetime; the next invocation retries the fetch.
  */
 let agentsPromise: Promise<AgentEntryDto[]> | null = null;
 const loadAgents = (): Promise<AgentEntryDto[]> =>
-  (agentsPromise ??= listAgents().catch(() => []));
+  (agentsPromise ??= listAgents().catch(() => {
+    // Clear the memo: the next `loadAgents` retries (the current callers
+    // keep the no-op `[]` resolution above).
+    agentsPromise = null;
+    return [];
+  }));

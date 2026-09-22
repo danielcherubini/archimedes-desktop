@@ -176,6 +176,30 @@ describe("SidePane", () => {
     expect(line.className).not.toMatch(/ opacity-100$/);
   });
 
+  it("still ends the drag and flushes the width when releasePointerCapture throws", () => {
+    const { container } = render(<SidePane />);
+    const handle = container.querySelector(".cursor-col-resize") as HTMLElement;
+    const line = handle.querySelector("div") as HTMLElement;
+    // An expired `pointerId` / non-compliant webview: `releasePointerCapture`
+    // throws — the drag must still end (the width must still flush; `dragging`
+    // must NOT stick on).
+    const release = vi
+      .spyOn(handle, "releasePointerCapture")
+      .mockImplementation(() => {
+        throw new Error("InvalidPointerId");
+      });
+    try {
+      fireEvent.pointerDown(handle);
+      expect(line.className).toMatch(/ opacity-100$/);
+      fireEvent.mouseMove(window, { clientX: 300 });
+      fireEvent.pointerUp(handle);
+      expect(line.className).not.toMatch(/ opacity-100$/);
+      expect(localStorage.getItem("side-pane-width")).toBe("240");
+    } finally {
+      release.mockRestore();
+    }
+  });
+
   it("ends the drag on window blur (a release outside the webview)", () => {
     const { container } = render(<SidePane />);
     const handle = container.querySelector(".cursor-col-resize") as HTMLElement;

@@ -80,8 +80,11 @@ export default function SpacesList() {
         );
   const newSession = useStartNewConversation(activeView);
 
-  // Stable handlers (the keydown effect below re-subscribes only when the
-  // view — not the whole component — changes).
+  // `handleOpenSpace` is stable forever; `handleNewSession` is stable only
+  // while `activeSessionId` and `newSession` are — but `useStartNewConversation`
+  // returns a FRESH object every render, so the keydown effect below
+  // re-subscribes on EVERY render. That is one cheap listener swap per
+  // render, and the `e.target` guard makes the churn harmless.
   const handleNewSession = useCallback(() => {
     // No active session (no view): the button opens the Open Space dialog
     // instead (the hook itself no-ops on an undefined view).
@@ -102,7 +105,7 @@ export default function SpacesList() {
       if (!e.metaKey && !e.ctrlKey) return;
       if (
         e.target instanceof HTMLElement &&
-        e.target.closest("input, textarea, [contenteditable], [role='dialog']")
+        e.target.closest("input, textarea, [contenteditable='true'], [role='dialog']")
       ) {
         return;
       }

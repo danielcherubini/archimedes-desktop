@@ -136,8 +136,16 @@ export default function SidePane() {
       setWidth(start.width - (e.clientX - start.x));
     };
     const onPointerEnd = (e: PointerEvent) => {
-      handleRef.current?.releasePointerCapture(e.pointerId);
+      // `endDrag` FIRST: if `releasePointerCapture` throws (an expired
+      // `pointerId` / a non-compliant webview) the drag must still end —
+      // otherwise `dragging` sticks and the width never flushes. (It is
+      // idempotent via the `dragStart` guard: a later `mouseup` is a no-op.)
       endDrag();
+      try {
+        handleRef.current?.releasePointerCapture(e.pointerId);
+      } catch {
+        // capture already expired — the drag is ended above
+      }
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", endDrag);

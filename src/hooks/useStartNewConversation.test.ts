@@ -65,8 +65,11 @@ beforeEach(() => {
 
 describe("useStartNewConversation", () => {
   // FIRST test in the file on purpose: the shared fetch is a module-level
-  // memo, so the very first test sees a cold cache. (Two hook instances ⇒
-  // `listAgents` must be called exactly once.)
+  // memo, and `beforeEach`'s `vi.clearAllMocks()` resets the mock's CALL
+  // COUNT — so if any earlier test had warmed the memo, `listAgents`
+  // would be called 0 times here and the assertion below would fail.
+  // Do NOT move this test. (Two hook instances ⇒ `listAgents` must be
+  // called exactly once from a cold memo.)
   it("shares ONE `listAgents` fetch across hook instances", async () => {
     renderHook(() => useStartNewConversation(view));
     renderHook(() => useStartNewConversation(view));
@@ -75,6 +78,32 @@ describe("useStartNewConversation", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(mockedListAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the registry fetch after a transient failure (the memo is not poisoned)", async () => {
+    // A FRESH module (fresh memo): `vi.resetModules()` + re-import — the
+    // static imports above share the memo the test above warmed.
+    vi.resetModules();
+    const tauri = (await vi.importMock("../lib/tauri")) as typeof import(
+      "../lib/tauri"
+    );
+    const agents = vi.mocked(tauri.listAgents);
+    agents.mockRejectedValueOnce(new Error("IPC not ready"));
+    const mod = await import("./useStartNewConversation");
+    // First load: the failure resolves to `[]` (the no-op-on-error
+    // behavior is preserved for the current callers).
+    renderHook(() => mod.useStartNewConversation(view));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(agents).toHaveBeenCalledTimes(1);
+    // The NEXT invocation retries (the memo was cleared on rejection —
+    // a transient failure does not poison it for the app's lifetime).
+    renderHook(() => mod.useStartNewConversation(view));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(agents).toHaveBeenCalledTimes(2);
   });
 
   it("guards against double-invocation (two rapid calls start ONE session)", async () => {

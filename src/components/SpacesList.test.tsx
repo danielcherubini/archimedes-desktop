@@ -238,16 +238,42 @@ describe("SpacesList", () => {
   it("ignores ⌘N / Ctrl+O while the target is an input or a dialog", async () => {
     render(<SpacesList />);
     const input = document.createElement("input");
-    document.body.appendChild(input);
-    // Ctrl+N on the input: hijacked by the guard (the target is an input).
-    fireEvent.keyDown(input, { key: "n", ctrlKey: true });
-    await waitFor(() => expect(mockedStartSession).not.toHaveBeenCalled());
     const dialog = document.createElement("div");
     dialog.setAttribute("role", "dialog");
-    document.body.appendChild(dialog);
-    // Ctrl+O on a `[role="dialog"]`: also ignored.
-    fireEvent.keyDown(dialog, { key: "o", metaKey: true });
-    expect(screen.queryByText("New space")).toBeNull();
+    // Appended to `document.body` OUTSIDE RTL's render tree — RTL cleanup
+    // does not touch manually appended nodes, so remove them explicitly
+    // (cross-test pollution: a stray `[role="dialog"]` in the body would
+    // make later tests' shortcuts no-op via the `e.target` guard).
+    document.body.append(input, dialog);
+    try {
+      // Ctrl+N on the input: hijacked by the guard (the target is an input).
+      fireEvent.keyDown(input, { key: "n", ctrlKey: true });
+      await waitFor(() => expect(mockedStartSession).not.toHaveBeenCalled());
+      // Ctrl+O on a `[role="dialog"]`: also ignored.
+      fireEvent.keyDown(dialog, { key: "o", metaKey: true });
+      expect(screen.queryByText("New space")).toBeNull();
+    } finally {
+      input.remove();
+      dialog.remove();
+    }
+  });
+
+  it("does NOT ignore ⌘N while the target is a contenteditable=\"false\" element (the guard matches only 'true')", async () => {
+    render(<SpacesList />);
+    const div = document.createElement("div");
+    div.setAttribute("contenteditable", "false");
+    // Same manual-append caveat as the guard test above: remove it in
+    // `finally` (RTL cleanup does not touch it).
+    document.body.appendChild(div);
+    try {
+      // `contenteditable="false"` is NOT editable: the shortcut fires.
+      fireEvent.keyDown(div, { key: "n", metaKey: true });
+      await waitFor(() =>
+        expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/alpha"),
+      );
+    } finally {
+      div.remove();
+    }
   });
 
   it("⌘N / Ctrl+N trigger the New Session handler (a bare key does not)", async () => {
