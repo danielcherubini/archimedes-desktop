@@ -7,9 +7,12 @@
  * The module is the SINGLE OWNER of the persistence: `setSidePaneCollapsed`
  * writes `localStorage["side-pane-collapse"]` itself, so the toggle's
  * `setSidePaneCollapsed(!collapsed)` reaches localStorage with no extra
- * step. `SidePane` hydrates the flag from localStorage on mount by calling
- * `setSidePaneCollapsed` (a harmless same-value echo — the module seeds
- * its state from the persisted value at load).
+ * step. The module SEEDS the flag from the persisted value at import
+ * (no mount-time hydration elsewhere — a re-read would be a no-op echo
+ * unless storage and memory disagree, in which case it would clobber the
+ * live flag). The `setItem` is guarded: a quota/lockdown throw must not
+ * take down the toggle's click handler (the state flip + notify still
+ * happen).
  */
 
 const STORAGE_KEY = "side-pane-collapse";
@@ -27,7 +30,12 @@ export function getSidePaneCollapsed(): boolean {
 export function setSidePaneCollapsed(v: boolean): void {
   if (v === collapsed) return; // same-value echo: no write, no notify
   collapsed = v;
-  localStorage.setItem(STORAGE_KEY, String(v));
+  try {
+    localStorage.setItem(STORAGE_KEY, String(v));
+  } catch {
+    // quota/lockdown: persistence is best-effort — the state flip and
+    // the notify below still happen (the toggle's handler must NOT throw).
+  }
   for (const fn of [...listeners]) fn();
 }
 

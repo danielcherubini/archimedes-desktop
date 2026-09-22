@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getSidePaneCollapsed,
   setSidePaneCollapsed,
@@ -26,6 +26,26 @@ describe("sidePaneState", () => {
     expect(localStorage.getItem("side-pane-collapse")).toBe("true");
     setSidePaneCollapsed(false);
     expect(localStorage.getItem("side-pane-collapse")).toBe("false");
+  });
+
+  it("still flips the flag and notifies subscribers when the localStorage write throws (quota/lockdown)", () => {
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new DOMException("quota", "QuotaExceededError");
+      });
+    try {
+      const seen: boolean[] = [];
+      const unsubscribe = subscribeSidePane(() => {
+        seen.push(getSidePaneCollapsed());
+      });
+      setSidePaneCollapsed(true);
+      expect(getSidePaneCollapsed()).toBe(true);
+      expect(seen).toEqual([true]);
+      unsubscribe();
+    } finally {
+      setItem.mockRestore();
+    }
   });
 
   it("fires subscribers when the flag flips, and stops after unsubscribing", () => {
