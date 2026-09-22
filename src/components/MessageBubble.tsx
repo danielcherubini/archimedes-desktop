@@ -51,23 +51,76 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 
   if (!html) {
     return (
-      <pre className="overflow-x-auto rounded-md bg-neutral-900 p-3 text-sm">
+      <pre className="overflow-x-auto rounded-lg bg-surface p-3 font-mono text-sm">
         <code>{code}</code>
       </pre>
     );
   }
   return (
     <div
-      className="overflow-x-auto rounded-md text-sm"
+      className="overflow-x-auto rounded-lg bg-surface p-3 font-mono text-sm"
       // Shiki output is produced locally from the user's own agent output.
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }
 
+/**
+ * The ZCode markdown scale (the `@tailwindcss/typography` `prose*` classes
+ * are NOT used — the component mapping below replaces them): h1 `text-ui-xl`,
+ * h2 `text-ui-lg`, h3–h6 `text-ui-base` + weight ramp, inline code
+ * `font-mono text-ui-sm` on the inline-code token, code blocks
+ * `rounded-lg bg-surface` at 14px mono, links `text-ui-base` in the
+ * icon-blue token, blocks on the 4px rhythm (`my-2`/`space-y-2`).
+ */
 function AgentMarkdown({ text }: { text: string }) {
   const components = useMemo(
     () => ({
+      h1: ({ children }: { children?: ReactNode }) => (
+        <h1 className="my-2 text-ui-xl">{children}</h1>
+      ),
+      h2: ({ children }: { children?: ReactNode }) => (
+        <h2 className="my-2 text-ui-lg">{children}</h2>
+      ),
+      h3: ({ children }: { children?: ReactNode }) => (
+        <h3 className="my-2 text-ui-base font-semibold">{children}</h3>
+      ),
+      h4: ({ children }: { children?: ReactNode }) => (
+        <h4 className="my-2 text-ui-base font-semibold">{children}</h4>
+      ),
+      h5: ({ children }: { children?: ReactNode }) => (
+        <h5 className="my-2 text-ui-base font-medium">{children}</h5>
+      ),
+      h6: ({ children }: { children?: ReactNode }) => (
+        <h6 className="my-2 text-ui-base font-normal">{children}</h6>
+      ),
+      p: ({ children }: { children?: ReactNode }) => (
+        <p className="my-2 text-ui-base">{children}</p>
+      ),
+      ul: ({ children }: { children?: ReactNode }) => (
+        <ul className="my-2 list-disc space-y-2 pl-5 text-ui-base">
+          {children}
+        </ul>
+      ),
+      ol: ({ children }: { children?: ReactNode }) => (
+        <ol className="my-2 list-decimal space-y-2 pl-5 text-ui-base">
+          {children}
+        </ol>
+      ),
+      table: ({ children }: { children?: ReactNode }) => (
+        <table className="my-2 text-ui-base">{children}</table>
+      ),
+      a: ({
+        children,
+        href,
+      }: {
+        children?: ReactNode;
+        href?: string;
+      }) => (
+        <a href={href} className="text-ui-base text-icon-blue underline">
+          {children}
+        </a>
+      ),
       code({ className, children }: { className?: string; children?: ReactNode }) {
         const codeText = String(children ?? "").replace(/\n$/, "");
         const lang = /language-(\w+)/.exec(className ?? "")?.[1];
@@ -75,7 +128,7 @@ function AgentMarkdown({ text }: { text: string }) {
           return <CodeBlock code={codeText} lang={lang} />;
         }
         return (
-          <code className="rounded bg-neutral-800 px-1 py-0.5 text-xs">
+          <code className="rounded-sm bg-markdown-inline-code px-1 font-mono text-ui-sm">
             {children}
           </code>
         );
@@ -85,7 +138,7 @@ function AgentMarkdown({ text }: { text: string }) {
   );
 
   return (
-    <div className="prose prose-invert prose-sm max-w-none break-words prose-p:my-2 prose-headings:my-3">
+    <div className="break-words text-ui-base">
       <ReactMarkdown components={components}>{text}</ReactMarkdown>
     </div>
   );
@@ -94,42 +147,35 @@ function AgentMarkdown({ text }: { text: string }) {
 export default function MessageBubble({ message }: { message: Message }) {
   switch (message.kind) {
     case "user":
+      // The design reference: a plain row — no bubble, no avatar.
       return (
-        <div className="flex justify-end">
-          <div className="max-w-[80%] rounded-lg bg-sky-700 px-3 py-2 text-sm whitespace-pre-wrap">
-            {message.text}
-          </div>
+        <div className="whitespace-pre-wrap text-ui-base text-foreground">
+          {message.text}
         </div>
       );
 
     case "agent-text":
       return (
-        <div className="flex justify-start">
-          <div className="max-w-[90%] rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2">
-            <AgentMarkdown text={message.text} />
-          </div>
+        <div className="text-ui-base">
+          <AgentMarkdown text={message.text} />
         </div>
       );
 
     case "tool-call":
       return (
-        <div className="flex justify-start">
-          <div className="w-full max-w-[90%]">
-            <ToolCallCard
-              title={message.title}
-              status={message.status}
-              diff={message.diff}
-            />
-          </div>
+        <div className="w-full">
+          <ToolCallCard
+            title={message.title}
+            status={message.status}
+            diff={message.diff}
+          />
         </div>
       );
 
     case "diff":
       return (
-        <div className="flex justify-start">
-          <div className="w-full max-w-[90%]">
-            <DiffBlock path={message.path} patch={message.patch} />
-          </div>
+        <div className="w-full">
+          <DiffBlock path={message.path} patch={message.patch} />
         </div>
       );
   }

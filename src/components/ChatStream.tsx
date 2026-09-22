@@ -1,13 +1,42 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
 import { closeSession, sendPrompt } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
+import { useSpinQuip } from "../hooks/useSpinQuip";
+import {
+  getSidePaneCollapsed,
+  setSidePaneCollapsed,
+  subscribeSidePane,
+} from "../lib/sidePaneState";
+import { BrailleLoader } from "./ui/braille-loader";
+import { Button } from "./ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./ui/select";
 import MessageBubble from "./MessageBubble";
 import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
+import FileSummaryCard from "./FileSummaryCard";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
 
@@ -76,6 +105,26 @@ export default function ChatStream() {
   const turnCompleted = useSessions((s) => s.turnCompleted);
   const resumeSession = useSessions((s) => s.resumeSession);
 
+  // The bridge agent state for the active session — the working indicator
+  // uses the `agentState` entry when present, else the `inTurn` fallback
+  // (a bridge agent that hasn't pushed yet — its turn IS in flight).
+  const agentState = useBridge((s) =>
+    activeSessionId ? s.agentState[activeSessionId] : undefined,
+  );
+  const workingOrInTurn =
+    agentState === "working" || (agentState === undefined && inTurn);
+  // Called UNCONDITIONALLY at the top of the component body (the hook
+  // contains `useState`/`useEffect` — invoking it inside the `working`
+  // branch would be a conditional hook call and crash React when the
+  // state flips).
+  const quip = useSpinQuip(workingOrInTurn);
+  // The shared side-pane collapsed flag (Task 4): the header toggle reads
+  // it for its `aria-pressed` and sets it on click (no events, no store).
+  const sidePaneCollapsed = useSyncExternalStore(
+    subscribeSidePane,
+    getSidePaneCollapsed,
+  );
+
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
@@ -94,7 +143,7 @@ export default function ChatStream() {
   // `#2`+ sessions, which are stored sessions of the space too, and the
   // space bar must stay rendered while they are open). `undefined` when
   // the active session belongs to no space (e.g. a legacy pre-Spaces DB
-  // row) — rendered exactly as today (no space bar, no selector).
+  // row) — rendered exactly as today (no space chip, no selector).
   const views = useMemo(
     () => spaces.map((s) => spaceViewFor(s, sessions, historySessions, closeReasons)),
     [spaces, sessions, historySessions, closeReasons],
@@ -108,7 +157,7 @@ export default function ChatStream() {
             v.storedSessionIds.includes(activeSessionId),
         );
 
-  // `New conversation` in this space (the extracted hook): `agentId =
+  // `New session` in this space (the extracted hook): `agentId =
   // live ?? storedMostRecent ?? firstAgentId (registry default)`,
   // `spacePath = view.path` (the active session's `cwd` by the match
   // above; the backend canonicalizes). With the one-live cap lifted
@@ -139,9 +188,10 @@ export default function ChatStream() {
 
   if (!activeSessionId) {
     return (
-      <main className="flex min-w-0 flex-1 flex-col items-center justify-center text-neutral-500">
-        <p className="text-lg">No active session</p>
-        <p className="mt-1 text-sm">Open a space from the list on the left.</p>
+      <main className="m-1 flex min-w-0 flex-1 items-center justify-center rounded-xl bg-background-alt">
+        <p className="text-ui-base text-foreground-subtle">
+          No active session — open a Space from the list on the left
+        </p>
       </main>
     );
   }
@@ -194,127 +244,217 @@ export default function ChatStream() {
       : basenameOfPath(liveSession?.cwd ?? historySession?.cwd ?? "")
     : undefined;
 
+  // The session title: the first `user` message truncated to ~80 chars
+  // (the same derivation as the sidebar rows), else the Space name.
+  const firstUserText = (() => {
+    const m = messages.find((x) => x.kind === "user");
+    return m && m.text !== "" ? m.text : undefined;
+  })();
+  const title =
+    firstUserText !== undefined
+      ? firstUserText.length > 80
+        ? firstUserText.slice(0, 80)
+        : firstUserText
+      : spaceTitle ?? "";
+
+  // The most recent turn (the messages after the last `user` message) and
+  // its standalone `diff` messages — the SINGLE SOURCE OF TRUTH for the
+  // file summary card: `applySessionUpdate`/`rowToMessages` emit BOTH a
+  // `tool-call.diff = diffs[0]` AND standalone `diff` messages for the
+  // same extracted diffs, so the `tool-call.diff` refs are deliberately
+  // NOT used (summing both would count every file twice).
+  const lastUserIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].kind === "user") return i;
+    }
+    return -1;
+  })();
+  const turnDiffs =
+    lastUserIndex === -1
+      ? []
+      : messages
+          .slice(lastUserIndex + 1)
+          .flatMap((m) =>
+            m.kind === "diff" ? [{ path: m.path, patch: m.patch }] : [],
+          );
+
+  // A collapsed pane gives no other cue that a request is waiting —
+  // the `bg-warning` dot on the toggle (the sidebar "Waiting" badge
+  // covers only the row the user is looking at).
+  const hasPendingRequest =
+    prompts.length > 0 ||
+    bridgeRequests.some(
+      (r) =>
+        r.method === "ask" || r.method === "confirm" || r.method === "password",
+    );
+
   return (
-    <main className="flex min-w-0 flex-1 flex-col">
-      {view && (
-        <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-4 py-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <p className="truncate text-sm font-medium">{spaceTitle}</p>
-            {(isLive || isHistoryOnly) && (
-              <p className={`text-xs ${isLive ? "text-emerald-400" : "text-neutral-500"}`}>
-                {isLive ? "live" : "stored"}
+    <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
+      {isHistoryOnly && (
+        <div className="m-2 flex items-center justify-between gap-2 rounded-md bg-surface px-3 py-2 text-ui-sm">
+          {canResume ? (
+            <span className="text-foreground-subtle">
+              This session is stored. Resuming reconnects it to the agent.
+            </span>
+          ) : (
+            <span className="text-warning">
+              History only — continuing starts a new session.
+            </span>
+          )}
+          {canResume && (
+            <Button size="xs" disabled={resuming} onClick={() => void resume()}>
+              {resuming ? "Resuming…" : "Resume"}
+            </Button>
+          )}
+        </div>
+      )}
+      <div className="flex h-12 items-center gap-2 border-b border-border/50 p-2">
+        {title !== "" && (
+          <span
+            className="min-w-0 flex-1 truncate text-ui-base font-medium"
+            style={{
+              maskImage:
+                "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+              WebkitMaskImage:
+                "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+            }}
+          >
+            {title}
+          </span>
+        )}
+        {view && (
+          <span className="flex shrink-0 items-center gap-1 rounded-lg bg-surface px-2 py-0.5">
+            <FolderIcon className="size-3.5" />
+            <span className="text-ui-sm">{spaceTitle}</span>
+          </span>
+        )}
+        {view && (
+          <Select value={activeSessionId} onValueChange={openSession}>
+            <SelectTrigger
+              variant="ghost"
+              size="sm"
+              className="w-24"
+              aria-label="Conversation"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {options.map((opt) => (
+                <SelectItem key={opt.id} value={opt.id}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon-sm" aria-label="Session actions">
+              <MoreHorizontalIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            {isLive && (
+              <DropdownMenuItem onSelect={() => void pause()}>
+                Pause
+              </DropdownMenuItem>
+            )}
+            {canResume && (
+              <DropdownMenuItem onSelect={() => void resume()}>
+                Resume
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onSelect={() => void startNewConversation()}>
+              New Session in this Space
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Toggle side pane"
+          aria-pressed={!sidePaneCollapsed}
+          onClick={() => setSidePaneCollapsed(!sidePaneCollapsed)}
+          className="relative ml-auto"
+        >
+          <PanelRightIcon className="size-4" />
+          {hasPendingRequest && (
+            <span
+              className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
+              aria-hidden
+            />
+          )}
+        </Button>
+      </div>
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
+        {messages.length === 0 ? (
+          <div className="flex h-full items-center justify-center">
+            <p className="text-ui-base text-foreground-subtlest">
+              Send a prompt to start
+            </p>
+          </div>
+        ) : (
+          <>
+            {messages.map((message, i) => {
+              // The `AskQuestionCard` replaces the pending `ask`
+              // `ToolCallCard` (correlated via `(source, toolCallId)`/
+              // `requestId` — a `main` ask whose `toolCallId` matches this
+              // tool-call message).
+              if (message.kind === "tool-call") {
+                const anchored = askRequests.find(
+                  (r) => r.source === "main" && r.toolCallId === message.id,
+                );
+                if (anchored) {
+                  return (
+                    <AskQuestionCard
+                      key={i}
+                      sessionId={activeSessionId}
+                      requestId={anchored.requestId}
+                    />
+                  );
+                }
+              }
+              return <MessageBubble key={i} message={message} />;
+            })}
+            {prompts.map((prompt) => (
+              <PermissionPrompt
+                key={prompt.requestId}
+                sessionId={activeSessionId}
+                requestId={prompt.requestId}
+              />
+            ))}
+            {/* Stacked bridge `ask` cards (one per pending request, arrival
+                order — concurrent asks stack vertically in the stream). */}
+            {stackedAskRequests.map((r) => (
+              <AskQuestionCard
+                key={r.requestId}
+                sessionId={activeSessionId}
+                requestId={r.requestId}
+              />
+            ))}
+            {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
+            {workingOrInTurn && (
+              <div className="flex items-center gap-2">
+                <BrailleLoader
+                  variant="typing"
+                  speed="normal"
+                  fontSize={14}
+                  label="Agent working"
+                />
+                <p className="text-ui-sm text-foreground-subtle">{quip}</p>
+              </div>
+            )}
+            {agentState === "blocked" && (
+              <p className="text-ui-sm text-foreground-subtle">
+                Waiting for your input…
               </p>
             )}
-          </div>
-          <div className="flex flex-shrink-0 items-center gap-2">
-            <select
-              value={activeSessionId}
-              onChange={(e) => openSession(e.target.value)}
-              className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs outline-none focus:border-sky-600"
-            >
-              {options.map((opt) => (
-                <option key={opt.id} value={opt.id}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-            {isLive && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void startNewConversation()}
-                  className="rounded-md border border-neutral-600 px-3 py-1 text-xs hover:bg-neutral-800"
-                >
-                  New conversation
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void pause()}
-                  className="rounded-md border border-neutral-600 px-3 py-1 text-xs hover:bg-neutral-800"
-                >
-                  Pause
-                </button>
-              </>
+            {!inTurn && stopReason && stopReason !== "end_turn" && (
+              <p className="text-ui-sm text-foreground-subtlest">
+                Turn ended: {stopReason}
+              </p>
             )}
-          </div>
-        </div>
-      )}
-      {isHistoryOnly && (
-        <div className="flex items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
-          {canResume ? (
-            <p className="text-xs text-neutral-400">
-              This session is stored. Resuming reconnects it to the agent.
-            </p>
-          ) : (
-            <p className="text-xs text-amber-400">
-              History only — continuing starts a new session.
-            </p>
-          )}
-          <div className="flex gap-2">
-            {canResume && (
-              <button
-                type="button"
-                onClick={() => void startNewConversation()}
-                className="rounded-md border border-neutral-600 px-3 py-1 text-xs font-medium hover:bg-neutral-800"
-              >
-                New conversation
-              </button>
-            )}
-            {canResume && (
-              <button
-                type="button"
-                onClick={() => void resume()}
-                disabled={resuming}
-                className="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-              >
-                {resuming ? "Resuming…" : "Resume"}
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
-        {messages.map((message, i) => {
-          // The `AskQuestionCard` replaces the pending `ask` `ToolCallCard`
-          // (correlated via `(source, toolCallId)`/`requestId` — a `main`
-          // ask whose `toolCallId` matches this tool-call message).
-          if (message.kind === "tool-call") {
-            const anchored = askRequests.find(
-              (r) => r.source === "main" && r.toolCallId === message.id,
-            );
-            if (anchored) {
-              return (
-                <AskQuestionCard
-                  key={i}
-                  sessionId={activeSessionId}
-                  requestId={anchored.requestId}
-                />
-              );
-            }
-          }
-          return <MessageBubble key={i} message={message} />;
-        })}
-        {prompts.map((prompt) => (
-          <PermissionPrompt
-            key={prompt.requestId}
-            sessionId={activeSessionId}
-            requestId={prompt.requestId}
-          />
-        ))}
-        {/* Stacked bridge `ask` cards (one per pending request, arrival
-            order — concurrent asks stack vertically in the stream). */}
-        {stackedAskRequests.map((r) => (
-          <AskQuestionCard
-            key={r.requestId}
-            sessionId={activeSessionId}
-            requestId={r.requestId}
-          />
-        ))}
-        {inTurn && (
-          <p className="text-xs text-neutral-500">Agent is working…</p>
-        )}
-        {!inTurn && stopReason && stopReason !== "end_turn" && (
-          <p className="text-xs text-neutral-500">Turn ended: {stopReason}</p>
+          </>
         )}
       </div>
 

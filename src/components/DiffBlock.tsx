@@ -12,19 +12,19 @@ export default function DiffBlock({
   const lines = patch.split("\n");
 
   return (
-    <div className="overflow-hidden rounded-md border border-neutral-700 bg-neutral-900 text-xs">
-      <div className="border-b border-neutral-700 bg-neutral-800 px-3 py-1.5 font-mono text-neutral-300">
+    <div className="overflow-hidden rounded-md bg-surface">
+      <div className="border-b border-border px-3 py-1.5 font-mono text-ui-sm text-foreground-subtle">
         {path}
       </div>
-      <pre className="overflow-x-auto p-2 font-mono leading-5">
+      <pre className="overflow-x-auto p-2 font-mono text-sm leading-5">
         {lines.map((line, i) => {
-          let cls = "text-neutral-400";
+          let cls = "text-foreground-subtle";
           if (line.startsWith("+") && !line.startsWith("+++")) {
-            cls = "bg-green-900/40 text-green-300";
+            cls = "text-diff-added";
           } else if (line.startsWith("-") && !line.startsWith("---")) {
-            cls = "bg-red-900/40 text-red-300";
+            cls = "text-diff-removed";
           } else if (line.startsWith("@@")) {
-            cls = "text-sky-300";
+            cls = "text-icon-blue";
           }
           return (
             <div key={i} className={cls}>

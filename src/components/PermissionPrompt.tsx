@@ -1,12 +1,17 @@
 import { useState } from "react";
 import { respondPermission, type PermissionOutcome } from "../lib/tauri";
 import { usePermissions } from "../store/permissions";
+import { Button } from "./ui/button";
 
 /**
  * Inline card shown when a `permission-request` event arrives for the active
- * session. Buttons answer the agent via the `respond_permission` command;
- * the prompt is removed locally on success (and auto-dismissed on
- * session-closed by the store).
+ * session (the green confirmation treatment). The header strip carries the
+ * tool name — there is NO tool detail or diff preview to render (`{
+ * requestId, toolTitle, options }` is all the store holds). The footer has
+ * one `button` per agent-defined option (first = primary, the rest =
+ * outline) + a Cancel. Buttons answer the agent via the
+ * `respond_permission` command; the prompt is removed locally on success
+ * (and auto-dismissed on session-closed by the store).
  */
 export default function PermissionPrompt({
   sessionId,
@@ -38,32 +43,36 @@ export default function PermissionPrompt({
   };
 
   return (
-    <div className="rounded-md border border-amber-600/50 bg-amber-950/40 px-3 py-2">
-      <p className="text-sm text-amber-200">
-        Agent requests permission: <strong>{prompt.toolTitle}</strong>
-      </p>
-      <div className="mt-2 flex flex-wrap gap-2">
-        {prompt.options.map((option) => (
-          <button
+    <div className="overflow-hidden rounded-xl border border-border">
+      <div className="bg-interaction-confirmation-surface px-3 py-2">
+        <p className="text-ui-base font-medium text-interaction-confirmation-foreground">
+          {prompt.toolTitle}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 p-3">
+        {prompt.options.map((option, i) => (
+          <Button
             key={option.optionId}
-            type="button"
+            variant={i === 0 ? "default" : "outline"}
+            size="sm"
             disabled={busy}
             onClick={() => respond({ selected: { option_id: option.optionId } })}
-            className="rounded bg-amber-600 px-3 py-1 text-sm text-black hover:bg-amber-500 disabled:opacity-50"
           >
             {option.name}
-          </button>
+          </Button>
         ))}
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           disabled={busy}
           onClick={() => respond("cancelled")}
-          className="rounded bg-neutral-700 px-3 py-1 text-sm text-neutral-200 hover:bg-neutral-600 disabled:opacity-50"
         >
           Cancel
-        </button>
+        </Button>
       </div>
-      {error && <p className="mt-1 text-xs text-red-400">{error}</p>}
+      {error && (
+        <p className="px-3 pb-2 text-ui-sm text-destructive">{error}</p>
+      )}
     </div>
   );
 }
