@@ -112,11 +112,24 @@ pub fn write_wrapper(
     let ext = if cfg!(windows) { ".cmd" } else { ".sh" };
     let path = dir.join(format!("wrapper-{}{ext}", uuid::Uuid::new_v4()));
     let script = build_wrapper_script(config, pi_command);
-    std::fs::write(&path, script)?;
+    // A write failure must leave NO partial file behind (a mid-write
+    // failure — ENOSPC/EDQUOT — leaves a truncated, unspawnable script;
+    // a failure at open leaves nothing). Best-effort unlink of our own
+    // path, then propagate the ORIGINAL error (the cleanup result is not
+    // what the caller needs).
+    if let Err(e) = std::fs::write(&path, script) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        // A chmod failure leaves an unspawnable (0644) wrapper — unlink it
+        // the same way (best-effort, original error propagates).
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
     }
     Ok(path)
 }
@@ -231,5 +244,49 @@ mod tests {
             assert_eq!(mode & 0o777, 0o755, "wrapper must be 0755");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (6) `write_wrapper` propagates a write failure (no panic) and leaves
+    /// NO wrapper garbage behind: `parent` is a regular FILE, so
+    /// `parent/sub/…` cannot be created (ENOTDIR — deterministic even as
+    /// root, unlike a chmod-555 directory, which root bypasses). A real
+    /// mid-write failure (ENOSPC/EDQUOT — the case that leaves a PARTIAL
+    /// file) cannot be forced portably in a unit test, so this pins the
+    /// observable contract (error propagates, no garbage) and exercises the
+    /// cleanup branch (a no-op here, since the file was never created; the
+    /// same branch unlinks a partial file when a real mid-write fails).
+    #[test]
+    fn write_wrapper_write_failure_leaves_no_wrapper_file() {
+        let tmp =
+            std::env::temp_dir().join(format!("launch-wrapper-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let parent = tmp.join("parent");
+        std::fs::write(&parent, b"x").unwrap(); // a FILE, not a directory
+        let dir = parent.join("sub"); // ENOTDIR: cannot be created
+        let result = write_wrapper(
+            &dir,
+            &LaunchConfig {
+                system_prompt: None,
+                model: None,
+                thinking: None,
+                tools: None,
+            },
+            "pi",
+        );
+        assert!(
+            result.is_err(),
+            "the write failure must propagate (no panic)"
+        );
+        let garbage: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("wrapper-"))
+            .collect();
+        assert!(
+            garbage.is_empty(),
+            "no wrapper file may be left: {garbage:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

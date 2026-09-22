@@ -32,11 +32,12 @@ final output + metrics. Subagent sessions are ephemeral (not stored,
   the connect fails) and falls back to the fork. The wrapper's `.cmd` variant
   exists for compilation completeness; it is not exercised in v1.
 - **A deliberate cancel never forks.** A bridge request aborted by the desktop
-  settles deterministically as `Error("bridge request cancelled")` (core
-  `channel.cancel()`), which the subagent package maps to a FAILED result
-  (`error: "cancelled"`) — never `{fallback: true}`. Only a transport failure
-  (no response frame) falls back to the fork. A pre-aborted signal short-circuits
-  the bridge dispatch before it starts.
+  settles deterministically as a `BridgeCancelledError` (core `channel.cancel()` —
+  a typed class, matched by `instanceof`, NOT the message string), which the
+  subagent package maps to a FAILED result (`error: "cancelled"`) — never
+  `{fallback: true}`. Only a transport failure (no response frame) falls back
+  to the fork. A pre-aborted signal short-circuits the bridge dispatch before
+  it starts.
 - **Timeouts are ambiguous-liveness, never fallback triggers.** A
   `dispatch_subagent` timeout is a plain `Error` (the peer may still be alive
   and deliver late); only `BridgeTransportError` triggers the fork fallback.
@@ -47,7 +48,3 @@ final output + metrics. Subagent sessions are ephemeral (not stored,
   runtime; suspected SDK/async-io global reactor) — tracked in ADR 0004
   (option 3); lifting the one-live cap is a one-token policy flip once fixed.
 - Suite-side self-usage `cost_update` push (fills the v1 metrics zeros above).
-- Replace the `"bridge request cancelled"` string contract between core and the
-  subagent package with a typed `BridgeCancelledError` (mirroring
-  `BridgeTransportError`).
-- `write_wrapper`: unlink its own (possibly partial) file on write failure.
