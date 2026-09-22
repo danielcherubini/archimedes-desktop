@@ -13,7 +13,7 @@ An external ACP-speaking coding agent process (pi, Claude Code, Codex, …), spa
 _Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated ACP session — see its entry below.)
 
 **Space**:
-A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: at most one live **Session** per Space, and at most one app-wide (the one-live policy); stored conversations of a Space survive.
+A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: one active conversation per Space — its most recent live **Session** (multiple live Sessions may coexist app-wide: the one-live policy was lifted 2026-09-22, ADR 0002 superseded); stored conversations of a Space survive.
 _Avoid_: Project, workspace, folder, directory, environment
 
 **Session**:
