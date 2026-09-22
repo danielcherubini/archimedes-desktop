@@ -1123,3 +1123,137 @@ async fn dispatch_no_text_after_text_dispatch_returns_empty_output() {
     let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+/// (6) **cost accumulation** (the `subagent-metrics-cost-push` E2E): the
+/// subagent (the default `subagent` variant + `FAKE_COST_PUSH=1`) pushes TWO
+/// `cost_update` frames through its OWN `PI_ARCHIMEDES_BRIDGE_SOCKET` before
+/// answering `session/prompt` (ONE connection per push — the desktop reads
+/// exactly one frame per connection — and it reads each bare `ack` line
+/// BEFORE the next write and before answering the prompt, so the desktop's
+/// `end_turn`-time capture is COMPLETE). Assert the `subagent-closed`
+/// metrics are the SUM of both payloads (inputTokens 100+200=300,
+/// outputTokens 50+25=75, cost 0.001+0.002=0.003 — NOT the last payload's
+/// `{ 200, 25, 0.002 }` and NOT the zeros of a session that pushed nothing)
+/// + a real `durationMs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_subagent_cost_push_is_accumulated_into_metrics() {
+    let config_dir = temp_config_dir();
+    let bin = unique_fake_agent(&config_dir);
+    // The main is in `dispatch` mode (it spawns the subagent); the subagent
+    // is the default `subagent` variant + `FAKE_COST_PUSH=1` (it pushes two
+    // `cost_update` frames through its OWN bridge before answering the
+    // prompt — the desktop's accumulator must SUM them into the metrics).
+    write_agents_json_custom(
+        &config_dir,
+        &bin,
+        "dispatch",
+        &[
+            ("FAKE_DISPATCH_TASK", "do the task"),
+            ("FAKE_SUBAGENT_MODE", "subagent"),
+            ("FAKE_COST_PUSH", "1"),
+        ],
+    );
+
+    let events: Arc<StdMutex<Vec<(String, Value)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(CollectSink {
+        events: Arc::clone(&events),
+    });
+    let cwd = config_dir.clone();
+
+    let subagent_manager = Arc::new(
+        SubagentSessionManager::new(config_dir.clone()).expect("subagent manager should build"),
+    );
+    let mut manager = SessionManager::new(config_dir.clone()).expect("main manager should build");
+    manager.set_subagent_manager(subagent_manager);
+    let manager = Arc::new(manager);
+
+    let info = manager
+        .start_session("fake", cwd, &sink)
+        .await
+        .expect("main start_session should succeed");
+    assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
+
+    // The main prompt fires the `dispatch_subagent` frame (the `dispatch`
+    // mode) and blocks until the response (the subagent answers
+    // `subagent-done` AFTER pushing its two `cost_update` frames). Hard 10 s
+    // timeout (the clean-red pattern).
+    let started = Instant::now();
+    let sid = info.session_id.to_string();
+    let reason = match tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.send_prompt(&sid, "go".to_string()),
+    )
+    .await
+    {
+        Ok(r) => r.expect("main send_prompt should succeed"),
+        Err(_) => panic!(
+            "the main prompt (the cost-push E2E) stalled — the 10 s hard timeout fired at {:?}",
+            started.elapsed()
+        ),
+    };
+    assert_eq!(
+        reason,
+        StopReason::EndTurn,
+        "the main prompt should resolve end_turn"
+    );
+
+    // The main's stream contains the echoed dispatch result
+    // (`dispatch:subagent-done` — the subagent answered its prompt AFTER both
+    // cost pushes were acked).
+    assert!(
+        wait_for_event(&events, Duration::from_secs(5), |evs| stream_texts(
+            evs,
+            FAKE_SESSION_ID_MAIN
+        )
+        .iter()
+        .any(|t| t.contains("dispatch:subagent-done")))
+        .await,
+        "the main's stream should contain `dispatch:subagent-done`"
+    );
+
+    // `subagent-closed` (completed) with the metrics snapshot.
+    assert!(
+        wait_for_event(&events, Duration::from_secs(5), |evs| subagent_closed(
+            evs,
+            FAKE_SESSION_ID_SUBAGENT
+        )
+        .and_then(|p| p["status"].as_str())
+            == Some("completed"))
+        .await,
+        "a subagent-closed (completed) for the subagent id should fire"
+    );
+    // The metrics are the SUM of BOTH pushed payloads (payload 1: input 100 /
+    // output 50 / cost 0.001, `cacheReadTokens` ABSENT → 0; payload 2: input
+    // 200 / output 25 / cacheRead 10 / cost 0.002): inputTokens 300, outputTokens
+    // 75, cost 0.003. The old last-payload semantics would have produced
+    // `{ 200, 25, 0.002 }` — the exact assertions below prove the accumulator.
+    {
+        let evs = events.lock().unwrap();
+        let closed = subagent_closed(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
+        let metrics = &closed["metrics"];
+        assert_eq!(
+            metrics["inputTokens"].as_u64(),
+            Some(300),
+            "inputTokens should be the SUM of both payloads (100 + 200 = 300)"
+        );
+        assert_eq!(
+            metrics["outputTokens"].as_u64(),
+            Some(75),
+            "outputTokens should be the SUM of both payloads (50 + 25 = 75)"
+        );
+        let cost = metrics["cost"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            (cost - 0.003).abs() < 1e-9,
+            "cost should be the SUM of both payloads (0.001 + 0.002 = 0.003), got {cost}"
+        );
+        let duration_ms = metrics["durationMs"].as_u64().unwrap_or(0);
+        assert!(
+            duration_ms > 0,
+            "durationMs should be the real wall clock (> 0), got {duration_ms}"
+        );
+    }
+
+    // Cleanup.
+    let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
+    let _ = std::fs::remove_dir_all(&config_dir);
+}

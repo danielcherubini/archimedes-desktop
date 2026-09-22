@@ -57,7 +57,11 @@
 //!   agent's abort — the parent close cancels the in-flight dispatch), then
 //!   echo a chunk + `end_turn` (the main stays live).
 //! - `subagent` (default subagent variant): `session/prompt` → one chunk
-//!   (`"subagent-done"`, `m1`) + `end_turn`.
+//!   (`"subagent-done"`, `m1`) + `end_turn`. With `FAKE_COST_PUSH=1` it FIRST
+//!   pushes TWO `cost_update` frames through its OWN
+//!   `PI_ARCHIMEDES_BRIDGE_SOCKET` (one connection per push, each acked and
+//!   read before the next — the desktop's `end_turn`-time capture is
+//!   complete), then the chunk + `end_turn`.
 //! - `subagent-hang` (`FAKE_SUBAGENT_MODE=hang`): `session/prompt` → one chunk
 //!   then NEVER respond (the prompt stays open forever — the cancellation
 //!   target).
@@ -72,10 +76,11 @@
 //!   `FAKE_SUBAGENT_DELAY_MS` is honored (the "thinking" delay).
 //!
 //! The subagent's bridge env vars are set by the desktop; the fake agent
-//! ignores them EXCEPT the `dispatch` / `dispatch-cancel` / `ask` modes, which
-//! connect to `PI_ARCHIMEDES_BRIDGE_SOCKET` (a bare Unix socket — the desktop's
-//! per-spawn peer-verified listener; in-test the fake agent is a direct child
-//! of the test process, so peer verification passes 1 hop).
+//! ignores them EXCEPT the `dispatch` / `dispatch-cancel` / `ask` modes and
+//! the `FAKE_COST_PUSH` rule, which connect to `PI_ARCHIMEDES_BRIDGE_SOCKET`
+//! (a bare Unix socket — the desktop's per-spawn peer-verified listener; in-test
+//! the fake agent is a direct child of the test process, so peer verification
+//! passes 1 hop).
 //!
 //! Wire-format notes: property keys are camelCase (`sessionUpdate`,
 //! `agentCapabilities`, `messageId`, `optionId`); discriminator
@@ -461,13 +466,15 @@ fn handle_prompt_dispatch(
 
 /// `subagent` mode: the subagent's `session/prompt`, selected by the variant
 /// (`FAKE_SUBAGENT_MODE`): `subagent` → one chunk (`"subagent-done"`) +
-/// `end_turn`; `hang` → one chunk then NEVER respond (the prompt stays open
-/// forever — the cancellation target); `ask` → connect to the agent's OWN
-/// bridge, send an `ask`, read the response, echo it as a chunk, then `end_turn`
-/// (the subagent's own bridge round-trip, the `ask` path, no relay); `echo` →
-/// one chunk with the PROMPT TEXT verbatim (a per-dispatch DISTINCT final
-/// text — the shared-capture regression), then `end_turn` (the `EMPTY` prompt
-/// text is a NO-TEXT turn — no chunks, `end_turn` only).
+/// `end_turn` (with `FAKE_COST_PUSH=1` it FIRST pushes TWO `cost_update`
+/// frames through its OWN bridge — see `push_cost_updates`); `hang` → one
+/// chunk then NEVER respond (the prompt stays open forever — the cancellation
+/// target); `ask` → connect to the agent's OWN bridge, send an `ask`, read the
+/// response, echo it as a chunk, then `end_turn` (the subagent's own bridge
+/// round-trip, the `ask` path, no relay); `echo` → one chunk with the PROMPT
+/// TEXT verbatim (a per-dispatch DISTINCT final text — the shared-capture
+/// regression), then `end_turn` (the `EMPTY` prompt text is a NO-TEXT turn —
+/// no chunks, `end_turn` only).
 fn handle_prompt_subagent(
     out: &mut impl Write,
     prompt_id: &Option<serde_json::Value>,
@@ -528,6 +535,14 @@ fn handle_prompt_subagent(
                 .unwrap_or(0);
             if delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            // `FAKE_COST_PUSH=1`: push TWO `cost_update` frames through the
+            // agent's OWN bridge BEFORE answering the prompt (one connection
+            // per push; the bare `ack` of each is read BEFORE the next write
+            // and before the prompt answer, so the desktop's `end_turn`-time
+            // capture is complete).
+            if std::env::var("FAKE_COST_PUSH").is_ok() {
+                push_cost_updates(out, sid);
             }
             write_chunk(out, sid, "m1", "subagent-done");
             write_result(
@@ -595,6 +610,89 @@ fn ask_round_trip(out: &mut impl Write, sid: &str) {
             eprintln!("fake_agent: ask read failed: {e}");
             write_chunk(out, sid, "m1", "ask:read-error");
         }
+    }
+}
+
+/// The `cost_update` push (the `FAKE_COST_PUSH` rule): push TWO `cost_update`
+/// frames through the agent's OWN `PI_ARCHIMEDES_BRIDGE_SOCKET` (the desktop
+/// set it for the subagent's spawn — the subagent's own listener, NOT the
+/// main's). ONE connection PER push (the desktop reads exactly ONE frame per
+/// connection), and the bare `ack` line of each push is read (blocking) BEFORE
+/// the next write and before the caller answers the prompt — a push is ACKED,
+/// not responded-to (the read is the bare line `ack`, NOT JSON — do not
+/// parse it), so the desktop has captured both pushes before the caller's
+/// `end_turn` triggers the desktop's metrics snapshot. `seq` is OMITTED
+/// (`seq == 0` is always delivered — the desktop's dedupe drops `seq <=
+/// last_seq` only for a non-zero `seq`).
+fn push_cost_updates(out: &mut impl Write, sid: &str) {
+    let socket = match std::env::var("PI_ARCHIMEDES_BRIDGE_SOCKET") {
+        Ok(s) => s,
+        Err(_) => {
+            // No bridge socket (defensive): echo a marker (the prompt still
+            // resolves; the desktop's metrics stay the zeros).
+            write_chunk(out, sid, "m1", "cost:no-bridge");
+            return;
+        }
+    };
+    // The two per-turn deltas (payload 1 has `cacheReadTokens` /
+    // `cacheWriteTokens` ABSENT — the desktop's accumulator treats absent as
+    // 0; the desktop's accumulator must SUM them: input 300, output 75,
+    // cost 0.003).
+    let payloads = [
+        serde_json::json!({
+            "v": 1,
+            "type": "push",
+            "event": "cost_update",
+            "payload": { "source": "main", "inputTokens": 100, "outputTokens": 50, "cost": 0.001 }
+        }),
+        serde_json::json!({
+            "v": 1,
+            "type": "push",
+            "event": "cost_update",
+            "payload": { "source": "main", "inputTokens": 200, "outputTokens": 25, "cacheReadTokens": 10, "cost": 0.002 }
+        }),
+    ];
+    for payload in payloads {
+        let stream = match connect_bridge_socket(&socket) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fake_agent: cost-push connect failed: {e}");
+                write_chunk(out, sid, "m1", "cost:connect-error");
+                return;
+            }
+        };
+        let mut stream = stream;
+        let data = payload.to_string() + "\n";
+        if let Err(e) = stream.write_all(data.as_bytes()) {
+            eprintln!("fake_agent: cost-push write failed: {e}");
+            write_chunk(out, sid, "m1", "cost:write-error");
+            return;
+        }
+        let _ = stream.flush();
+        // Read the bare `ack` line (blocking; the desktop acks AFTER the
+        // capture — the line is NOT JSON, so do NOT parse it).
+        let mut line = String::new();
+        let mut reader = io::BufReader::new(&mut *stream);
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // EOF before an ack (the desktop closed — defensive).
+                eprintln!("fake_agent: cost-push read EOF (no ack)");
+                write_chunk(out, sid, "m1", "cost:no-ack");
+                return;
+            }
+            Ok(_) => {
+                if line.trim() != "ack" {
+                    eprintln!("fake_agent: cost-push unexpected read: {line}");
+                }
+            }
+            Err(e) => {
+                eprintln!("fake_agent: cost-push read failed: {e}");
+                write_chunk(out, sid, "m1", "cost:read-error");
+                return;
+            }
+        }
+        // Drop `stream` → close the connection (the desktop closes on the
+        // first data; the next push opens a FRESH connection).
     }
 }
 

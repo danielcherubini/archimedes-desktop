@@ -38,7 +38,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::acp::launch_wrapper::LaunchConfig;
-use crate::acp::session::{EventSink, SubagentSpawn};
+use crate::acp::session::{CostAccumulator, EventSink, SubagentSpawn};
 use crate::acp::subagent::{SubagentMetrics, SubagentOutcome};
 
 /// The manager's map of pending bridge-request senders.
@@ -130,8 +130,8 @@ pub fn available() -> bool {
 ///
 /// `subagent` (main only — `Some`) is the subagent dispatch handle; the
 /// `dispatch_subagent` method (method-aware: NO timeout) is serviced by it.
-/// `cost_capture` (subagents only — `Some`) stores the last `cost_update`
-/// push payload (the v1 metrics source).
+/// `cost_capture` (subagents only — `Some`) accumulates the `cost_update`
+/// payloads (the v1 metrics source).
 ///
 /// **Platform policy:** on **macOS** (and other platforms) the listener is
 /// NOT started — a no-op handle is returned (fail-closed, ADR 0003).
@@ -145,7 +145,7 @@ pub async fn start_listener(
     close_tx: &watch::Sender<bool>,
     timeout: Duration,
     subagent: Option<SubagentSpawn>,
-    cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
+    cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
 ) -> Result<BridgeHandle, String> {
     #[cfg(target_os = "linux")]
     {
@@ -412,8 +412,8 @@ struct ConnCtx {
     /// non-bridge setups (a `dispatch_subagent` frame on such a listener gets
     /// the unknown-method `error` response).
     subagent: Option<SubagentSpawn>,
-    /// Last `cost_update` push payload (subagents only; `None` for main).
-    cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
+    /// Accumulated `cost_update` usage (subagents only; `None` for main).
+    cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
 }
 
 /// Handle one bridge connection: read exactly ONE frame (a line — the agent
@@ -600,7 +600,7 @@ where
             let delivered = seq == 0 || last_seq.fetch_max(seq, Ordering::Relaxed) < seq;
             if delivered {
                 let sid = session_id.lock().await.clone();
-                // (b) Store the `cost_update` payload (subagents only;
+                // (b) Accumulate the `cost_update` payload (subagents only;
                 // `None` for main) — the v1 metrics source. The lock is
                 // TOLERANT of a poisoned mutex (`into_inner` — a poisoned
                 // capture degrades to its last good state, not a panic: a
@@ -610,7 +610,7 @@ where
                 if frame.get("event").and_then(Value::as_str) == Some("cost_update") {
                     if let Some(cc) = &cost_capture {
                         if let Some(p) = frame.get("payload") {
-                            *cc.lock().unwrap_or_else(|p| p.into_inner()) = Some(p.clone());
+                            cc.lock().unwrap_or_else(|p| p.into_inner()).add_payload(p);
                         }
                     }
                 }

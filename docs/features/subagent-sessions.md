@@ -17,16 +17,27 @@ final output + metrics. Subagent sessions are ephemeral (not stored,
 
 ## Constraints
 
-- **Metrics are zero-valued in v1 except `durationMs`.** The suite does NOT
-  emit a `cost_update` for a process's OWN usage (the only bus `COST_UPDATE`
-  emitter is the subagent tool reporting forked children's deltas, source
-  `subagent:<name>`). The desktop's captured metrics for a subagent session are
-  `{0, 0, 0, <real durationMs>}` — `durationMs` is real (wall clock); the
-  token/cost fields are 0. The desktop's capture mechanism is in place for a
-  future suite-side self-usage push (e.g. on `agent_settled`) — that push is a
-  tracked follow-up; it would also change the main session's `cost_update`
-  semantics. The tool's `usage`/`progressSummary.tokens` report zeros in bridge
-  mode — documented, not silent.
+- **Metrics are real.** The suite self-emits a per-turn `COST_UPDATE` (source
+  `"main"`, from pi's `turn_end` usage — per-turn deltas, `reasoning` excluded
+  as an `output` subset); the desktop accumulates a subagent's `cost_update`
+  payloads (sum, not last-payload) into the metrics snapshot. `cost` is real
+  (pi-ai's pricing table); `durationMs` is the desktop's wall clock. The wire
+  metrics shape is unchanged: `{ inputTokens, outputTokens, cost, durationMs }`
+  (the cache fields flow in the payload but are not in the wire shape — YAGNI).
+  In bridge mode, the `subagent` tool's `usage` (its report to the main agent)
+  is built from the `dispatch_subagent` RESPONSE's `metrics` (the desktop's
+  accumulator output): `dispatchViaBridge`'s success path
+  (`packages/subagent/src/dispatch.ts`) maps `res.metrics` → `usage` with REAL
+  `input`/`output`/`cost` (the `cacheRead`/`cacheWrite` fields are hardcoded 0 —
+  the wire metrics shape has no cache fields) and
+  `progressSummary.tokens = inputTokens + outputTokens` (REAL). The SYNTHESIZED
+  `progress.*` token fields (the in-flight progress updates from
+  `packages/subagent/src/execute.ts`'s bridge branch — the placeholder + the
+  final-failure progress) remain ZEROS (the bridge branch synthesizes
+  `progress` without token data — including the RESULT's own `progress` field,
+  also synthesized zero-token by `dispatchViaBridge`; only the RESULT's
+  `usage`/`progressSummary` are real): result `usage`/`progressSummary` = real,
+  in-flight `progress` = zeros.
 - **macOS/Windows: the bridge listeners are no-ops there (ADR 0003).** The
   suite's dispatch branch sees a `BridgeTransportError` (no response frame —
   the connect fails) and falls back to the fork. The wrapper's `.cmd` variant
@@ -47,4 +58,3 @@ final output + metrics. Subagent sessions are ephemeral (not stored,
 - Root-cause the 2026-09-15 hang (two concurrent ACP sessions on one tokio
   runtime; suspected SDK/async-io global reactor) — tracked in ADR 0004
   (option 3); lifting the one-live cap is a one-token policy flip once fixed.
-- Suite-side self-usage `cost_update` push (fills the v1 metrics zeros above).

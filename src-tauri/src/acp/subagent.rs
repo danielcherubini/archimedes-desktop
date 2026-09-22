@@ -28,7 +28,8 @@ use crate::acp::bridge;
 use crate::acp::launch_wrapper::{self, LaunchConfig};
 use crate::acp::permission::{self, PermissionOutcome};
 use crate::acp::session::{
-    bridge_spawn_setup, CloseKind, EventSink, ExternalClose, SessionDriver, SessionInfo,
+    bridge_spawn_setup, CloseKind, CostAccumulator, EventSink, ExternalClose, SessionDriver,
+    SessionInfo,
 };
 use crate::acp::worker_runtime::WorkerRuntime;
 use crate::config::{ConfigError, Registry};
@@ -164,7 +165,7 @@ impl SubagentSessionManager {
             db: base.db.clone(),
             text_capture: Some(Arc::new(StdMutex::new(std::collections::HashMap::new()))),
             last_message_id: Some(Arc::new(StdMutex::new(None))),
-            cost_capture: Some(Arc::new(StdMutex::new(None))),
+            cost_capture: Some(Arc::new(StdMutex::new(CostAccumulator::default()))),
             subagent: base.subagent.clone(),
         };
         // Cheap owned clones so the worker task borrows NOTHING from `self`
@@ -379,8 +380,8 @@ impl SubagentSessionManager {
                     // `output` = the accumulated text of the
                     // `last_message_id` (NOT `HashMap` iteration order; no
                     // text → empty string); `metrics` from `cost_capture`
-                    // (the last `cost_update` payload, defaulting to 0) +
-                    // `duration_ms` (wall clock since step 1).
+                    // (the accumulated `cost_update` usage, defaulting to 0)
+                    // + `duration_ms` (wall clock since step 1).
                     let (output, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
                     // Close the session (kind `User`, first-set-wins — the
                     // driver task tears down: process group, bridge
@@ -530,9 +531,9 @@ impl SubagentCancel {
 /// Read the final output + metrics from the driver's capture hooks:
 /// `output` is the accumulated text of the `last_message_id` (NOT `HashMap`
 /// iteration order; no text → empty string); the token/cost fields come from
-/// the last `cost_update` payload (defaulting to 0 — v1: the suite does not
-/// emit a `cost_update` for a process's OWN usage); `duration_ms` is the
-/// caller's wall clock.
+/// the accumulated `cost_update` usage (defaulting to 0 — the
+/// `CostAccumulator` default when the session pushed none); `duration_ms` is
+/// the caller's wall clock.
 ///
 /// The capture reads are TOLERANT of a poisoned mutex (`into_inner` — a
 /// poisoned capture degrades to its last good state, not a panic): a panic
@@ -545,11 +546,10 @@ fn captures(driver: &SessionDriver, duration_ms: u64) -> (String, SubagentMetric
         ..Default::default()
     };
     if let Some(cc) = &driver.cost_capture {
-        if let Some(p) = cc.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            metrics.input_tokens = p.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
-            metrics.output_tokens = p.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
-            metrics.cost = p.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
-        }
+        let c = cc.lock().unwrap_or_else(|p| p.into_inner());
+        metrics.input_tokens = c.input_tokens;
+        metrics.output_tokens = c.output_tokens;
+        metrics.cost = c.cost;
     }
     let output = driver
         .last_message_id
@@ -578,10 +578,12 @@ fn metrics_json(m: SubagentMetrics) -> Value {
     })
 }
 
-/// The metrics captured for a subagent session (the last `cost_update`
-/// payload + the wall-clock duration). v1: the suite does not emit a
-/// `cost_update` for a process's OWN usage, so the token/cost fields are 0
-/// and `duration_ms` is real (see the wire contract's metrics note).
+/// The metrics captured for a subagent session (the accumulated
+/// `cost_update` usage + the wall-clock duration). The suite self-emits a
+/// per-turn `cost_update` (source `main` — `subagent-metrics-cost-push`
+/// Task 1); the token/cost fields are real when the session pushed usage (0
+/// when it didn't — the `CostAccumulator` default) and `duration_ms` is
+/// always the wall clock (see the wire contract's metrics note).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SubagentMetrics {
     pub input_tokens: u64,
@@ -594,7 +596,7 @@ pub struct SubagentMetrics {
 #[derive(Debug)]
 pub enum SubagentOutcome {
     /// The task completed; `output` is the last message's accumulated text,
-    /// `metrics` is the captured `cost_update` payload + duration.
+    /// `metrics` is the accumulated `cost_update` usage + duration.
     Completed {
         output: String,
         metrics: SubagentMetrics,

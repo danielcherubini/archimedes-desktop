@@ -180,6 +180,39 @@ pub struct SubagentSpawn {
     pub parent_agent_id: String,
 }
 
+/// Accumulated `cost_update` usage (the subagent metrics source). Sums the
+/// optional numeric fields across `cost_update` payloads (per-turn deltas
+/// from the suite's self-usage emitter — Task 1 of this plan); an absent
+/// field contributes 0. `Default` = all zeros (a session that never pushed
+/// usage — the pre-Task-1 v1 state).
+#[derive(Debug, Clone, Default)]
+pub struct CostAccumulator {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost: f64,
+}
+
+impl CostAccumulator {
+    /// Fold one `cost_update` payload (the wire shape: `inputTokens` /
+    /// `outputTokens` / `cacheReadTokens` / `cacheWriteTokens` / `cost`,
+    /// all optional) into the accumulator (absent → 0).
+    pub fn add_payload(&mut self, p: &Value) {
+        self.input_tokens += p.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
+        self.output_tokens += p.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
+        self.cache_read_tokens += p
+            .get("cacheReadTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.cache_write_tokens += p
+            .get("cacheWriteTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.cost += p.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+    }
+}
+
 /// The shared session-driver state. `SessionManager` (main sessions) and
 /// `SubagentSessionManager` (worker runtime) each own one.
 ///
@@ -205,8 +238,8 @@ pub struct SessionDriver {
     /// so the "last message" is tracked separately, not derived from
     /// iteration order.
     pub(crate) last_message_id: Option<Arc<StdMutex<Option<String>>>>,
-    /// Last `cost_update` push payload (subagents only; `None` for main).
-    pub(crate) cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
+    /// Accumulated `cost_update` usage (subagents only; `None` for main).
+    pub(crate) cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
     /// The subagent dispatch handle (main manager only — `Some`); `None`
     /// for the subagent manager itself (subagents cannot dispatch
     /// subagents — the tool is excluded from their spawn).
@@ -1348,4 +1381,45 @@ pub(crate) fn bridge_spawn_setup(
         socket_path.to_string_lossy().to_string(),
     );
     Some((env, session_id.to_string(), socket_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::CostAccumulator;
+
+    /// Two payloads with one ABSENT field each → the sums (an absent field
+    /// contributes 0; payload 1 has NO `cacheReadTokens` / `cacheWriteTokens`).
+    #[test]
+    fn add_payload_sums_fields_across_payloads() {
+        let mut acc = CostAccumulator::default();
+        acc.add_payload(
+            &json!({ "source": "main", "inputTokens": 100, "outputTokens": 50, "cost": 0.001 }),
+        );
+        acc.add_payload(
+            &json!({ "source": "main", "inputTokens": 200, "outputTokens": 25, "cacheReadTokens": 10, "cost": 0.002 }),
+        );
+        assert_eq!(acc.input_tokens, 300, "inputTokens should SUM (100 + 200)");
+        assert_eq!(acc.output_tokens, 75, "outputTokens should SUM (50 + 25)");
+        assert_eq!(acc.cache_read_tokens, 10, "the absent field contributes 0");
+        assert_eq!(acc.cache_write_tokens, 0, "the absent field contributes 0");
+        assert!(
+            (acc.cost - 0.003).abs() < 1e-9,
+            "cost should SUM (0.001 + 0.002 = 0.003), got {}",
+            acc.cost
+        );
+    }
+
+    /// An all-absent payload (only `source`) → NO change to the accumulator.
+    #[test]
+    fn add_payload_all_absent_is_a_no_op() {
+        let mut acc = CostAccumulator::default();
+        acc.add_payload(&json!({ "source": "main" }));
+        assert_eq!(acc.input_tokens, 0);
+        assert_eq!(acc.output_tokens, 0);
+        assert_eq!(acc.cache_read_tokens, 0);
+        assert_eq!(acc.cache_write_tokens, 0);
+        assert_eq!(acc.cost, 0.0);
+    }
 }
