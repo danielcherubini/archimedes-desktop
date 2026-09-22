@@ -5,6 +5,7 @@ import { sendPrompt } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
+import { useSubagents } from "../store/subagents";
 import { getSidePaneCollapsed, setSidePaneCollapsed } from "../lib/sidePaneState";
 
 // jsdom exposes a non-callable `window.matchMedia` (the `"matchMedia" in
@@ -109,6 +110,11 @@ beforeEach(() => {
   });
   useBridge.getState().dismissSession("s1");
   usePermissions.getState().dismissSessionPrompts("s1");
+  for (const id of Object.keys(useSubagents.getState().entries)) {
+    useSubagents.getState().dismiss(id);
+  }
+  useBridge.getState().dismissSession("sub1");
+  usePermissions.getState().dismissSessionPrompts("sub1");
 });
 
 describe("ChatStream", () => {
@@ -226,13 +232,16 @@ describe("ChatStream", () => {
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
   });
 
-  it("renders the composer shell (rounded-2xl, bg-input, border-input-border)", () => {
+  it("renders the composer shell (rounded-2xl, bg-input, border + border-input-border)", () => {
     seedLiveSession();
     const { container } = render(<ChatStream />);
     const shell = container.querySelector(".rounded-2xl");
     expect(shell).toBeTruthy();
     expect(shell!.className).toContain("bg-input");
     expect(shell!.className).toContain("border-input-border");
+    // The `border` WIDTH class (Tailwind preflight sets `border-width: 0`
+    // — the hover/focus border-COLOR states are dead without it).
+    expect(shell!.className).toMatch(/(^|\s)border(\s|$)/);
   });
 
   it("shows the composer placeholder 'Send a prompt…' for a live idle session", () => {
@@ -354,8 +363,72 @@ describe("ChatStream", () => {
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
     expect(textarea.hasAttribute("disabled")).toBe(true);
+    // The placeholder pins the working copy (the `working` mismatch does
+    // not leave the idle copy behind).
+    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("disables the send button, the textarea, and no-ops Enter while the bridge agentState is blocked (mid-turn awaiting a request response)", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    // Idle → enabled (sanity: `blocked` has NOT been pushed yet).
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    // `inTurn` is true (a `blocked` agent is mid-turn — it is awaiting a
+    // request response, so `inTurn` alone used to lock the composer) +
+    // the bridge says blocked → the composer is dead for the whole
+    // wait: button AND textarea disabled, Enter no-ops (no
+    // double-send, no clobbered turn bookkeeping).
+    await act(async () => {
+      useSessions.getState().beginTurn("s1");
+      useBridge.getState().applyState("s1", { state: "blocked" });
+    });
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("shows the bg-warning toggle dot for a pending SUBAGENT request (the pane's pill is clipped when collapsed — the dot is the cue)", () => {
+    seedLiveSession();
+    useSubagents.getState().addSession({
+      sessionId: "sub1",
+      parentSessionId: "s1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "running",
+    });
+    useBridge.getState().addRequest("sub1", {
+      requestId: "r1",
+      method: "ask",
+      source: "subagent:reviewer",
+      params: { question: "which library?" },
+    });
+    render(<ChatStream />);
+    const toggle = screen.getByRole("button", { name: "Toggle side pane" });
+    // The subagent session id is never the ACTIVE session — the dot
+    // counts the subagent's pending request via the shared hook.
+    expect(toggle.querySelector(".bg-warning")).toBeTruthy();
+  });
+
+  it("does NOT show the toggle dot when there are no pending requests (active or subagent)", () => {
+    seedLiveSession();
+    useSubagents.getState().addSession({
+      sessionId: "sub1",
+      parentSessionId: "s1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "running",
+    });
+    render(<ChatStream />);
+    const toggle = screen.getByRole("button", { name: "Toggle side pane" });
+    expect(toggle.querySelector(".bg-warning")).toBeNull();
   });
 
   it("keeps the composer consistent when the bridge is idle but the store is inTurn", () => {

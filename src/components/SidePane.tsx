@@ -3,8 +3,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs";
 import { useSessions } from "../store/sessions";
 import { useSubagents } from "../store/subagents";
-import { useBridge } from "../store/bridge";
-import { usePermissions } from "../store/permissions";
+import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { getSidePaneCollapsed, subscribeSidePane } from "../lib/sidePaneState";
 import TodoBoardPanel, { useMainTodoItems } from "./TodoBoardPanel";
 import SubagentPanel from "./SubagentPanel";
@@ -62,13 +61,14 @@ function initialTab(): "todos" | "subagents" {
  *   never disagree); Subagents = the subagent entry count — REPLACED by
  *   a green "Waiting" pill (the SAME treatment as the sidebar session
  *   row's `waiting` badge in `SpacesList`) while ANY subagent session has
- *   a pending interactive request (`useBridge` `ask`/`confirm`/`password`
- *   requests + `usePermissions` prompts): without the cue, a pending
- *   subagent request would strand until the bridge timeout when the tab
- *   is inactive or the pane is collapsed (the entry count does not change
- *   when a request arrives, and the `ChatStream` toggle dot counts only
- *   the ACTIVE session's requests — subagent session ids are never
- *   active).
+ *   a pending interactive request (via `usePendingSubagentRequests` —
+ *   the SAME derivation the `ChatStream` header toggle dot uses, so the
+ *   two cues can never disagree). The pill is the cue for the
+ *   INACTIVE-TAB case (the entry count does not change when a request
+ *   arrives); the `ChatStream` header toggle dot is the cue for the
+ *   COLLAPSED-PANE case (the pill is clipped by the frame's `width: 0`
+ *   + `overflow: hidden` when collapsed — it cannot carry the cue
+ *   then).
  */
 export default function SidePane() {
   const [width, setWidthState] = useState(initialWidth);
@@ -161,25 +161,14 @@ export default function SidePane() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
   const mainTodoCount = useMainTodoItems(activeSessionId).length;
   // Stable-reference selectors (no fresh values built INSIDE the selector —
-  // Zustand re-renders forever otherwise); the pending counts are derived
-  // in the body across ALL subagent entry session ids (the entry count does
-  // NOT change when a request arrives, and the `ChatStream` toggle dot
-  // counts only the ACTIVE session's requests — subagent session ids are
-  // never active — so without this cue a pending request would strand
-  // until the bridge timeout when the tab is inactive or the pane is
-  // collapsed).
+  // Zustand re-renders forever otherwise); the pending count comes from
+  // `usePendingSubagentRequests` (the SAME derivation the `ChatStream`
+  // header toggle dot uses — the pill is the cue for the inactive-tab
+  // case, the toggle dot for the collapsed-pane case).
   const subagentEntries = useSubagents((s) => s.entries);
-  const bridgeRequests = useBridge((s) => s.requests);
-  const permissionPrompts = usePermissions((s) => s.prompts);
+  const pendingSubagentRequests = usePendingSubagentRequests();
   const subagentCount = Object.keys(subagentEntries).length;
-  let subagentPendingCount = 0;
-  for (const id of Object.keys(subagentEntries)) {
-    subagentPendingCount += (bridgeRequests[id] ?? []).filter(
-      (r) => r.method === "ask" || r.method === "confirm" || r.method === "password",
-    ).length;
-    subagentPendingCount += (permissionPrompts[id] ?? []).length;
-  }
-  const subagentWaiting = subagentPendingCount > 0;
+  const subagentWaiting = pendingSubagentRequests > 0;
 
   return (
     // Collapse = `width: 0` + `overflow: hidden` (the content stays mounted;

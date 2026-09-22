@@ -12,6 +12,7 @@ import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
+import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
 import {
   getSidePaneCollapsed,
@@ -113,6 +114,11 @@ export default function ChatStream() {
   );
   const workingOrInTurn =
     agentState === "working" || (agentState === undefined && inTurn);
+  // A `blocked` bridge agent is mid-turn AWAITING a request response
+  // (`inTurn` is true) — the composer must stay locked for the whole
+  // wait (pre-branch, `main`'s composer locked on `inTurn`): sending
+  // concurrently would double-send and clobber the turn bookkeeping.
+  const composerLocked = workingOrInTurn || agentState === "blocked";
   // Called UNCONDITIONALLY at the top of the component body (the hook
   // contains `useState`/`useEffect` — invoking it inside the `working`
   // branch would be a conditional hook call and crash React when the
@@ -218,12 +224,13 @@ export default function ChatStream() {
 
   const send = async () => {
     const text = draft.trim();
-    // The UNIFIED working predicate (the same as the placeholder, the
+    // The UNIFIED composer lock (the same as the placeholder, the
     // textarea's `disabled`, and the send button below — `agentState`
-    // when present, else the `inTurn` fallback): sending while the
-    // agent is working is not possible (no `session/cancel` backend —
-    // follow-up).
-    if (!text || workingOrInTurn || !isLive) return;
+    // when present, else the `inTurn` fallback; `blocked` locks too —
+    // the agent is mid-turn awaiting a request response): sending while
+    // the agent is working or blocked is not possible (no
+    // `session/cancel` backend — follow-up).
+    if (!text || composerLocked || !isLive) return;
     setDraft("");
     setError(null);
     addUserMessage(activeSessionId, text);
@@ -303,20 +310,25 @@ export default function ChatStream() {
             m.kind === "diff" ? [{ path: m.path, patch: m.patch }] : [],
           );
 
-  // A collapsed pane gives no other cue that a request is waiting —
-  // the `bg-warning` dot on the toggle (the sidebar "Waiting" badge
-  // covers only the row the user is looking at).
+  // The `bg-warning` dot on the toggle — the cue for the COLLAPSED-PANE
+  // case (the `SidePane` "Waiting" pill is clipped by the frame's
+  // `width: 0` + `overflow: hidden` when collapsed): it counts the
+  // ACTIVE session's requests PLUS pending subagent requests (subagent
+  // session ids are never active, so the active-session count alone
+  // would strand a pending subagent request until the bridge timeout).
+  const pendingSubagentRequests = usePendingSubagentRequests();
   const hasPendingRequest =
     prompts.length > 0 ||
     bridgeRequests.some(
       (r) =>
         r.method === "ask" || r.method === "confirm" || r.method === "password",
-    );
-  // The "Send a prompt to start" hint is hidden when a pending
-  // permission prompt or bridge `ask` (the cards render in the stream
-  // regardless of the transcript's length) or a working/blocked line
-  // is present — otherwise the card would be swallowed by the hint.
-  const hasPendingPromptOrAsk = prompts.length > 0 || askRequests.length > 0;
+    ) ||
+    pendingSubagentRequests > 0;
+  // The "Send a prompt to start" hint is hidden when a pending request
+  // (permission prompt or bridge `ask`/`confirm`/`password` — the cards
+  // render in the stream regardless of the transcript's length) or a
+  // working/blocked line is present — otherwise the card would be
+  // swallowed by the hint.
 
   return (
     <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
@@ -423,7 +435,7 @@ export default function ChatStream() {
             window between `openSession` and `loadHistory` hydration,
             must not have its request swallowed by the hint). */}
         {messages.length === 0 &&
-          !hasPendingPromptOrAsk &&
+          !hasPendingRequest &&
           !workingOrInTurn &&
           agentState !== "blocked" && (
             <div className="flex h-full items-center justify-center">
@@ -498,7 +510,7 @@ export default function ChatStream() {
           {error ?? newConversationError}
         </p>
       )}
-      <div className="m-3 rounded-2xl border-input-border bg-input p-2 hover:border-input-border-hover focus-within:border-input-border-focused">
+      <div className="m-3 rounded-2xl border border-input-border bg-input p-2 hover:border-input-border-hover focus-within:border-input-border-focused">
         <textarea
           ref={composerRef}
           value={draft}
@@ -511,7 +523,7 @@ export default function ChatStream() {
           }}
           placeholder={
             isLive
-              ? workingOrInTurn
+              ? composerLocked
                 ? "Agent is working…"
                 : "Send a prompt…"
               : canResume
@@ -519,7 +531,7 @@ export default function ChatStream() {
                 : "This session is closed"
           }
           rows={2}
-          disabled={!isLive || workingOrInTurn}
+          disabled={!isLive || composerLocked}
           className="max-h-32 resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
         />
         <div className="mt-1 flex items-center justify-between">
@@ -531,7 +543,7 @@ export default function ChatStream() {
             <Button
               size="icon"
               aria-label="Send"
-              disabled={!isLive || workingOrInTurn || draft.trim() === ""}
+              disabled={!isLive || composerLocked || draft.trim() === ""}
               onClick={() => void send()}
               className="size-8 rounded-full bg-primary text-primary-foreground"
             >
