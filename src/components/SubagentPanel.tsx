@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { useSubagents, type SubagentEntry } from "../store/subagents";
 import { useBridge, type BridgeRequestData } from "../store/bridge";
@@ -13,9 +13,9 @@ import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
 
 const STATE_CHIP_STYLES: Record<"working" | "idle" | "blocked", string> = {
-  working: "bg-emerald-500/20 text-emerald-300",
-  idle: "bg-neutral-500/20 text-neutral-300",
-  blocked: "bg-amber-500/20 text-amber-300",
+  working: "bg-warning/14 text-warning",
+  idle: "text-foreground-subtlest",
+  blocked: "text-foreground-subtle",
 };
 
 /**
@@ -26,9 +26,9 @@ const STATE_CHIP_STYLES: Record<"working" | "idle" | "blocked", string> = {
 const EMPTY: never[] = [];
 
 const STATUS_CHIP_STYLES: Record<SubagentEntry["status"], string> = {
-  running: "bg-sky-500/20 text-sky-300",
-  completed: "bg-green-500/20 text-green-300",
-  failed: "bg-red-500/20 text-red-300",
+  running: "text-warning",
+  completed: "text-success",
+  failed: "text-destructive",
 };
 
 /**
@@ -54,29 +54,29 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
   const askRequests = requestList.filter((r) => r.method === "ask");
 
   return (
-    <section className="rounded-md border border-neutral-800 bg-neutral-900/40 p-2">
+    <section className="flex flex-col gap-2 rounded-xl border-card-border bg-card p-3">
       {/* Header: the agent's name (the label — the subagent's own `ask`
           cards render in its stream with `source: "main"` from its own
           session id), the `state` push chip (finally rendered), the
           subagent status, a pending-permission badge, and a dismiss. */}
       <div className="flex items-center gap-1.5">
-        <p className="min-w-0 flex-1 truncate text-xs font-medium">
+        <p className="min-w-0 flex-1 truncate text-ui-base font-medium">
           {entry.agentName}
         </p>
         {agentState && (
           <span
-            className={`rounded px-1 py-0.5 text-[10px] ${STATE_CHIP_STYLES[agentState]}`}
+            className={`rounded px-1 py-0.5 text-ui-xs ${STATE_CHIP_STYLES[agentState]}`}
           >
             {agentState}
           </span>
         )}
         <span
-          className={`rounded px-1 py-0.5 text-[10px] ${STATUS_CHIP_STYLES[entry.status]}`}
+          className={`rounded-full px-2 py-0.5 text-ui-xs font-medium ${STATUS_CHIP_STYLES[entry.status]}`}
         >
           {entry.status}
         </span>
         {promptList.length > 0 && (
-          <span className="rounded bg-amber-600/40 px-1 py-0.5 text-[10px] text-amber-200">
+          <span className="rounded-full bg-interaction-confirmation-surface px-2 py-0.5 text-ui-xs font-medium text-interaction-confirmation-foreground">
             {promptList.length} awaiting
           </span>
         )}
@@ -84,9 +84,9 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           type="button"
           onClick={() => dismiss(entry.sessionId)}
           aria-label={`Dismiss ${entry.agentName}`}
-          className="text-xs text-neutral-500 hover:text-neutral-300"
+          className="flex size-6 items-center justify-center text-foreground-subtlest hover:text-foreground"
         >
-          ✕
+          <X className="size-4" />
         </button>
       </div>
       {/* The compact stream: the same pipeline, condensed (smaller
@@ -94,7 +94,7 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           `agent-text`, `ToolCallCard` for `tool-call` (collapsed by
           default), `DiffBlock` for `diff`. */}
       {messageList.length > 0 && (
-        <div className="mt-2 max-h-48 space-y-1 overflow-y-auto rounded bg-neutral-950 p-2 text-xs">
+        <div className="mt-1 max-h-48 space-y-1 overflow-y-auto rounded-md bg-surface p-2">
           {messageList.map((m, i) => {
             if (m.kind === "agent-text") {
               return <MessageBubble key={i} message={m} />;
@@ -137,14 +137,14 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           `session-closed` handler's `dismissSession` deletes it, and the
           two events are concurrent). */}
       {entry.status !== "running" && (entry.metrics || entry.error) && (
-        <p className="mt-1 text-[10px] text-neutral-500">
+        <p className="text-ui-xs text-foreground-subtlest">
           {entry.status === "failed" && entry.error && (
-            <span className="text-red-400">{entry.error}</span>
+            <span className="text-destructive">{entry.error}</span>
           )}
           {entry.metrics && (
             <span>
-              {entry.metrics.inputTokens} in / {entry.metrics.outputTokens} out / $
-              {entry.metrics.cost.toFixed(2)} / {entry.metrics.durationMs} ms
+              {entry.metrics.inputTokens} in · {entry.metrics.outputTokens} out · $
+              {entry.metrics.cost.toFixed(2)} · {entry.metrics.durationMs} ms
             </span>
           )}
         </p>
@@ -154,19 +154,22 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
 }
 
 /**
- * Collapsible right rail: one section per subagent session (arrival order).
+ * One card stack (the `SidePane`'s Subagents tab): one card per subagent
+ * session (arrival order).
  *
- * - No entries → render nothing (the rail collapses).
- * - Collapsed = a slim bar with the count badge; expanded = the sections.
- * - Auto-expands on dispatch (0 → >0 entries) and on a pending permission
- *   prompt (badge 0 → >0).
+ * - No entries → an empty state ("No subagent sessions"). Collapse is the
+ *   `SidePane` frame's job now (via `sidePaneState`) — the old rail
+ *   collapse UI and auto-expand behavior are dropped (the tab trigger's
+ *   count badge covers discoverability).
  * - The `confirm`/`password` `SudoConfirmModal`/`SudoPasswordModal` are
- *   rendered HERE (outside the collapsed content — a collapsed rail never
+ *   rendered HERE (outside the scrollable content — a collapsed pane never
  *   hides a pending modal): `ChatStream` renders them ONLY for the ACTIVE
- *   session's requests, and the subagent's session id is never active.
- *   They are `fixed` overlays, so rendering them from the panel is fine;
- *   the answer path is unchanged (`respondBridgeRequest` routes to the
- *   subagent manager).
+ *   session's requests, and the subagent's session id is never active —
+ *   this panel is the ONLY render site for subagent-session requests
+ *   (an unrendered request would hang until the bridge timeout). They are
+ *   `fixed` overlays, so rendering them from the panel is fine; the answer
+ *   path is unchanged (`respondBridgeRequest` routes to the subagent
+ *   manager).
  */
 export default function SubagentPanel() {
   // The entries (the whole object — one reference per subagents change).
@@ -185,35 +188,6 @@ export default function SubagentPanel() {
       return out;
     }),
   );
-  // The entries' pending-prompt count (a PRIMITIVE — no aggregate object
-  // to shallow-compare; `undefined` slices count as 0).
-  const promptCount = usePermissions((s) => {
-    let n = 0;
-    for (const e of entryList) {
-      n += s.prompts[e.sessionId]?.length ?? 0;
-    }
-    return n;
-  });
-  const [expanded, setExpanded] = useState(false);
-
-  // Auto-expand on dispatch (0 → >0 entries).
-  const prevEntryCount = useRef(entryList.length);
-  useEffect(() => {
-    if (prevEntryCount.current === 0 && entryList.length > 0) {
-      setExpanded(true);
-    }
-    prevEntryCount.current = entryList.length;
-  }, [entryList.length]);
-
-  // Auto-expand on a pending permission prompt (badge 0 → >0).
-  const prevPromptCount = useRef(promptCount);
-  useEffect(() => {
-    if (prevPromptCount.current === 0 && promptCount > 0) {
-      setExpanded(true);
-    }
-    prevPromptCount.current = promptCount;
-  }, [promptCount]);
-
   // The entries' pending `confirm`/`password` requests (the modals render
   // at the panel level — see the component doc above).
   const confirmRefs: Array<{ sessionId: string; requestId: string }> = [];
@@ -228,40 +202,23 @@ export default function SubagentPanel() {
     }
   }
 
-  if (entryList.length === 0) return null;
+  if (entryList.length === 0) {
+    return (
+      <p className="text-center text-ui-sm text-foreground-subtlest">
+        No subagent sessions
+      </p>
+    );
+  }
 
   return (
     <>
-      <aside
-        aria-label="Subagents"
-        className="w-64 shrink-0 overflow-y-auto border-l border-neutral-800 bg-neutral-950 p-3"
-      >
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-medium text-neutral-400">
-            Subagents
-            <span className="ml-1 rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-300">
-              {entryList.length}
-            </span>
-          </p>
-          <button
-            type="button"
-            onClick={() => setExpanded((v) => !v)}
-            aria-label={expanded ? "Collapse subagents" : "Expand subagents"}
-            className="text-xs text-neutral-400 hover:text-neutral-200"
-          >
-            {expanded ? "▾" : "▸"}
-          </button>
-        </div>
-        {expanded && (
-          <div className="mt-2 space-y-2">
-            {entryList.map((e) => (
-              <SubagentSection key={e.sessionId} entry={e} />
-            ))}
-          </div>
-        )}
-      </aside>
+      <div className="flex flex-col gap-2">
+        {entryList.map((e) => (
+          <SubagentSection key={e.sessionId} entry={e} />
+        ))}
+      </div>
       {/* Bridge modals for the entries (rendered at the panel root —
-          `fixed` overlays, NOT inside the collapsed content). */}
+          `fixed` overlays, NOT inside the scrollable content). */}
       {confirmRefs.map((r) => (
         <SudoConfirmModal
           key={r.requestId}

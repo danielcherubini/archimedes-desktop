@@ -9,8 +9,6 @@ import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
-import TodoBoardPanel from "./TodoBoardPanel";
-import SubagentPanel from "./SubagentPanel";
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -169,17 +167,10 @@ export default function ChatStream() {
 
   if (!activeSessionId) {
     return (
-      // Both return paths wrap in a flex row for the `TodoBoardPanel`
-      // right rail (M3): a single-path change would leave the rail
-      // missing in one state.
-      <div className="flex min-w-0 flex-1">
-        <main className="flex flex-1 flex-col items-center justify-center text-neutral-500">
-          <p className="text-lg">No active session</p>
-          <p className="mt-1 text-sm">Open a space from the list on the left.</p>
-        </main>
-        <TodoBoardPanel sessionId={null} />
-        <SubagentPanel />
-      </div>
+      <main className="flex min-w-0 flex-1 flex-col items-center justify-center text-neutral-500">
+        <p className="text-lg">No active session</p>
+        <p className="mt-1 text-sm">Open a space from the list on the left.</p>
+      </main>
     );
   }
 
@@ -232,10 +223,7 @@ export default function ChatStream() {
     : undefined;
 
   return (
-    // Flex row: the stream (main) + the `TodoBoardPanel` right rail
-    // (M3 — both return paths are wrapped; see the empty-state path above).
-    <div className="flex min-w-0 flex-1">
-      <main className="flex min-w-0 flex-1 flex-col">
+    <main className="flex min-w-0 flex-1 flex-col">
       {view && (
         <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-4 py-2">
           <div className="flex min-w-0 items-center gap-2">
@@ -393,9 +381,6 @@ export default function ChatStream() {
           </button>
         </div>
       </div>
-      </main>
-      <TodoBoardPanel sessionId={activeSessionId} />
-      <SubagentPanel />
       {/* Bridge modals (rendered at the `ChatStream` root — `fixed`
           overlays, NOT inside the scroll region). */}
       {confirmRequests.map((r) => (
@@ -412,6 +397,6 @@ export default function ChatStream() {
           requestId={r.requestId}
         />
       ))}
-    </div>
+    </main>
   );
 }
