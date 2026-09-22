@@ -181,7 +181,9 @@ export default function SubagentPanel() {
   // store change, since `addRequest` replaces the `requests` object).
   const entryRequests = useBridge(
     useShallow((s) => {
-      const out: Record<string, BridgeRequestData[]> = {};
+      // `| undefined` is honest: a session with no (yet) requests maps to
+      // `undefined`, and the consumers guard with `?? []`.
+      const out: Record<string, BridgeRequestData[] | undefined> = {};
       for (const e of entryList) {
         out[e.sessionId] = s.requests[e.sessionId];
       }

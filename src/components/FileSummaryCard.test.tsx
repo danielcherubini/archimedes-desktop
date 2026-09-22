@@ -39,7 +39,7 @@ describe("FileSummaryCard", () => {
     const { container } = render(
       <FileSummaryCard diffs={[{ path: "src/a.ts", patch: patch(["x"], ["y"]) }]} />,
     );
-    expect(screen.getByText("1 files changed")).toBeTruthy();
+    expect(screen.getByText("1 file changed")).toBeTruthy();
     // Exactly one `h-8` file row.
     expect(container.querySelectorAll(".h-8")).toHaveLength(1);
     expect(screen.getByText("src/a.ts")).toBeTruthy();
@@ -51,7 +51,7 @@ describe("FileSummaryCard", () => {
         diffs={[{ path: "src/a.ts", patch: "no plus or minus lines here" }]}
       />,
     );
-    expect(screen.getByText("1 files changed")).toBeTruthy();
+    expect(screen.getByText("1 file changed")).toBeTruthy();
     // Header total and the file row both read +0 −0.
     expect(screen.getAllByText("+0")).toHaveLength(2);
     expect(screen.getAllByText("−0")).toHaveLength(2);
@@ -68,7 +68,7 @@ describe("FileSummaryCard", () => {
         ]}
       />,
     );
-    expect(screen.getByText("1 files changed")).toBeTruthy();
+    expect(screen.getByText("1 file changed")).toBeTruthy();
     // The LATEST patch wins: +2 −3 (header total = the single file's
     // stats, so each appears twice: header + row), and the superseded
     // +1 −1 is gone.

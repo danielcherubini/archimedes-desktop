@@ -207,7 +207,7 @@ describe("ChatStream", () => {
     // The LATEST patch wins: +2 −3 (header total = the single file's
     // stats, so each appears twice: header + row); the superseded
     // +1 −1 is not counted.
-    expect(screen.getByText("1 files changed")).toBeTruthy();
+    expect(screen.getByText("1 file changed")).toBeTruthy();
     expect(screen.getAllByText("−3")).toHaveLength(2);
     expect(screen.queryByText("+1")).toBeNull();
     expect(screen.queryByText("−1")).toBeNull();

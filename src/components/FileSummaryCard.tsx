@@ -30,7 +30,9 @@ export default function FileSummaryCard({
         <div className="flex items-center gap-2">
           <FileCodeIcon className="size-4 text-foreground-subtle" />
           <span className="text-ui-base font-medium">
-            {files.length} files changed
+            {files.length === 1
+              ? "1 file changed"
+              : `${files.length} files changed`}
           </span>
           <span className="text-ui-base tabular-nums text-diff-added">
             +{totalAdditions}
