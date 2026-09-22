@@ -16,7 +16,9 @@ use agent_client_protocol::schema::v1::{
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::acp::{AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager};
+use crate::acp::{
+    AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager, SubagentSessionManager,
+};
 use crate::storage::Db;
 
 /// `EventSink` backed by `AppHandle::emit`.
@@ -90,13 +92,29 @@ pub async fn close_session(
 #[tauri::command]
 pub async fn respond_permission(
     state: State<'_, Arc<SessionManager>>,
+    subagent_state: State<'_, Arc<SubagentSessionManager>>,
     session_id: String,
     request_id: String,
     outcome: PermissionOutcome,
 ) -> Result<(), AcpError> {
-    state
-        .respond_permission(&session_id, &request_id, outcome)
-        .await
+    // Main manager first; a miss (no entry) routes to the subagent manager
+    // (the subagent's own listener's map — the `session_id` is the
+    // subagent's ACP id). The existing "silent no-op when gone" semantics
+    // stay: a miss on both managers is a no-op (success either way) — but
+    // it is LOGGED (a double-miss is a routing/id mismatch, and a silent
+    // success would make it invisible). `||` short-circuits: the subagent
+    // lookup runs only when the main manager missed.
+    let main_hit = state
+        .respond_permission(&session_id, &request_id, outcome.clone())
+        .await?;
+    let sub_hit = main_hit
+        || subagent_state
+            .respond_permission(&session_id, &request_id, outcome)
+            .await;
+    if !sub_hit {
+        eprintln!("respond_permission: no pending entry for session {session_id} request {request_id} (main and subagent managers)");
+    }
+    Ok(())
 }
 
 /// Deliver the user's answer to a pending bridge request to the agent.
@@ -110,13 +128,29 @@ pub async fn respond_permission(
 #[tauri::command]
 pub async fn respond_bridge_request(
     state: State<'_, Arc<SessionManager>>,
+    subagent_state: State<'_, Arc<SubagentSessionManager>>,
     session_id: String,
     request_id: String,
     result: Value,
 ) -> Result<(), AcpError> {
-    state
-        .respond_bridge_request(&session_id, &request_id, result)
-        .await
+    // Main manager first; a miss (no entry) routes to the subagent manager
+    // (the subagent's own listener's map — the `session_id` is the
+    // subagent's ACP id). The existing "silent no-op when gone" semantics
+    // stay: a miss on both managers is a no-op (success either way) — but
+    // it is LOGGED (a double-miss is a routing/id mismatch, and a silent
+    // success would make it invisible). `||` short-circuits: the subagent
+    // lookup runs only when the main manager missed.
+    let main_hit = state
+        .respond_bridge_request(&session_id, &request_id, result.clone())
+        .await?;
+    let sub_hit = main_hit
+        || subagent_state
+            .respond_bridge_request(&session_id, &request_id, result)
+            .await;
+    if !sub_hit {
+        eprintln!("respond_bridge_request: no pending entry for session {session_id} request {request_id} (main and subagent managers)");
+    }
+    Ok(())
 }
 
 /// Resume a stored session: spawn a fresh agent for `agent_id`, initialize

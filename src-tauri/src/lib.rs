@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Emitter, Manager};
 
-use crate::acp::{EventSink, SessionManager};
+use crate::acp::{EventSink, SessionManager, SubagentSessionManager};
 use crate::storage::Db;
 
 /// The shared app setup: agent registry from `config_dir`, persistence
@@ -23,14 +23,26 @@ pub fn setup_dirs<R: tauri::Runtime>(
     app_data_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The agent registry lives in the app's config directory.
-    let mut manager =
-        SessionManager::new(config_dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let mut manager = SessionManager::new(config_dir.clone())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     // The persistence database lives in the app data directory.
     let db = Arc::new(
         Db::open(&app_data_dir.join("archimedes.db"))
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     );
     manager.attach_db(db.clone());
+    // The subagent manager (its own `SessionDriver` + a dedicated
+    // `WorkerRuntime`, built in `new()` — two idle threads, negligible).
+    // Injected into the main manager (the main session's bridge listener
+    // services `dispatch_subagent` frames); the injection order breaks the
+    // apparent cycle: the subagent manager needs nothing from the main
+    // manager; only the main manager's `SessionDriver.subagent` field points
+    // at it.
+    let subagent_manager = Arc::new(
+        SubagentSessionManager::new(config_dir)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
+    manager.set_subagent_manager(subagent_manager.clone());
     // The event sink (TauriSink) is managed state so commands — and the
     // headless IPC test — can obtain it without an `AppHandle` parameter.
     //
@@ -46,6 +58,10 @@ pub fn setup_dirs<R: tauri::Runtime>(
     // The manager is `Sync` (its mutable state is `Arc<Mutex<…>>`
     // internally), so it is shared directly without an outer lock.
     app.manage(Arc::new(manager));
+    // The subagent manager is `Send + Sync` (same reasoning — the
+    // `WorkerRuntime` fields are `Send` + `Sync`), so it is managed
+    // directly too (the `respond_*` commands resolve it as state).
+    app.manage(subagent_manager);
     app.manage(db);
     Ok(())
 }

@@ -216,6 +216,47 @@ export type BridgeResponseDto =
   | { confirmed: boolean }
   | { password: string };
 
+/**
+ * The `metrics` of the `subagent-closed` payload / the `dispatch_subagent`
+ * response (same shape over the wire). v1: the suite does NOT push the
+ * subagent's OWN usage, so the captured values are `{0, 0, 0, <real
+ * durationMs>}` — `durationMs` is real (wall clock), the token/cost fields
+ * are 0.
+ */
+export interface SubagentMetrics {
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  durationMs: number;
+}
+
+/**
+ * A `subagent-session-started` event payload (camelCase over the wire —
+ * emitted by the `SubagentSessionManager` once the subagent's ACP session
+ * is ESTABLISHED, so `sessionId` is the ACP id, never the placeholder).
+ */
+export interface SubagentSessionStartedPayload {
+  sessionId: string;
+  parentSessionId: string;
+  agentName: string;
+  task: string;
+}
+
+/**
+ * A `subagent-closed` event payload (camelCase over the wire). `error` is
+ * present only for `failed`; `metrics` = the captured `cost_update` payload
+ * + duration (see `SubagentMetrics`). CONCURRENT with the driver teardown's
+ * `session-closed` for the same id (the worker task does not await it) —
+ * the frontend stores the snapshot in the subagents store for exactly this
+ * reason.
+ */
+export interface SubagentClosedPayload {
+  sessionId: string;
+  status: "completed" | "failed";
+  error?: string;
+  metrics?: SubagentMetrics;
+}
+
 /** A row from the app's SQLite `messages` table (camelCase over IPC). */
 export interface MessageRow {
   id: number;
@@ -364,6 +405,23 @@ export function listenBridgeEvent(
   callback: (payload: BridgeEventPayload) => void,
 ): Promise<UnlistenFn> {
   return listen<BridgeEventPayload>("bridge-event", (event) =>
+    callback(event.payload),
+  );
+}
+
+export function listenSubagentSessionStarted(
+  callback: (payload: SubagentSessionStartedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<SubagentSessionStartedPayload>(
+    "subagent-session-started",
+    (event) => callback(event.payload),
+  );
+}
+
+export function listenSubagentClosed(
+  callback: (payload: SubagentClosedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<SubagentClosedPayload>("subagent-closed", (event) =>
     callback(event.payload),
   );
 }

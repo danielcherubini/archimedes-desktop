@@ -30,14 +30,16 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use crate::acp::session::EventSink;
+use crate::acp::launch_wrapper::LaunchConfig;
+use crate::acp::session::{EventSink, SubagentSpawn};
+use crate::acp::subagent::{SubagentMetrics, SubagentOutcome};
 
 /// The manager's map of pending bridge-request senders.
 ///
@@ -126,8 +128,14 @@ pub fn available() -> bool {
 /// cancels every in-flight request. `timeout` caps each request (default
 /// [`DEFAULT_BRIDGE_TIMEOUT`]; a test injects a short value).
 ///
+/// `subagent` (main only — `Some`) is the subagent dispatch handle; the
+/// `dispatch_subagent` method (method-aware: NO timeout) is serviced by it.
+/// `cost_capture` (subagents only — `Some`) stores the last `cost_update`
+/// push payload (the v1 metrics source).
+///
 /// **Platform policy:** on **macOS** (and other platforms) the listener is
 /// NOT started — a no-op handle is returned (fail-closed, ADR 0003).
+#[allow(clippy::too_many_arguments)]
 pub async fn start_listener(
     placeholder_session_id: String,
     socket_path: &Path,
@@ -136,6 +144,8 @@ pub async fn start_listener(
     pending_bridge: PendingBridge,
     close_tx: &watch::Sender<bool>,
     timeout: Duration,
+    subagent: Option<SubagentSpawn>,
+    cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
 ) -> Result<BridgeHandle, String> {
     #[cfg(target_os = "linux")]
     {
@@ -212,6 +222,8 @@ pub async fn start_listener(
                                             last_seq: last_seq.clone(),
                                             close_tx: close_tx.clone(),
                                             timeout,
+                                            subagent: subagent.clone(),
+                                            cost_capture: cost_capture.clone(),
                                         };
                                         tokio::spawn(handle_connection(
                                             stream,
@@ -249,6 +261,8 @@ pub async fn start_listener(
             pending_bridge,
             close_tx,
             timeout,
+            subagent,
+            cost_capture,
         );
         // TODO(windows): minimal named-pipe listener — create a
         // `\\.\pipe\<name>` instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`
@@ -277,6 +291,8 @@ pub async fn start_listener(
             pending_bridge,
             close_tx,
             timeout,
+            subagent,
+            cost_capture,
         );
         // macOS (and other platforms): the bridge is unavailable —
         // fail-closed (ADR 0003). Return a no-op handle so the caller's
@@ -392,6 +408,12 @@ struct ConnCtx {
     last_seq: Arc<AtomicU64>,
     close_tx: Arc<watch::Sender<bool>>,
     timeout: Duration,
+    /// The subagent dispatch handle (main only — `Some`); `None` for tests /
+    /// non-bridge setups (a `dispatch_subagent` frame on such a listener gets
+    /// the unknown-method `error` response).
+    subagent: Option<SubagentSpawn>,
+    /// Last `cost_update` push payload (subagents only; `None` for main).
+    cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
 }
 
 /// Handle one bridge connection: read exactly ONE frame (a line — the agent
@@ -447,6 +469,10 @@ where
         last_seq,
         close_tx,
         timeout,
+        // The subagent dispatch handle (main only — `Some`); the
+        // `dispatch_subagent` method is method-aware (NO timeout).
+        subagent,
+        cost_capture,
     } = ctx;
     match frame.get("type").and_then(Value::as_str) {
         Some("request") => {
@@ -456,6 +482,31 @@ where
                 .unwrap_or_default()
                 .to_string();
             let sid = session_id.lock().await.clone();
+            let method = frame
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            // `dispatch_subagent` is method-aware: NO `pending_bridge`
+            // entry (the desktop answers it itself — not the user), NO
+            // `bridge-request` UI event (the panel is fed by
+            // `subagent-session-started`), NO timeout arm (a subagent task
+            // may run minutes; cancellation is the parent close / the
+            // agent's EOF). All OTHER methods keep the existing 330 s
+            // behavior below.
+            if method == "dispatch_subagent" {
+                handle_dispatch_subagent(
+                    stream,
+                    id,
+                    sid,
+                    frame.get("params"),
+                    sink,
+                    subagent,
+                    close_tx,
+                )
+                .await;
+                return;
+            }
 
             // (a) Register the oneshot the user's answer flows through —
             // BEFORE the event is emitted. The UI (and the acp_flow test)
@@ -549,6 +600,20 @@ where
             let delivered = seq == 0 || last_seq.fetch_max(seq, Ordering::Relaxed) < seq;
             if delivered {
                 let sid = session_id.lock().await.clone();
+                // (b) Store the `cost_update` payload (subagents only;
+                // `None` for main) — the v1 metrics source. The lock is
+                // TOLERANT of a poisoned mutex (`into_inner` — a poisoned
+                // capture degrades to its last good state, not a panic: a
+                // panic here would chain into the driver task, and on a
+                // subagent dispatch into a dropped oneshot — a crash
+                // silently reported as a "cancelled" dispatch).
+                if frame.get("event").and_then(Value::as_str) == Some("cost_update") {
+                    if let Some(cc) = &cost_capture {
+                        if let Some(p) = frame.get("payload") {
+                            *cc.lock().unwrap_or_else(|p| p.into_inner()) = Some(p.clone());
+                        }
+                    }
+                }
                 let payload = json!({
                     "sessionId": sid,
                     "seq": seq,
@@ -567,6 +632,203 @@ where
             // failure and retries / gives up per its own policy).
         }
     }
+}
+
+/// The outcome of the `dispatch_subagent` waiter.
+#[derive(Debug)]
+enum DispatchWait {
+    /// The dispatch completed (the output + the metrics, verbatim in the
+    /// response's `result`).
+    Completed {
+        output: String,
+        metrics: SubagentMetrics,
+    },
+    /// The dispatch failed (the error, verbatim in the response's `error`).
+    Failed { error: String },
+    /// The parent closed / the agent's EOF / a dropped oneshot — the
+    /// dispatch is cancelled (the terminal `error:"cancelled"` frame).
+    Cancelled,
+}
+
+/// Parse + validate the `dispatch_subagent` frame's `params` →
+/// `(task, LaunchConfig)`. `None` when the `task` is missing or empty (the
+/// caller responds `error: "invalid params"` — a missing `task` must NOT
+/// dispatch an empty-prompt subagent session). `tools: []` is treated as
+/// `None` (an empty allowlist is malformed, not an allowlist — it would
+/// produce `--tools ''`).
+fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> {
+    let task = params
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if task.trim().is_empty() {
+        return None;
+    }
+    Some((
+        task.to_string(),
+        LaunchConfig {
+            system_prompt: params
+                .get("systemPrompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            thinking: params
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tools: params
+                .get("tools")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    let tools: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    (!tools.is_empty()).then_some(tools)
+                }),
+        },
+    ))
+}
+
+/// The `dispatch_subagent` request branch (method-aware — see the
+/// `handle_connection` request arm): spawn the subagent dispatch on the
+/// worker runtime (the oneshot is the only handoff — the caller never
+/// blocks on the worker runtime) and wait for it. The waiter `select!`s on
+/// `dispatch_rx` (→ the response frame), the parent close (the `close_tx`
+/// flag — a subagent's own listener carries the external close here, so a
+/// cancel also cancels its in-flight `ask` waiters), and the agent's EOF
+/// (→ `cancel.cancel()` + the terminal `error:"cancelled"` frame). NO
+/// timeout arm for this method (the `timeout` is ignored; all other
+/// methods keep the existing 330 s behavior).
+async fn handle_dispatch_subagent<S>(
+    mut stream: S,
+    id: String,
+    parent_session_id: String,
+    params: Option<&Value>,
+    sink: Arc<dyn EventSink>,
+    subagent: Option<SubagentSpawn>,
+    close_tx: Arc<watch::Sender<bool>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    // A `dispatch_subagent` frame on a listener without a subagent manager
+    // (tests, non-bridge setups) gets the unknown-method `error` response.
+    let Some(spawn) = subagent else {
+        let response = json!({ "v": 1, "type": "response", "id": id, "error": "unknown method" });
+        let data = response.to_string() + "\n";
+        let _ = stream.write_all(data.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    };
+
+    // Validation (BEFORE the spawn): a missing / empty `task` is rejected
+    // (`error: "invalid params"`, no dispatch — an empty-prompt subagent
+    // session would be a wasted process burning tokens on nothing);
+    // `tools: []` is treated as `None` (it would produce `--tools ''`).
+    let params = params.cloned().unwrap_or(Value::Null);
+    let (task, launch) = match dispatch_params(&params) {
+        Some(p) => p,
+        None => {
+            let response =
+                json!({ "v": 1, "type": "response", "id": id, "error": "invalid params" });
+            let data = response.to_string() + "\n";
+            let _ = stream.write_all(data.as_bytes()).await;
+            let _ = stream.flush().await;
+            return;
+        }
+    };
+    // `agentName` is the dispatch's agent name (the `subagent-session-
+    // started` payload) — NOT part of the launch config.
+    let agent_name = params
+        .get("agentName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // Pre-check (BEFORE the spawn): a parent that is ALREADY closing must
+    // NOT spawn a subagent at all — the dispatch would be ORPHANED (no
+    // code path could close it: `SubagentCancel` has no `Drop`, and the
+    // sender stays alive via `LiveSession.close_tx`): it would run until
+    // its own prompt settles / app exit — a live agent process burning
+    // tokens whose result nobody consumes. (The post-spawn
+    // `close_rx.changed()` arm below is the belt-and-braces race guard for
+    // a flag that flips AFTER the check — it cancels the spawned dispatch.)
+    let mut close_rx = close_tx.subscribe();
+    let close_already = *close_rx.borrow();
+    let outcome = if close_already {
+        DispatchWait::Cancelled
+    } else {
+        // The desktop spawns the dispatch (the whole lifecycle runs on the
+        // worker runtime; `parent_session_id` is the parent's ACP id — the
+        // `ConnCtx` session-id state after the parent's `set_session_id`).
+        let (dispatch_rx, cancel) = spawn.manager.dispatch(
+            &parent_session_id,
+            &spawn.parent_cwd,
+            &spawn.parent_agent_id,
+            agent_name,
+            launch,
+            task,
+            &sink,
+        );
+        tokio::select! {
+            r = dispatch_rx => match r {
+                Ok(SubagentOutcome::Completed { output, metrics }) => {
+                    DispatchWait::Completed { output, metrics }
+                }
+                Ok(SubagentOutcome::Failed { error }) => DispatchWait::Failed { error },
+                // The worker task vanished without resolving (app exit —
+                // a panicked task is logged by the worker runtime,
+                // unwind profiles only; release builds abort the process
+                // on a panic by design): the dispatch is gone — cancel.
+                Err(_) => DispatchWait::Cancelled,
+            },
+            // The parent closed AFTER the pre-check passed (the race the
+            // pre-check can't cover — the flag flipped between the check
+            // and here): cancel the spawned dispatch (it would otherwise
+            // be orphaned — no code path could close it).
+            _ = close_rx.changed() => {
+                cancel.cancel();
+                DispatchWait::Cancelled
+            },
+            // EOF drain: read until EOF, DISCARDING bytes in 4 KiB chunks
+            // (no `read_to_end` into a growing Vec — a peer that streams
+            // bytes without closing can't make this allocate without
+            // bound).
+            _ = drain_until_eof(&mut stream) => {
+                cancel.cancel();
+                DispatchWait::Cancelled
+            }
+        }
+    };
+    let response = match outcome {
+        DispatchWait::Completed { output, metrics } => {
+            json!({
+                "v": 1, "type": "response", "id": id,
+                "result": {
+                    "output": output,
+                    "metrics": {
+                        "inputTokens": metrics.input_tokens,
+                        "outputTokens": metrics.output_tokens,
+                        "cost": metrics.cost,
+                        "durationMs": metrics.duration_ms,
+                    }
+                }
+            })
+        }
+        DispatchWait::Failed { error } => {
+            json!({ "v": 1, "type": "response", "id": id, "error": error })
+        }
+        DispatchWait::Cancelled => {
+            json!({ "v": 1, "type": "response", "id": id, "error": "cancelled" })
+        }
+    };
+    let data = response.to_string() + "\n";
+    let _ = stream.write_all(data.as_bytes()).await;
+    let _ = stream.flush().await;
+    // Drop the stream → close the connection.
 }
 
 /// The outcome of a capped frame read. The enum makes the cap-exceeded
@@ -790,7 +1052,8 @@ mod tests {
     /// first data — one frame per connection), and return the path + the
     /// server task. A tokio-native `UnixListener`/`UnixStream::connect` is
     /// used (NOT `UnixStream::from_std` on a blocking fd, which tokio 1.53
-    /// refuses to register).
+    /// refuses to register). `subagent` (the `dispatch_subagent` dispatch
+    /// handle) is `None` for the non-dispatch tests.
     async fn spawn_server(
         session_id: String,
         sink: Arc<CapturingSink>,
@@ -798,6 +1061,7 @@ mod tests {
         last_seq: Arc<AtomicU64>,
         close_tx: Arc<watch::Sender<bool>>,
         timeout: Duration,
+        subagent: Option<crate::acp::session::SubagentSpawn>,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -816,6 +1080,8 @@ mod tests {
                 last_seq,
                 close_tx,
                 timeout,
+                subagent,
+                cost_capture: None,
             };
             handle_connection(stream, ctx).await
         });
@@ -851,6 +1117,7 @@ mod tests {
             last_seq.clone(),
             close_tx.clone(),
             Duration::from_secs(30),
+            None,
         )
         .await;
         let mut client = connect_client(&path).await;
@@ -879,6 +1146,7 @@ mod tests {
             last_seq.clone(),
             close_tx.clone(),
             Duration::from_secs(30),
+            None,
         )
         .await;
         let mut client = connect_client(&path).await;
@@ -914,6 +1182,7 @@ mod tests {
             last_seq,
             close_tx,
             Duration::from_secs(30),
+            None,
         )
         .await;
         let mut client = connect_client(&path).await;
@@ -1000,6 +1269,7 @@ mod tests {
             // The injectable timeout (the `Duration` parameter — Task 6 shrinks
             // it to 50 ms; here 200 ms).
             Duration::from_millis(200),
+            None,
         )
         .await;
         let mut client = connect_client(&path).await;
@@ -1045,6 +1315,7 @@ mod tests {
             last_seq,
             close_tx.clone(),
             Duration::from_secs(30),
+            None,
         )
         .await;
         let mut client = connect_client(&path).await;
@@ -1079,6 +1350,179 @@ mod tests {
             response.get("error").and_then(Value::as_str),
             Some("cancelled"),
             "a session close writes the terminal error:\"cancelled\" frame"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `dispatch_subagent` param validation (the review finding: a missing
+    // `task` must not dispatch an empty-prompt subagent session; `tools: []`
+    // must not produce `--tools ''`).
+    // -------------------------------------------------------------------
+
+    /// A missing `task` is rejected (no dispatch is spawned).
+    #[test]
+    fn dispatch_params_rejects_a_missing_task() {
+        assert!(dispatch_params(&json!({})).is_none());
+        assert!(dispatch_params(&json!({ "agentName": "fake" })).is_none());
+    }
+
+    /// An empty (or blank) `task` is rejected (no dispatch is spawned).
+    #[test]
+    fn dispatch_params_rejects_an_empty_task() {
+        assert!(dispatch_params(&json!({ "task": "" })).is_none());
+        assert!(dispatch_params(&json!({ "task": "   " })).is_none());
+    }
+
+    /// `tools: []` is treated as `None` (an empty allowlist is malformed, not
+    /// an allowlist — it would produce `--tools ''`); a non-empty list is
+    /// kept verbatim; a missing `tools` is `None`.
+    #[test]
+    fn dispatch_params_treats_an_empty_tools_list_as_none() {
+        let (task, launch) = dispatch_params(&json!({ "task": "t", "tools": [] })).unwrap();
+        assert_eq!(task, "t");
+        assert!(
+            launch.tools.is_none(),
+            "tools: [] is malformed, not an allowlist (it would produce `--tools ''`)"
+        );
+        let (_, launch) =
+            dispatch_params(&json!({ "task": "t", "tools": ["read", "bash"] })).unwrap();
+        assert_eq!(
+            launch.tools.as_deref(),
+            Some(&["read".to_string(), "bash".to_string()][..])
+        );
+        let (_, launch) = dispatch_params(&json!({ "task": "t" })).unwrap();
+        assert!(launch.tools.is_none());
+    }
+
+    /// A `dispatch_subagent` frame with NO `task` gets `error: "invalid
+    /// params"` (and NO dispatch is spawned — no `subagent-session-started`
+    /// event). The server carries a real subagent manager (so the method is
+    /// reachable — a `None` manager would get the unknown-method response
+    /// instead).
+    #[tokio::test]
+    async fn a_dispatch_subagent_frame_without_a_task_gets_invalid_params() {
+        let sink = Arc::new(CapturingSink::default());
+        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
+        let last_seq = Arc::new(AtomicU64::new(0));
+        let (close_tx, _close_rx) = watch::channel(false);
+        let close_tx = Arc::new(close_tx);
+        // A real subagent manager (an empty config dir — no agents; the
+        // validation happens BEFORE any dispatch, so nothing is spawned).
+        let dir =
+            std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = crate::acp::subagent::SubagentSessionManager::new(dir.clone())
+            .expect("subagent manager should build");
+        let spawn = crate::acp::session::SubagentSpawn {
+            manager: Arc::new(manager),
+            parent_cwd: dir.clone(),
+            parent_agent_id: "fake".to_string(),
+        };
+
+        let (path, server_task) = spawn_server(
+            "sess-1".to_string(),
+            sink.clone(),
+            pending,
+            last_seq,
+            close_tx,
+            Duration::from_secs(30),
+            Some(spawn),
+        )
+        .await;
+        let mut client = connect_client(&path).await;
+        // A `dispatch_subagent` frame with NO `task` (the other params are
+        // present — only `task` is missing/invalid).
+        let frame = json!({
+            "v": 1, "type": "request", "id": "r-dispatch", "method": "dispatch_subagent",
+            "source": "main", "params": { "agentName": "fake", "model": null }
+        });
+        client
+            .write_all((frame.to_string() + "\n").as_bytes())
+            .await
+            .expect("write frame");
+        let _ = client.flush().await;
+        let mut response_line = String::new();
+        let _ = client.read_line(&mut response_line).await;
+        server_task.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
+        assert_eq!(
+            response.get("type").and_then(Value::as_str),
+            Some("response")
+        );
+        assert_eq!(
+            response.get("id").and_then(Value::as_str),
+            Some("r-dispatch")
+        );
+        assert_eq!(
+            response.get("error").and_then(Value::as_str),
+            Some("invalid params"),
+            "a missing `task` is rejected with `error: \"invalid params\"`"
+        );
+        // NO dispatch was spawned (no `subagent-session-started` event).
+        assert!(
+            sink.events_named("subagent-session-started").is_empty(),
+            "a rejected frame must not spawn a subagent dispatch"
+        );
+    }
+
+    /// A `dispatch_subagent` frame with an EMPTY `task` gets `error:
+    /// "invalid params"` (same rejection as a missing `task`).
+    #[tokio::test]
+    async fn a_dispatch_subagent_frame_with_an_empty_task_gets_invalid_params() {
+        let sink = Arc::new(CapturingSink::default());
+        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
+        let last_seq = Arc::new(AtomicU64::new(0));
+        let (close_tx, _close_rx) = watch::channel(false);
+        let close_tx = Arc::new(close_tx);
+        let dir =
+            std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = crate::acp::subagent::SubagentSessionManager::new(dir.clone())
+            .expect("subagent manager should build");
+        let spawn = crate::acp::session::SubagentSpawn {
+            manager: Arc::new(manager),
+            parent_cwd: dir.clone(),
+            parent_agent_id: "fake".to_string(),
+        };
+
+        let (path, server_task) = spawn_server(
+            "sess-1".to_string(),
+            sink.clone(),
+            pending,
+            last_seq,
+            close_tx,
+            Duration::from_secs(30),
+            Some(spawn),
+        )
+        .await;
+        let mut client = connect_client(&path).await;
+        let frame = json!({
+            "v": 1, "type": "request", "id": "r-dispatch-2", "method": "dispatch_subagent",
+            "source": "main", "params": { "agentName": "fake", "task": "" }
+        });
+        client
+            .write_all((frame.to_string() + "\n").as_bytes())
+            .await
+            .expect("write frame");
+        let _ = client.flush().await;
+        let mut response_line = String::new();
+        let _ = client.read_line(&mut response_line).await;
+        server_task.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
+        assert_eq!(
+            response.get("error").and_then(Value::as_str),
+            Some("invalid params"),
+            "an empty `task` is rejected with `error: \"invalid params\"`"
+        );
+        assert!(
+            sink.events_named("subagent-session-started").is_empty(),
+            "a rejected frame must not spawn a subagent dispatch"
         );
     }
 }

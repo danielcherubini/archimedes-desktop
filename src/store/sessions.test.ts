@@ -1,13 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   applySessionUpdate,
   autoSelectActive,
+  discardSessionMessages,
   finalizeSessionMessages,
   rowToMessages,
   spaceViewFor,
+  useSessions,
   type AcpSessionUpdate,
   type Message,
 } from "./sessions";
+import { useSubagents } from "./subagents";
 import type {
   CloseReasonStr,
   MessageRow,
@@ -430,6 +433,109 @@ describe("finalizeSessionMessages (session-closed cleanup)", () => {
       throw new Error("missing tool calls");
     expect(a.status).toBe("completed");
     expect(b.status).toBe("failed");
+  });
+});
+
+describe("discardSessionMessages (ephemeral subagent cleanup)", () => {
+  // The store is global — reset the subagent entries and transcripts the
+  // previous test may have left behind.
+  beforeEach(() => {
+    for (const id of Object.keys(useSubagents.getState().entries)) {
+      useSubagents.getState().dismiss(id);
+    }
+    useSessions.setState({ messages: {} });
+  });
+
+  it("deletes a closed subagent session's messages (ephemeral: no history to preserve)", () => {
+    useSubagents.getState().addSession({
+      sessionId: "sub1",
+      parentSessionId: "main1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "completed",
+    });
+    const sub: Message[] = [
+      { kind: "agent-text", messageId: "m1", text: "hi", at: 1 },
+      {
+        kind: "tool-call",
+        id: "t1",
+        title: "Bash",
+        status: "pending",
+        at: 1,
+      },
+    ];
+    const main: Message[] = [
+      { kind: "agent-text", messageId: "m2", text: "main", at: 1 },
+    ];
+    useSessions.setState({ messages: { sub1: sub, main1: main } });
+
+    useSessions.getState().handleSessionClosed("sub1", "user");
+    discardSessionMessages("sub1");
+    expect(useSessions.getState().messages["sub1"]).toBeUndefined();
+    // The MAIN session's transcript is kept (finalized by
+    // `handleSessionClosed`, NOT deleted — its history survives in the
+    // database and the in-memory record stays).
+    useSessions.getState().handleSessionClosed("main1", "user");
+    discardSessionMessages("main1");
+    expect(useSessions.getState().messages["main1"]).toEqual(
+      finalizeSessionMessages(main),
+    );
+  });
+
+  it("is a no-op for a main session id (no subagent entry)", () => {
+    const main: Message[] = [{ kind: "user", text: "hello", at: 1 }];
+    useSessions.setState({ messages: { main1: main } });
+    discardSessionMessages("main1");
+    expect(useSessions.getState().messages["main1"]).toEqual(main);
+  });
+
+  it("is a no-op when the subagent has no transcript yet", () => {
+    useSubagents.getState().addSession({
+      sessionId: "sub1",
+      parentSessionId: "main1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "running",
+    });
+    discardSessionMessages("sub1");
+    expect(useSessions.getState().messages).toEqual({});
+  });
+
+  it("deletes the transcript when the `subagent-closed` path runs `discardSessionMessages` + `markClosed` (the `listenSubagentClosed` handler's call sequence — the `session-closed`-beats-`subagent-session-started` ordering-race guarantee)", () => {
+    // WHY this exists: `subagent-session-started` is emitted by the
+    // WORKER task (after `drive_session` returns) while `session-closed`
+    // is emitted by the DRIVER task (after teardown) — different tasks.
+    // If the agent dies (or a cancel lands) immediately
+    // post-establishment, `session-closed` can beat `started`: the
+    // `session-closed` handler's `discardSessionMessages` no-ops (no
+    // subagent entry yet) while `handleSessionClosed` creates
+    // `messages[sid]`, and nothing else re-runs the discard — a small
+    // unreclaimed leak (at most a partial transcript) per occurrence.
+    // The `subagent-closed` handler therefore discards too: the entry
+    // exists from `started` (the worker task emits `started` before
+    // `subagent-closed` sequentially) and `running` entries are never
+    // evicted, so the discard-first order is deterministic. (Discard
+    // must run BEFORE `markClosed`: `markClosed` can evict this entry
+    // synchronously — the oldest of 21+ closed entries — and a discard
+    // running after would then no-op its guard.)
+    useSubagents.getState().addSession({
+      sessionId: "sub2",
+      parentSessionId: "main1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "running",
+    });
+    // `session-closed` beat `started` and created the transcript:
+    useSessions.setState({
+      messages: {
+        sub2: [{ kind: "agent-text", messageId: "m1", text: "partial", at: 1 }],
+      },
+    });
+    // The `listenSubagentClosed` handler's call sequence (App.tsx) —
+    // discard FIRST, then `markClosed`:
+    discardSessionMessages("sub2");
+    useSubagents.getState().markClosed("sub2", "failed", "died");
+    expect(useSessions.getState().messages["sub2"]).toBeUndefined();
   });
 });
 

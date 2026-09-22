@@ -6,6 +6,8 @@
 //! removed and a `session-closed` event with `reason: "agent-exited"` is
 //! emitted.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -14,7 +16,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{AcpError, EventSink, PermissionOutcome, SessionManager};
+use archimedes_desktop_lib::acp::{
+    AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager,
+};
 use archimedes_desktop_lib::storage::Db;
 
 /// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).
@@ -77,25 +81,17 @@ fn session_update_text(payload: &Value) -> Option<String> {
 }
 
 /// Find the pid of a running fake agent matching `pattern`, if any.
-fn find_fake_agent_pid(pattern: &Path) -> Option<i32> {
-    let out = std::process::Command::new("pgrep")
-        .args(["-f", pattern.to_string_lossy().as_ref()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .split_whitespace()
-        .next()
-        .and_then(|p| p.parse().ok())
+///
+/// A fast DIRECT `/proc` scan (no `pgrep` fork+exec, which is ~45 ms and whose
+/// fork can transiently fail under load) — see `common::proc_scan`.
+fn find_fake_agent_pid(pattern: &Path) -> Option<u32> {
+    common::proc_scan::ProcScan::new(pattern).find_pid()
 }
 
-fn kill_pid(pid: i32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status();
+/// SIGKILL `pid` (a direct `kill(2)` syscall — NO fork+exec of the `kill`
+/// binary, whose fork can transiently fail (EAGAIN) under load).
+fn kill_pid(pid: u32) {
+    common::proc_scan::kill_pid(pid);
 }
 
 /// Write an agents.json pointing at a specific (per-test) agent binary path.
@@ -133,15 +129,80 @@ fn unique_fake_agent(dir: &Path) -> PathBuf {
 
 /// Poll until the fake agent process is gone, or `timeout` elapses.
 /// Returns true if the process was reaped in time.
+///
+/// Uses a fast DIRECT `/proc` scan (no `pgrep` fork+exec) — the process under
+/// test lives only a few ms, so the observation must be fast. We POLL for the
+/// reap with a deadline (we WAIT for it, we don't sleep and hope). A zombie
+/// (killed but not yet reaped) reads as GONE (its `cmdline` is empty), the same
+/// as `pgrep`'s default skip-zombies behavior.
 fn wait_for_process_gone(pattern: &Path, timeout: Duration) -> bool {
+    let scan = common::proc_scan::ProcScan::new(pattern);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if find_fake_agent_pid(pattern).is_none() {
+        if !scan.alive() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    find_fake_agent_pid(pattern).is_none()
+    !scan.alive()
+}
+
+/// Call `op` (a `start_session` / `resume_session` future), RETRYING on a
+/// transient `SpawnFailed` until a non-`SpawnFailed` result or the deadline.
+/// Returns the first non-`SpawnFailed` result (an `Ok`, or a different error
+/// the caller is asserting on, e.g. `InitializeFailed` / `NotResumable`).
+///
+/// A `SpawnFailed` is retried because the agent binary was just copied to a
+/// known-good path, so the only realistic cause is a TRANSIENT OS refusal (the
+/// test process's `fork()` refusing under load — the machine is overcommitted).
+/// The spawn is idempotent (a fresh process each attempt; a failed spawn
+/// registers no session), so retrying is safe. A SUSTAINED failure (the
+/// deadline) returns the last error, so the test still fails loudly if the
+/// spawn genuinely can't succeed. This makes the test DETERMINISTIC: it waits
+/// for a successful spawn instead of hoping the first attempt succeeds.
+async fn retry_on_spawn_failed<T, F, Fut>(deadline: Duration, mut op: F) -> Result<T, AcpError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AcpError>>,
+{
+    let end = Instant::now() + deadline;
+    loop {
+        match op().await {
+            Err(AcpError::SpawnFailed { .. }) if Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `start_session`, retrying a transient `SpawnFailed` (see
+/// `retry_on_spawn_failed`).
+async fn start_retrying(
+    manager: &SessionManager,
+    agent_id: &str,
+    cwd: PathBuf,
+    sink: &Arc<dyn EventSink>,
+) -> Result<SessionInfo, AcpError> {
+    retry_on_spawn_failed(Duration::from_secs(20), || {
+        manager.start_session(agent_id, cwd.clone(), sink)
+    })
+    .await
+}
+
+/// `resume_session`, retrying a transient `SpawnFailed` (see
+/// `retry_on_spawn_failed`).
+async fn resume_retrying(
+    manager: &SessionManager,
+    agent_id: &str,
+    session_id: &str,
+    cwd: PathBuf,
+    sink: &Arc<dyn EventSink>,
+) -> Result<SessionInfo, AcpError> {
+    retry_on_spawn_failed(Duration::from_secs(20), || {
+        manager.resume_session(agent_id, session_id, cwd.clone(), sink)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +222,7 @@ async fn full_session_flow_streams_and_cleans_up() {
     let cwd = config_dir.clone();
 
     // 1. Start the session (initialize + session/new).
-    let info = manager
-        .start_session("fake", cwd, &sink)
+    let info = start_retrying(&manager, "fake", cwd, &sink)
         .await
         .expect("start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
@@ -223,8 +283,7 @@ async fn resume_session_round_trips_the_session_id() {
 
     // Resume the stored session id. The fake agent in `resume` mode
     // advertises `loadSession: true` and answers `session/load`.
-    let info = manager
-        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+    let info = resume_retrying(&manager, "fake", FAKE_SESSION_ID, cwd, &sink)
         .await
         .expect("resume_session should succeed");
     assert_eq!(
@@ -288,9 +347,12 @@ async fn establishment_times_out_when_the_agent_hangs() {
 
     // The agent answers `initialize` but never answers `session/new` —
     // establishment must time out instead of hanging forever.
+    // (The inner `start_session` retries a transient `SpawnFailed`; its 20 s
+    // retry deadline is inside the 30 s outer timeout, so the outer guard
+    // still bounds the whole thing.)
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        manager.start_session("fake", cwd, &sink),
+        start_retrying(&manager, "fake", cwd, &sink),
     )
     .await
     .expect("start_session must not hang past the establishment timeout");
@@ -324,8 +386,7 @@ async fn resume_replaces_stored_transcript() {
     let cwd = config_dir.clone();
 
     // 1. Start the session and populate the stored transcript.
-    manager
-        .start_session("fake", cwd.clone(), &sink)
+    start_retrying(&manager, "fake", cwd.clone(), &sink)
         .await
         .expect("start_session should succeed");
     manager
@@ -353,8 +414,7 @@ async fn resume_replaces_stored_transcript() {
     // 2. Resume. The fake agent replays one chunk (`m1`: "resumed") on
     //    load — the stored transcript must be REPLACED by it, not
     //    duplicated (no stale `hello world` row, no duplicate `m1` row).
-    manager
-        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+    resume_retrying(&manager, "fake", FAKE_SESSION_ID, cwd, &sink)
         .await
         .expect("resume_session should succeed");
 
@@ -496,16 +556,14 @@ async fn one_live_supersede_policy() {
     );
 
     // 2. The first session starts and is the only live session.
-    manager
-        .start_session("l1", cwd_a.clone(), &sink)
+    start_retrying(&manager, "l1", cwd_a.clone(), &sink)
         .await
         .expect("start_session l1 should succeed");
     assert_eq!(manager.session_count().await, 1);
 
     // 3. A second live session starts: it supersedes s1 (an async flag send
     //    — the teardown runs concurrently in s1's driver task).
-    manager
-        .start_session("l2", cwd_b.clone(), &sink)
+    start_retrying(&manager, "l2", cwd_b.clone(), &sink)
         .await
         .expect("start_session l2 should succeed");
     // Do NOT assert the count right here: s2 is already in the map and s1's
@@ -549,15 +607,13 @@ async fn one_live_supersede_policy() {
     // 8. A superseded session is re-resumable (loadSession is true in the
     //    `resume` mode); step 7 closed everything, so this takes the policy's
     //    no-op branch and s1 establishes cleanly.
-    manager
-        .resume_session("l1", "s1", cwd_a, &sink)
+    resume_retrying(&manager, "l1", "s1", cwd_a, &sink)
         .await
         .expect("resume_session s1 should succeed after a supersede");
     assert_eq!(manager.session_count().await, 1);
 
     // 9. `start_session` supersedes a *resumed* session too.
-    manager
-        .start_session("l2", cwd_b.clone(), &sink)
+    start_retrying(&manager, "l2", cwd_b.clone(), &sink)
         .await
         .expect("start_session l2 should succeed (again)");
     wait_for_closed(&rx, "s1", "replaced").await;
@@ -628,8 +684,7 @@ async fn resume_without_load_session_is_not_resumable() {
     let manager = SessionManager::new(config_dir.clone()).unwrap();
     let cwd = config_dir.clone();
 
-    let err = manager
-        .resume_session("fake", FAKE_SESSION_ID, cwd, &sink)
+    let err = resume_retrying(&manager, "fake", FAKE_SESSION_ID, cwd, &sink)
         .await
         .expect_err("resume should fail: the agent does not advertise load_session");
     assert!(
@@ -664,8 +719,7 @@ async fn transcript_is_persisted_with_upsert_semantics() {
     manager.attach_db(db.clone());
 
     let cwd = config_dir.clone();
-    let info = manager
-        .start_session("fake", cwd, &sink)
+    let info = start_retrying(&manager, "fake", cwd, &sink)
         .await
         .expect("start_session should succeed");
     manager
@@ -732,8 +786,7 @@ async fn agent_death_produces_session_closed() {
     let manager = SessionManager::new(config_dir.clone()).unwrap();
     let cwd = config_dir.clone();
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
+    let info = start_retrying(&manager, "fake", cwd, &sink)
         .await
         .expect("start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
@@ -767,8 +820,7 @@ async fn permission_round_trip_is_answerable_and_nonblocking() {
     let manager = Arc::new(SessionManager::new(config_dir.clone()).unwrap());
     let cwd = config_dir.clone();
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
+    let info = start_retrying(&manager, "fake", cwd, &sink)
         .await
         .expect("start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);

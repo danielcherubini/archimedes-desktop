@@ -81,8 +81,12 @@ impl ClosedReason {
 
 /// How a live session was (or was about to be) closed. `None` at
 /// teardown time means the agent process exited on its own.
-#[derive(Debug, Clone, Copy)]
-enum CloseKind {
+///
+/// `pub(crate)`: the `ExternalClose` handle (the subagent cancel path) and
+/// `SubagentCancel` (subagent.rs) carry a `CloseKind` across the module
+/// boundary, so it must be visible to the whole crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseKind {
     /// An explicit user close (`close_session`).
     User,
     /// Closed because another session started (one-live policy, ADR 0002).
@@ -109,52 +113,570 @@ pub struct SessionInfo {
 ///
 /// `session_id`, `cwd`, and `agent_id` are carried for diagnostics and for
 /// resume; they are not read by the prompt path.
+///
+/// `pub(crate)` + `pub(crate)` fields: `subagent.rs` reads `driver.sessions`
+/// entries (to clone the `cx` for the subagent's task prompt), so the
+/// struct and its fields are visible to the whole crate.
 #[derive(Debug)]
 #[allow(dead_code)]
-struct LiveSession {
+pub(crate) struct LiveSession {
     /// Cheap clone of the connection, shared with the driver task.
-    cx: ConnectionTo<Agent>,
-    session_id: SessionId,
-    cwd: PathBuf,
-    agent_id: String,
+    pub(crate) cx: ConnectionTo<Agent>,
+    pub(crate) session_id: SessionId,
+    pub(crate) cwd: PathBuf,
+    pub(crate) agent_id: String,
     /// Set to `true` to make the driver task's closure return, tearing down
     /// the connection (and the agent's process group on Unix).
-    close_tx: watch::Sender<bool>,
+    ///
+    /// For a subagent session this IS the `ExternalClose`'s sender (a cancel
+    /// flips it); for a main session it is the driver's internal flag.
+    pub(crate) close_tx: watch::Sender<bool>,
     /// The close kind, decided by `close_session` / `supersede_live_sessions`
     /// (first-set-wins) and read by the driver task once `connect_with`
-    /// returns.
-    close_kind: Arc<StdMutex<Option<CloseKind>>>,
+    /// returns. For a subagent session this IS the `ExternalClose`'s kind.
+    pub(crate) close_kind: Arc<StdMutex<Option<CloseKind>>>,
 }
 
 /// One live session's close plumbing: the flag sender (cheap) and the
 /// shared close kind set by closers when they supersede/close it.
 type LiveClose = (watch::Sender<bool>, Arc<StdMutex<Option<CloseKind>>>);
 
-/// Manages all live ACP sessions.
+/// The external-close handle: the subagent cancel path (main sessions pass
+/// `None` to `drive_session`).
+///
+/// The dispatch worker task owns the `tx` + `kind` (it is handed to the
+/// caller as a [`SubagentCancel`]); the driver task keeps the `rx` and
+/// SELECTS on it in BOTH the establish phase and the block-until-close
+/// phase (so a cancel during the 30 s establish window is honored, not
+/// deferred), and reads the `kind` (INSTEAD of its own internal kind) for
+/// the close reason (one kind, first-set-wins across the whole session).
+/// The `tx` is also handed to the subagent's bridge listener, so a cancel
+/// cancels the subagent's in-flight `ask` waiters via their `close_rx` arm.
+#[derive(Clone)]
+pub(crate) struct ExternalClose {
+    /// The close flag sender (the `SubagentCancel` flips it; the bridge
+    /// listener observes it; the driver task selects on its receiver).
+    pub(crate) tx: watch::Sender<bool>,
+    /// The close flag receiver the driver task selects on.
+    pub(crate) rx: watch::Receiver<bool>,
+    /// The close kind (first-set-wins): the `SubagentCancel` sets it `User`
+    /// before flipping the flag; the driver task reads it for the reason.
+    pub(crate) kind: Arc<StdMutex<Option<CloseKind>>>,
+}
+
+/// A cheap, `'static`-safe handle to the subagent dispatch (the `Arc` is
+/// NOT a `&` — `ConnCtx` is moved into `tokio::spawn` and must be `'static`).
+///
+/// The parent session's bridge listener carries one so it can service
+/// `dispatch_subagent` frames: `manager` is the `SubagentSessionManager`,
+/// `parent_cwd` is the parent's Space folder (the subagent's cwd + fs
+/// sandbox root), `parent_agent_id` is the parent's registry agent id (the
+/// subagent spawns the SAME registry entry as the parent — the built-in
+/// `pi` entry in production).
+#[derive(Clone)]
+pub struct SubagentSpawn {
+    pub manager: Arc<crate::acp::subagent::SubagentSessionManager>,
+    pub parent_cwd: PathBuf,
+    pub parent_agent_id: String,
+}
+
+/// The shared session-driver state. `SessionManager` (main sessions) and
+/// `SubagentSessionManager` (worker runtime) each own one.
+///
+/// Holds the live-session map, the pending-request maps, the establish
+/// timeout, and the per-manager policy knobs (persistence, the in-memory
+/// text/cost captures, and the subagent dispatch handle). `drive_session`
+/// (the shared driver) is a method on this struct.
+pub struct SessionDriver {
+    pub(crate) sessions: Arc<Mutex<HashMap<SessionId, LiveSession>>>,
+    pub(crate) pending_permissions: PendingPermissions,
+    pub(crate) pending_bridge: PendingBridge,
+    /// How long the establishment phase (agent spawn + `initialize` +
+    /// `session/new` or `session/load`) may run before it is cancelled.
+    /// Default: 30 s.
+    pub(crate) establish_timeout: Duration,
+    /// Persistence (main only; `None` for subagents — ephemeral, not stored).
+    pub(crate) db: Option<Arc<Db>>,
+    /// In-memory per-`messageId` agent-text accumulator for the FINAL
+    /// OUTPUT (subagents only; `None` for main — main persists to the DB).
+    pub(crate) text_capture: Option<Arc<StdMutex<HashMap<String, String>>>>,
+    /// The last-seen `messageId` (updated for EVERY `agent_message_chunk`,
+    /// alongside `text_capture`): a plain `HashMap` has no insertion order,
+    /// so the "last message" is tracked separately, not derived from
+    /// iteration order.
+    pub(crate) last_message_id: Option<Arc<StdMutex<Option<String>>>>,
+    /// Last `cost_update` push payload (subagents only; `None` for main).
+    pub(crate) cost_capture: Option<Arc<StdMutex<Option<Value>>>>,
+    /// The subagent dispatch handle (main manager only — `Some`); `None`
+    /// for the subagent manager itself (subagents cannot dispatch
+    /// subagents — the tool is excluded from their spawn).
+    pub(crate) subagent: Option<Arc<crate::acp::subagent::SubagentSessionManager>>,
+}
+
+impl SessionDriver {
+    /// Create a driver (a fresh sessions map, empty pending maps, a 30 s
+    /// establish timeout, no persistence / captures / subagent handle).
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            pending_bridge: Arc::new(Mutex::new(HashMap::new())),
+            establish_timeout: Duration::from_secs(30),
+            db: None,
+            text_capture: None,
+            last_message_id: None,
+            cost_capture: None,
+            subagent: None,
+        }
+    }
+
+    /// Shared driver: spawn the agent, register the client-side backends,
+    /// run the *establisher* (initialize + `session/new` or `session/load`),
+    /// then block until the session closes.
+    ///
+    /// `establish` receives the fresh connection and must return the
+    /// established `(session_id, SessionInfo)`. On failure it must return
+    /// `Err` — the error is mapped to an [`AcpError`] (a
+    /// "does not support session/load" marker becomes
+    /// [`AcpError::NotResumable`]).
+    ///
+    /// `external_close` (subagents only; `None` for main) is the cancel
+    /// path: the driver task selects on its receiver in BOTH the establish
+    /// phase and the block-until-close phase, and reads its `kind` (instead
+    /// of the internal kind) for the close reason (one kind, first-set-wins
+    /// across the whole session).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn drive_session<F, Fut>(
+        &self,
+        agent: AcpAgent,
+        agent_id: &str,
+        hint: String,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+        bridge_setup: Option<(String, PathBuf)>,
+        external_close: Option<ExternalClose>,
+        establish: F,
+    ) -> Result<SessionInfo, AcpError>
+    where
+        F: FnOnce(ConnectionTo<Agent>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(SessionId, SessionInfo), ProtocolError>> + Send + 'static,
+    {
+        // Split the external close (the subagent cancel path): the driver
+        // task selects on `rx` (establish + block phases) and reads `kind`
+        // for the reason; the bridge listener observes `tx` (a cancel also
+        // cancels in-flight `ask` waiters). `None` for main sessions.
+        let (ec_tx, ec_rx, ec_kind) = match external_close {
+            Some(ec) => (Some(ec.tx), Some(ec.rx), Some(ec.kind)),
+            None => (None, None, None),
+        };
+
+        // Channels that carry values out of the (long-lived) closure.
+        let (ready_tx, ready_rx) = oneshot::channel::<ConnectionTo<Agent>>();
+        let (session_ready_tx, session_ready_rx) = oneshot::channel::<SessionInfo>();
+        let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
+        let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
+        let (close_tx, close_rx) = watch::channel(false);
+        // The internal close kind (main sessions). The driver reads the
+        // external kind INSTEAD when `external_close` is present (one kind,
+        // first-set-wins across the whole session). `None` means the agent
+        // process exited on its own (the close flag alone cannot carry the
+        // reason: on a user close the agent process may notice the EOF and
+        // exit first, so the reason must be decided by whoever closed).
+        let internal_kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
+        let kind: Arc<StdMutex<Option<CloseKind>>> =
+            ec_kind.clone().unwrap_or_else(|| internal_kind.clone());
+        // A clone for the driver task (held by the task until AFTER its kind
+        // read below); the original moves into the `LiveSession` value.
+        let kind_for_task = kind.clone();
+        // The close flag the bridge listener observes: the external close's
+        // sender (subagents — a cancel cancels in-flight `ask` waiters),
+        // else the driver's internal flag (main sessions).
+        let listener_close_tx: &watch::Sender<bool> = ec_tx.as_ref().unwrap_or(&close_tx);
+
+        // Bridge listener (ADR 0003): started BEFORE the driver task spawns
+        // (the push retry window is only ~2 s). The anchor is the desktop's
+        // own pid (`std::process::id()`, always alive). The driver-task
+        // `close_tx` is passed so a session close cancels every in-flight
+        // bridge request. `None` for non-bridge agents / macOS (fail-closed).
+        let bridge_handle = match bridge_setup {
+            Some((client_session_id, socket_path)) => {
+                // The subagent dispatch handle (main only — `Some`): the
+                // main session's listener services `dispatch_subagent`
+                // frames. Built from the driver's `subagent` handle + the
+                // session's `cwd` + `agent_id` (all in scope).
+                let subagent_spawn = self.subagent.clone().map(|m| SubagentSpawn {
+                    manager: m,
+                    parent_cwd: cwd.clone(),
+                    parent_agent_id: agent_id.to_string(),
+                });
+                let cost_capture = self.cost_capture.clone();
+                Some(
+                    bridge::start_listener(
+                        client_session_id,
+                        &socket_path,
+                        std::process::id(),
+                        sink.clone(),
+                        self.pending_bridge.clone(),
+                        listener_close_tx,
+                        bridge::DEFAULT_BRIDGE_TIMEOUT,
+                        subagent_spawn,
+                        cost_capture,
+                    )
+                    .await
+                    .map_err(|e| AcpError::SpawnFailed {
+                        hint: format!("bridge listener: {e}"),
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        // Per-session transcript accumulators for the persistence hook.
+        let agent_text_acc: Arc<StdMutex<HashMap<String, String>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let tool_call_state: Arc<StdMutex<HashMap<String, Value>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
+        let sessions_arc = self.sessions.clone();
+        let pending_permissions_arc = self.pending_permissions.clone();
+        let pending_bridge_arc = self.pending_bridge.clone();
+        let establish_timeout = self.establish_timeout;
+        let db = self.db.clone();
+        // The capture hooks (subagents only; `None` for main). Clones for
+        // the `connect_with` notification handler.
+        let text_capture = self.text_capture.clone();
+        let last_message_id = self.last_message_id.clone();
+        let sink = sink.clone();
+        let notify_sink = sink.clone();
+        let cwd_owned = cwd.clone();
+        // The external close's receiver for the driver task (cloned per
+        // select phase — a `None` receiver is inert).
+        let ec_rx_task = ec_rx;
+
+        // SPAWN the connection as a driver task. `connect_with` only resolves
+        // when the closure returns (i.e. at session close), so it must never
+        // be awaited inline here.
+        tokio::spawn(async move {
+            // Client-side backends for this session.
+            let fs_backend = FsBackend {
+                root: cwd_owned.clone(),
+            };
+
+            // Cheap clones so each handler closure can own its copy.
+            let fs_read = fs_backend.clone();
+            let fs_write = fs_backend.clone();
+            let perm_sink = sink.clone();
+            let perm_pp = pending_permissions_arc.clone();
+            // A clone for the `connect_with` closure (to call `set_session_id`
+            // once the ACP id is known); the original `bridge_handle` stays
+            // here for the unconditional `teardown` in the cleanup below.
+            let bridge_handle_cx = bridge_handle.clone();
+
+            let builder = Client
+                .builder()
+                .name("archimedes-desktop")
+                .on_receive_notification(
+                    async move |notif: SessionNotification, _cx: ConnectionTo<Agent>| {
+                        let payload = serde_json::to_value(&notif.update).unwrap_or(Value::Null);
+                        let frame = serde_json::json!({
+                            "sessionId": notif.session_id.to_string(),
+                            "update": payload,
+                        });
+                        notify_sink.emit("session-update", frame);
+
+                        // The client owns history: upsert the transcript row
+                        // as the update streams in.
+                        if let Some(db) = &db {
+                            persist_update(
+                                db,
+                                &notif.session_id.to_string(),
+                                &notif.update,
+                                &agent_text_acc,
+                                &tool_call_state,
+                            );
+                        }
+                        // (a) Capture the agent text for the FINAL OUTPUT
+                        // (subagents only; `None` for main — main persists
+                        // to the DB). A plain `HashMap` has no insertion
+                        // order, so the "last message" is tracked separately
+                        // (`last_message_id`), not derived from iteration.
+                        // The capture locks are TOLERANT of a poisoned
+                        // mutex (`into_inner` — a poisoned capture degrades
+                        // to its last good state, not a panic: a panic here
+                        // would chain into the driver task, and on a
+                        // subagent dispatch into a dropped oneshot — a
+                        // crash silently reported as a "cancelled" dispatch).
+                        if let Some(tc) = &text_capture {
+                            if let SessionUpdate::AgentMessageChunk(chunk) = &notif.update {
+                                if let ContentBlock::Text(text) = &chunk.content {
+                                    if !text.text.is_empty() {
+                                        let key = chunk
+                                            .message_id
+                                            .as_ref()
+                                            .map(|m| m.to_string())
+                                            .unwrap_or_else(|| "default".to_string());
+                                        let mut acc = tc.lock().unwrap_or_else(|p| p.into_inner());
+                                        acc.entry(key.clone()).or_default().push_str(&text.text);
+                                        if let Some(lmi) = &last_message_id {
+                                            *lmi.lock().unwrap_or_else(|p| p.into_inner()) =
+                                                Some(key);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_notification!(),
+                )
+                .on_receive_request(
+                    async move |req: ReadTextFileRequest,
+                                responder: Responder<ReadTextFileResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        match fs_read.read(&req.path) {
+                            Ok(content) => {
+                                responder.respond(ReadTextFileResponse::new(content))?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_internal_error(e.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: WriteTextFileRequest,
+                                responder: Responder<WriteTextFileResponse>,
+                                _cx: ConnectionTo<Agent>| {
+                        match fs_write.write(&req.path, &req.content) {
+                            Ok(()) => {
+                                responder.respond(WriteTextFileResponse::new())?;
+                            }
+                            Err(e) => {
+                                responder.respond_with_internal_error(e.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: RequestPermissionRequest,
+                                responder: Responder<RequestPermissionResponse>,
+                                cx: ConnectionTo<Agent>| {
+                        permission::handle_permission_request(
+                            &req, responder, &cx, &perm_sink, &perm_pp,
+                        )
+                        .await;
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                );
+
+            let _ = builder
+                .connect_with(agent, |cx: ConnectionTo<Agent>| async move {
+                    // Hand the connection to the manager so it can send prompts.
+                    let cx2 = cx.clone();
+                    ready_tx.send(cx2).ok();
+
+                    // Establish the session (initialize + session/new for a
+                    // new session, initialize + session/load for a resume).
+                    // Bounded + external-close aware: a cancel during the
+                    // establish window is honored (not deferred to the
+                    // timeout).
+                    let timeout_detail = format!(
+                        "agent did not answer initialize within {}s",
+                        establish_timeout.as_secs()
+                    );
+                    let mut establish_rx = ec_rx_task.clone();
+                    let established = tokio::select! {
+                        r = tokio::time::timeout(establish_timeout, establish(cx.clone())) => {
+                            match r {
+                                Ok(Ok(e)) => Some(e),
+                                Ok(Err(err)) => {
+                                    // Report the failure to the awaiting
+                                    // command, then tear the connection down.
+                                    error_tx.send(err).ok();
+                                    None
+                                }
+                                Err(_) => {
+                                    // The detail text doubles as the mapping
+                                    // marker in `map_establish_error`.
+                                    let timeout_err =
+                                        agent_client_protocol::util::internal_error(&timeout_detail);
+                                    error_tx.send(timeout_err).ok();
+                                    None
+                                }
+                            }
+                        }
+                        // A cancel during the establish window is honored
+                        // (not deferred to the timeout); a `None` receiver
+                        // is inert (main sessions).
+                        _ = changed_or_inert(&mut establish_rx) => None,
+                    };
+                    let (session_id, info) = match established {
+                        Some(e) => e,
+                        None => return Ok(()),
+                    };
+
+                    session_id_tx.send(session_id.clone()).ok();
+                    session_ready_tx.send(info).ok();
+
+                    // Hand the ACP `session_id` to the bridge handle so
+                    // `bridge-request`/`bridge-event` payloads carry the ACP
+                    // id (bridge requests only occur mid-turn, after
+                    // establish, so they always carry the ACP id).
+                    if let Some(h) = &bridge_handle_cx {
+                        h.set_session_id(&session_id.to_string()).await;
+                    }
+
+                    // BLOCK until close_session OR agent death OR the
+                    // external close. A clean incoming EOF does NOT cancel
+                    // main_fn, so select on all three.
+                    let mut block_rx = ec_rx_task.clone();
+                    // The internal close flag is inert for SUBAGENTS (the
+                    // external close is their cancel path — the internal
+                    // sender is dropped, and a dropped sender's `changed()`
+                    // resolves immediately, which would tear the session
+                    // down right after establishment).
+                    let mut internal_rx = ec_rx_task.is_none().then_some(close_rx);
+                    tokio::select! {
+                        // The close kind was set by the closer before the
+                        // flag send and read by the task after this returns;
+                        // the closure itself does not decide the reason.
+                        _ = changed_or_inert(&mut internal_rx) => {}
+                        // Agent exited; the kind stays whatever the closer
+                        // (if any) already set — `None` means the agent
+                        // process exited on its own.
+                        _ = cx.incoming_closed() => {}
+                        // The external close (subagent cancel); a `None`
+                        // receiver is inert (main sessions).
+                        _ = changed_or_inert(&mut block_rx) => {}
+                    }
+                    Ok(())
+                })
+                .await;
+
+            // Connection returned (closed, agent died, or error): clean up.
+            // The reason comes from the close kind the closer recorded: a
+            // kind set before the flag send wins; `None` means the agent
+            // process exited on its own and nobody closed it.
+            let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
+            let reason = match kind {
+                Some(CloseKind::User) => ClosedReason::User,
+                Some(CloseKind::Replaced) => ClosedReason::Replaced,
+                None => ClosedReason::AgentExited,
+            };
+            if let Ok(session_id) = session_id_rx.await {
+                sessions_arc.lock().await.remove(&session_id);
+                // Keys are `"{session_id}/{request_id}"` — match on the
+                // trailing-slash prefix so closing "s1" does not cancel
+                // the pending prompt of the longer session "s10".
+                let prefix = permission::session_key_prefix(&session_id.to_string());
+                pending_permissions_arc
+                    .lock()
+                    .await
+                    .retain(|key, _| !key.starts_with(&prefix));
+                // Drain this session's pending bridge requests too (dropping
+                // the senders cancels the spawned waiters, which write the
+                // terminal `error:"cancelled"` frame). The `session_id` is
+                // only known here, so this drain is nested in the guard.
+                let bridge_prefix = bridge::session_key_prefix(&session_id.to_string());
+                pending_bridge_arc
+                    .lock()
+                    .await
+                    .retain(|key, _| !key.starts_with(&bridge_prefix));
+                sink.emit(
+                    "session-closed",
+                    serde_json::json!({
+                        "sessionId": session_id.to_string(),
+                        "reason": reason.as_str(),
+                    }),
+                );
+            }
+            // Tear the bridge listener down UNCONDITIONALLY (do NOT nest it
+            // inside the `session_id` guard, or a failed `connect_with` /
+            // `session/new` would leak the listener): stop the accept loop +
+            // unlink the socket (Unix; Windows pipes vanish on last close).
+            bridge::teardown(bridge_handle);
+        });
+
+        // Await the connection, then the established session.
+        let cx = ready_rx
+            .await
+            .map_err(|_| AcpError::SpawnFailed { hint: hint.clone() })?;
+        let info = match session_ready_rx.await {
+            Ok(info) => info,
+            Err(_) => {
+                // The closure never delivered an established session: either
+                // the establisher failed (it sent the error first) or the
+                // connection died mid-establish.
+                match error_rx.try_recv() {
+                    Ok(err) => return Err(map_establish_error(agent_id, err)),
+                    Err(_) => {
+                        return Err(AcpError::InitializeFailed {
+                            detail: "agent did not complete initialize/session-new".to_string(),
+                        })
+                    }
+                }
+            }
+        };
+
+        let live = LiveSession {
+            cx,
+            session_id: info.session_id.clone(),
+            cwd,
+            agent_id: agent_id.to_string(),
+            close_tx: ec_tx.unwrap_or_else(|| close_tx.clone()),
+            close_kind: kind,
+        };
+        self.sessions
+            .lock()
+            .await
+            .insert(info.session_id.clone(), live);
+
+        Ok(info)
+    }
+}
+
+/// A future that resolves when the (optional) close receiver's value
+/// changes; inert (never resolves) when `None` — so a session with no such
+/// receiver is unaffected by the select arm. Used for BOTH the internal-close
+/// arm and the external-close arm:
+///
+/// - the EXTERNAL arm is `None` for a MAIN session (no external close — the
+///   `None` receiver is inert, so the select arm never fires);
+/// - the INTERNAL arm is `None` for a SUBAGENT session (its internal sender
+///   is dropped — the `LiveSession` holds the external one — and a dropped
+///   sender's `changed()` resolves immediately, which would tear the session
+///   down right after establishment).
+async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
+    match rx {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Manages all live ACP sessions (the MAIN sessions).
+///
+/// Owns a [`SessionDriver`] (db: attached via [`Self::attach_db`],
+/// captures: `None`, subagent: injected via [`Self::set_subagent_manager`])
+/// plus the agent registry + config dir. The one-live policy, DB
+/// recording, and `record_session` stay here; the shared driver
+/// (`drive_session`) is delegated to.
 ///
 /// `Sync` — the mutable state is `Arc<Mutex<…>>` internally, so the
 /// manager is managed directly (no outer lock); each method locks only
 /// its own internal maps, briefly.
 pub struct SessionManager {
-    /// Shared with driver tasks (the `Arc` is cloned into each `tokio::spawn`).
-    sessions: Arc<Mutex<HashMap<SessionId, LiveSession>>>,
-    /// Pending permission requests, keyed by `"{session_id}/{request_id}"`.
-    /// Populated by the permission bridge (Task 3); the driver-task cleanup
-    /// drains all entries for a closing session.
-    pending_permissions: PendingPermissions,
-    /// Pending bridge requests, keyed by `"{session_id}/{request_id}"` (the
-    /// `permission` convention). Populated by the bridge listener (Task 4);
-    /// the driver-task cleanup drains all entries for a closing session.
-    pending_bridge: PendingBridge,
+    driver: SessionDriver,
     registry: Registry,
     config_dir: PathBuf,
-    /// The app's SQLite database (Task 5); `None` in tests that do not
-    /// attach one.
-    db: Option<Arc<Db>>,
-    /// How long the establishment phase (agent spawn + `initialize` +
-    /// `session/new` or `session/load`) may run before it is cancelled.
-    /// Default: 30 s.
-    establish_timeout: Duration,
 }
 
 impl SessionManager {
@@ -162,25 +684,30 @@ impl SessionManager {
     pub fn new(config_dir: PathBuf) -> Result<Self, ConfigError> {
         let registry = Registry::load(&config_dir)?;
         Ok(Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
-            pending_bridge: Arc::new(Mutex::new(HashMap::new())),
+            driver: SessionDriver::new(),
             registry,
             config_dir,
-            db: None,
-            establish_timeout: Duration::from_secs(30),
         })
     }
 
     /// Attach the persistence database. Persistence is a no-op without it.
     pub fn attach_db(&mut self, db: Arc<Db>) {
-        self.db = Some(db);
+        self.driver.db = Some(db);
     }
 
     /// Override the establishment timeout (default 30 s; tests shrink it
     /// so a hanging agent does not make them wait).
     pub fn set_establish_timeout(&mut self, timeout: Duration) {
-        self.establish_timeout = timeout;
+        self.driver.establish_timeout = timeout;
+    }
+
+    /// Inject the subagent manager (main only — sets the driver's
+    /// `subagent` handle so the main session's bridge listener can service
+    /// `dispatch_subagent` frames). The subagent manager needs nothing from
+    /// the main manager; only this field points at it (intra-crate type
+    /// cycles are fine in Rust).
+    pub fn set_subagent_manager(&mut self, m: Arc<crate::acp::subagent::SubagentSessionManager>) {
+        self.driver.subagent = Some(m);
     }
 
     /// The configured config directory (useful for tests and diagnostics).
@@ -196,7 +723,8 @@ impl SessionManager {
     /// request.
     pub async fn connection(&self, session_id: &str) -> Result<ConnectionTo<Agent>, AcpError> {
         let sid = SessionId::new(session_id);
-        self.sessions
+        self.driver
+            .sessions
             .lock()
             .await
             .get(&sid)
@@ -208,7 +736,7 @@ impl SessionManager {
 
     /// Number of live sessions.
     pub async fn session_count(&self) -> usize {
-        self.sessions.lock().await.len()
+        self.driver.sessions.lock().await.len()
     }
 
     /// The configured agents (consumed by the `list_agents` command).
@@ -227,6 +755,7 @@ impl SessionManager {
         // be, because the kind mutex is always unlocked when touched and
         // exports no references into the map.
         let live: Vec<LiveClose> = self
+            .driver
             .sessions
             .lock()
             .await
@@ -248,7 +777,7 @@ impl SessionManager {
 
     /// Record a session in the persistence layer (no-op without a database).
     fn record_session(&self, info: &SessionInfo) {
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.driver.db {
             let _ = db.record_session(info);
             // A start/resume updates or creates the space row (and `resume`
             // re-touches `last_opened_at`): a space is born/touched when a
@@ -309,6 +838,7 @@ impl SessionManager {
         let cwd_owned = cwd.clone();
 
         let info = self
+            .driver
             .drive_session(
                 agent,
                 agent_id,
@@ -316,6 +846,7 @@ impl SessionManager {
                 cwd,
                 sink,
                 bridge_setup,
+                None,
                 move |cx| async move {
                     let init = cx
                         .send_request(
@@ -410,9 +941,10 @@ impl SessionManager {
         let sid = SessionId::new(session_id);
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
-        let db = self.db.clone();
+        let db = self.driver.db.clone();
 
         let info = self
+            .driver
             .drive_session(
                 agent,
                 agent_id,
@@ -420,6 +952,7 @@ impl SessionManager {
                 cwd,
                 sink,
                 bridge_setup,
+                None,
                 move |cx| async move {
                     let init = cx
                         .send_request(
@@ -475,323 +1008,6 @@ impl SessionManager {
         Ok(info)
     }
 
-    /// Shared driver: spawn the agent, register the client-side backends,
-    /// run the *establisher* (initialize + `session/new` or `session/load`),
-    /// then block until the session closes.
-    ///
-    /// `establish` receives the fresh connection and must return the
-    /// established `(session_id, SessionInfo)`. On failure it must return
-    /// `Err` — the error is mapped to an [`AcpError`] (a
-    /// "does not support session/load" marker becomes
-    /// [`AcpError::NotResumable`]).
-    #[allow(clippy::too_many_arguments)]
-    async fn drive_session<F, Fut>(
-        &self,
-        agent: AcpAgent,
-        agent_id: &str,
-        hint: String,
-        cwd: PathBuf,
-        sink: &Arc<dyn EventSink>,
-        bridge_setup: Option<(String, PathBuf)>,
-        establish: F,
-    ) -> Result<SessionInfo, AcpError>
-    where
-        F: FnOnce(ConnectionTo<Agent>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(SessionId, SessionInfo), ProtocolError>> + Send + 'static,
-    {
-        // Channels that carry values out of the (long-lived) closure.
-        let (ready_tx, ready_rx) = oneshot::channel::<ConnectionTo<Agent>>();
-        let (session_ready_tx, session_ready_rx) = oneshot::channel::<SessionInfo>();
-        let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
-        let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
-        let (close_tx, mut close_rx) = watch::channel(false);
-        // Bridge listener (ADR 0003): started BEFORE the driver task spawns
-        // (the push retry window is only ~2 s). The anchor is the desktop's
-        // own pid (`std::process::id()`, always alive). The driver-task
-        // `close_tx` is passed so a session close cancels every in-flight
-        // bridge request. `None` for non-bridge agents / macOS (fail-closed).
-        let bridge_handle = match bridge_setup {
-            Some((client_session_id, socket_path)) => Some(
-                bridge::start_listener(
-                    client_session_id,
-                    &socket_path,
-                    std::process::id(),
-                    sink.clone(),
-                    self.pending_bridge.clone(),
-                    &close_tx,
-                    bridge::DEFAULT_BRIDGE_TIMEOUT,
-                )
-                .await
-                .map_err(|e| AcpError::SpawnFailed {
-                    hint: format!("bridge listener: {e}"),
-                })?,
-            ),
-            None => None,
-        };
-        // Set by `close_session` / `supersede_live_sessions` (first-set-wins)
-        // BEFORE their close-flag send. The driver task reads it after
-        // `connect_with` returns to decide the close reason; `None` means the
-        // agent process exited on its own. (The close flag alone cannot carry
-        // the reason: on a user close the agent process may notice the EOF
-        // and exit first, so the reason must be decided by whoever closed.)
-        let close_kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
-        // A clone for the driver task (held by the task until AFTER its kind
-        // read below); the original moves into the `LiveSession` value.
-        let close_kind_for_task = close_kind.clone();
-
-        // Per-session transcript accumulators for the persistence hook.
-        let agent_text_acc: Arc<StdMutex<HashMap<String, String>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-        let tool_call_state: Arc<StdMutex<HashMap<String, Value>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-
-        let sessions_arc = self.sessions.clone();
-        let pending_permissions_arc = self.pending_permissions.clone();
-        let pending_bridge_arc = self.pending_bridge.clone();
-        let establish_timeout = self.establish_timeout;
-        let db = self.db.clone();
-        let sink = sink.clone();
-        let notify_sink = sink.clone();
-        let cwd_owned = cwd.clone();
-
-        // SPAWN the connection as a driver task. `connect_with` only resolves
-        // when the closure returns (i.e. at session close), so it must never
-        // be awaited inline here.
-        tokio::spawn(async move {
-            // Client-side backends for this session.
-            let fs_backend = FsBackend {
-                root: cwd_owned.clone(),
-            };
-
-            // Cheap clones so each handler closure can own its copy.
-            let fs_read = fs_backend.clone();
-            let fs_write = fs_backend.clone();
-            let perm_sink = sink.clone();
-            let perm_pp = pending_permissions_arc.clone();
-            // A clone for the `connect_with` closure (to call `set_session_id`
-            // once the ACP id is known); the original `bridge_handle` stays
-            // here for the unconditional `teardown` in the cleanup below.
-            let bridge_handle_cx = bridge_handle.clone();
-
-            let builder = Client
-                .builder()
-                .name("archimedes-desktop")
-                .on_receive_notification(
-                    async move |notif: SessionNotification, _cx: ConnectionTo<Agent>| {
-                        let payload = serde_json::to_value(&notif.update).unwrap_or(Value::Null);
-                        let frame = serde_json::json!({
-                            "sessionId": notif.session_id.to_string(),
-                            "update": payload,
-                        });
-                        notify_sink.emit("session-update", frame);
-
-                        // The client owns history: upsert the transcript row
-                        // as the update streams in.
-                        if let Some(db) = &db {
-                            persist_update(
-                                db,
-                                &notif.session_id.to_string(),
-                                &notif.update,
-                                &agent_text_acc,
-                                &tool_call_state,
-                            );
-                        }
-                        Ok(())
-                    },
-                    on_receive_notification!(),
-                )
-                .on_receive_request(
-                    async move |req: ReadTextFileRequest,
-                                responder: Responder<ReadTextFileResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        match fs_read.read(&req.path) {
-                            Ok(content) => {
-                                responder.respond(ReadTextFileResponse::new(content))?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_internal_error(e.to_string())?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: WriteTextFileRequest,
-                                responder: Responder<WriteTextFileResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        match fs_write.write(&req.path, &req.content) {
-                            Ok(()) => {
-                                responder.respond(WriteTextFileResponse::new())?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_internal_error(e.to_string())?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: RequestPermissionRequest,
-                                responder: Responder<RequestPermissionResponse>,
-                                cx: ConnectionTo<Agent>| {
-                        permission::handle_permission_request(
-                            &req, responder, &cx, &perm_sink, &perm_pp,
-                        )
-                        .await;
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                );
-
-            let _ = builder
-                .connect_with(agent, |cx: ConnectionTo<Agent>| async move {
-                    // Hand the connection to the manager so it can send prompts.
-                    let cx2 = cx.clone();
-                    ready_tx.send(cx2).ok();
-
-                    // Establish the session (initialize + session/new for a
-                    // new session, initialize + session/load for a resume).
-                    // Bounded: a slow/hanging agent must not hang the
-                    // establishment indefinitely.
-                    let timeout_detail = format!(
-                        "agent did not answer initialize within {}s",
-                        establish_timeout.as_secs()
-                    );
-                    let (session_id, info) = match tokio::time::timeout(
-                        establish_timeout,
-                        establish(cx.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(established)) => established,
-                        Ok(Err(err)) => {
-                            // Report the failure to the awaiting command,
-                            // then tear the connection down.
-                            error_tx.send(err).ok();
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            // The detail text doubles as the mapping
-                            // marker in `map_establish_error`.
-                            let timeout_err =
-                                agent_client_protocol::util::internal_error(&timeout_detail);
-                            error_tx.send(timeout_err).ok();
-                            return Ok(());
-                        }
-                    };
-
-                    session_id_tx.send(session_id.clone()).ok();
-                    session_ready_tx.send(info).ok();
-
-                    // Hand the ACP `session_id` to the bridge handle so
-                    // `bridge-request`/`bridge-event` payloads carry the ACP
-                    // id (bridge requests only occur mid-turn, after
-                    // establish, so they always carry the ACP id).
-                    if let Some(h) = &bridge_handle_cx {
-                        h.set_session_id(&session_id.to_string()).await;
-                    }
-
-                    // BLOCK until close_session OR agent death. A clean
-                    // incoming EOF does NOT cancel main_fn, so select on both.
-                    tokio::select! {
-                        // The close kind was set by the closer before the
-                        // flag send and read by the task after this returns;
-                        // the closure itself does not decide the reason.
-                        _ = close_rx.changed() => {}
-                        // Agent exited; the kind stays whatever the closer
-                        // (if any) already set — `None` means the agent
-                        // process exited on its own.
-                        _ = cx.incoming_closed() => {}
-                    }
-                    Ok(())
-                })
-                .await;
-
-            // Connection returned (closed, agent died, or error): clean up.
-            // The reason comes from the close kind the closer recorded: a
-            // kind set before the flag send wins; `None` means the agent
-            // process exited on its own and nobody closed it.
-            let kind = *close_kind_for_task
-                .lock()
-                .expect("close-kind mutex poisoned");
-            let reason = match kind {
-                Some(CloseKind::User) => ClosedReason::User,
-                Some(CloseKind::Replaced) => ClosedReason::Replaced,
-                None => ClosedReason::AgentExited,
-            };
-            if let Ok(session_id) = session_id_rx.await {
-                sessions_arc.lock().await.remove(&session_id);
-                // Keys are `"{session_id}/{request_id}"` — match on the
-                // trailing-slash prefix so closing "s1" does not cancel
-                // the pending prompt of the longer session "s10".
-                let prefix = permission::session_key_prefix(&session_id.to_string());
-                pending_permissions_arc
-                    .lock()
-                    .await
-                    .retain(|key, _| !key.starts_with(&prefix));
-                // Drain this session's pending bridge requests too (dropping
-                // the senders cancels the spawned waiters, which write the
-                // terminal `error:"cancelled"` frame). The `session_id` is
-                // only known here, so this drain is nested in the guard.
-                let bridge_prefix = bridge::session_key_prefix(&session_id.to_string());
-                pending_bridge_arc
-                    .lock()
-                    .await
-                    .retain(|key, _| !key.starts_with(&bridge_prefix));
-                sink.emit(
-                    "session-closed",
-                    serde_json::json!({
-                        "sessionId": session_id.to_string(),
-                        "reason": reason.as_str(),
-                    }),
-                );
-            }
-            // Tear the bridge listener down UNCONDITIONALLY (do NOT nest it
-            // inside the `session_id` guard, or a failed `connect_with` /
-            // `session/new` would leak the listener): stop the accept loop +
-            // unlink the socket (Unix; Windows pipes vanish on last close).
-            bridge::teardown(bridge_handle);
-        });
-
-        // Await the connection, then the established session.
-        let cx = ready_rx
-            .await
-            .map_err(|_| AcpError::SpawnFailed { hint: hint.clone() })?;
-        let info = match session_ready_rx.await {
-            Ok(info) => info,
-            Err(_) => {
-                // The closure never delivered an established session: either
-                // the establisher failed (it sent the error first) or the
-                // connection died mid-establish.
-                match error_rx.try_recv() {
-                    Ok(err) => return Err(map_establish_error(agent_id, err)),
-                    Err(_) => {
-                        return Err(AcpError::InitializeFailed {
-                            detail: "agent did not complete initialize/session-new".to_string(),
-                        })
-                    }
-                }
-            }
-        };
-
-        let live = LiveSession {
-            cx,
-            session_id: info.session_id.clone(),
-            cwd,
-            agent_id: agent_id.to_string(),
-            close_tx,
-            close_kind,
-        };
-        self.sessions
-            .lock()
-            .await
-            .insert(info.session_id.clone(), live);
-
-        Ok(info)
-    }
-
     /// Send a prompt to a live session and wait for the turn to finish.
     ///
     /// Returns the [`StopReason`] the agent reported (the frontend needs the
@@ -804,7 +1020,7 @@ impl SessionManager {
         let sid = SessionId::new(session_id);
         // Clone just the (cheap) connection handle, not the whole LiveSession.
         let cx = {
-            let sessions = self.sessions.lock().await;
+            let sessions = self.driver.sessions.lock().await;
             sessions
                 .get(&sid)
                 .map(|live| live.cx.clone())
@@ -815,7 +1031,7 @@ impl SessionManager {
 
         // Record the user's message in the transcript (the client owns
         // history) before the turn begins.
-        if let Some(db) = &self.db {
+        if let Some(db) = &self.driver.db {
             let payload = serde_json::json!({ "text": text });
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
@@ -836,22 +1052,26 @@ impl SessionManager {
     /// Looks up the oneshot sender by the compound key
     /// `"{session_id}/{request_id}"` and sends the outcome through it. If the
     /// entry is gone (the session closed, or the prompt already resolved), this
-    /// is a silent no-op.
+    /// is a silent no-op. Returns `true` when an entry was resolved (the caller
+    /// can then route a miss to the subagent manager).
     pub async fn respond_permission(
         &self,
         session_id: &str,
         request_id: &str,
         outcome: permission::PermissionOutcome,
-    ) -> Result<(), AcpError> {
+    ) -> Result<bool, AcpError> {
         let key = permission::permission_key(session_id, request_id);
-        let sender = self.pending_permissions.lock().await.remove(&key);
+        let sender = self.driver.pending_permissions.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the prompt was
         // already resolved (timeout / session close), so there is nothing to
         // do.
-        if let Some(sender) = sender {
-            let _ = sender.send(outcome);
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(outcome);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(())
     }
 
     /// Deliver the user's answer to a pending bridge request.
@@ -861,22 +1081,26 @@ impl SessionManager {
     /// (no wrapper — for `password`, `{password}`; for `confirm`,
     /// `{confirmed}`; for `ask`, the `AskResponsePayload`). If the entry is
     /// gone (the session closed, or the request already resolved), this is a
-    /// silent no-op.
+    /// silent no-op. Returns `true` when an entry was resolved (the caller
+    /// can then route a miss to the subagent manager).
     pub async fn respond_bridge_request(
         &self,
         session_id: &str,
         request_id: &str,
         result: serde_json::Value,
-    ) -> Result<(), AcpError> {
+    ) -> Result<bool, AcpError> {
         let key = bridge::bridge_key(session_id, request_id);
-        let sender = self.pending_bridge.lock().await.remove(&key);
+        let sender = self.driver.pending_bridge.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the request was
         // already resolved (timeout / session close), so there is nothing to
         // do.
-        if let Some(sender) = sender {
-            let _ = sender.send(result);
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(result);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(())
     }
 
     /// Close a live session.
@@ -890,7 +1114,7 @@ impl SessionManager {
         // Clone just the close flag's sender and the shared close kind (both
         // cheaply cloneable).
         let (close_tx, close_kind) = {
-            let sessions = self.sessions.lock().await;
+            let sessions = self.driver.sessions.lock().await;
             sessions
                 .get(&sid)
                 .map(|live| (live.close_tx.clone(), live.close_kind.clone()))
@@ -1033,7 +1257,7 @@ fn spawn_hint(command: &str) -> String {
 /// per-user already). On macOS the bridge is unavailable, so this
 /// returns a placeholder that is never used (`bridge::available()` is
 /// `false`).
-fn bridge_socket_path() -> Option<PathBuf> {
+pub(crate) fn bridge_socket_path() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1099,7 +1323,7 @@ fn bridge_socket_path() -> Option<PathBuf> {
 /// socket path)` the driver uses to start the listener. Returns `None` when
 /// the agent is not a bridge agent OR the bridge is unavailable on this
 /// platform (macOS — fail-closed).
-fn bridge_spawn_setup(
+pub(crate) fn bridge_spawn_setup(
     entry: &AgentEntry,
     session_id: &str,
 ) -> Option<(BTreeMap<String, String>, String, PathBuf)> {

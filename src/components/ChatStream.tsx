@@ -10,6 +10,7 @@ import AskQuestionCard from "./AskQuestionCard";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
 import TodoBoardPanel from "./TodoBoardPanel";
+import SubagentPanel from "./SubagentPanel";
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -178,6 +179,7 @@ export default function ChatStream() {
           <p className="mt-1 text-sm">Open a space from the list on the left.</p>
         </main>
         <TodoBoardPanel sessionId={null} />
+        <SubagentPanel />
       </div>
     );
   }
@@ -396,6 +398,7 @@ export default function ChatStream() {
       </div>
       </main>
       <TodoBoardPanel sessionId={activeSessionId} />
+      <SubagentPanel />
       {/* Bridge modals (rendered at the `ChatStream` root — `fixed`
           overlays, NOT inside the scroll region). */}
       {confirmRequests.map((r) => (

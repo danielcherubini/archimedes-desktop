@@ -16,6 +16,7 @@ import {
 import { basenameOfPath } from "../lib/paths";
 import { unifiedPatch } from "../lib/diff";
 import { usePermissions } from "./permissions";
+import { useSubagents } from "./subagents";
 
 export type { AcpSessionUpdate } from "../lib/tauri";
 
@@ -170,6 +171,29 @@ export function finalizeSessionMessages(messages: Message[]): Message[] {
       ? { ...m, status: "failed" as const }
       : m,
   );
+}
+
+/**
+ * Session-closed cleanup for EPHEMERAL (subagent) sessions: delete the
+ * transcript entirely. Subagent sessions are never persisted (the
+ * desktop's Rust side records them with `db: None`), so there is no
+ * history to preserve. MAIN sessions are untouched — `handleSessionClosed`
+ * keeps their transcript (finalized) for the history list, so this is a
+ * no-op when the id has no subagent entry.
+ */
+export function discardSessionMessages(sessionId: string): void {
+  // ASSUMES ACP session ids are globally unique across main + subagent
+  // sessions: the subagent-entry guard below would delete a MAIN
+  // transcript if a subagent id ever collided with a main id (a
+  // collision would already merge the sessions' `session-update` event
+  // streams into one `messages[id]` before the delete matters; the Rust
+  // side is immune — separate `sessions` maps per manager).
+  if (!useSubagents.getState().entries[sessionId]) return; // main: keep
+  useSessions.setState((state) => {
+    if (!(sessionId in state.messages)) return state;
+    const { [sessionId]: _gone, ...rest } = state.messages;
+    return { messages: rest };
+  });
 }
 
 /**

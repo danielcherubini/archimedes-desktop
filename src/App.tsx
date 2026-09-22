@@ -7,13 +7,16 @@ import {
   listenPermissionRequest,
   listenSessionClosed,
   listenSessionUpdate,
+  listenSubagentClosed,
+  listenSubagentSessionStarted,
   listSessions,
   listSpaces,
 } from "./lib/tauri";
 import { checkForUpdate, installUpdate } from "./lib/updater";
-import { useSessions } from "./store/sessions";
+import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
 import { useBridge } from "./store/bridge";
+import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 
@@ -39,6 +42,10 @@ function App() {
         useSessions
           .getState()
           .handleSessionClosed(payload.sessionId, payload.reason);
+        // Ephemeral subagent sessions have no stored history: their
+        // transcript is deleted (a no-op for MAIN sessions, whose
+        // `handleSessionClosed` behavior above stays unchanged).
+        discardSessionMessages(payload.sessionId);
       }),
     );
     unlistenPromises.push(
@@ -69,6 +76,52 @@ function App() {
         } else if (payload.event === "session") {
           s.applySession(payload.sessionId, payload.payload);
         }
+      }),
+    );
+    // Subagent sessions (Task 4): the `subagent-session-started` /
+    // `subagent-closed` events feed the subagents store (the panel's
+    // authority for subagent STATUS + the metrics SNAPSHOT — the existing
+    // `listenSessionClosed` handler above stays as-is; its bridge-store
+    // deletion is exactly why the metrics live in the snapshot).
+    unlistenPromises.push(
+      listenSubagentSessionStarted((p) =>
+        useSubagents.getState().addSession({
+          sessionId: p.sessionId,
+          parentSessionId: p.parentSessionId,
+          agentName: p.agentName,
+          task: p.task,
+          status: "running",
+        }),
+      ),
+    );
+    unlistenPromises.push(
+      listenSubagentClosed((p) => {
+        // Discard the transcript BEFORE `markClosed` (order matters):
+        // `markClosed` runs `evictOldestClosed`, which can evict this
+        // entry synchronously (the oldest of 21+ closed entries by
+        // insertion order) — a discard running AFTER would then no-op
+        // its `entries[sessionId]` guard. The entry exists from
+        // `subagent-session-started` (the worker task emits `started`
+        // before `subagent-closed` sequentially) and `running` entries
+        // are never evicted, so the discard-first order is deterministic
+        // (absent an explicit user `dismiss`).
+        //
+        // Why discard here AT ALL (not only in `listenSessionClosed`):
+        // `subagent-session-started` is emitted by the WORKER task
+        // (after `drive_session` returns) while `session-closed` is
+        // emitted by the DRIVER task (after teardown) — different
+        // tasks. If the agent dies (or a cancel lands) immediately
+        // post-establishment, `session-closed` can beat `started`: the
+        // `session-closed` handler's `discardSessionMessages` no-ops (no
+        // subagent entry yet) while `handleSessionClosed` creates
+        // `messages[sid]`, and nothing else re-runs the discard — a
+        // small unreclaimed leak (at most a partial transcript) per
+        // occurrence. Discarding here covers that race independent of
+        // the cross-task ordering.
+        discardSessionMessages(p.sessionId);
+        useSubagents
+          .getState()
+          .markClosed(p.sessionId, p.status, p.error, p.metrics);
       }),
     );
     return () => {
