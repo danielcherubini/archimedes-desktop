@@ -48,6 +48,28 @@ describe("parseDiffStats", () => {
     expect(parseDiffStats(patch)).toEqual({ additions: 1, deletions: 0 });
   });
 
+  it("counts a deleted line whose content is `-- x` (patch line `--- x`) after a hunk as a deletion", () => {
+    const patch = [
+      "--- a/src/foo.md",
+      "+++ b/src/foo.md",
+      "@@ -1,2 +1,1 @@",
+      " keep",
+      "--- x",
+    ].join("\n");
+    expect(parseDiffStats(patch)).toEqual({ additions: 0, deletions: 1 });
+  });
+
+  it("counts an added line whose content is `++ y` (patch line `+++ y`) after a hunk as an addition", () => {
+    const patch = [
+      "--- a/src/foo.md",
+      "+++ b/src/foo.md",
+      "@@ -1,1 +1,2 @@",
+      " keep",
+      "+++ y",
+    ].join("\n");
+    expect(parseDiffStats(patch)).toEqual({ additions: 1, deletions: 0 });
+  });
+
   it("returns 0/0 for a context-only patch", () => {
     const patch = [
       "--- a/src/foo.ts",

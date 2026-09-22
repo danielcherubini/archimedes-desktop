@@ -88,17 +88,24 @@ export interface DiffStats {
 /**
  * Count added/removed lines in a unified-diff patch. Lines starting with `+`
  * count as additions and lines starting with `-` as deletions, EXCEPT the
- * 3-char file headers: lines matching exactly `^(\+\+\+|---)\s` (i.e. `+++ ` /
- * `--- ` followed by whitespace and a path) are metadata, not content — so a
- * real added line whose content itself starts with `---` (e.g. `+---
- * separator`) still counts as an addition. Malformed input (no valid lines)
- * → { additions: 0, deletions: 0 }.
+ * 3-char file headers: `+++ ` / `--- ` followed by whitespace and a path.
+ * File headers are only ever the first two non-empty lines of a patch,
+ * before any `@@` hunk header — so this skip applies ONLY before the first
+ * `@@`. Content lines after a hunk that happen to look like a header (e.g.
+ * `--- x` = a deleted `-- x` line, or `+++ y` = an added `++ y` line)
+ * count as real deletions/additions. Malformed input (no valid lines) →
+ * { additions: 0, deletions: 0 }.
  */
 export function parseDiffStats(patch: string): DiffStats {
   let additions = 0;
   let deletions = 0;
+  let hunkSeen = false;
   for (const line of patch.split("\n")) {
-    if (/^(\+\+\+|---)\s/.test(line)) continue; // file header — metadata
+    if (line.startsWith("@@")) {
+      hunkSeen = true;
+      continue; // hunk header — metadata
+    }
+    if (!hunkSeen && /^(\+\+\+|---)\s/.test(line)) continue; // file header
     if (line.startsWith("+")) additions++;
     else if (line.startsWith("-")) deletions++;
   }
