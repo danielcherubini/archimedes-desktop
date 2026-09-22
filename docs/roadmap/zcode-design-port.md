@@ -253,7 +253,7 @@ The app frame becomes three panes and the two right-rail panels move into a new 
 **Acceptance criteria:**
 - [ ] The app renders three panes; `ChatStream` no longer renders `TodoBoardPanel`/`SubagentPanel` (their imports are removed from it in THIS task — the panels are already hosted by `SidePane` here, so removing them from `ChatStream` now avoids double-rendering; `ChatStream`'s header rework is Task 6).
 - [ ] Pane width persists across a re-mount (localStorage); collapse/re-open works via `sidePaneState` (the shared module Task 6's toggle consumes); tab selection persists; a collapsed pane never hides a pending subagent modal.
-- [ ] Both restyled panels pass their suites: `TodoBoardPanel.test.tsx` (new) fully green; `SubagentPanel.test.tsx` green with the ~5 mechanical rewrites applied and every data-logic assertion intact. No store or Tauri file was modified.
+- [ ] Both restyled panels pass their suites: `TodoBoardPanel.test.tsx` (new) fully green; `SubagentPanel.test.tsx` green with the ~8 mechanical rewrites applied and every data-logic assertion intact. No store or Tauri file was modified.
 
 ---
 
