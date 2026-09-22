@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { startSession } from "../lib/tauri";
+import { closeSession, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
@@ -21,10 +21,12 @@ vi.mock("../lib/tauri", async () => {
     respondPermission: vi.fn(),
     respondBridgeRequest: vi.fn(),
     loadHistory: vi.fn().mockResolvedValue([]),
+    closeSession: vi.fn().mockRejectedValue(new Error("boom")),
   };
 });
 
 const mockedStartSession = vi.mocked(startSession);
+const mockedCloseSession = vi.mocked(closeSession);
 
 /**
  * Fixture: two spaces. `alpha` holds a live session `s1` (in-turn, with a
@@ -203,6 +205,49 @@ describe("SpacesList", () => {
       .getByText("Refactor the parser")
       .closest('[role="button"]');
     expect(row!.className).toContain("bg-selected");
+  });
+
+  it("truncates a long title on a single line (the fade mask is the sole cue)", () => {
+    // A 120-char first user message → `titleFor` slices it to 80 chars; the
+    // title span must carry the truncation classes so it overflows under the
+    // fade instead of wrapping.
+    useSessions.setState({
+      messages: {
+        s1: [{ kind: "user", text: "x".repeat(120), at: Date.now() - 10_000 }],
+      },
+    });
+    render(<SpacesList />);
+    const title = screen.getByText("x".repeat(80));
+    expect(title.className).toContain("overflow-hidden");
+    expect(title.className).toContain("whitespace-nowrap");
+    expect(title.className).toContain("min-w-0");
+  });
+
+  it("logs a console error when Pause fails to close the session", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<SpacesList />);
+    fireEvent.click(screen.getByRole("button", { name: /Pause/ }));
+    await waitFor(() => expect(mockedCloseSession).toHaveBeenCalledWith("s1"));
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to pause session:",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("ignores ⌘N / Ctrl+O while the target is an input or a dialog", async () => {
+    render(<SpacesList />);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    // Ctrl+N on the input: hijacked by the guard (the target is an input).
+    fireEvent.keyDown(input, { key: "n", ctrlKey: true });
+    await waitFor(() => expect(mockedStartSession).not.toHaveBeenCalled());
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    document.body.appendChild(dialog);
+    // Ctrl+O on a `[role="dialog"]`: also ignored.
+    fireEvent.keyDown(dialog, { key: "o", metaKey: true });
+    expect(screen.queryByText("New space")).toBeNull();
   });
 
   it("⌘N / Ctrl+N trigger the New Session handler (a bare key does not)", async () => {

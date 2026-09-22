@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -80,7 +80,9 @@ export default function SpacesList() {
         );
   const newSession = useStartNewConversation(activeView);
 
-  const handleNewSession = () => {
+  // Stable handlers (the keydown effect below re-subscribes only when the
+  // view — not the whole component — changes).
+  const handleNewSession = useCallback(() => {
     // No active session (no view): the button opens the Open Space dialog
     // instead (the hook itself no-ops on an undefined view).
     if (activeSessionId === null) {
@@ -88,13 +90,22 @@ export default function SpacesList() {
       return;
     }
     void newSession.startNewConversation();
-  };
-  const handleOpenSpace = () => setDialogOpen(true);
+  }, [activeSessionId, newSession]);
+  const handleOpenSpace = useCallback(() => setDialogOpen(true), []);
 
-  // ⌘N / Ctrl+N → New Session, ⌘O / Ctrl+O → Open Space.
+  // ⌘N / Ctrl+N → New Session, ⌘O / Ctrl+O → Open Space. Ignored while the
+  // key is pressed in an input, textarea, editable element, or dialog (e.g.
+  // the composer or NewSpaceDialog's fields) so native shortcuts keep
+  // working there.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!e.metaKey && !e.ctrlKey) return;
+      if (
+        e.target instanceof HTMLElement &&
+        e.target.closest("input, textarea, [contenteditable], [role='dialog']")
+      ) {
+        return;
+      }
       const key = e.key.toLowerCase();
       if (key === "n") {
         e.preventDefault();
@@ -292,7 +303,7 @@ function SessionRow({
         <span className="size-4 shrink-0" />
       )}
       <span
-        className="flex-1 text-ui-base text-foreground"
+        className="min-w-0 flex-1 overflow-hidden whitespace-nowrap text-ui-base text-foreground"
         style={{
           maskImage:
             "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
@@ -311,8 +322,10 @@ function SessionRow({
             aria-label={`Pause ${title}`}
             onClick={(e) => {
               e.stopPropagation();
-              void closeSession(sessionId).catch(() => {
-                // `close_session` failures surface in the chat's error line.
+              void closeSession(sessionId).catch((err) => {
+                // `close_session` failures are logged (this path touches no
+                // error state).
+                console.error("Failed to pause session:", err);
               });
             }}
             className="hidden size-6 items-center justify-center rounded-md group-hover:flex hover:bg-surface-hover"
