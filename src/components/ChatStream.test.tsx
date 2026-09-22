@@ -336,6 +336,21 @@ describe("ChatStream", () => {
     expect(screen.queryByText("Send a prompt to start")).toBeNull();
   });
 
+  it("renders a pending sudo password request on an empty transcript (no fresh-session hint)", () => {
+    seedLiveSession();
+    // No `toolCallId` (absent for `password`) → the modal renders
+    // immediately (unanchored).
+    useBridge.getState().addRequest("s1", {
+      requestId: "req-pw",
+      method: "password",
+      source: "main",
+      params: { command: "apt install ripgrep", reason: "install the tool" },
+    });
+    render(<ChatStream />);
+    expect(screen.getByText("Sudo password required")).toBeTruthy();
+    expect(screen.queryByText("Send a prompt to start")).toBeNull();
+  });
+
   it("renders 'Waiting for your input…' on an empty transcript when the bridge agentState is blocked", async () => {
     seedLiveSession();
     useBridge.getState().applyState("s1", { state: "blocked" });

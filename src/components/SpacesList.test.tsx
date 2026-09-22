@@ -258,7 +258,7 @@ describe("SpacesList", () => {
     }
   });
 
-  it("does NOT ignore ⌘N while the target is a contenteditable=\"false\" element (the guard matches only 'true')", async () => {
+  it("does NOT ignore ⌘N while the target is a contenteditable=\"false\" element (the guard matches `contenteditable` except `false`)", async () => {
     render(<SpacesList />);
     const div = document.createElement("div");
     div.setAttribute("contenteditable", "false");

@@ -99,13 +99,17 @@ export default function SpacesList() {
   // ⌘N / Ctrl+N → New Session, ⌘O / Ctrl+O → Open Space. Ignored while the
   // key is pressed in an input, textarea, editable element, or dialog (e.g.
   // the composer or NewSpaceDialog's fields) so native shortcuts keep
-  // working there.
+  // working there. The `contenteditable` match is spec-exact: per HTML,
+  // `contenteditable=""` and a bare `contenteditable` BOTH mean editable,
+  // so the guard matches the attribute's PRESENCE except `contenteditable="false"`.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!e.metaKey && !e.ctrlKey) return;
       if (
         e.target instanceof HTMLElement &&
-        e.target.closest("input, textarea, [contenteditable='true'], [role='dialog']")
+        e.target.closest(
+          "input, textarea, [contenteditable]:not([contenteditable='false']), [role='dialog']",
+        )
       ) {
         return;
       }
