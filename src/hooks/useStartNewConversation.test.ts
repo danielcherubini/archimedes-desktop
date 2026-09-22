@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  listAgents,
   startSession,
   type SessionInfo,
   type SpaceRow,
@@ -27,6 +28,7 @@ vi.mock("../lib/tauri", async () => {
 });
 
 const mockedStartSession = vi.mocked(startSession);
+const mockedListAgents = vi.mocked(listAgents);
 
 /**
  * Fixture data. `spaceViewFor` for the `spaces` row below yields a view
@@ -62,6 +64,31 @@ beforeEach(() => {
 });
 
 describe("useStartNewConversation", () => {
+  // FIRST test in the file on purpose: the shared fetch is a module-level
+  // memo, so the very first test sees a cold cache. (Two hook instances ⇒
+  // `listAgents` must be called exactly once.)
+  it("shares ONE `listAgents` fetch across hook instances", async () => {
+    renderHook(() => useStartNewConversation(view));
+    renderHook(() => useStartNewConversation(view));
+    // Let both `useEffect`s + the memoized promise settle.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockedListAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("guards against double-invocation (two rapid calls start ONE session)", async () => {
+    const { result } = renderHook(() => useStartNewConversation(view));
+    await act(async () => {
+      // Fire both WITHOUT awaiting the first — the second must be
+      // suppressed by the `inFlight` guard, not create a second session.
+      void result.current.startNewConversation();
+      void result.current.startNewConversation();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockedStartSession).toHaveBeenCalledTimes(1);
+  });
+
   it("starts with the live session's agentId (the fallback chain's first hit) and records the session + space", async () => {
     const { result } = renderHook(() => useStartNewConversation(view));
     await act(async () => {

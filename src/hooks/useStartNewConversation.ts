@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listAgents, startSession, type AgentEntryDto } from "../lib/tauri";
 import { useSessions, type SpaceView } from "../store/sessions";
 
@@ -14,6 +14,13 @@ import { useSessions, type SpaceView } from "../store/sessions";
  *
  * `view === undefined` → no-op, and `agentId === ""` → no-op (the registry
  * hasn't loaded yet — the same guard `ChatStream` applied to the button).
+ *
+ * The registry fetch is a MODULE-LEVEL memoized promise: the hook is
+ * consumed at `ChatStream` (the "…" menu item), `SpacesList` top-level
+ * ("New Session"), and once per `SpaceGroup` (the per-space `+`) — ten
+ * spaces ⇒ 12 identical `listAgents` IPC round-trips at boot without it.
+ * All instances share ONE fetch (`.catch(() => [])` keeps the
+ * no-op-on-error behavior).
  */
 export function useStartNewConversation(view: SpaceView | undefined): {
   startNewConversation: () => Promise<void>;
@@ -28,9 +35,13 @@ export function useStartNewConversation(view: SpaceView | undefined): {
   // `firstAgentId` is the default).
   const [agents, setAgents] = useState<AgentEntryDto[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Double-invoke guard: ⌘N twice fast (or double-clicking a group's `+`)
+  // must fire ONE `startSession`, not two. (Suppresses CONCURRENT
+  // double-invokes only — the `agentId === ""` no-op above still applies.)
+  const inFlight = useRef(false);
 
   useEffect(() => {
-    listAgents().then(setAgents).catch(() => setAgents([]));
+    void loadAgents().then(setAgents);
   }, []);
 
   const live = sessions.find((s) => s.sessionId === view?.liveSessionId);
@@ -42,6 +53,8 @@ export function useStartNewConversation(view: SpaceView | undefined): {
 
   const startNewConversation = async () => {
     if (view === undefined || agentId === "") return;
+    if (inFlight.current) return;
+    inFlight.current = true;
     setError(null);
     try {
       const info = await startSession(agentId, view.path);
@@ -51,6 +64,8 @@ export function useStartNewConversation(view: SpaceView | undefined): {
       addSpace(info.cwd);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      inFlight.current = false;
     }
   };
 
@@ -60,3 +75,13 @@ export function useStartNewConversation(view: SpaceView | undefined): {
     clearError: () => setError(null),
   };
 }
+
+/**
+ * Module-level memoized registry fetch — all hook instances share ONE
+ * `listAgents` call. `.catch(() => [])` keeps the no-op-on-error behavior
+ * (an empty registry ⇒ `firstAgentId === ""` ⇒ `startNewConversation` no-ops)
+ * and poisons the memo with `[]` rather than a rejected promise.
+ */
+let agentsPromise: Promise<AgentEntryDto[]> | null = null;
+const loadAgents = (): Promise<AgentEntryDto[]> =>
+  (agentsPromise ??= listAgents().catch(() => []));
