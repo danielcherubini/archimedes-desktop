@@ -79,3 +79,28 @@ export function unifiedPatch(
     ),
   ].join("\n");
 }
+
+export interface DiffStats {
+  additions: number;
+  deletions: number;
+}
+
+/**
+ * Count added/removed lines in a unified-diff patch. Lines starting with `+`
+ * count as additions and lines starting with `-` as deletions, EXCEPT the
+ * 3-char file headers: lines matching exactly `^(\+\+\+|---)\s` (i.e. `+++ ` /
+ * `--- ` followed by whitespace and a path) are metadata, not content — so a
+ * real added line whose content itself starts with `---` (e.g. `+---
+ * separator`) still counts as an addition. Malformed input (no valid lines)
+ * → { additions: 0, deletions: 0 }.
+ */
+export function parseDiffStats(patch: string): DiffStats {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of patch.split("\n")) {
+    if (/^(\+\+\+|---)\s/.test(line)) continue; // file header — metadata
+    if (line.startsWith("+")) additions++;
+    else if (line.startsWith("-")) deletions++;
+  }
+  return { additions, deletions };
+}
