@@ -88,4 +88,41 @@ describe("SessionConfigSelect", () => {
     const { waitForElementToBeRemoved } = await import("@testing-library/react");
     await waitForElementToBeRemoved(() => screen.queryByRole("alert"), { timeout: 8000 });
   }, 10000);
+
+  it("renders grouped options correctly", async () => {
+    const groupedOption: SessionConfigOption = {
+      id: "model",
+      name: "Model",
+      type: "select",
+      currentValue: "claude",
+      options: [
+        {
+          name: "OpenAI",
+          options: [
+            { value: "gpt-4", name: "GPT-4" },
+            { value: "gpt-4-turbo", name: "GPT-4 Turbo" },
+          ],
+        },
+        { value: "claude", name: "Claude" },
+      ],
+    };
+    const onSet = vi.fn().mockResolvedValue(undefined);
+    render(<SessionConfigSelect option={groupedOption} onSet={onSet} />);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+
+    // Assert group label renders
+    expect(screen.getByText("OpenAI")).toBeTruthy();
+    
+    // Assert nested items render
+    expect(screen.getByRole("option", { name: "GPT-4" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "GPT-4 Turbo" })).toBeTruthy();
+
+    // Assert flat entry renders
+    expect(screen.getByRole("option", { name: "Claude" })).toBeTruthy();
+
+    // Select nested item
+    fireEvent.click(screen.getByRole("option", { name: "GPT-4" }));
+    await waitFor(() => expect(onSet).toHaveBeenCalledWith("gpt-4"));
+  });
 });

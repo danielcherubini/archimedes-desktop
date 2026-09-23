@@ -5,6 +5,8 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  SelectGroup,
+  SelectLabel,
 } from "../components/ui/select";
 import { SessionConfigOption } from "../lib/tauri";
 
@@ -58,14 +60,14 @@ export default function SessionConfigSelect({
           {option.options?.map((opt) => {
             if ("options" in opt) {
               return (
-                <div key={opt.name} className="px-2 py-1 text-ui-xs text-muted-foreground font-medium">
-                  {opt.name}
+                <SelectGroup key={opt.name}>
+                  <SelectLabel>{opt.name}</SelectLabel>
                   {opt.options.map((subOpt) => (
                     <SelectItem key={subOpt.value} value={subOpt.value}>
                       {subOpt.name}
                     </SelectItem>
                   ))}
-                </div>
+                </SelectGroup>
               );
             }
             return (
