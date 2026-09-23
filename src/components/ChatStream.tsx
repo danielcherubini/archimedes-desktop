@@ -438,12 +438,6 @@ export default function ChatStream() {
             </SelectContent>
           </Select>
         )}
-        {isLive && modelOption && (
-          <SessionConfigSelect option={modelOption} onSet={setConfigValue} />
-        )}
-        {isLive && thinkingOption && (
-          <SessionConfigSelect option={thinkingOption} onSet={setConfigValue} />
-        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="icon-sm" aria-label="Session actions">
@@ -582,7 +576,7 @@ export default function ChatStream() {
           {error ?? newConversationError}
         </p>
       )}
-      <div className="m-3 rounded-2xl border border-input-border bg-input p-2 hover:border-input-border-hover focus-within:border-input-border-focused">
+      <div className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused">
         <textarea
           ref={composerRef}
           value={draft}
@@ -597,27 +591,36 @@ export default function ChatStream() {
             isLive
               ? composerLocked
                 ? "Agent is working…"
-                : "Send a prompt…"
+                : messages.length === 0
+                  ? "Ask anything…"
+                  : "Ask for follow-up changes"
               : canResume
                 ? "Paused — Resume to reconnect"
                 : "This session is closed"
           }
           rows={2}
           disabled={!isLive || composerLocked}
-          className="max-h-32 resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
+          className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
         />
-        <div className="mt-1 flex items-center justify-between">
-          <span aria-hidden />
-          <div className="flex items-center gap-2">
-            <span className="text-ui-xs text-foreground-subtlest">
-              {liveSession?.agentId ?? historySession?.agentId}
-            </span>
+        <div className="mt-1 flex items-center justify-between gap-2">
+          <span className="text-ui-xs text-foreground-subtlest">
+            {liveSession?.agentId ?? historySession?.agentId}
+          </span>
+          {/* ZCode's composer carries the config controls in its toolbar
+              (left of the send button) — the header does not. */}
+          <div className="flex flex-wrap items-center gap-2">
+            {isLive && modelOption && (
+              <SessionConfigSelect option={modelOption} onSet={setConfigValue} />
+            )}
+            {isLive && thinkingOption && (
+              <SessionConfigSelect option={thinkingOption} onSet={setConfigValue} />
+            )}
             <Button
-              size="icon"
+              size="icon-md"
               aria-label="Send"
               disabled={!isLive || composerLocked || draft.trim() === ""}
               onClick={() => void send()}
-              className="size-8 rounded-full bg-primary text-primary-foreground"
+              className="bg-primary text-primary-foreground"
             >
               <ArrowUp className="size-4" />
             </Button>

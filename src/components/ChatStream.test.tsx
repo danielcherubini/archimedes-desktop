@@ -309,10 +309,34 @@ describe("ChatStream", () => {
     expect(shell!.className).toMatch(/(^|\s)border(\s|$)/);
   });
 
-  it("shows the composer placeholder 'Send a prompt…' for a live idle session", () => {
+  it("shows the ZCode placeholder 'Ask anything…' for a fresh live session (no history)", () => {
     seedLiveSession();
     render(<ChatStream />);
-    expect(screen.getByPlaceholderText("Send a prompt…")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask anything…")).toBeTruthy();
+  });
+
+  it("shows the ZCode placeholder 'Ask for follow-up changes' for a live session WITH history", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hello");
+    render(<ChatStream />);
+    expect(
+      screen.getByPlaceholderText("Ask for follow-up changes"),
+    ).toBeTruthy();
+  });
+
+  it("renders the composer textarea at full width (w-full — a width:auto <textarea> falls back to its intrinsic cols width, ~177px)", () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox");
+    expect(textarea.className).toContain("w-full");
+  });
+
+  it("renders the ZCode-style send button (icon-md: size-7 rounded-lg — not the old circular size-8 rounded-full)", () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    expect(sendButton.className).toContain("rounded-lg");
+    expect(sendButton.className).not.toContain("rounded-full");
   });
 
   it("shows the composer placeholder 'Agent is working…' for a live working session", () => {
@@ -340,7 +364,7 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    const textarea = screen.getByPlaceholderText("Ask anything…");
     // Empty draft → disabled.
     expect(sendButton.hasAttribute("disabled")).toBe(true);
     // Non-empty draft, idle → enabled.
@@ -357,7 +381,7 @@ describe("ChatStream", () => {
   it("calls sendPrompt when Enter is pressed with a draft", () => {
     seedLiveSession();
     render(<ChatStream />);
-    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    const textarea = screen.getByPlaceholderText("Ask anything…");
     fireEvent.change(textarea, { target: { value: "hello" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).toHaveBeenCalledWith("s1", "hello");
@@ -431,7 +455,7 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    const textarea = screen.getByPlaceholderText("Ask anything…");
     // Idle → enabled (sanity).
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
@@ -454,7 +478,7 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Send a prompt…");
+    const textarea = screen.getByPlaceholderText("Ask anything…");
     // Idle → enabled (sanity: `blocked` has NOT been pushed yet).
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
@@ -542,7 +566,7 @@ describe("ChatStream", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("a live session WITH a model + thinking config option renders BOTH selectors", async () => {
+  it("a live session WITH a model + thinking config option renders BOTH selects IN THE COMPOSER (ZCode's placement — the header carries no config selects)", async () => {
     seedLiveSession();
     useSessions.setState({
       configOptions: {
@@ -570,9 +594,15 @@ describe("ChatStream", () => {
         ],
       },
     });
-    render(<ChatStream />);
-    expect(screen.getByRole("combobox", { name: "Model" })).toBeTruthy();
-    expect(screen.getByRole("combobox", { name: "Thinking" })).toBeTruthy();
+    const { container } = render(<ChatStream />);
+    // ZCode's composer carries the model/thought controls in its toolbar
+    // (left of the send button) — the header does NOT.
+    const composer = container.querySelector(".rounded-2xl")!;
+    expect(composer.querySelector('[aria-label="Model"]')).toBeTruthy();
+    expect(composer.querySelector('[aria-label="Thinking"]')).toBeTruthy();
+    const header = container.querySelector(".h-12")!;
+    expect(header.querySelector('[aria-label="Model"]')).toBeNull();
+    expect(header.querySelector('[aria-label="Thinking"]')).toBeNull();
     expect(screen.getByText("acme/Alpha")).toBeTruthy();
     expect(screen.getByText("Medium")).toBeTruthy();
   });
