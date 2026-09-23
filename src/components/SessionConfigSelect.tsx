@@ -43,7 +43,7 @@ export default function SessionConfigSelect({
   };
 
   return (
-    <div className="flex flex-col gap-1">
+    <div className="relative">
       <Select value={value} onValueChange={handleValueChange}>
         <SelectTrigger
           variant="ghost"
@@ -63,7 +63,7 @@ export default function SessionConfigSelect({
         </SelectContent>
       </Select>
       {error && (
-        <span className="text-ui-sm text-destructive" role="alert">
+        <span className="text-ui-sm text-destructive absolute left-0 top-full mt-1 z-10 rounded bg-background px-1" role="alert">
           {error}
         </span>
       )}

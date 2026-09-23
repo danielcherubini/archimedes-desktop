@@ -76,15 +76,16 @@ describe("SessionConfigSelect", () => {
     const onSet = vi.fn().mockRejectedValue(new Error("boom"));
     render(<SessionConfigSelect option={mockOption} onSet={onSet} />);
 
-    // Open select
+    // Open select + pick item
     fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
-
-    // Pick item
-    const beta = screen.getByRole("option", { name: "acme/Beta" });
-    fireEvent.click(beta);
+    fireEvent.click(screen.getByRole("option", { name: "acme/Beta" }));
 
     // Error should appear
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe("boom");
-  });
+
+    // Real-timer approach: wait for the 5s timer
+    const { waitForElementToBeRemoved } = await import("@testing-library/react");
+    await waitForElementToBeRemoved(() => screen.queryByRole("alert"), { timeout: 8000 });
+  }, 10000);
 });
