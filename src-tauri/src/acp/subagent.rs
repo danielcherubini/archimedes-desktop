@@ -1034,32 +1034,12 @@ mod tests {
     }
 
     async fn drive_with_retry<F, Fut>(
-        mut attempt_fn: F,
+        attempt_fn: F,
     ) -> Result<SessionInfo, crate::acp::errors::AcpError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<SessionInfo, crate::acp::errors::AcpError>>,
     {
-        let mut last_err = None;
-        for i in 0..3 {
-            match attempt_fn().await {
-                Ok(info) => return Ok(info),
-                Err(crate::acp::errors::AcpError::SpawnFailed { .. }) => {
-                    last_err = Some(crate::acp::errors::AcpError::SpawnFailed {
-                        hint: "spawn failed".to_string(),
-                    });
-                    if i < 2 {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        continue;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(
-            last_err.unwrap_or_else(|| crate::acp::errors::AcpError::Protocol {
-                message: "unreachable".to_string(),
-            }),
-        )
+        crate::test_support::run_with_retry(attempt_fn).await
     }
 }

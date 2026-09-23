@@ -2,6 +2,8 @@ pub mod acp;
 pub mod commands;
 pub mod config;
 pub mod storage;
+#[cfg(test)]
+pub mod test_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
