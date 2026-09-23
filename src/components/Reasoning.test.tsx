@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
-import { Reasoning, ReasoningTrigger, ReasoningContent, useReasoning } from "./Reasoning";
+import { Reasoning, ReasoningTrigger, ReasoningContent, useReasoning, shouldAutoCollapseReasoning } from "./Reasoning";
 
 // Stub matchMedia for Radix
 beforeAll(() => {
@@ -89,17 +89,56 @@ describe("Reasoning component", () => {
     expect(screen.getByTestId("probe").textContent).toBe("false");
   });
 
-  it("duration updates", () => {
+  it("shouldAutoCollapseReasoning logic", () => {
+    expect(shouldAutoCollapseReasoning({ autoCollapseKey: "b", previousAutoCollapseKey: "a", userInteracted: false })).toBe(true);
+    expect(shouldAutoCollapseReasoning({ autoCollapseKey: "b", previousAutoCollapseKey: "a", userInteracted: true })).toBe(false);
+    expect(shouldAutoCollapseReasoning({ autoCollapseKey: null, previousAutoCollapseKey: "a", userInteracted: false })).toBe(false);
+  });
+
+  it("auto-collapse integration", () => {
     vi.useFakeTimers();
-    render(
-      <Reasoning isStreaming={true}>
+    const { rerender } = render(
+      <Reasoning defaultOpen isStreaming={true} autoCollapseKey={null}>
+        <ReasoningTrigger />
+        <ReasoningContent>body</ReasoningContent>
+        <Probe />
+      </Reasoning>
+    );
+
+    expect(screen.getByTestId("probe").textContent).toBe("true");
+
+    rerender(
+      <Reasoning defaultOpen isStreaming={false} autoCollapseKey="complete">
+        <ReasoningTrigger />
+        <ReasoningContent>body</ReasoningContent>
+        <Probe />
+      </Reasoning>
+    );
+
+    act(() => vi.advanceTimersByTime(300));
+    expect(screen.getByTestId("probe").textContent).toBe("false");
+  });
+
+  it("duration updates and freezes", () => {
+    vi.useFakeTimers();
+    const { rerender } = render(
+      <Reasoning isStreaming={true} defaultOpen>
         <ReasoningTrigger />
       </Reasoning>
     );
-    fireEvent.click(screen.getByTestId("reasoning-trigger"));
+    // Clicked trigger isn't strictly needed if defaultOpen is true
     expect(screen.getByText("1 seconds")).toBeDefined();
     act(() => vi.advanceTimersByTime(2000));
     expect(screen.getByText("2 seconds")).toBeDefined();
-    // Re-render as not streaming
+
+    rerender(
+      <Reasoning isStreaming={false} defaultOpen>
+        <ReasoningTrigger />
+      </Reasoning>
+    );
+
+    act(() => vi.advanceTimersByTime(5000));
+    expect(screen.getByText("2 seconds")).toBeDefined();
+    expect(screen.queryByText("3 seconds")).toBeNull();
   });
 });
