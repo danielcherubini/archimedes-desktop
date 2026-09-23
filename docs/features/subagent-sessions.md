@@ -55,6 +55,8 @@ final output + metrics. Subagent sessions are ephemeral (not stored,
 
 ## Follow-ups
 
-- Root-cause the 2026-09-15 hang (two concurrent ACP sessions on one tokio
-  runtime; suspected SDK/async-io global reactor) — tracked in ADR 0004
-  (option 3); lifting the one-live cap is a one-token policy flip once fixed.
+- 2026-09-15 hang (two concurrent ACP sessions on one tokio
+  runtime): **no longer reproduces** on current versions (ADR 0002,
+  resolved 2026-09-22 — root cause never confirmed, likely
+  version/environment-specific); the one-live cap is lifted. If it
+  reappears, root-cause per ADR 0004 (option 3).

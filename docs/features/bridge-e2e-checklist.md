@@ -56,7 +56,7 @@ Trigger by prompting `pi` to run a command via `sudo_exec`.
 
 - [ ] **Session close with a pending prompt** — trigger an `ask`/`sudo` prompt, leave it pending, then **close the session** → the pending prompt is **drained as cancelled** (the `close_tx` flag cancels the waiter; the `pending_bridge` entry is drained by the `"{session_id}/"` prefix). No leaked waiter, no crash.
 - [ ] **Crash / restart mid-request** — kill the desktop (or the agent) mid-request, then **restart** the desktop → the **stale socket file is tolerated/cleaned** at startup (a fresh per-spawn randomized socket is used; a stale file does not block the new session) → the new session works.
-- [ ] **Two sessions (frame isolation)** — given the one-live policy, run two `pi` sessions **back-to-back**: start session A, let it push frames (`seq` 1, 2, …), close it; start session B, let it push → session B's `seq` **starts at 1 again** (a fresh per-spawn listener), **not** continuing from A's `lastSeq`. Each session's `bridge-request`/`bridge-event` carries its **own** `sessionId`; no cross-talk.
+- [ ] **Two sessions (frame isolation)** — run two `pi` sessions **back-to-back**: start session A, let it push frames (`seq` 1, 2, …), close it; start session B, let it push → session B's `seq` **starts at 1 again** (a fresh per-spawn listener), **not** continuing from A's `lastSeq`. Each session's `bridge-request`/`bridge-event` carries its **own** `sessionId`; no cross-talk.
 - [ ] **Agent exit tears the listener down** — let a `pi` session end on its own → the bridge listener is **torn down and unlinked** (the socket file disappears), closing the pid-reuse window.
 
 ## 5. Downgrade combos (release safety)

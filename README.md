@@ -15,10 +15,9 @@ See [CONTEXT.md](CONTEXT.md) for the project's language and terminology.
 - Presents **spaces** — each space is a folder; your conversations live
   inside spaces, and the agent's file access is sandboxed to the space's
   folder.
-- One conversation is live at a time; starting a conversation in another
-  space pauses the current one (it stays resumable). This sidesteps a
-  known two-session runtime constraint
-  ([docs/decisions/0002](docs/decisions/0002-one-live-acp-session.md)).
+- Multiple conversations can be live at once — starting a conversation
+  in another space does not pause the current one (both keep running;
+  a closed conversation stays resumable).
 - Streams the conversation: agent text, tool calls, and file diffs.
 - Permission prompts: the agent asks before each tool call; you approve
   or deny in the UI.
