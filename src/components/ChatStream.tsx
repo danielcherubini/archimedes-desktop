@@ -6,7 +6,12 @@ import {
   useSyncExternalStore,
 } from "react";
 import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
-import { closeSession, sendPrompt, setSessionConfigOption, type SessionConfigOption } from "../lib/tauri";
+import {
+  closeSession,
+  sendPrompt,
+  setSessionConfigOption,
+  type SessionConfigOption,
+} from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
