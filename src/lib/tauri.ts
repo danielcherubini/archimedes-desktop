@@ -134,13 +134,18 @@ export type ToolCallContent =
   | { type: "diff"; path: string; oldText?: string | null; newText: string };
 
 /**
- * A `session/update` notification body. The three update types the desktop
- * renders are modelled; anything else (unknown/future types) falls through
+ * A `session/update` notification body. The five update types the desktop
+ * handles are modelled; anything else (unknown/future types) falls through
  * to the reducer's `default` branch and is ignored (forward-compat).
  */
 export type AcpSessionUpdate =
   | {
       sessionUpdate: "agent_message_chunk";
+      content?: ContentBlock;
+      messageId?: string;
+    }
+  | {
+      sessionUpdate: "agent_thought_chunk";
       content?: ContentBlock;
       messageId?: string;
     }
@@ -289,7 +294,7 @@ export interface SubagentClosedPayload {
 export interface MessageRow {
   id: number;
   sessionId: string;
-  kind: "user" | "agent-text" | "tool-call" | "diff" | (string & {});
+  kind: "user" | "agent-text" | "agent-thought" | "tool-call" | "diff" | (string & {});
   /** ContentChunk.messageId for agent-text; the tool call id for tool-call. */
   messageKey: string | null;
   /** The message body, serialized (camelCase). */

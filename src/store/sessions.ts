@@ -32,6 +32,7 @@ export interface DiffRef {
 export type Message =
   | { kind: "user"; text: string; at: number }
   | { kind: "agent-text"; messageId: string; text: string; at: number }
+  | { kind: "agent-thought"; messageId: string; text: string; at: number }
   | {
       kind: "tool-call";
       id: string;
@@ -86,6 +87,9 @@ function diffMessages(diffs: DiffRef[], at: number): Message[] {
  *   the same `messageId`; a new `messageId` (or an intervening non-text
  *   message) starts a new message — real agents emit several messages per
  *   turn, so we never just "append to the last agent-text".
+ * - `agent_thought_chunk`: appended to the trailing agent-thought message with
+ *   the same `messageId`; a new `messageId` (or an intervening non-thought
+ *   message) starts a new message — same segmentation rules as agent-text.
  * - `tool_call` / `tool_call_update`: create/update the tool-call message;
  *   diffs inside the content are extracted into standalone diff messages
  *   (there is no dedicated file-edit update type).
@@ -110,6 +114,21 @@ export function applySessionUpdate(
         return [...messages.slice(0, -1), { ...last, text: last.text + text }];
       }
       return [...messages, { kind: "agent-text", messageId, text, at }];
+    }
+
+    case "agent_thought_chunk": {
+      const content = update.content;
+      if (!content || content.type !== "text" || typeof content.text !== "string") {
+        return messages;
+      }
+      const text = content.text;
+      if (text === "") return messages;
+      const messageId = update.messageId ?? "default";
+      const last = messages[messages.length - 1];
+      if (last && last.kind === "agent-thought" && last.messageId === messageId) {
+        return [...messages.slice(0, -1), { ...last, text: last.text + text }];
+      }
+      return [...messages, { kind: "agent-thought", messageId, text, at }];
     }
 
     case "tool_call": {
@@ -220,6 +239,17 @@ export function rowToMessages(row: MessageRow): Message[] {
         ? [
             {
               kind: "agent-text",
+              messageId: row.messageKey ?? "default",
+              text: payload.text,
+              at: row.createdAt,
+            },
+          ]
+        : [];
+    case "agent-thought":
+      return typeof payload.text === "string"
+        ? [
+            {
+              kind: "agent-thought",
               messageId: row.messageKey ?? "default",
               text: payload.text,
               at: row.createdAt,
