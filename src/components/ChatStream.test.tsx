@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import ChatStream from "./ChatStream";
-import { sendPrompt } from "../lib/tauri";
+import { sendPrompt, setSessionConfigOption } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -12,18 +12,28 @@ import { getSidePaneCollapsed, setSidePaneCollapsed } from "../lib/sidePaneState
 // window` guard in the `BrailleLoader`'s `usePrefersReducedMotion` passes,
 // then the call throws) — stub a full MediaQueryList so the working
 // indicator renders (the `braille-loader` test's full-stub pattern).
-vi.stubGlobal(
-  "matchMedia",
-  (q: string) => ({
-    matches: false,
-    media: q,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    addListener: vi.fn(),
-    removeListener: vi.fn(),
-    dispatchEvent: vi.fn(),
-  }),
-);
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+  Element.prototype.hasPointerCapture = vi.fn(() => false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  HTMLElement.prototype.hasPointerCapture = vi.fn(() => false);
+  HTMLElement.prototype.setPointerCapture = vi.fn();
+  HTMLElement.prototype.releasePointerCapture = vi.fn();
+  vi.stubGlobal(
+    "matchMedia",
+    (q: string) => ({
+      matches: false,
+      media: q,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  );
+});
 
 // Mock the Tauri IPC layer; everything else (stores) is the real code.
 vi.mock("../lib/tauri", async () => {
@@ -41,6 +51,7 @@ vi.mock("../lib/tauri", async () => {
     sendPrompt: vi.fn().mockResolvedValue("end_turn"),
     respondPermission: vi.fn().mockResolvedValue(undefined),
     respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    setSessionConfigOption: vi.fn().mockResolvedValue([]),
   };
 });
 
@@ -59,6 +70,7 @@ function seedLiveSession(): void {
     inTurn: {},
     stopReasons: {},
     closeReasons: {},
+    configOptions: {},
   });
 }
 
@@ -81,6 +93,7 @@ function seedStoredSession(
     inTurn: {},
     stopReasons: {},
     closeReasons: {},
+    configOptions: {},
   });
 }
 
@@ -107,6 +120,7 @@ beforeEach(() => {
     inTurn: {},
     stopReasons: {},
     closeReasons: {},
+    configOptions: {},
   });
   useBridge.getState().dismissSession("s1");
   usePermissions.getState().dismissSessionPrompts("s1");
@@ -494,5 +508,90 @@ describe("ChatStream", () => {
     // loader (role="status") does NOT (both would render otherwise).
     expect(screen.getByText("Waiting for your input…")).toBeTruthy();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("a live session WITH a model + thinking config option renders BOTH selectors", async () => {
+    seedLiveSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "acme/alpha",
+            options: [
+              { value: "acme/alpha", name: "acme/Alpha" },
+              { value: "acme/beta", name: "acme/Beta" },
+            ],
+          },
+          {
+            id: "thought_level",
+            name: "Thinking",
+            type: "select",
+            currentValue: "medium",
+            options: [
+              { value: "low", name: "Low" },
+              { value: "medium", name: "Medium" },
+            ],
+          },
+        ],
+      },
+    });
+    render(<ChatStream />);
+    expect(screen.getByRole("combobox", { name: "Model" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Thinking" })).toBeTruthy();
+    expect(screen.getByText("acme/Alpha")).toBeTruthy();
+    expect(screen.getByText("Medium")).toBeTruthy();
+  });
+
+  it("choosing a model item invokes setSessionConfigOption", async () => {
+    seedLiveSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "acme/alpha",
+            options: [
+              { value: "acme/alpha", name: "acme/Alpha" },
+              { value: "acme/beta", name: "acme/Beta" },
+            ],
+          },
+        ],
+      },
+    });
+    render(<ChatStream />);
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    fireEvent.click(screen.getByRole("option", { name: "acme/Beta" }));
+    expect(setSessionConfigOption).toHaveBeenCalledWith("s1", "model", "acme/beta");
+  });
+
+  it("a live session WITHOUT configOptions renders neither selector", () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Thinking" })).toBeNull();
+  });
+
+  it("a STORED session with configOptions renders neither selector", () => {
+    seedStoredSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "acme/alpha",
+            options: [{ value: "acme/alpha", name: "acme/Alpha" }],
+          },
+        ],
+      },
+    });
+    render(<ChatStream />);
+    expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
   });
 });

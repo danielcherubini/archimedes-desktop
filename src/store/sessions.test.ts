@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applySessionUpdate,
   autoSelectActive,
@@ -17,6 +17,21 @@ import type {
   SessionInfo,
   SpaceRow,
 } from "../lib/tauri";
+
+vi.mock("../lib/tauri", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
+  return {
+    ...actual,
+    resumeSession: vi.fn().mockResolvedValue({
+      sessionId: "s1",
+      agentId: "a1",
+      cwd: "/x",
+      capabilities: {},
+      configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "gpt-4" }],
+    }),
+    loadHistory: vi.fn().mockResolvedValue([]),
+  };
+});
 
 /**
  * Fixtures use EXACTLY the four `SessionInfo` wire fields — `SessionInfo`
@@ -648,5 +663,94 @@ describe("rowToMessages (history replay from the database)", () => {
       rowToMessages(row({ kind: "user", payloadJson: "not json" })),
     ).toHaveLength(0);
     expect(rowToMessages(row({ kind: "mystery" }))).toHaveLength(0);
+  });
+});
+
+describe("configOptions state", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      activeSessionId: null,
+      messages: {},
+      configOptions: {},
+    });
+  });
+
+  it("seeds configOptions from a started session's SessionInfo (and not when absent)", () => {
+    useSessions.getState().addSession({
+      sessionId: "s1",
+      agentId: "a1",
+      cwd: "/x",
+      capabilities: {},
+      configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "gpt-4" }],
+    });
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+
+    useSessions.getState().addSession({
+      sessionId: "s2",
+      agentId: "a2",
+      cwd: "/x",
+      capabilities: {},
+    });
+    expect("s2" in useSessions.getState().configOptions).toBe(false);
+  });
+
+  it("seeds configOptions from a resumed session's SessionInfo", async () => {
+    useSessions.setState({
+      historySessions: [
+        { sessionId: "s1", agentId: "a1", cwd: "/x", capabilities: {} },
+      ],
+    });
+    await useSessions.getState().resumeSession("s1");
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+  });
+
+  it("replaces a session's configOptions on a config_option_update update", () => {
+    useSessions.getState().applyConfigOptions("s1", [
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-3.5" },
+    ]);
+    useSessions.getState().applySessionUpdate("s1", {
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+      ],
+    });
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+
+    // Non-config update should not change it
+    useSessions.getState().applySessionUpdate("s1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hi" },
+    });
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+  });
+
+  it("replaces a session's configOptions via applyConfigOptions", () => {
+    useSessions.getState().applyConfigOptions("s1", [
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-3.5" },
+    ]);
+    useSessions.getState().applyConfigOptions("s1", [
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+  });
+
+  it("clears a session's configOptions on close", () => {
+    useSessions.getState().applyConfigOptions("s1", [
+      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
+    ]);
+    useSessions.getState().handleSessionClosed("s1", "user");
+    expect("s1" in useSessions.getState().configOptions).toBe(false);
   });
 });

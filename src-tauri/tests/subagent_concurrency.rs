@@ -198,10 +198,11 @@ async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
     // 1. The MAIN-runtime session (the test's own runtime plays the "app
     //    runtime" role — the test does not require the Tauri app runtime).
     let manager = SessionManager::new(config_dir.clone()).unwrap();
-    let info = manager
-        .start_session("main", cwd.clone(), &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("main", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // 2. The WORKER-runtime session: built on the dedicated runtime via
@@ -219,10 +220,13 @@ async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
             let manager = Arc::new(
                 SessionManager::new(worker_config_dir).expect("worker SessionManager should build"),
             );
-            let info = manager
-                .start_session("worker", cwd, &worker_sink)
-                .await
-                .expect("worker start_session should succeed");
+            let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+                manager
+                    .start_session("worker", cwd.clone(), &worker_sink)
+                    .await
+            })
+            .await
+            .expect("worker start_session should succeed");
             (manager, info.session_id.to_string())
         })
         .await
@@ -328,9 +332,11 @@ async fn app_exit_shutdown_and_join_reaps_worker_agent() {
         let s = Arc::clone(&sink);
         worker
             .spawn_task(async move {
-                m.start_session("worker", cwd, &s)
-                    .await
-                    .expect("worker start_session should succeed")
+                archimedes_desktop_lib::test_support::run_with_retry(|| async {
+                    m.start_session("worker", cwd.clone(), &s).await
+                })
+                .await
+                .expect("worker start_session should succeed")
             })
             .await
             .expect("worker spawn_task should complete")

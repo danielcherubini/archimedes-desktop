@@ -34,8 +34,9 @@ use tokio::sync::{oneshot, watch, Mutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -107,6 +108,11 @@ pub struct SessionInfo {
     pub agent_id: String,
     pub cwd: PathBuf,
     pub capabilities: AgentCapabilities,
+    /// The agent's session configuration options (model / thinking level
+    /// selectors) from the `newSession` / `loadSession` response; `None`
+    /// when the agent does not advertise any (or for stored sessions —
+    /// `list_sessions` always reports `None`).
+    pub config_options: Option<Vec<SessionConfigOption>>,
 }
 
 /// A live, in-memory session handle.
@@ -868,6 +874,7 @@ impl SessionManager {
                             agent_id: agent_id_owned,
                             cwd: cwd_owned,
                             capabilities: init.agent_capabilities,
+                            config_options: new_session.config_options.clone(),
                         },
                     ))
                 },
@@ -976,7 +983,7 @@ impl SessionManager {
                         let _ = db.clear_messages_for(&sid.to_string());
                     }
 
-                    let _restored = cx
+                    let restored = cx
                         .load_session(sid.clone(), cwd_owned.as_path())
                         .block_task()
                         .start_session()
@@ -989,6 +996,7 @@ impl SessionManager {
                             agent_id: agent_id_owned,
                             cwd: cwd_owned,
                             capabilities: init.agent_capabilities,
+                            config_options: restored.response().config_options.clone(),
                         },
                     ))
                 },
@@ -1036,6 +1044,42 @@ impl SessionManager {
                     message: err.message,
                 })?;
         Ok(response.stop_reason)
+    }
+
+    /// Set a session config option (e.g. the model) on a live session.
+    ///
+    /// Clones the (cheap) connection handle, drops the lock, sends
+    /// `session/set_config_option`, and returns the agent's updated
+    /// `configOptions` (the agent also emits a `config_option_update`
+    /// notification — the two paths converge to the same state).
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<SessionConfigOption>, AcpError> {
+        let sid = SessionId::new(session_id);
+        let cx = {
+            let sessions = self.driver.sessions.lock().await;
+            sessions
+                .get(&sid)
+                .map(|live| live.cx.clone())
+                .ok_or_else(|| AcpError::UnknownSession {
+                    session_id: session_id.to_string(),
+                })?
+        };
+        // `SessionConfigId` has `From` ONLY for `Arc<str>` / `String` /
+        // `&'static str` — a borrowed `&str` does NOT convert; wrap it.
+        let request =
+            SetSessionConfigOptionRequest::new(sid, SessionConfigId::new(config_id), value);
+        let response =
+            cx.send_request(request)
+                .block_task()
+                .await
+                .map_err(|err| AcpError::Protocol {
+                    message: err.message,
+                })?;
+        Ok(response.config_options)
     }
 
     /// Deliver the user's answer to a pending permission request.
@@ -1379,5 +1423,243 @@ mod tests {
         assert_eq!(acc.cache_read_tokens, 0);
         assert_eq!(acc.cache_write_tokens, 0);
         assert_eq!(acc.cost, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
+    };
+    use std::path::Path;
+
+    use tokio::sync::mpsc;
+
+    pub struct TestSink {
+        tx: mpsc::UnboundedSender<Value>,
+    }
+
+    impl EventSink for TestSink {
+        fn emit(&self, event: &str, payload: Value) {
+            let _ = self
+                .tx
+                .send(serde_json::json!({ "event": event, "payload": payload }));
+        }
+    }
+
+    pub fn temp_config_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    pub fn unique_fake_agent(dir: &Path) -> PathBuf {
+        let fake = dir.join("fake_agent");
+        let bin = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_agent"
+        ));
+        std::fs::copy(&bin, &fake).expect("failed to copy fake_agent");
+        fake
+    }
+
+    pub fn write_agents_json_cmd(cmd: &Path, dir: &Path, mode: Option<&str>) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "fake",
+                "name": "Fake Agent",
+                "command": cmd,
+                "args": mode.map(|m| vec![m]).unwrap_or_default(),
+                "env": {}
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_session_returns_config_options_from_new_session_response() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, None);
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+
+        assert!(info.config_options.is_some());
+        let opts = info.config_options.unwrap();
+        assert_eq!(opts.len(), 2);
+
+        let model = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
+            .unwrap();
+        match &model.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "acme/alpha");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+
+        let thought = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+            .unwrap();
+        match &thought.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "medium");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 6),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_session_returns_config_options_from_load_session_response() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, Some("resume"));
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.resume_session("fake", "fake-session-1", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+
+        assert!(info.config_options.is_some());
+        let opts = info.config_options.unwrap();
+        assert_eq!(opts.len(), 2);
+
+        let model = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
+            .unwrap();
+        match &model.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "acme/alpha");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (set) `set_config_option` round-trips: the request reaches the agent,
+    /// the response's updated `configOptions` come back (model current value
+    /// moved to `acme/beta`, the thinking entry unchanged), AND the agent's
+    /// `config_option_update` notification arrives as a `session-update`
+    /// event with the same updated options.
+    #[tokio::test]
+    async fn set_config_option_round_trips_and_notifies() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, None);
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+
+        let updated = manager
+            .set_config_option(&info.session_id.to_string(), "model", "acme/beta")
+            .await
+            .unwrap();
+
+        assert_eq!(updated.len(), 2);
+        let model = updated
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
+            .unwrap();
+        match &model.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "acme/beta");
+            }
+            _ => panic!("expected select"),
+        }
+
+        // Wait for the notification
+        let mut found = false;
+        for _ in 0..10 {
+            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                let msg = msg.unwrap();
+                if msg["event"] == "session-update" {
+                    let payload = &msg["payload"]["update"];
+                    if payload["sessionUpdate"] == "config_option_update" {
+                        found = true;
+                        assert_eq!(
+                            payload["configOptions"],
+                            serde_json::to_value(&updated).unwrap()
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found, "notification not received");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (error) `set_config_option_error` mode: the agent's rejection maps to
+    /// `AcpError::Protocol`.
+    #[tokio::test]
+    async fn set_config_option_rejection_maps_to_protocol_error() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, Some("set_config_option_error"));
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+
+        let result = manager
+            .set_config_option(&info.session_id.to_string(), "model", "acme/beta")
+            .await;
+
+        assert!(matches!(result, Err(AcpError::Protocol { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (unknown) `set_config_option` on an unknown session id maps to
+    /// `AcpError::UnknownSession`.
+    #[tokio::test]
+    async fn set_config_option_unknown_session() {
+        let dir = temp_config_dir();
+        let manager = SessionManager::new(dir.clone()).unwrap();
+
+        let result = manager
+            .set_config_option("nope", "model", "acme/beta")
+            .await;
+
+        assert!(matches!(result, Err(AcpError::UnknownSession { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

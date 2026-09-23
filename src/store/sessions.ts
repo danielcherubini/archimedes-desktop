@@ -8,6 +8,7 @@ import {
   type AcpToolCallStatus,
   type CloseReasonStr,
   type MessageRow,
+  type SessionConfigOption,
   type SessionInfo,
   type SpaceRow,
   type StopReason,
@@ -19,6 +20,7 @@ import { usePermissions } from "./permissions";
 import { useSubagents } from "./subagents";
 
 export type { AcpSessionUpdate } from "../lib/tauri";
+export type { SessionConfigOption } from "../lib/tauri";
 
 export type ToolCallUiStatus = "pending" | "completed" | "failed";
 
@@ -387,6 +389,8 @@ interface SessionsState {
   closeReasons: Record<string, CloseReasonStr>;
   /** Transcript per session id. Kept after close for history. */
   messages: Record<string, Message[]>;
+  /** Config options per session id. */
+  configOptions: Record<string, SessionConfigOption[]>;
   /** Whether a prompt turn is in flight for a session. */
   inTurn: Record<string, boolean>;
   /** Last stop reason reported for a session's turn. */
@@ -434,6 +438,7 @@ interface SessionsState {
   resumeSession: (sessionId: string) => Promise<SessionInfo>;
   addUserMessage: (sessionId: string, text: string) => void;
   beginTurn: (sessionId: string) => void;
+  applyConfigOptions: (sessionId: string, options: SessionConfigOption[]) => void;
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
   handleSessionClosed: (sessionId: string, reason: CloseReasonStr) => void;
   turnCompleted: (sessionId: string, stopReason: StopReason) => void;
@@ -446,6 +451,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
   spaces: [],
   closeReasons: {},
   messages: {},
+  configOptions: {},
   inTurn: {},
   stopReasons: {},
 
@@ -464,6 +470,14 @@ export const useSessions = create<SessionsState>((set, get) => ({
       // unchanged.)
       activeSessionId: info.sessionId,
       messages: { ...state.messages, [info.sessionId]: [] },
+      configOptions: info.configOptions
+        ? { ...state.configOptions, [info.sessionId]: info.configOptions }
+        : state.configOptions,
+    })),
+
+  applyConfigOptions: (sessionId, options) =>
+    set((state) => ({
+      configOptions: { ...state.configOptions, [sessionId]: options },
     })),
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
@@ -555,6 +569,9 @@ export const useSessions = create<SessionsState>((set, get) => ({
         (s) => s.sessionId !== sessionId,
       ),
       activeSessionId: st.activeSessionId ?? sessionId,
+      configOptions: info.configOptions
+        ? { ...st.configOptions, [sessionId]: info.configOptions }
+        : st.configOptions,
     }));
     // ACP `session/load` does not re-stream the transcript — reload it from
     // the persisted history so the pane shows the conversation on resume.
@@ -587,16 +604,26 @@ export const useSessions = create<SessionsState>((set, get) => ({
     set((state) => ({ inTurn: { ...state.inTurn, [sessionId]: true } })),
 
   applySessionUpdate: (sessionId, update) =>
-    set((state) => ({
-      messages: {
-        ...state.messages,
-        [sessionId]: applySessionUpdate(
-          state.messages[sessionId] ?? [],
-          update,
-          Date.now(),
-        ),
-      },
-    })),
+    set((state) => {
+      const messages = applySessionUpdate(
+        state.messages[sessionId] ?? [],
+        update,
+        Date.now(),
+      );
+
+      let configOptions = state.configOptions;
+      if (update.sessionUpdate === "config_option_update") {
+        configOptions = { ...state.configOptions, [sessionId]: update.configOptions };
+      }
+
+      return {
+        messages: {
+          ...state.messages,
+          [sessionId]: messages,
+        },
+        configOptions,
+      };
+    }),
 
   handleSessionClosed: (sessionId, reason) => {
     // Dismiss the session's permission prompts (auto-cancelled server-side).
@@ -604,30 +631,34 @@ export const useSessions = create<SessionsState>((set, get) => ({
     const closedInfo = useSessions
       .getState()
       .sessions.find((s) => s.sessionId === sessionId);
-    set((state) => ({
-      sessions: state.sessions.filter((s) => s.sessionId !== sessionId),
-      // The session remains in the database: it moves to the history list.
-      historySessions: closedInfo
-        ? [
-            ...state.historySessions.filter(
-              (s) => s.sessionId !== sessionId,
-            ),
-            closedInfo,
-          ]
-        : state.historySessions,
-      // A close is a PAUSE, not a discard: the conversation moves to the
-      // history list but STAYS the displayed one, so `ChatStream` renders
-      // its stored/paused banner instead of the `No active session` empty
-      // state. (Required for the Task 6 `Pause` behavior.)
-      activeSessionId: state.activeSessionId,
-      // Merge-only: a close reason outlives its event (never delete keys).
-      closeReasons: { ...state.closeReasons, [sessionId]: reason },
-      messages: {
-        ...state.messages,
-        [sessionId]: finalizeSessionMessages(state.messages[sessionId] ?? []),
-      },
-      inTurn: { ...state.inTurn, [sessionId]: false },
-    }));
+    set((state) => {
+      const { [sessionId]: _goneConfig, ...restConfig } = state.configOptions;
+      return {
+        sessions: state.sessions.filter((s) => s.sessionId !== sessionId),
+        // The session remains in the database: it moves to the history list.
+        historySessions: closedInfo
+          ? [
+              ...state.historySessions.filter(
+                (s) => s.sessionId !== sessionId,
+              ),
+              closedInfo,
+            ]
+          : state.historySessions,
+        // A close is a PAUSE, not a discard: the conversation moves to the
+        // history list but STAYS the displayed one, so `ChatStream` renders
+        // its stored/paused banner instead of the `No active session` empty
+        // state. (Required for the Task 6 `Pause` behavior.)
+        activeSessionId: state.activeSessionId,
+        // Merge-only: a close reason outlives its event (never delete keys).
+        closeReasons: { ...state.closeReasons, [sessionId]: reason },
+        messages: {
+          ...state.messages,
+          [sessionId]: finalizeSessionMessages(state.messages[sessionId] ?? []),
+        },
+        configOptions: restConfig,
+        inTurn: { ...state.inTurn, [sessionId]: false },
+      };
+    });
   },
 
   turnCompleted: (sessionId, stopReason) =>

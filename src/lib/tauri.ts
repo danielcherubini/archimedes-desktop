@@ -18,12 +18,41 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 // Types mirroring the Rust side
 // ---------------------------------------------------------------------------
 
+/** One entry of a config option's `options` list (camelCase). */
+export interface SessionConfigSelectOption {
+  value: string;
+  name: string;
+  description?: string | null;
+}
+
+/** A group in a config option's `options` list (camelCase). */
+export interface SessionConfigSelectGroup {
+  name: string;
+  options: SessionConfigSelectOption[];
+}
+
+/**
+ * A session config option the agent advertises (camelCase wire shape).
+ * `category` is snake_case per the ACP spec (`"model"`,
+ * `"thought_level"`); `type` discriminates the payload shape.
+ */
+export interface SessionConfigOption {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  type: "select" | "boolean";
+  currentValue: string | boolean;
+  options?: (SessionConfigSelectOption | SessionConfigSelectGroup)[]; // select kind only
+}
+
 /** Return value of the `start_session` command (camelCase). */
 export interface SessionInfo {
   sessionId: string;
   agentId: string;
   cwd: string;
   capabilities: Record<string, unknown>;
+  configOptions?: SessionConfigOption[];
 }
 
 /** A registry entry over IPC (camelCase). */
@@ -130,7 +159,8 @@ export type AcpSessionUpdate =
       status?: AcpToolCallStatus;
       rawInput?: unknown;
       content?: ToolCallContent[];
-    };
+    }
+  | { sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] };
 
 export interface SessionUpdatePayload {
   sessionId: string;
@@ -310,6 +340,19 @@ export async function resumeSession(
   cwd: string,
 ): Promise<SessionInfo> {
   return invoke<SessionInfo>("resume_session", { agentId, sessionId, cwd });
+}
+
+/** Set a session config option (model / thinking level); returns the agent's updated `configOptions`. */
+export async function setSessionConfigOption(
+  sessionId: string,
+  configId: string,
+  value: string,
+): Promise<SessionConfigOption[]> {
+  return invoke<SessionConfigOption[]>("set_session_config_option", {
+    sessionId,
+    configId,
+    value,
+  });
 }
 
 // ---------------------------------------------------------------------------

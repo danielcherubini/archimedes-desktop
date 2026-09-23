@@ -35,3 +35,7 @@ _Avoid_: Approval dialog, consent prompt, confirm
 **Bridge**:
 The mechanism by which the archimedes suite (running inside an Agent process managed by the Client) routes its interactive UI primitives (ask picker, confirmations, masked password input) and ambient state (todos, cost, subagent streams, agent state) to the Client over a local channel. Gated by process spawn: the Client sets the bridge env vars on the Agent it spawns; the suite is inert when they are absent. See the pi-archimedes glossary for the suite-side view.
 _Avoid_: Side channel, socket bridge, client mode, host mode
+
+**Config option**:
+A per-session selector the agent advertises over ACP (e.g. model, thinking level) — a `select` (or `boolean`) with a current value and choices. Delivered in the `newSession`/`loadSession` response, updated via `config_option_update` notifications, and set by the Client via `session/set_config_option`. The agent is the source of truth: the Client does not persist config options; a resume re-fetches fresh state from the agent.
+_Avoid_: Model list, model picker, settings, preferences

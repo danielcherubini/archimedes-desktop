@@ -6,7 +6,12 @@ import {
   useSyncExternalStore,
 } from "react";
 import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
-import { closeSession, sendPrompt } from "../lib/tauri";
+import {
+  closeSession,
+  sendPrompt,
+  setSessionConfigOption,
+  type SessionConfigOption,
+} from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
@@ -34,6 +39,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
+import SessionConfigSelect from "./SessionConfigSelect";
 import MessageBubble from "./MessageBubble";
 import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
@@ -135,6 +141,24 @@ export default function ChatStream() {
     subscribeSidePane,
     getSidePaneCollapsed,
   );
+  const configOptions = useSessions(
+    (s) => s.configOptions[s.activeSessionId ?? ""] ?? null,
+  );
+  const findOption = (category: string, id: string) =>
+    configOptions?.find(
+      (o) =>
+        (o.category === category || o.id === id) &&
+        o.type === "select" &&
+        (o.options?.length ?? 0) > 0,
+    );
+  const modelOption = findOption("model", "model");
+  const thinkingOption = findOption("thought_level", "thought_level");
+  const applyConfigOptions = useSessions((s) => s.applyConfigOptions);
+  const setConfigOption = (option: SessionConfigOption) => (value: string) =>
+    setSessionConfigOption(activeSessionId!, option.id, value).then((options) =>
+      applyConfigOptions(activeSessionId!, options),
+    );
+
   // Pending subagent requests (the toggle dot) — called UNCONDITIONALLY,
   // BEFORE the `!activeSessionId` early return below: this hook contains
   // `useSyncExternalStore` (via zustand), so calling it only on the
@@ -399,6 +423,18 @@ export default function ChatStream() {
               ))}
             </SelectContent>
           </Select>
+        )}
+        {isLive && modelOption && (
+          <SessionConfigSelect
+            option={modelOption}
+            onSet={setConfigOption(modelOption)}
+          />
+        )}
+        {isLive && thinkingOption && (
+          <SessionConfigSelect
+            option={thinkingOption}
+            onSet={setConfigOption(thinkingOption)}
+          />
         )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

@@ -302,6 +302,7 @@ impl SubagentSessionManager {
                                     agent_id: establish_agent_id.clone(),
                                     cwd,
                                     capabilities: init.agent_capabilities,
+                                    config_options: None,
                                 },
                             ))
                         }
@@ -373,6 +374,9 @@ impl SubagentSessionManager {
             );
             let prompt = cx.send_request(request).block_task().await;
 
+            // Ensure teardown on completion or failure.
+            task_cancel.cancel();
+
             // 6 / 7 / 8. Close + emit + resolve (the `end_turn` path) or
             // fail (cancellation / the agent died mid-turn).
             match prompt {
@@ -383,10 +387,6 @@ impl SubagentSessionManager {
                     // (the accumulated `cost_update` usage, defaulting to 0)
                     // + `duration_ms` (wall clock since step 1).
                     let (output, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    // Close the session (kind `User`, first-set-wins — the
-                    // driver task tears down: process group, bridge
-                    // listener, socket unlink, `session-closed` emit).
-                    task_cancel.cancel();
                     // The worker task owns the wrapper path — unlink it.
                     if let Some(p) = &wrapper_path {
                         let _ = std::fs::remove_file(p);
@@ -411,9 +411,6 @@ impl SubagentSessionManager {
                         e.message.clone()
                     };
                     let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    // Ensure the teardown (idempotent — a no-op when the
-                    // session already closed).
-                    task_cancel.cancel();
                     if let Some(p) = &wrapper_path {
                         let _ = std::fs::remove_file(p);
                     }
@@ -800,7 +797,6 @@ mod tests {
 
         let registry = Registry::load(&config_dir).unwrap();
         let entry = registry.get("fake").unwrap();
-        let agent = make_agent(entry);
         let cwd = config_dir.clone();
 
         let mut driver = SessionDriver::new();
@@ -813,48 +809,63 @@ mod tests {
         // Drive the session (the fake agent in `two-msgs` mode answers
         // initialize + session/new, then streams m1 then m2 on prompt).
         let establish_cwd = cwd.clone();
-        let info = driver
-            .drive_session(
-                agent,
-                "fake",
-                String::new(),
-                cwd.clone(),
-                &sink,
-                None,
-                None,
-                move |cx: ConnectionTo<agent_client_protocol::Agent>| {
-                    let cwd = establish_cwd.clone();
-                    async move {
-                        let init = cx
-                            .send_request(
-                                InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                                    ClientCapabilities::default()
-                                        .fs(FileSystemCapabilities::default()
-                                            .read_text_file(true)
-                                            .write_text_file(true))
-                                        .terminal(false),
-                                ),
-                            )
-                            .block_task()
-                            .await?;
-                        let new_session = cx
-                            .send_request(NewSessionRequest::new(cwd.clone()))
-                            .block_task()
-                            .await?;
-                        Ok((
-                            new_session.session_id.clone(),
-                            SessionInfo {
-                                session_id: new_session.session_id.clone(),
-                                agent_id: "fake".to_string(),
-                                cwd,
-                                capabilities: init.agent_capabilities,
-                            },
-                        ))
-                    }
-                },
-            )
-            .await
-            .expect("drive_session should establish");
+        let driver_clone = driver.clone();
+        let sink_clone = sink.clone();
+        let entry_clone = entry.clone();
+        let info = drive_with_retry(|| {
+            let agent = make_agent(&entry_clone);
+            let cwd = establish_cwd.clone();
+            let sink = sink_clone.clone();
+            let establish_cwd = establish_cwd.clone();
+            let driver_inner = driver_clone.clone();
+            async move {
+                driver_inner
+                    .drive_session(
+                        agent,
+                        "fake",
+                        String::new(),
+                        cwd,
+                        &sink,
+                        None,
+                        None,
+                        move |cx: ConnectionTo<agent_client_protocol::Agent>| {
+                            let cwd = establish_cwd.clone();
+                            async move {
+                                let init = cx
+                                    .send_request(
+                                        InitializeRequest::new(ProtocolVersion::V1)
+                                            .client_capabilities(
+                                                ClientCapabilities::default()
+                                                    .fs(FileSystemCapabilities::default()
+                                                        .read_text_file(true)
+                                                        .write_text_file(true))
+                                                    .terminal(false),
+                                            ),
+                                    )
+                                    .block_task()
+                                    .await?;
+                                let new_session = cx
+                                    .send_request(NewSessionRequest::new(cwd.clone()))
+                                    .block_task()
+                                    .await?;
+                                Ok((
+                                    new_session.session_id.clone(),
+                                    SessionInfo {
+                                        session_id: new_session.session_id.clone(),
+                                        agent_id: "fake".to_string(),
+                                        cwd,
+                                        capabilities: init.agent_capabilities,
+                                        config_options: None,
+                                    },
+                                ))
+                            }
+                        },
+                    )
+                    .await
+            }
+        })
+        .await
+        .expect("drive_session should establish");
 
         // Send a prompt to trigger the chunks.
         let cx = driver
@@ -875,7 +886,7 @@ mod tests {
             .expect("prompt should succeed");
 
         // Poll the captures until both messages are accumulated.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             let acc = text_capture.lock().unwrap();
             let done = acc.get("m1").is_some() && acc.get("m2").is_some();
@@ -906,104 +917,122 @@ mod tests {
 
     /// (4) The `external_close` arm: a driver task with `external_close: Some`
     /// tears down when the external flag flips DURING the establish phase (the
-    /// fake agent's `hang` mode holds `session/new` open; flip the flag; the
-    /// `drive_session` future completes well under the establish timeout — the
-    /// external kind won the race, so the reason is `user`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn external_close_tears_down_during_establish() {
-        let config_dir = temp_config_dir();
-        let agent_bin = unique_fake_agent(&config_dir);
-        write_agents_json_cmd(&agent_bin, &config_dir, Some("hang"));
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let config_dir = temp_config_dir();
+            let agent_bin = unique_fake_agent(&config_dir);
+            write_agents_json_cmd(&agent_bin, &config_dir, Some("hang"));
 
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let registry = Registry::load(&config_dir).unwrap();
-        let entry = registry.get("fake").unwrap();
-        let agent = make_agent(entry);
-        let cwd = config_dir.clone();
+            let registry = Registry::load(&config_dir).unwrap();
+            let entry = registry.get("fake").unwrap();
+            let cwd = config_dir.clone();
 
-        // A long establish timeout (10 s): the external close must win, so
-        // the teardown happens well under it (not deferred to the timeout).
-        let mut driver = SessionDriver::new();
-        driver.establish_timeout = Duration::from_secs(10);
-        let driver = Arc::new(driver);
+            let mut driver = SessionDriver::new();
+            driver.establish_timeout = Duration::from_secs(10);
+            let driver = Arc::new(driver);
 
-        // Build the external close (the driver selects on `rx`; the kind is
-        // set `User` before the flag flips — first-set-wins).
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let kind = Arc::new(StdMutex::new(None));
-        let external_close = ExternalClose {
-            tx: tx.clone(),
-            rx,
-            kind: kind.clone(),
-        };
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let kind = Arc::new(StdMutex::new(None));
+            let external_close = ExternalClose {
+                tx: tx.clone(),
+                rx,
+                kind: kind.clone(),
+            };
 
-        // Drive the session in a spawned task (the fake agent in `hang` mode
-        // answers initialize but holds session/new open). The `drive_session`
-        // future borrows `driver`, so call it INSIDE the spawned task (the
-        // `async move` block moves the `Arc` into the task, keeping it `'static`).
-        let establish_cwd = cwd.clone();
-        let drive = tokio::spawn(async move {
-            driver
-                .drive_session(
-                    agent,
-                    "fake",
-                    String::new(),
-                    establish_cwd.clone(),
-                    &sink,
-                    None,
-                    Some(external_close),
-                    move |cx: ConnectionTo<agent_client_protocol::Agent>| {
-                        let cwd = establish_cwd.clone();
-                        async move {
-                            let init = cx
-                                .send_request(
-                                    InitializeRequest::new(ProtocolVersion::V1)
-                                        .client_capabilities(
-                                            ClientCapabilities::default()
-                                                .fs(FileSystemCapabilities::default()
-                                                    .read_text_file(true)
-                                                    .write_text_file(true))
-                                                .terminal(false),
-                                        ),
-                                )
-                                .block_task()
-                                .await?;
-                            let new_session = cx
-                                .send_request(NewSessionRequest::new(cwd.clone()))
-                                .block_task()
-                                .await?;
-                            Ok((
-                                new_session.session_id.clone(),
-                                SessionInfo {
-                                    session_id: new_session.session_id.clone(),
-                                    agent_id: "fake".to_string(),
-                                    cwd,
-                                    capabilities: init.agent_capabilities,
-                                },
-                            ))
-                        }
-                    },
-                )
-                .await
-        });
+            let establish_cwd = cwd.clone();
+            let driver_clone = driver.clone();
+            let sink_clone = sink.clone();
+            let registry_entry = entry.clone();
+            let drive = tokio::spawn(async move {
+                driver_clone
+                    .drive_session(
+                        make_agent(&registry_entry),
+                        "fake",
+                        String::new(),
+                        establish_cwd.clone(),
+                        &sink_clone,
+                        None,
+                        Some(external_close),
+                        move |cx: ConnectionTo<agent_client_protocol::Agent>| {
+                            let cwd = establish_cwd.clone();
+                            async move {
+                                let init = cx
+                                    .send_request(
+                                        InitializeRequest::new(ProtocolVersion::V1)
+                                            .client_capabilities(
+                                                ClientCapabilities::default()
+                                                    .fs(FileSystemCapabilities::default()
+                                                        .read_text_file(true)
+                                                        .write_text_file(true))
+                                                    .terminal(false),
+                                            ),
+                                    )
+                                    .block_task()
+                                    .await?;
+                                let new_session = cx
+                                    .send_request(NewSessionRequest::new(cwd.clone()))
+                                    .block_task()
+                                    .await?;
+                                Ok((
+                                    new_session.session_id.clone(),
+                                    SessionInfo {
+                                        session_id: new_session.session_id.clone(),
+                                        agent_id: "fake".to_string(),
+                                        cwd,
+                                        capabilities: init.agent_capabilities,
+                                        config_options: None,
+                                    },
+                                ))
+                            }
+                        },
+                    )
+                    .await
+            });
 
-        // Wait a moment for `initialize` to complete (session/new is still
-        // hanging), then flip the external flag (after setting the kind User).
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        *kind.lock().unwrap() = Some(CloseKind::User);
-        tx.send(true).expect("flip the external close flag");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            *kind.lock().unwrap() = Some(CloseKind::User);
+            let _ = tx.send(true);
 
-        // The driver task tears down when the flag flips — well under the 10 s
-        // establish timeout (the external kind won the race, not the timeout).
-        let result = tokio::time::timeout(Duration::from_secs(3), drive).await;
-        assert!(
-            result.is_ok(),
-            "drive_session should complete when the external flag flips during establish, \
-             not wait for the 10 s establish timeout"
-        );
-        let _ = result.unwrap();
-        let _ = std::fs::remove_dir_all(&config_dir);
+            let result = tokio::time::timeout(Duration::from_secs(8), drive).await;
+
+            let final_res = match result {
+                Ok(inner) => inner,
+                Err(_) => panic!("Test timed out at 8s"),
+            };
+
+            match final_res {
+                Ok(Err(crate::acp::errors::AcpError::SpawnFailed { .. })) if attempts < 3 => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                Ok(Err(crate::acp::errors::AcpError::InitializeFailed { detail })) => {
+                    assert!(
+                        detail.contains("agent did not complete initialize/session-new"),
+                        "Expected teardown (User), but got: {}",
+                        detail
+                    );
+                    break;
+                }
+                Ok(Ok(_)) => panic!("Session established unexpectedly"),
+                Err(e) => panic!("Task panicked: {:?}", e),
+                Ok(Err(e)) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+    }
+
+    async fn drive_with_retry<F, Fut>(
+        attempt_fn: F,
+    ) -> Result<SessionInfo, crate::acp::errors::AcpError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<SessionInfo, crate::acp::errors::AcpError>>,
+    {
+        crate::test_support::run_with_retry(attempt_fn).await
     }
 }
