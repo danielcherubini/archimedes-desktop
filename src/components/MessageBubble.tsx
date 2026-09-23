@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import type { Message } from "../store/sessions";
@@ -145,50 +145,57 @@ function AgentMarkdown({ text }: { text: string }) {
   );
 }
 
-export default function MessageBubble({ message, isStreaming = false }: { message: Message; isStreaming?: boolean }) {
-  switch (message.kind) {
-    case "user":
-      // The design reference: a plain row — no bubble, no avatar.
-      return (
-        <div className="whitespace-pre-wrap text-ui-base text-foreground">
-          {message.text}
-        </div>
-      );
+// Memoized: during a live turn EVERY thought/text chunk replaces only the
+// trailing message object in the reducer — every other bubble receives the
+// SAME reference. Without this, each chunk re-rendered the whole transcript
+// (a full ReactMarkdown re-parse per agent-text bubble), which made the app
+// render real slow. Only the changed bubble re-renders now.
+export default memo(
+  function MessageBubble({ message, isStreaming = false }: { message: Message; isStreaming?: boolean }) {
+    switch (message.kind) {
+      case "user":
+        // The design reference: a plain row — no bubble, no avatar.
+        return (
+          <div className="whitespace-pre-wrap text-ui-base text-foreground">
+            {message.text}
+          </div>
+        );
 
-    case "agent-text":
-      return (
-        <div className="text-ui-base">
-          <AgentMarkdown text={message.text} />
-        </div>
-      );
+      case "agent-text":
+        return (
+          <div className="text-ui-base">
+            <AgentMarkdown text={message.text} />
+          </div>
+        );
 
-    case "agent-thought":
-      return (
-        <Reasoning
-          isStreaming={isStreaming}
-          autoCollapseKey={isStreaming ? null : "complete"}
-        >
-          <ReasoningTrigger streamingText={message.text} />
-          <ReasoningContent>{message.text}</ReasoningContent>
-        </Reasoning>
-      );
+      case "agent-thought":
+        return (
+          <Reasoning
+            isStreaming={isStreaming}
+            autoCollapseKey={isStreaming ? null : "complete"}
+          >
+            <ReasoningTrigger streamingText={message.text} />
+            <ReasoningContent>{message.text}</ReasoningContent>
+          </Reasoning>
+        );
 
-    case "tool-call":
-      return (
-        <div className="w-full">
-          <ToolCallCard
-            title={message.title}
-            status={message.status}
-            diff={message.diff}
-          />
-        </div>
-      );
+      case "tool-call":
+        return (
+          <div className="w-full">
+            <ToolCallCard
+              title={message.title}
+              status={message.status}
+              diff={message.diff}
+            />
+          </div>
+        );
 
-    case "diff":
-      return (
-        <div className="w-full">
-          <DiffBlock path={message.path} patch={message.patch} />
-        </div>
-      );
-  }
-}
+      case "diff":
+        return (
+          <div className="w-full">
+            <DiffBlock path={message.path} patch={message.patch} />
+          </div>
+        );
+    }
+  },
+);
