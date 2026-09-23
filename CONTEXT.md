@@ -39,3 +39,7 @@ _Avoid_: Side channel, socket bridge, client mode, host mode
 **Config option**:
 A per-session selector the agent advertises over ACP (e.g. model, thinking level) — a `select` (or `boolean`) with a current value and choices. Delivered in the `newSession`/`loadSession` response, updated via `config_option_update` notifications, and set by the Client via `session/set_config_option`. The agent is the source of truth: the Client does not persist config options; a resume re-fetches fresh state from the agent.
 _Avoid_: Model list, model picker, settings, preferences
+
+**Thinking block**:
+The collapsible UI unit that shows the agent's streamed internal reasoning (ACP `agent_thought_chunk`) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
+_Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZCode's term; the Client's UI says "Thinking…"/"Thought")
