@@ -1,9 +1,3 @@
-/*
- * Derived from vercel/ai-elements (packages/elements/src/reasoning.tsx).
- * Copyright 2023 Vercel, Inc. Licensed under Apache-2.0.
- * Modified by ZCode: local integration, formatting and adaptations.
- * See THIRD-PARTY-NOTICES.md in the repository root for license and provenance.
- */
 // Ported to the Client 2026-09-23 (ADR 0007): imports, i18n, test-ids adapted; "use client" dropped (Vite SPA); behavior verbatim.
 
 import { useControllableState } from "@radix-ui/react-use-controllable-state";
@@ -137,6 +131,8 @@ export const Reasoning = memo(
         startTimeRef.current = Date.now();
       }
 
+      // 收起态展示流式摘要，不需要为了隐藏的耗时每秒触发整块 reasoning 重渲染；
+      // 展开时再按同一个开始时间补算并持续更新时间。
       if (!isOpen) {
         return;
       }
@@ -161,6 +157,7 @@ export const Reasoning = memo(
         return;
       }
 
+      // 输出边界是结束收起的补充信号；用户手动操作后，自动规则不能覆盖选择。
       if (
         shouldAutoCollapseReasoning({
           autoCollapseKey,
@@ -186,6 +183,8 @@ export const Reasoning = memo(
         return;
       }
 
+      // 思考内容收起时不能立刻卸载 children。Radix 的高度动画需要
+      // closed 阶段仍能读到真实内容高度；先让 300ms 收起动画跑完，再卸载重 DOM。
       contentUnmountDelayRef.current = window.setTimeout(() => {
         setShouldRenderContent(false);
         contentUnmountDelayRef.current = null;
@@ -301,6 +300,8 @@ export const ReasoningTrigger = memo(
           const next = isReasoningSummaryOverflowing(viewport);
           return current === next ? current : next;
         });
+        // 流式摘要超过可用宽度后，普通 overflow-hidden 会固定显示旧前缀，
+        // 最新 token 被裁在右侧。每次内容增长后把单行视口推到末尾，让旧内容向左移。
         scrollReasoningSummaryToEnd(viewport);
       };
 
@@ -319,18 +320,30 @@ export const ReasoningTrigger = memo(
     const thinkingMessage =
       getThinkingMessage?.(isStreaming, duration) ??
       (isStreaming && !isOpen ? (
-        <span className="animated-gradient-text font-medium">Thinking</span>
+        <span className="animated-gradient-text font-medium">
+          Thinking
+        </span>
       ) : duration === undefined ? (
         <span className="inline-flex items-center gap-2">
-          <span className="font-medium text-foreground-subtlest">Thought</span>
+          {/* 完成态“思考”单独使用 semibold，比同列工具类型标签更粗。
+              统一为 medium，保持对话时间线的视觉层级一致。 */}
+          <span className="font-medium text-foreground-subtlest">
+            Thought
+          </span>
           <span className="font-normal text-foreground-subtlest">·</span>
-          <span className="font-normal text-foreground-subtlest">a few seconds</span>
+          <span className="font-normal text-foreground-subtlest">
+            a few seconds
+          </span>
         </span>
       ) : (
         <span className="inline-flex items-center gap-2">
-          <span className="font-medium text-foreground-subtlest">Thought</span>
+          <span className="font-medium text-foreground-subtlest">
+            Thought
+          </span>
           <span className="font-normal text-foreground-subtlest">·</span>
-          <span className="font-normal text-foreground-subtlest">{duration} seconds</span>
+          <span className="font-normal text-foreground-subtlest">
+            {`${duration} seconds`}
+          </span>
         </span>
       ));
 
@@ -345,7 +358,11 @@ export const ReasoningTrigger = memo(
       >
         {children ?? (
           <>
+            {/* thinking 会在长流式回复里持续存在，旋转 loader 会长期占用渲染资源；
+            运行态保留文案扫光，图标固定为静态思考语义。 */}
             <BrainIcon className="size-4 shrink-0 text-foreground-subtlest" />
+            {/* 右侧流式摘要是可伸缩内容；如果左侧标签也参与 flex shrink，
+                长摘要会把思考状态标签挤成多行。固定语义标签宽度，只让摘要占剩余空间。 */}
             <span className="shrink-0 whitespace-nowrap" data-reasoning-label="true">
               {thinkingMessage}
             </span>
@@ -459,6 +476,8 @@ export const ReasoningContent = memo(
         return;
       }
 
+      // thought 内容流式追加时 scrollHeight 会变化；同时监听容器和内容尺寸。
+      // 默认吸底跟随最新思考；用户主动离底后暂停，直到用户自己滚回底部再恢复。
       const syncScrollPosition = () => {
         if (autoFollowBottomRef.current) {
           scrollToReasoningBottom();
@@ -514,12 +533,19 @@ export const ReasoningContent = memo(
               ref={scrollRef}
               className={cn(
                 "max-h-60 space-y-2 overflow-auto text-ui-base text-foreground-subtlest",
+                // CUA Group 已提供清晰的父级边界；子思考继续显示左导线与缩进会形成重复层级。
                 variant === "default" && "ml-2 border-border border-l pl-3.5",
               )}
               data-reasoning-scroll-mask={scrollMaskData}
               onScroll={handleScroll}
               style={scrollMaskStyle}
             >
+              {/* 思考块之前打开时把 Radix content 一起按需挂载并强制 forceMount，
+                  content 首帧已经是 open 状态，高度动画来不及从 closed 状态过渡，看起来像突然展开。
+                  这里和工具详情保持一致：CollapsibleContent 只负责 Presence/高度动画，重内容单独延迟卸载；
+                  间距放在动画内容内部，避免 closed 动画结束时父级 gap/padding 被移除造成末帧跳动。
+                  性能修复：thought 内容可能非常长且会流式追加，展开后如果继续走 MessageResponse/Streamdown，
+                  每次 chunk 都会重跑 Markdown 解析和插件渲染，字数越多越卡；这里按纯文本展示并保留换行。 */}
               <div
                 ref={contentRef}
                 className="min-w-0 whitespace-pre-wrap break-words text-foreground-subtlest"
