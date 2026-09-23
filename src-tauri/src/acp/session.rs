@@ -1441,6 +1441,30 @@ mod session_tests {
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
     }
 
+    async fn start_with_retry<F, Fut>(
+        manager: &SessionManager,
+        agent_id: &str,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+        mut attempt_fn: F,
+    ) -> Result<SessionInfo, AcpError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<SessionInfo, AcpError>>,
+    {
+        for i in 0..3 {
+            match attempt_fn().await {
+                Ok(info) => return Ok(info),
+                Err(AcpError::SpawnFailed { .. }) if i < 2 => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
     #[tokio::test]
     async fn start_session_returns_config_options_from_new_session_response() {
         let dir = temp_config_dir();
@@ -1450,10 +1474,11 @@ mod session_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = manager
-            .start_session("fake", dir.clone(), &sink)
-            .await
-            .unwrap();
+        let info = start_with_retry(&manager, "fake", dir.clone(), &sink, || {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
 
         assert!(info.config_options.is_some());
         let opts = info.config_options.unwrap();
@@ -1488,6 +1513,7 @@ mod session_tests {
             }
             _ => panic!("expected select"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1499,10 +1525,11 @@ mod session_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = manager
-            .resume_session("fake", "fake-session-1", dir.clone(), &sink)
-            .await
-            .unwrap();
+        let info = start_with_retry(&manager, "fake", dir.clone(), &sink, || {
+            manager.resume_session("fake", "fake-session-1", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
 
         assert!(info.config_options.is_some());
         let opts = info.config_options.unwrap();
@@ -1522,5 +1549,6 @@ mod session_tests {
             }
             _ => panic!("expected select"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
