@@ -29,11 +29,11 @@ use std::time::Duration;
 use agent_client_protocol::Error as ProtocolError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, ContentBlock, ContentChunk, FileSystemCapabilities,
-    InitializeRequest, NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
+    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
     TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
@@ -1523,6 +1523,7 @@ mod session_tests {
         ContentChunk, SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
     };
     use std::path::Path;
+    use tokio::sync::mpsc;
 
     #[test]
     fn persist_update_records_agent_thought_chunks() {
