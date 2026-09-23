@@ -72,7 +72,19 @@ describe("SessionConfigSelect", () => {
     await waitFor(() => expect(trigger.getAttribute("data-disabled")).toBeNull());
   });
 
-  it.skip("an onSet rejection shows the error text", () => {
-    render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
+  it("an onSet rejection shows the error text and clears after 5s", async () => {
+    const onSet = vi.fn().mockRejectedValue(new Error("boom"));
+    render(<SessionConfigSelect option={mockOption} onSet={onSet} />);
+
+    // Open select
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+
+    // Pick item
+    const beta = screen.getByRole("option", { name: "acme/Beta" });
+    fireEvent.click(beta);
+
+    // Error should appear
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("boom");
   });
 });
