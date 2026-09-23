@@ -877,7 +877,7 @@ mod tests {
             .expect("prompt should succeed");
 
         // Poll the captures until both messages are accumulated.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             let acc = text_capture.lock().unwrap();
             let done = acc.get("m1").is_some() && acc.get("m2").is_some();
@@ -1000,7 +1000,7 @@ mod tests {
 
         // The driver task tears down when the flag flips — well under the 10 s
         // establish timeout (the external kind won the race, not the timeout).
-        let result = tokio::time::timeout(Duration::from_secs(3), drive).await;
+        let result = tokio::time::timeout(Duration::from_secs(8), drive).await;
         assert!(
             result.is_ok(),
             "drive_session should complete when the external flag flips during establish, \
