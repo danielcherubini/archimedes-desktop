@@ -1477,15 +1477,6 @@ mod session_tests {
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
     }
 
-    #[allow(dead_code)]
-    async fn start_with_retry<F, Fut>(attempt_fn: F) -> Result<SessionInfo, AcpError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<SessionInfo, AcpError>>,
-    {
-        crate::test_support::run_with_retry(attempt_fn).await
-    }
-
     #[tokio::test]
     async fn start_session_returns_config_options_from_new_session_response() {
         let dir = temp_config_dir();
