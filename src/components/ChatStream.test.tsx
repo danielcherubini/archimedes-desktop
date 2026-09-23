@@ -608,6 +608,46 @@ describe("ChatStream", () => {
     expect(screen.queryByRole("combobox", { name: "Thinking" })).toBeNull();
   });
 
+  it("does NOT leak Reasoning state across sessions (per-session key)", () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      sessions: [
+        { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+        { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+      ],
+      spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+      historySessions: [],
+      messages: {
+        s1: [
+          { kind: "user", text: "hi1", at: 1 },
+          { kind: "agent-thought", messageId: "m1", text: "thought-one", at: 2 },
+        ],
+        s2: [
+          { kind: "user", text: "hi2", at: 1 },
+          { kind: "agent-thought", messageId: "m2", text: "thought-two", at: 2 },
+        ],
+      },
+      inTurn: {},
+      stopReasons: {},
+      closeReasons: {},
+      configOptions: {},
+    });
+    render(<ChatStream />);
+    // s1's thinking block is collapsed by default…
+    expect(screen.queryByText("thought-one")).toBeNull();
+    // …and expands on click.
+    fireEvent.click(screen.getByTestId("reasoning-trigger"));
+    expect(screen.getByText("thought-one")).toBeTruthy();
+    // Switching sessions must NOT reuse the same Reasoning instance at
+    // the same index: s2's block starts collapsed (no inherited
+    // expanded state or duration) and s1's content is gone.
+    act(() => {
+      useSessions.setState({ activeSessionId: "s2" });
+    });
+    expect(screen.queryByText("thought-two")).toBeNull();
+    expect(screen.queryByText("thought-one")).toBeNull();
+  });
+
   it("a STORED session with configOptions renders neither selector", () => {
     seedStoredSession();
     useSessions.setState({

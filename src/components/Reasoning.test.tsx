@@ -55,10 +55,17 @@ describe("Reasoning component", () => {
   it("live summary shows last non-empty line", () => {
     render(
       <Reasoning isStreaming={true}>
-        <ReasoningTrigger streamingText="line one\n\nline two" />
+        {/* A JS expression, NOT a JSX string attribute: in a string
+            attribute `\n` is a literal backslash-n (the split would be a
+            no-op), so the escapes only process inside an expression.
+            The trailing blank lines cover the trailing-blank-lines case. */}
+        <ReasoningTrigger streamingText={"line one\n\nline two\n\n"} />
       </Reasoning>
     );
-    expect(screen.getByText(/line two/)).toBeDefined();
+    const trigger = screen.getByTestId("reasoning-trigger");
+    expect(trigger.textContent).toContain("line two");
+    // Only the LAST non-empty line shows — the earlier one does not.
+    expect(trigger.textContent).not.toContain("line one");
   });
 
   it("expand shows content", () => {

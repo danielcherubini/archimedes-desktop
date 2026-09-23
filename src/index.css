@@ -730,4 +730,10 @@ body {
       background-position: 0% 0;
     }
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animated-gradient-text {
+      animation: none;
+    }
+  }
 }
