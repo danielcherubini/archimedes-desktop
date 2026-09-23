@@ -1,56 +1,22 @@
 import { useMemo } from "react";
+import { Check } from "lucide-react";
+import { Progress } from "./ui/progress";
 import { useBridge, type TodoItem } from "../store/bridge";
 import { useSessions } from "../store/sessions";
 
-const STATUS_MARK: Record<TodoItem["status"], string> = {
-  completed: "✓",
-  in_progress: "◉",
-  pending: "○",
-};
-
-function TodoItems({ items }: { items: TodoItem[] }) {
-  return (
-    <ol className="mt-1 space-y-1">
-      {items.map((item, i) => (
-        <li key={i} className="flex gap-2 text-xs">
-          <span aria-hidden className="text-neutral-400">
-            {STATUS_MARK[item.status]}
-          </span>
-          <span
-            className={
-              item.status === "completed"
-                ? "text-neutral-600 line-through"
-                : "text-neutral-300"
-            }
-          >
-            {i + 1}. {item.content}
-          </span>
-        </li>
-      ))}
-    </ol>
-  );
-}
-
 /**
- * Collapsible right rail: the session's todo board.
+ * The main-column todo derivation (extracted so the `SidePane`'s tab
+ * count badge and the panel's checklist consume the SAME derivation and
+ * can never disagree):
  *
- * - `main` column: numbered ✓/◉/○ items (completed = ✓, in_progress = ◉,
- *   pending = ○), from the `todos_update`/`todos_clear` bridge events.
- * - Subagent columns (`subagents[source]`): labeled sections, fed by the
- *   same bridge events (the existing `stream.ts` parent-bus relay — a
- *   unique `source` per child, cleared on child exit).
- * - `rawInput` fallback for non-bridge agents: when there are no bridge
- *   todos, the latest `manage_todo_list` `rawInput` (from the ACP
+ * - Bridge todos (`todos_update`/`todos_clear` columns) win.
+ * - `rawInput` fallback for non-bridge agents: when the bridge delivered
+ *   no column, the latest `manage_todo_list` `rawInput` (from the ACP
  *   `tool_call` frame, via the `sessions` store) seeds the board. The
  *   `title` is the reliable discriminator (the `name` field is unstable in
  *   ACP 1.7).
- * - Auto-collapses when empty (renders nothing).
  */
-export default function TodoBoardPanel({
-  sessionId,
-}: {
-  sessionId: string | null;
-}) {
+export function useMainTodoItems(sessionId: string | null): TodoItem[] {
   const column = useBridge((state) =>
     sessionId ? state.todos[sessionId] : undefined,
   );
@@ -58,9 +24,9 @@ export default function TodoBoardPanel({
     sessionId ? state.messages[sessionId] : undefined,
   );
 
-  // The latest `manage_todo_list` `rawInput` (written ops only) — the
-  // fallback for non-bridge agents. Derived outside the selector (the
-  // selector returns stable references only, or Zustand re-renders forever).
+  // The latest `manage_todo_list` `rawInput` (written ops only). Derived
+  // outside the selector (the selector returns stable references only, or
+  // Zustand re-renders forever).
   const rawTodos = useMemo<TodoItem[] | undefined>(() => {
     if (!messages) return undefined;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -93,33 +59,120 @@ export default function TodoBoardPanel({
 
   // Bridge todos win; the `rawInput` seeds the board only when the bridge
   // delivered no column for this session.
-  const mainItems = column?.main ?? rawTodos ?? [];
-  const subagents = column?.subagents ?? {};
+  return column?.main ?? rawTodos ?? [];
+}
+
+/** The three-state indicator: done = check circle, in-progress = `◉`, pending = `○`. */
+function TodoIndicator({ status }: { status: TodoItem["status"] }) {
+  if (status === "completed") {
+    return (
+      <span className="flex size-4 shrink-0 items-center justify-center rounded-full border border-success text-success">
+        <Check className="size-3" />
+      </span>
+    );
+  }
+  if (status === "in_progress") {
+    return <span aria-hidden className="text-ui-base text-warning">◉</span>;
+  }
+  return <span aria-hidden className="text-ui-base text-foreground-subtlest">○</span>;
+}
+
+function TodoItems({ items }: { items: TodoItem[] }) {
+  return (
+    <ol className="space-y-0.5">
+      {items.map((item, i) => (
+        <li
+          key={i}
+          className="flex h-8 items-center gap-2 rounded-md hover:bg-surface-hover"
+        >
+          <TodoIndicator status={item.status} />
+          <span
+            className={
+              item.status === "completed"
+                ? "text-ui-base text-foreground-subtle"
+                : "text-ui-base text-foreground"
+            }
+          >
+            {item.content}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * The session's todo board (hosted by the `SidePane`'s Todos tab):
+ *
+ * - Progress header (`N/M` + `progress` bar, primary fill) when M > 0.
+ * - `h-8` checklist rows with the three-state indicators (done = a
+ *   `size-4` check circle `text-success` + label `text-foreground-subtle`;
+ *   in-progress = `◉` `text-warning`; pending = `○`
+ *   `text-foreground-subtlest`).
+ * - Subagent todo columns (`subagents[source]`, fed by the same bridge
+ *   events — a unique `source` per child, cleared on child exit) as
+ *   indented sub-rows (`pl-6`, `text-ui-sm`), one block per source with a
+ *   `text-ui-xs text-foreground-subtlest` header.
+ * - `rawInput` fallback for non-bridge agents (via `useMainTodoItems`).
+ * - Empty: "No todos yet" (the `SidePane` frame owns collapse now — the
+ *   panel no longer auto-collapses).
+ */
+export default function TodoBoardPanel({
+  sessionId,
+}: {
+  sessionId: string | null;
+}) {
+  const mainItems = useMainTodoItems(sessionId);
+  const subagents = useBridge((state) =>
+    sessionId ? state.todos[sessionId]?.subagents : undefined,
+  ) ?? {};
   const subagentEntries = Object.entries(subagents).filter(
     ([, items]) => items.length > 0,
   );
 
-  // Auto-collapse when empty.
-  if (mainItems.length === 0 && subagentEntries.length === 0) return null;
+  if (mainItems.length === 0 && subagentEntries.length === 0) {
+    return (
+      <p className="text-center text-ui-sm text-foreground-subtlest">No todos yet</p>
+    );
+  }
 
   const completed = mainItems.filter((t) => t.status === "completed").length;
 
   return (
-    <aside className="w-64 shrink-0 overflow-y-auto border-l border-neutral-800 bg-neutral-950 p-3">
-      <p className="text-xs font-medium text-neutral-400">
-        Todo List — {completed}/{mainItems.length} completed
-      </p>
-      {mainItems.length > 0 && <TodoItems items={mainItems} />}
-      {subagentEntries.length > 0 && (
-        <div className="mt-3 space-y-3">
-          {subagentEntries.map(([source, items]) => (
-            <div key={source}>
-              <p className="text-xs font-medium text-amber-400/70">{source}</p>
-              <TodoItems items={items} />
-            </div>
-          ))}
+    <div className="flex flex-col gap-3">
+      {mainItems.length > 0 && (
+        <div>
+          <p className="text-ui-base font-medium">
+            {completed}/{mainItems.length}
+          </p>
+          <Progress value={(completed / mainItems.length) * 100} />
         </div>
       )}
-    </aside>
+      {mainItems.length > 0 && <TodoItems items={mainItems} />}
+      {subagentEntries.map(([source, items]) => (
+        <div key={source} className="pl-6">
+          <p className="text-ui-xs text-foreground-subtlest">{source}</p>
+          <div className="mt-0.5 space-y-0.5">
+            {items.map((item, i) => (
+              <div
+                key={i}
+                className="flex h-7 items-center gap-2 text-ui-sm"
+              >
+                <TodoIndicator status={item.status} />
+                <span
+                  className={
+                    item.status === "completed"
+                      ? "text-foreground-subtle"
+                      : "text-foreground"
+                  }
+                >
+                  {item.content}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }

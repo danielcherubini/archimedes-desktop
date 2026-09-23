@@ -99,6 +99,29 @@ describe("AskQuestionCard", () => {
     );
   });
 
+  it("renders the ask treatment (tint header, question + options, fill on select)", () => {
+    useBridge.getState().addRequest("s1", singleRequest);
+    const { container } = render(<AskQuestionCard sessionId="s1" requestId="r1" />);
+    // The `--color-interaction-ask-*` treatment: a `bg-interaction-ask-surface`
+    // tint header with the label in the ask foreground.
+    const header = container.querySelector(
+      ".bg-interaction-ask-surface",
+    )!;
+    expect(header).toBeTruthy();
+    expect(
+      header.querySelector(".text-interaction-ask-foreground")?.textContent,
+    ).toBe("Agent question");
+    // The option list renders the question + options.
+    expect(screen.getByText("Which color?")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Red" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Blue" })).toBeTruthy();
+    // No option is selected yet: no `bg-interaction-ask-fill`.
+    expect(container.querySelector(".bg-interaction-ask-fill")).toBeNull();
+    // Selecting an option gets the ask-fill treatment.
+    fireEvent.click(screen.getByRole("button", { name: "Red" }));
+    expect(container.querySelector(".bg-interaction-ask-fill")).toBeTruthy();
+  });
+
   it("receives focus on mount when unanchored (Enter/Esc are live)", () => {
     useBridge.getState().addRequest("s1", singleRequest);
     const { container } = render(<AskQuestionCard sessionId="s1" requestId="r1" />);

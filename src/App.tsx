@@ -19,6 +19,7 @@ import { useBridge } from "./store/bridge";
 import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
+import SidePane from "./components/SidePane";
 
 function App() {
   // Register the Tauri event listeners once; dispatch into the stores.
@@ -173,9 +174,10 @@ function App() {
   }, []);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-neutral-950 text-neutral-100">
+    <div className="flex h-screen w-screen bg-background text-foreground">
       <SpacesList />
       <ChatStream />
+      <SidePane />
     </div>
   );
 }

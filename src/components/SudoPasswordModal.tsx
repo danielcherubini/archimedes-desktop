@@ -1,6 +1,15 @@
 import { useState, type ChangeEvent } from "react";
 import { respondBridgeRequest } from "../lib/tauri";
 import { useBridge } from "../store/bridge";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
 /**
  * Modal for a bridge `password` request (the `sudo_exec` credential gate):
@@ -66,18 +75,18 @@ export default function SudoPasswordModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
-      <div className="w-full max-w-md rounded-md border border-amber-600/50 bg-neutral-900 p-4">
-        <p className="text-sm font-medium text-amber-200">
-          Sudo password required
-        </p>
-        <pre className="mt-2 overflow-x-auto rounded bg-neutral-950 p-2 text-xs text-neutral-300">
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent showCloseButton={false} className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Sudo password required</DialogTitle>
+        </DialogHeader>
+        <pre className="overflow-x-auto rounded-md bg-surface p-2 font-mono text-ui-sm">
           {params.command ?? ""}
         </pre>
         {params.reason && (
-          <p className="mt-2 text-xs text-neutral-400">{params.reason}</p>
+          <p className="text-ui-sm text-foreground-subtle">{params.reason}</p>
         )}
-        <input
+        <Input
           autoFocus
           value={masked}
           onChange={onChange}
@@ -92,31 +101,25 @@ export default function SudoPasswordModal({
           }}
           placeholder="••••••••"
           aria-label="Password"
-          className="mt-3 w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm tracking-widest outline-none focus:border-amber-500"
+          className="tracking-widest"
         />
-        <p className="mt-1 text-xs text-neutral-500">
+        <p className="text-ui-xs text-foreground-subtlest">
           Enter confirm · Esc cancel · Backspace deletes the last character
         </p>
-        {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-        <div className="mt-3 flex justify-end gap-2">
-          <button
-            type="button"
+        {error && <p className="text-ui-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button
+            variant="outline"
             disabled={busy}
             onClick={() => void respond(true)}
-            className="rounded bg-neutral-700 px-3 py-1 text-sm text-neutral-200 hover:bg-neutral-600 disabled:opacity-50"
           >
             Cancel
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void respond(false)}
-            className="rounded bg-amber-600 px-3 py-1 text-sm text-black hover:bg-amber-500 disabled:opacity-50"
-          >
+          </Button>
+          <Button disabled={busy} onClick={() => void respond(false)}>
             Confirm
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
