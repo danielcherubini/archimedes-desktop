@@ -200,6 +200,8 @@ fn main() -> ExitCode {
     };
     // The session id (DISTINCT for the subagent).
     let sid = session_id(subagent);
+    // The agent holds config state across requests, like real pi-acp.
+    let mut config_options = fake_config_options();
 
     loop {
         let mut line = String::new();
@@ -217,7 +219,6 @@ fn main() -> ExitCode {
 
         let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = frame.get("id").cloned();
-        let mut config_options = fake_config_options();
 
         match method {
             "session/set_config_option" => {
