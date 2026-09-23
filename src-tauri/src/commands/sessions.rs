@@ -60,6 +60,7 @@ pub async fn send_prompt(
     // The client owns history: record the user's message before the turn.
     // (The `SessionManager::send_prompt` method does the same for direct
     // callers; the command path never goes through that method.)
+    state.begin_user_turn(&session_id).await;
     let payload = serde_json::json!({ "text": text });
     let _ = db.record_message(&session_id, "user", None, &payload.to_string());
     let request = PromptRequest::new(
