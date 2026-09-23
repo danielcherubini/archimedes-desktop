@@ -374,6 +374,9 @@ impl SubagentSessionManager {
             );
             let prompt = cx.send_request(request).block_task().await;
 
+            // Ensure teardown on completion or failure.
+            task_cancel.cancel();
+
             // 6 / 7 / 8. Close + emit + resolve (the `end_turn` path) or
             // fail (cancellation / the agent died mid-turn).
             match prompt {
@@ -384,10 +387,6 @@ impl SubagentSessionManager {
                     // (the accumulated `cost_update` usage, defaulting to 0)
                     // + `duration_ms` (wall clock since step 1).
                     let (output, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    // Close the session (kind `User`, first-set-wins — the
-                    // driver task tears down: process group, bridge
-                    // listener, socket unlink, `session-closed` emit).
-                    task_cancel.cancel();
                     // The worker task owns the wrapper path — unlink it.
                     if let Some(p) = &wrapper_path {
                         let _ = std::fs::remove_file(p);
@@ -412,9 +411,6 @@ impl SubagentSessionManager {
                         e.message.clone()
                     };
                     let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    // Ensure the teardown (idempotent — a no-op when the
-                    // session already closed).
-                    task_cancel.cancel();
                     if let Some(p) = &wrapper_path {
                         let _ = std::fs::remove_file(p);
                     }

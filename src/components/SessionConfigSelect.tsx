@@ -55,11 +55,25 @@ export default function SessionConfigSelect({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          {option.options?.map((opt) => (
-            <SelectItem key={opt.value} value={opt.value}>
-              {opt.name}
-            </SelectItem>
-          ))}
+          {option.options?.map((opt) => {
+            if ("options" in opt) {
+              return (
+                <div key={opt.name} className="px-2 py-1 text-ui-xs text-muted-foreground font-medium">
+                  {opt.name}
+                  {opt.options.map((subOpt) => (
+                    <SelectItem key={subOpt.value} value={subOpt.value}>
+                      {subOpt.name}
+                    </SelectItem>
+                  ))}
+                </div>
+              );
+            }
+            return (
+              <SelectItem key={opt.value} value={opt.value}>
+                {opt.name}
+              </SelectItem>
+            );
+          })}
         </SelectContent>
       </Select>
       {error && (

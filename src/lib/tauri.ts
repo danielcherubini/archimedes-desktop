@@ -25,6 +25,12 @@ export interface SessionConfigSelectOption {
   description?: string | null;
 }
 
+/** A group in a config option's `options` list (camelCase). */
+export interface SessionConfigSelectGroup {
+  name: string;
+  options: SessionConfigSelectOption[];
+}
+
 /**
  * A session config option the agent advertises (camelCase wire shape).
  * `category` is snake_case per the ACP spec (`"model"`,
@@ -37,7 +43,7 @@ export interface SessionConfigOption {
   category?: string | null;
   type: "select" | "boolean";
   currentValue: string | boolean;
-  options?: SessionConfigSelectOption[]; // select kind only
+  options?: (SessionConfigSelectOption | SessionConfigSelectGroup)[]; // select kind only
 }
 
 /** Return value of the `start_session` command (camelCase). */
