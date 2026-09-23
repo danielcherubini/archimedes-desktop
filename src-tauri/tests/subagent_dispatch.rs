@@ -148,6 +148,256 @@ fn write_agents_json_custom(dir: &Path, bin: &Path, mode: &str, env: &[(&str, &s
     .unwrap();
 }
 
+async fn drive_dispatch_success_scenario(
+    manager: &Arc<SessionManager>,
+    events: &Arc<StdMutex<Vec<(String, Value)>>>,
+    bin: &Path,
+    info: archimedes_desktop_lib::acp::SessionInfo,
+) -> Result<(), String> {
+    let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
+    {
+        let manager = Arc::clone(manager);
+        let sid = info.session_id.to_string();
+        tokio::spawn(async move {
+            let r = manager.send_prompt(&sid, "go".to_string()).await;
+            let _ = prompt_tx.send(r);
+        });
+    }
+
+    let mut counter = ProcessCounter::new(bin);
+    let peak = Arc::new(AtomicUsize::new(counter.scan()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let peak = Arc::clone(&peak);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = counter;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = c.scan();
+                if n > peak.load(Ordering::Relaxed) {
+                    peak.store(n, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let prompt_deadline = Instant::now() + Duration::from_secs(30);
+    let reason = loop {
+        match prompt_rx.try_recv() {
+            Ok(r) => break r.map_err(|e| format!("main send_prompt failed: {e}"))?,
+            Err(_) => {
+                if prompt_rx.is_terminated() {
+                    stop.store(true, Ordering::Relaxed);
+                    sampler.join().ok();
+                    return Err("the prompt task vanished without resolving".to_string());
+                }
+            }
+        }
+        if Instant::now() > prompt_deadline {
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().ok();
+            return Err("timeout waiting for the main prompt (the dispatch E2E)".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    stop.store(true, Ordering::Relaxed);
+    sampler
+        .join()
+        .map_err(|_| "the sampler thread should finish")?;
+    let peak = peak.load(Ordering::Relaxed);
+    if reason != StopReason::EndTurn {
+        return Err(format!("expected EndTurn, got {:?}", reason));
+    }
+
+    if peak != 2 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let dump = events.lock().unwrap();
+        eprintln!("[DEBUG] peak={peak}; events:");
+        for (name, p) in dump.iter() {
+            eprintln!("  {name}: {}", p);
+        }
+        drop(dump);
+        return Err(format!("expected peak 2, got {}", peak));
+    }
+
+    if !wait_for_event(events, Duration::from_secs(5), |evs| {
+        stream_texts(evs, FAKE_SESSION_ID_MAIN)
+            .iter()
+            .any(|t| t.contains("dispatch:subagent-done"))
+    })
+    .await
+    {
+        return Err("the main's stream should contain `dispatch:subagent-done`".to_string());
+    }
+
+    if !wait_for_event(events, Duration::from_secs(5), |evs| {
+        subagent_started(evs, FAKE_SESSION_ID_SUBAGENT).is_some()
+    })
+    .await
+    {
+        return Err("a subagent-session-started for the subagent id should fire".to_string());
+    }
+    {
+        let evs = events.lock().unwrap();
+        let started = subagent_started(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
+        if started["parentSessionId"].as_str() != Some(FAKE_SESSION_ID_MAIN) {
+            return Err("unexpected parent session id".to_string());
+        }
+        if started["agentName"].as_str() != Some("fake") {
+            return Err("unexpected agent name".to_string());
+        }
+        if started["task"].as_str() != Some("do the task") {
+            return Err("unexpected task".to_string());
+        }
+    }
+
+    if !wait_for_event(events, Duration::from_secs(5), |evs| {
+        subagent_closed(evs, FAKE_SESSION_ID_SUBAGENT).and_then(|p| p["status"].as_str())
+            == Some("completed")
+    })
+    .await
+    {
+        return Err("a subagent-closed (completed) for the subagent id should fire".to_string());
+    }
+    {
+        let evs = events.lock().unwrap();
+        let closed = subagent_closed(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
+        if !closed["metrics"]["durationMs"].is_number() {
+            return Err("durationMs not a number".to_string());
+        }
+    }
+
+    if !wait_for_event(events, Duration::from_secs(5), |evs| {
+        session_closed(evs, FAKE_SESSION_ID_SUBAGENT).is_some()
+    })
+    .await
+    {
+        return Err("a session-closed for the subagent id should fire".to_string());
+    }
+
+    let mut reap_counter = ProcessCounter::new(bin);
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let c = reap_counter.scan();
+        if c == 1 {
+            break;
+        }
+        if Instant::now() > reap_deadline {
+            return Err(format!(
+                "the subagent process should be reaped (count back to 1); got {c}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+async fn drive_dispatch_cancellation_scenario(
+    manager: &Arc<SessionManager>,
+    events: &Arc<StdMutex<Vec<(String, Value)>>>,
+    bin: &Path,
+    info: archimedes_desktop_lib::acp::SessionInfo,
+) -> Result<(), String> {
+    let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
+    {
+        let manager = Arc::clone(manager);
+        let sid = info.session_id.to_string();
+        tokio::spawn(async move {
+            let r = manager.send_prompt(&sid, "go".to_string()).await;
+            let _ = prompt_tx.send(r);
+        });
+    }
+
+    let mut counter = ProcessCounter::new(bin);
+    let peak = Arc::new(AtomicUsize::new(counter.scan()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let peak = Arc::clone(&peak);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = counter;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = c.scan();
+                if n > peak.load(Ordering::Relaxed) {
+                    peak.store(n, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let prompt_deadline = Instant::now() + Duration::from_secs(30);
+    let reason = loop {
+        match prompt_rx.try_recv() {
+            Ok(r) => break r.map_err(|e| format!("main send_prompt failed: {e}"))?,
+            Err(_) => {
+                if prompt_rx.is_terminated() {
+                    stop.store(true, Ordering::Relaxed);
+                    sampler.join().ok();
+                    return Err("the prompt task vanished without resolving".to_string());
+                }
+            }
+        }
+        if Instant::now() > prompt_deadline {
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().ok();
+            return Err("timeout waiting for the main prompt (the cancellation E2E)".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    stop.store(true, Ordering::Relaxed);
+    sampler
+        .join()
+        .map_err(|_| "the sampler thread should finish")?;
+    let peak = peak.load(Ordering::Relaxed);
+
+    if reason != StopReason::EndTurn {
+        return Err(format!("expected EndTurn, got {:?}", reason));
+    }
+
+    if peak != 2 {
+        return Err(format!("expected peak 2, got {}", peak));
+    }
+
+    if !wait_for_event(events, Duration::from_secs(5), |evs| {
+        subagent_closed(evs, FAKE_SESSION_ID_SUBAGENT)
+            .filter(|p| p["status"].as_str() == Some("failed"))
+            .is_some()
+    })
+    .await
+    {
+        return Err("subagent-closed (failed) should fire".to_string());
+    }
+    {
+        let evs = events.lock().unwrap();
+        let closed = subagent_closed(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
+        if closed["error"].as_str() != Some("cancelled") {
+            return Err("expected error `cancelled`".to_string());
+        }
+    }
+
+    let mut reap_counter = ProcessCounter::new(bin);
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let c = reap_counter.scan();
+        if c == 1 {
+            break;
+        }
+        if Instant::now() > reap_deadline {
+            return Err(format!("subagent not reaped; got {c}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if manager.session_count().await != 1 {
+        return Err("expected 1 session count".to_string());
+    }
+    Ok(())
+}
+
 /// The DISTINCT `sessionId`s of the `subagent-session-started` events.
 fn distinct_started_ids(evs: &[(String, Value)]) -> std::collections::HashSet<&str> {
     evs.iter()
@@ -463,150 +713,15 @@ async fn run_dispatch_success_scenario() -> Result<(), String> {
     .await
     .map_err(|e| format!("main start_session failed: {e}"))?;
     if info.session_id.to_string() != FAKE_SESSION_ID_MAIN {
+        let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
+        let _ = std::fs::remove_dir_all(&config_dir);
         return Err(format!("unexpected session id: {}", info.session_id));
     }
 
-    let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
-    {
-        let manager = Arc::clone(&manager);
-        let sid = info.session_id.to_string();
-        tokio::spawn(async move {
-            let r = manager.send_prompt(&sid, "go".to_string()).await;
-            let _ = prompt_tx.send(r);
-        });
-    }
-
-    let mut counter = ProcessCounter::new(&bin);
-    let peak = Arc::new(AtomicUsize::new(counter.scan()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let sampler = {
-        let peak = Arc::clone(&peak);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut c = counter;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let n = c.scan();
-                if n > peak.load(Ordering::Relaxed) {
-                    peak.store(n, Ordering::Relaxed);
-                }
-            }
-        })
-    };
-    let prompt_deadline = Instant::now() + Duration::from_secs(30);
-    let reason = loop {
-        match prompt_rx.try_recv() {
-            Ok(r) => break r.map_err(|e| format!("main send_prompt failed: {e}"))?,
-            Err(_) => {
-                if prompt_rx.is_terminated() {
-                    stop.store(true, Ordering::Relaxed);
-                    sampler.join().ok();
-                    return Err("the prompt task vanished without resolving".to_string());
-                }
-            }
-        }
-        if Instant::now() > prompt_deadline {
-            stop.store(true, Ordering::Relaxed);
-            sampler.join().ok();
-            return Err("timeout waiting for the main prompt (the dispatch E2E)".to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    stop.store(true, Ordering::Relaxed);
-    sampler
-        .join()
-        .map_err(|_| "the sampler thread should finish")?;
-    let peak = peak.load(Ordering::Relaxed);
-    if reason != StopReason::EndTurn {
-        return Err(format!("expected EndTurn, got {:?}", reason));
-    }
-
-    if peak != 2 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let dump = events.lock().unwrap();
-        eprintln!("[DEBUG] peak={peak}; events:");
-        for (name, p) in dump.iter() {
-            eprintln!("  {name}: {}", p);
-        }
-        drop(dump);
-        return Err(format!("expected peak 2, got {}", peak));
-    }
-
-    if !wait_for_event(&events, Duration::from_secs(5), |evs| {
-        stream_texts(evs, FAKE_SESSION_ID_MAIN)
-            .iter()
-            .any(|t| t.contains("dispatch:subagent-done"))
-    })
-    .await
-    {
-        return Err("the main's stream should contain `dispatch:subagent-done`".to_string());
-    }
-
-    if !wait_for_event(&events, Duration::from_secs(5), |evs| {
-        subagent_started(evs, FAKE_SESSION_ID_SUBAGENT).is_some()
-    })
-    .await
-    {
-        return Err("a subagent-session-started for the subagent id should fire".to_string());
-    }
-    {
-        let evs = events.lock().unwrap();
-        let started = subagent_started(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
-        if started["parentSessionId"].as_str() != Some(FAKE_SESSION_ID_MAIN) {
-            return Err("unexpected parent session id".to_string());
-        }
-        if started["agentName"].as_str() != Some("fake") {
-            return Err("unexpected agent name".to_string());
-        }
-        if started["task"].as_str() != Some("do the task") {
-            return Err("unexpected task".to_string());
-        }
-    }
-
-    if !wait_for_event(&events, Duration::from_secs(5), |evs| {
-        subagent_closed(evs, FAKE_SESSION_ID_SUBAGENT).and_then(|p| p["status"].as_str())
-            == Some("completed")
-    })
-    .await
-    {
-        return Err("a subagent-closed (completed) for the subagent id should fire".to_string());
-    }
-    {
-        let evs = events.lock().unwrap();
-        let closed = subagent_closed(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
-        if !closed["metrics"]["durationMs"].is_number() {
-            return Err("durationMs not a number".to_string());
-        }
-    }
-
-    if !wait_for_event(&events, Duration::from_secs(5), |evs| {
-        session_closed(evs, FAKE_SESSION_ID_SUBAGENT).is_some()
-    })
-    .await
-    {
-        return Err("a session-closed for the subagent id should fire".to_string());
-    }
-
-    let mut reap_counter = ProcessCounter::new(&bin);
-    let reap_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let c = reap_counter.scan();
-        if c == 1 {
-            break;
-        }
-        if Instant::now() > reap_deadline {
-            return Err(format!(
-                "the subagent process should be reaped (count back to 1); got {c}"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
+    let result = drive_dispatch_success_scenario(&manager, &events, &bin, info).await;
     let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
     let _ = std::fs::remove_dir_all(&config_dir);
-    Ok(())
+    result
 }
 
 /// (2) **cancellation**: the main (a `dispatch-cancel` fake agent — sends the
@@ -657,108 +772,15 @@ async fn run_dispatch_cancellation_scenario() -> Result<(), String> {
     .await
     .map_err(|e| format!("main start_session failed: {e}"))?;
     if info.session_id.to_string() != FAKE_SESSION_ID_MAIN {
+        let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
+        let _ = std::fs::remove_dir_all(&config_dir);
         return Err(format!("unexpected session id: {}", info.session_id));
     }
 
-    let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
-    {
-        let manager = Arc::clone(&manager);
-        let sid = info.session_id.to_string();
-        tokio::spawn(async move {
-            let r = manager.send_prompt(&sid, "go".to_string()).await;
-            let _ = prompt_tx.send(r);
-        });
-    }
-
-    let mut counter = ProcessCounter::new(&bin);
-    let peak = Arc::new(AtomicUsize::new(counter.scan()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let sampler = {
-        let peak = Arc::clone(&peak);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut c = counter;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let n = c.scan();
-                if n > peak.load(Ordering::Relaxed) {
-                    peak.store(n, Ordering::Relaxed);
-                }
-            }
-        })
-    };
-    let prompt_deadline = Instant::now() + Duration::from_secs(30);
-    let reason = loop {
-        match prompt_rx.try_recv() {
-            Ok(r) => break r.map_err(|e| format!("main send_prompt failed: {e}"))?,
-            Err(_) => {
-                if prompt_rx.is_terminated() {
-                    stop.store(true, Ordering::Relaxed);
-                    sampler.join().ok();
-                    return Err("the prompt task vanished without resolving".to_string());
-                }
-            }
-        }
-        if Instant::now() > prompt_deadline {
-            stop.store(true, Ordering::Relaxed);
-            sampler.join().ok();
-            return Err("timeout waiting for the main prompt (the cancellation E2E)".to_string());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    stop.store(true, Ordering::Relaxed);
-    sampler
-        .join()
-        .map_err(|_| "the sampler thread should finish")?;
-    let peak = peak.load(Ordering::Relaxed);
-
-    if reason != StopReason::EndTurn {
-        return Err(format!("expected EndTurn, got {:?}", reason));
-    }
-
-    if peak != 2 {
-        return Err(format!("expected peak 2, got {}", peak));
-    }
-
-    if !wait_for_event(&events, Duration::from_secs(5), |evs| {
-        subagent_closed(evs, FAKE_SESSION_ID_SUBAGENT)
-            .filter(|p| p["status"].as_str() == Some("failed"))
-            .is_some()
-    })
-    .await
-    {
-        return Err("subagent-closed (failed) should fire".to_string());
-    }
-    {
-        let evs = events.lock().unwrap();
-        let closed = subagent_closed(&evs, FAKE_SESSION_ID_SUBAGENT).unwrap();
-        if closed["error"].as_str() != Some("cancelled") {
-            return Err("expected error `cancelled`".to_string());
-        }
-    }
-
-    let mut reap_counter = ProcessCounter::new(&bin);
-    let reap_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let c = reap_counter.scan();
-        if c == 1 {
-            break;
-        }
-        if Instant::now() > reap_deadline {
-            return Err(format!("subagent not reaped; got {c}"));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    if manager.session_count().await != 1 {
-        return Err("expected 1 session count".to_string());
-    }
-
+    let result = drive_dispatch_cancellation_scenario(&manager, &events, &bin, info).await;
     let _ = manager.close_session(FAKE_SESSION_ID_MAIN).await;
     let _ = std::fs::remove_dir_all(&config_dir);
-    Ok(())
+    result
 }
 
 /// (3) **the subagent's own bridge round-trip** (the `ask` path, no relay):
