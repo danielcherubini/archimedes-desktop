@@ -1017,7 +1017,13 @@ mod tests {
         // caught by the other e2e tests).
         let _ = tx.send(true);
 
-        let result = tokio::time::timeout(Duration::from_secs(12), drive).await;
+        // The driver task tears down when the flag flips — well under the 10 s
+        // establish timeout (the external kind won the race, not the timeout).
+        // The 8 s outer bound is BELOW the 10 s establish timeout on purpose:
+        // if the external close did NOT work, the task would run to the 10 s
+        // timeout and this assertion would catch it (a longer bound would let
+        // the broken case pass vacuously).
+        let result = tokio::time::timeout(Duration::from_secs(8), drive).await;
         assert!(
             result.is_ok(),
             "drive_session should complete when the external flag flips during establish, \
