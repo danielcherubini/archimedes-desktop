@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { memo, useState, useEffect } from "react";
 import {
   Select,
   SelectContent,
@@ -12,13 +12,17 @@ import { SessionConfigOption } from "../lib/tauri";
 
 interface SessionConfigSelectProps {
   option: SessionConfigOption;
-  onSet: (value: string) => Promise<void>;
+  /**
+   * Stable callback taking the option id — ONE useCallback in the consumer
+   * serves both selects. A per-option closure (`onSet(option)`) minted per
+   * render would defeat the memo below and re-render ~600 mounted (but
+   * invisible — Radix keeps closed-select items in a detached
+   * DocumentFragment) SelectItems on EVERY composer keystroke.
+   */
+  onSet: (optionId: string, value: string) => Promise<void>;
 }
 
-export default function SessionConfigSelect({
-  option,
-  onSet,
-}: SessionConfigSelectProps) {
+function SessionConfigSelect({ option, onSet }: SessionConfigSelectProps) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,7 +40,7 @@ export default function SessionConfigSelect({
     setPending(true);
     setError(null);
     try {
-      await onSet(val);
+      await onSet(option.id, val);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -86,3 +90,13 @@ export default function SessionConfigSelect({
     </div>
   );
 }
+
+/**
+ * MEMO IS THE FIX (perf regression): the composer's `draft` state re-renders
+ * `ChatStream` on every keystroke; without this memo (and a stable `onSet`),
+ * every keystroke re-rendered the FULL model catalog mounted inside the
+ * selects (~600 items × ~8 fibers ≈ 140ms/keystroke — typing lagged a full
+ * minute behind). With stable `option`/`onSet` references the subtree is
+ * skipped entirely; a new `option` object (config applied) still re-renders.
+ */
+export default memo(SessionConfigSelect);

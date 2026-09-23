@@ -51,7 +51,7 @@ describe("SessionConfigSelect", () => {
     const beta = screen.getByRole("option", { name: "acme/Beta" });
     fireEvent.click(beta);
 
-    await waitFor(() => expect(onSet).toHaveBeenCalledWith("acme/beta"));
+    await waitFor(() => expect(onSet).toHaveBeenCalledWith("model", "acme/beta"));
   });
 
   it("the trigger is disabled while onSet is pending", async () => {
@@ -123,6 +123,6 @@ describe("SessionConfigSelect", () => {
 
     // Select nested item
     fireEvent.click(screen.getByRole("option", { name: "GPT-4" }));
-    await waitFor(() => expect(onSet).toHaveBeenCalledWith("gpt-4"));
+    await waitFor(() => expect(onSet).toHaveBeenCalledWith("model", "gpt-4"));
   });
 });

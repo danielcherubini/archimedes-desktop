@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useCallback,
   useMemo,
   useRef,
   useState,
@@ -10,7 +11,6 @@ import {
   closeSession,
   sendPrompt,
   setSessionConfigOption,
-  type SessionConfigOption,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
@@ -154,10 +154,24 @@ export default function ChatStream() {
   const modelOption = findOption("model", "model");
   const thinkingOption = findOption("thought_level", "thought_level");
   const applyConfigOptions = useSessions((s) => s.applyConfigOptions);
-  const setConfigOption = (option: SessionConfigOption) => (value: string) =>
-    setSessionConfigOption(activeSessionId!, option.id, value).then((options) =>
-      applyConfigOptions(activeSessionId!, options),
-    );
+  // ONE stable callback for both config selects (the consumer-side half of
+  // the SessionConfigSelect memo fix): a per-option closure minted per
+  // render would re-render the ~600 mounted model-catalog SelectItems on
+  // EVERY composer keystroke (~140ms each — see SessionConfigSelect.tsx).
+  // `applyConfigOptions` is a zustand action — a stable reference, so this
+  // callback's identity only changes when the active session changes.
+  const setConfigValue = useCallback(
+    async (optionId: string, value: string) => {
+      if (!activeSessionId) return;
+      const options = await setSessionConfigOption(
+        activeSessionId,
+        optionId,
+        value,
+      );
+      applyConfigOptions(activeSessionId, options);
+    },
+    [activeSessionId, applyConfigOptions],
+  );
 
   // Pending subagent requests (the toggle dot) — called UNCONDITIONALLY,
   // BEFORE the `!activeSessionId` early return below: this hook contains
@@ -425,16 +439,10 @@ export default function ChatStream() {
           </Select>
         )}
         {isLive && modelOption && (
-          <SessionConfigSelect
-            option={modelOption}
-            onSet={setConfigOption(modelOption)}
-          />
+          <SessionConfigSelect option={modelOption} onSet={setConfigValue} />
         )}
         {isLive && thinkingOption && (
-          <SessionConfigSelect
-            option={thinkingOption}
-            onSet={setConfigOption(thinkingOption)}
-          />
+          <SessionConfigSelect option={thinkingOption} onSet={setConfigValue} />
         )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
