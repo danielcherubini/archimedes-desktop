@@ -1,4 +1,8 @@
 // Ported to the Client 2026-09-23 (ADR 0007): imports, i18n, test-ids adapted; "use client" dropped (Vite SPA); behavior verbatim.
+// One documented deviation: `resolveReasoningStreamingSummary` is an O(last line)
+// backwards scan instead of ZCode's `replace`+`split` — behavior-identical, but
+// the whole-text split does not scale to unboundedly growing thinking text
+// (the summary runs on every render of the streaming trigger).
 
 import { useControllableState } from "@radix-ui/react-use-controllable-state";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -244,17 +248,47 @@ export function isReasoningSummaryOverflowing({
   return scrollWidth > clientWidth + 1;
 }
 
+const WS_LOOKUP: Uint8Array = (() => {
+  const t = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    t[i] = /\s/.test(String.fromCharCode(i)) ? 1 : 0;
+  }
+  return t;
+})();
+const isLineWs = (code: number) =>
+  code < 256 ? WS_LOOKUP[code] === 1 : /\s/.test(String.fromCharCode(code));
+
 export function resolveReasoningStreamingSummary(
   streamingText: string,
 ): { key: string; text: string } | null {
-  const lines = streamingText.replace(/\r\n?/gu, "\n").split("\n");
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const text = lines[index]?.trim() ?? "";
-    if (text.length > 0) {
-      return { key: String(index), text };
+  // O(last line), not O(whole text): the summary runs on every render of the
+  // streaming trigger and the thinking text grows unboundedly during a long
+  // run — a per-render `replace`+`split` over the whole text made the main
+  // thread cost grow with the run (measured 14% -> 50% -> 77% RISING during a
+  // live xhigh stream). Scan lines backwards from the end instead.
+  //
+  // `key` is the line's start offset: stable while the line grows, changes
+  // when a new line starts — the summary's identity for the roll queue
+  // (`contentKey`), never displayed.
+  let lineEnd = streamingText.length;
+  for (;;) {
+    let i = lineEnd - 1;
+    while (i >= 0) {
+      const c = streamingText.charCodeAt(i);
+      if (c === 10 || c === 13) break; // \n or \r
+      i -= 1;
     }
+    const lineStart = i + 1;
+    let start = lineStart;
+    let stop = lineEnd;
+    while (start < stop && isLineWs(streamingText.charCodeAt(start))) start += 1;
+    while (stop > start && isLineWs(streamingText.charCodeAt(stop - 1))) stop -= 1;
+    if (stop > start) {
+      return { key: String(lineStart), text: streamingText.slice(start, stop) };
+    }
+    if (i < 0) return null;
+    lineEnd = i; // blank line: continue before its terminator
   }
-  return null;
 }
 
 const REASONING_SUMMARY_MASK =
