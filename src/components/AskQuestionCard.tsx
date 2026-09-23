@@ -6,6 +6,7 @@ import {
 } from "../lib/tauri";
 import { useBridge } from "../store/bridge";
 import { useSessions } from "../store/sessions";
+import { Button } from "./ui/button";
 
 const OTHER_OPTION = "Other (type your own)";
 const RECOMMENDED_TAG = " (Recommended)";
@@ -202,8 +203,8 @@ export default function AskQuestionCard({
   // expected (then the full card, unanchored/labeled).
   if (queued) {
     return (
-      <div className="rounded-md border border-amber-600/50 bg-amber-950/40 px-3 py-2">
-        <p className="text-sm text-amber-200">
+      <div className="rounded-xl border border-border bg-interaction-ask-surface px-3 py-2">
+        <p className="text-ui-sm text-interaction-ask-foreground">
           {isSubagent ? `${request.source} is asking…` : "Agent is asking…"}
         </p>
       </div>
@@ -216,7 +217,7 @@ export default function AskQuestionCard({
     <div
       ref={cardRef}
       tabIndex={-1}
-      className="rounded-md border border-amber-600/50 bg-amber-950/40 px-3 py-2 focus-visible:outline focus-visible:outline-amber-500/60"
+      className="rounded-xl border border-border focus-visible:outline focus-visible:outline-foreground-subtle/60"
       onKeyDown={(e) => {
         if (e.key === "Enter" && canSubmit && !busy) {
           e.preventDefault();
@@ -228,22 +229,24 @@ export default function AskQuestionCard({
       }}
     >
       {/* Accent separator (the TUI's accent line). */}
-      <div className="mb-2 flex items-center gap-2">
-        <span className="h-px flex-1 bg-amber-500/60" aria-hidden />
-        <span className="text-xs text-amber-400">
+      <div className="flex items-center gap-2 bg-interaction-ask-surface px-3 py-2">
+        <span className="h-px flex-1 bg-interaction-ask-foreground/60" aria-hidden />
+        <span className="text-ui-xs text-interaction-ask-foreground">
           {isSubagent ? request.source : "Agent question"}
         </span>
-        <span className="h-px flex-1 bg-amber-500/60" aria-hidden />
+        <span className="h-px flex-1 bg-interaction-ask-foreground/60" aria-hidden />
       </div>
 
-      <div className="space-y-4">
+      <div className="space-y-4 p-3">
         {questions.map((question) => {
           const d = draft(question.id);
           return (
             <div key={question.id}>
-              <p className="text-sm text-amber-200">{question.question}</p>
+              <p className="text-ui-base text-interaction-ask-foreground">
+                {question.question}
+              </p>
               {question.description && (
-                <p className="mt-1 text-xs text-neutral-400">
+                <p className="mt-1 text-ui-xs text-foreground-subtle">
                   {question.description}
                 </p>
               )}
@@ -257,17 +260,28 @@ export default function AskQuestionCard({
                         type="button"
                         disabled={busy}
                         onClick={() => toggleOption(question, index)}
-                        className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-sm hover:bg-neutral-800/60 disabled:opacity-50"
+                        className={`flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left text-ui-base hover:bg-surface-hover disabled:opacity-50 ${
+                          selected ? "bg-interaction-ask-fill" : ""
+                        }`}
                       >
                         {question.multi ? (
-                          <span aria-hidden className="text-amber-400">
+                          <span
+                            aria-hidden
+                            className={
+                              selected
+                                ? "text-interaction-ask-foreground"
+                                : "text-foreground-subtlest"
+                            }
+                          >
                             {selected ? "☑" : "☐"}
                           </span>
                         ) : (
                           <span
                             aria-hidden
                             className={
-                              selected ? "text-amber-400" : "text-neutral-600"
+                              selected
+                                ? "text-interaction-ask-foreground"
+                                : "text-foreground-subtlest"
                             }
                           >
                             {selected ? "●" : "○"}
@@ -275,7 +289,9 @@ export default function AskQuestionCard({
                         )}
                         <span
                           className={
-                            selected ? "text-amber-200" : "text-neutral-300"
+                            selected
+                              ? "text-interaction-ask-foreground"
+                              : "text-foreground"
                           }
                         >
                           {option.label}
@@ -295,7 +311,7 @@ export default function AskQuestionCard({
                             }))
                           }
                           placeholder="note (optional)"
-                          className="ml-6 mt-1 w-3/4 rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-xs outline-none focus:border-amber-500"
+                          className="ml-6 mt-1 w-3/4 rounded-md border-input-border bg-input px-2 py-0.5 text-ui-xs outline-none placeholder:text-foreground-subtlest focus:border-input-border-focused"
                         />
                       )}
                     </div>
@@ -306,17 +322,28 @@ export default function AskQuestionCard({
                     type="button"
                     disabled={busy}
                     onClick={() => toggleOther(question)}
-                    className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-sm hover:bg-neutral-800/60 disabled:opacity-50"
+                    className={`flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left text-ui-base hover:bg-surface-hover disabled:opacity-50 ${
+                      d.other ? "bg-interaction-ask-fill" : ""
+                    }`}
                   >
                     {question.multi ? (
-                      <span aria-hidden className="text-amber-400">
+                      <span
+                        aria-hidden
+                        className={
+                          d.other
+                            ? "text-interaction-ask-foreground"
+                            : "text-foreground-subtlest"
+                        }
+                      >
                         {d.other ? "☑" : "☐"}
                       </span>
                     ) : (
                       <span
                         aria-hidden
                         className={
-                          d.other ? "text-amber-400" : "text-neutral-600"
+                          d.other
+                            ? "text-interaction-ask-foreground"
+                            : "text-foreground-subtlest"
                         }
                       >
                         {d.other ? "●" : "○"}
@@ -324,7 +351,7 @@ export default function AskQuestionCard({
                     )}
                     <span
                       className={
-                        d.other ? "text-amber-200" : "text-neutral-300"
+                        d.other ? "text-interaction-ask-foreground" : "text-foreground"
                       }
                     >
                       {OTHER_OPTION}
@@ -340,7 +367,7 @@ export default function AskQuestionCard({
                         }))
                       }
                       placeholder="Type your own answer"
-                      className="ml-6 mt-1 w-3/4 rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-xs outline-none focus:border-amber-500"
+                      className="ml-6 mt-1 w-3/4 rounded-md border-input-border bg-input px-2 py-0.5 text-ui-xs outline-none placeholder:text-foreground-subtlest focus:border-input-border-focused"
                     />
                   )}
                 </div>
@@ -352,8 +379,8 @@ export default function AskQuestionCard({
 
       {/* Final batch review for multi-question asks. */}
       {questions.length > 1 && (
-        <div className="mt-3 rounded border border-neutral-800 bg-neutral-900/60 p-2">
-          <p className="text-xs font-medium text-neutral-400">Review</p>
+        <div className="mt-3 rounded-md bg-surface p-2">
+          <p className="text-ui-xs font-medium text-foreground-subtle">Review</p>
           <ul className="mt-1 space-y-0.5">
             {questions.map((question) => {
               const d = draft(question.id);
@@ -369,7 +396,7 @@ export default function AskQuestionCard({
                 );
               }
               return (
-                <li key={question.id} className="text-xs text-neutral-300">
+                <li key={question.id} className="text-ui-sm text-foreground-subtle">
                   {question.question}:{" "}
                   {parts.length > 0 ? parts.join(", ") : "—"}
                 </li>
@@ -380,28 +407,29 @@ export default function AskQuestionCard({
       )}
 
       {/* Footer hints + actions. */}
-      <div className="mt-3 flex items-center justify-between gap-2">
-        <p className="text-xs text-neutral-500">Enter submit · Esc cancel</p>
+      <div className="mt-3 flex items-center justify-between gap-2 px-3 pb-3">
+        <p className="text-ui-xs text-foreground-subtlest">
+          Enter submit · Esc cancel
+        </p>
         <div className="flex gap-2">
-          <button
-            type="button"
+          <Button
+            variant="outline"
+            size="sm"
             disabled={busy}
             onClick={() => void respond(true)}
-            className="rounded bg-neutral-700 px-3 py-1 text-sm text-neutral-200 hover:bg-neutral-600 disabled:opacity-50"
           >
             Cancel
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            size="sm"
             disabled={busy || !canSubmit}
             onClick={() => void respond(false)}
-            className="rounded bg-amber-600 px-3 py-1 text-sm text-black hover:bg-amber-500 disabled:opacity-50"
           >
             Submit
-          </button>
+          </Button>
         </div>
       </div>
-      {error && <p className="mt-1 text-xs text-red-400">{error}</p>}
+      {error && <p className="px-3 pb-2 text-ui-sm text-destructive">{error}</p>}
     </div>
   );
 }

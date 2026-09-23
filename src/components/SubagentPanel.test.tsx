@@ -36,45 +36,45 @@ beforeEach(() => {
 });
 
 describe("SubagentPanel", () => {
-  it("renders nothing when there are no entries", () => {
-    const { container } = render(<SubagentPanel />);
-    expect(container.firstChild).toBeNull();
+  it("renders the empty state when there are no entries", () => {
+    render(<SubagentPanel />);
+    expect(screen.getByText("No subagent sessions")).toBeTruthy();
   });
 
-  it("auto-expands when the first entry arrives (0 → >0)", () => {
+  it("renders a new entry's section", () => {
     const { container } = render(<SubagentPanel />);
-    expect(container.firstChild).toBeNull();
     act(() => {
       useSubagents.getState().addSession(entry);
     });
-    // The 0 → >0 transition flipped the expanded state: the section is
-    // visible WITHOUT a manual expand click.
     expect(screen.getByText("reviewer")).toBeTruthy();
+    // The card carries a border WIDTH class alongside `border-card-border`
+    // (a color class alone renders no visible border — Tailwind's reset
+    // leaves `border-width: 0`). Assert the standalone `border` class via
+    // a word-boundary match.
+    const card = container.querySelector("section");
+    expect(card).toBeTruthy();
+    expect(card?.className).toMatch(/(^|\s)border(\s|$)/);
   });
 
   it("renders a header with the agentName, the state chip, and the status for a running entry", () => {
     useSubagents.getState().addSession(entry);
     useBridge.getState().applyState("sub1", { state: "working" });
     render(<SubagentPanel />);
-    // The rail starts collapsed (a slim bar with the count badge) — expand it.
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
+    // Sections always render (the SidePane frame owns collapse now).
     expect(screen.getByText("reviewer")).toBeTruthy();
     expect(screen.getByText("working")).toBeTruthy();
     expect(screen.getByText("running")).toBeTruthy();
   });
 
-  it("auto-expands on a pending permission prompt (badge 0 → >0) and shows the badge", () => {
+  it("shows the pending-permission badge", () => {
     useSubagents.getState().addSession(entry);
     render(<SubagentPanel />);
-    // Collapsed: the section is hidden.
-    expect(screen.queryByText("reviewer")).toBeNull();
     act(() => {
       usePermissions.getState().addPrompt("sub1", "p1", {
         toolCall: { title: "Bash (apt install ripgrep)" },
         options: [{ optionId: "allow", name: "Allow" }],
       });
     });
-    // The 0 → >0 transition auto-expanded the panel.
     expect(screen.getByText("reviewer")).toBeTruthy();
     expect(screen.getByText("1 awaiting")).toBeTruthy();
   });
@@ -88,7 +88,6 @@ describe("SubagentPanel", () => {
       durationMs: 1234,
     });
     render(<SubagentPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
     expect(screen.getByText("completed")).toBeTruthy();
     expect(screen.getByText(/1234 ms/)).toBeTruthy();
     // The race: the driver teardown's `session-closed` fires the bridge's
@@ -106,7 +105,6 @@ describe("SubagentPanel", () => {
     useSubagents.getState().addSession(entry);
     useSubagents.getState().markClosed("sub1", "failed", "boom");
     render(<SubagentPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
     expect(screen.getByText("failed")).toBeTruthy();
     expect(screen.getByText("boom")).toBeTruthy();
   });
@@ -130,7 +128,6 @@ describe("SubagentPanel", () => {
       },
     });
     render(<SubagentPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
     expect(screen.getByText("Which color?")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Red" })).toBeTruthy();
   });
@@ -174,16 +171,31 @@ describe("SubagentPanel", () => {
       content: { type: "text", text: "hello from the subagent" },
     });
     render(<SubagentPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
     expect(screen.getByText("hello from the subagent")).toBeTruthy();
   });
 
   it("dismisses an entry via the header's dismiss button", () => {
     useSubagents.getState().addSession(entry);
     render(<SubagentPanel />);
-    fireEvent.click(screen.getByRole("button", { name: "Expand subagents" }));
     fireEvent.click(screen.getByRole("button", { name: "Dismiss reviewer" }));
     expect(useSubagents.getState().entries["sub1"]).toBeUndefined();
     expect(screen.queryByText("reviewer")).toBeNull();
+  });
+
+  it("styles the status chip per status (running → warning, failed → destructive)", () => {
+    useSubagents.getState().addSession(entry);
+    useSubagents.getState().addSession({
+      sessionId: "sub2",
+      parentSessionId: "main1",
+      agentName: "worker",
+      task: "work the diff",
+      status: "failed",
+      error: "boom",
+    });
+    render(<SubagentPanel />);
+    expect(screen.getByText("reviewer")).toBeTruthy();
+    expect(screen.getByText("worker")).toBeTruthy();
+    expect(screen.getByText("running").className).toContain("text-warning");
+    expect(screen.getByText("failed").className).toContain("text-destructive");
   });
 });

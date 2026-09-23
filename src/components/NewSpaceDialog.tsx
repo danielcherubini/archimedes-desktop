@@ -9,6 +9,16 @@ import {
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions } from "../store/sessions";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
 /**
  * Modal for starting a space: pick an agent (registry-driven dropdown,
@@ -80,6 +90,9 @@ export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
     }
   };
 
+  // The dynamic title's condition is the `spaceForPath(cwd)` check's
+  // `isSpace` (the folder is an EXISTING space), NOT "cwd is set": a
+  // fresh (unvalidated) folder renders the literal "New space".
   const existingSpace = check?.isSpace;
   const titleBase = basenameOfPath(cwd);
   const title = existingSpace
@@ -109,67 +122,65 @@ export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="w-96 rounded-lg border border-neutral-700 bg-neutral-900 p-4">
-        <h2 className="text-lg font-semibold">{title}</h2>
-        <label className="mt-4 block text-sm text-neutral-300">
-          Agent
-          {agentsError ? (
-            <input
-              disabled
-              value=""
-              placeholder={agentsError}
-              className="mt-1 w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none"
-            />
-          ) : (
-            <select
-              value={effectiveAgentId}
-              onChange={(e) => setSelectedAgentId(e.target.value)}
-              className="mt-1 w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none focus:border-sky-600"
-            >
-              {selectedAgentId === "" && (
-                <option value="">Select an agent…</option>
-              )}
-              {agents.map((agent) => (
-                <option key={agent.id} value={agent.id}>
-                  {agent.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </label>
-        <label className="mt-3 block text-sm text-neutral-300">
-          Folder
-          <div className="mt-1 flex gap-2">
-            <input
-              value={cwd}
-              onChange={(e) => changeCwd(e.target.value)}
-              placeholder="/path/to/project"
-              className="flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm outline-none focus:border-sky-600"
-            />
-            <button
-              type="button"
-              onClick={() => void pickDirectory()}
-              className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm hover:bg-neutral-800"
-            >
-              Browse…
-            </button>
-          </div>
-          {folderError && (
-            <p className="mt-1 text-xs text-red-400">{folderError}</p>
-          )}
-        </label>
-        {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
-        <div className="mt-4 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm hover:bg-neutral-800"
-          >
+    <Dialog open onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>
+            Start a session in a folder — starting IS the space.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-ui-base">
+            Agent
+            {agentsError ? (
+              <Input disabled value="" placeholder={agentsError} />
+            ) : (
+              <select
+                value={effectiveAgentId}
+                onChange={(e) => setSelectedAgentId(e.target.value)}
+                className="h-7 w-full rounded-md border border-input-border bg-input px-2 text-ui-base text-foreground outline-none"
+              >
+                {selectedAgentId === "" && (
+                  <option value="">Select an agent…</option>
+                )}
+                {agents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </label>
+          <label className="flex flex-col gap-1 text-ui-base">
+            Folder
+            <div className="flex gap-2">
+              <Input
+                value={cwd}
+                onChange={(e) => changeCwd(e.target.value)}
+                placeholder="/path/to/project"
+                className="flex-1"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void pickDirectory()}
+              >
+                Browse…
+              </Button>
+            </div>
+            {folderError && (
+              <p className="text-ui-sm text-destructive">{folderError}</p>
+            )}
+          </label>
+        </div>
+        {error && <p className="text-ui-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="destructive" onClick={onClose}>
             Cancel
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
             onClick={() => void start()}
             disabled={
               busy ||
@@ -177,12 +188,11 @@ export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
               cwd.trim() === "" ||
               folderError !== null
             }
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
           >
             {busy ? "Starting…" : "Start"}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

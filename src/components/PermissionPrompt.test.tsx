@@ -40,6 +40,28 @@ describe("PermissionPrompt", () => {
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
   });
 
+  it("renders the confirmation treatment with one button per option + Cancel", () => {
+    usePermissions.getState().addPrompt("s1", "r1", request);
+    const { container } = render(
+      <PermissionPrompt sessionId="s1" requestId="r1" />,
+    );
+    // The green confirmation treatment: a `bg-interaction-confirmation-surface`
+    // header strip with the tool name in the confirmation foreground.
+    const header = container.querySelector(
+      ".bg-interaction-confirmation-surface",
+    )!;
+    expect(header).toBeTruthy();
+    const title = header.querySelector(
+      ".text-interaction-confirmation-foreground",
+    )!;
+    expect(title.textContent).toContain("run a tool");
+    // The footer renders ONE button per fixture option (the fixture has 2)
+    // + a Cancel button.
+    expect(screen.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+  });
+
   it("renders nothing when no prompt is pending for the request id", () => {
     const { container } = render(
       <PermissionPrompt sessionId="s1" requestId="missing" />,

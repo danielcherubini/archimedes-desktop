@@ -19,6 +19,7 @@
 //! "absent" (the main stays live).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -464,35 +465,55 @@ async fn dispatch_success_full_round_trip() {
         });
     }
     // The subagent is a SHORT-LIVED process (the fake `subagent` variant
-    // answers its prompt in milliseconds; its process lives a few ms), so a
-    // coarse poll can miss the 2-process window entirely. `ProcessCounter`
-    // scans in ~0.2 ms (a `pgrep` fork+exec takes ~45 ms here) — poll TIGHT
-    // (no sleep between samples) for a bounded window: the peak assertion
-    // needs at least one sample inside the subagent's lifetime.
+    // answers its prompt in milliseconds; its process lives a few ms), so
+    // the sampler must run CONTINUOUSLY for the whole prompt: a fixed
+    // 500 ms window missed spawns delayed past it under CI load, and a
+    // 10 ms poll is too coarse to sample a few-ms lifetime. A dedicated
+    // thread (a sleep-free loop would starve a tokio worker) samples as
+    // fast as `ProcessCounter` allows (~0.2 ms/scan — a `pgrep` fork+exec
+    // takes ~45 ms here): the subagent's lifetime — whenever the spawn
+    // happens — is guaranteed to contain samples.
     let mut counter = ProcessCounter::new(&bin);
-    let mut peak = counter.scan();
-    let peak_window = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < peak_window {
-        peak = peak.max(counter.scan());
-        if peak == 2 {
-            break;
-        }
-    }
+    let peak = Arc::new(AtomicUsize::new(counter.scan()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let peak = Arc::clone(&peak);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = counter;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = c.scan();
+                if n > peak.load(Ordering::Relaxed) {
+                    peak.store(n, Ordering::Relaxed);
+                }
+            }
+        })
+    };
     let prompt_deadline = Instant::now() + Duration::from_secs(30);
     let reason = loop {
         match prompt_rx.try_recv() {
             Ok(r) => break r.expect("main send_prompt should succeed"),
             Err(_) => {
                 if prompt_rx.is_terminated() {
+                    stop.store(true, Ordering::Relaxed);
+                    sampler.join().ok();
                     panic!("the prompt task vanished without resolving");
                 }
             }
         }
         if Instant::now() > prompt_deadline {
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().ok();
             panic!("timeout waiting for the main prompt (the dispatch E2E)");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().expect("the sampler thread should finish");
+    let peak = peak.load(Ordering::Relaxed);
     assert_eq!(
         reason,
         StopReason::EndTurn,
@@ -592,10 +613,14 @@ async fn dispatch_success_full_round_trip() {
     );
 
     // The subagent is reaped: the process COUNT returns to 1 (the main stays
-    // live — NOT "absent", which would mean the main was reaped too).
+    // live — NOT "absent", which would mean the main was reaped too). A
+    // FRESH counter (the first one moved into the sampler thread): its
+    // baseline covers the main (+ the subagent if not yet reaped), so
+    // `scan()` is 2 until the subagent is reaped and 1 after.
+    let mut reap_counter = ProcessCounter::new(&bin);
     let reap_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let c = counter.scan();
+        let c = reap_counter.scan();
         if c == 1 {
             break;
         }
@@ -659,35 +684,55 @@ async fn dispatch_cancellation_tears_down_subagent() {
     }
     // The subagent is a SHORT-LIVED process here too (the main closes its
     // bridge connection right after sending the frame, so the cancellation
-    // tears the subagent down within milliseconds of the spawn) — a coarse
-    // poll can miss the 2-process window entirely. `ProcessCounter` scans in
-    // ~0.2 ms (a `pgrep` fork+exec takes ~45 ms here) — poll TIGHT (no sleep
-    // between samples) for a bounded window: the peak assertion needs at
-    // least one sample inside the subagent's lifetime.
+    // tears the subagent down within milliseconds of the spawn), so the
+    // sampler must run CONTINUOUSLY for the whole prompt: a fixed 500 ms
+    // window missed spawns delayed past it under CI load, and a 10 ms
+    // poll is too coarse to sample a few-ms lifetime. A dedicated thread
+    // (a sleep-free loop would starve a tokio worker) samples as fast as
+    // `ProcessCounter` allows (~0.2 ms/scan — a `pgrep` fork+exec takes
+    // ~45 ms here): the subagent's lifetime — whenever the spawn happens —
+    // is guaranteed to contain samples.
     let mut counter = ProcessCounter::new(&bin);
-    let mut peak = counter.scan();
-    let peak_window = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < peak_window {
-        peak = peak.max(counter.scan());
-        if peak == 2 {
-            break;
-        }
-    }
+    let peak = Arc::new(AtomicUsize::new(counter.scan()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let peak = Arc::clone(&peak);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = counter;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = c.scan();
+                if n > peak.load(Ordering::Relaxed) {
+                    peak.store(n, Ordering::Relaxed);
+                }
+            }
+        })
+    };
     let prompt_deadline = Instant::now() + Duration::from_secs(30);
     let reason = loop {
         match prompt_rx.try_recv() {
             Ok(r) => break r.expect("the main prompt should still resolve (the main stays live)"),
             Err(_) => {
                 if prompt_rx.is_terminated() {
+                    stop.store(true, Ordering::Relaxed);
+                    sampler.join().ok();
                     panic!("the prompt task vanished without resolving");
                 }
             }
         }
         if Instant::now() > prompt_deadline {
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().ok();
             panic!("timeout waiting for the main prompt (the cancellation E2E)");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().expect("the sampler thread should finish");
+    let peak = peak.load(Ordering::Relaxed);
     assert_eq!(
         reason,
         StopReason::EndTurn,
@@ -721,10 +766,13 @@ async fn dispatch_cancellation_tears_down_subagent() {
     }
 
     // The subagent is reaped: the process COUNT returns to 1 (the main stays
-    // live).
+    // live). A FRESH counter (the first one moved into the sampler thread):
+    // its baseline covers the main (+ the subagent if not yet reaped), so
+    // `scan()` is 2 until the subagent is reaped and 1 after.
+    let mut reap_counter = ProcessCounter::new(&bin);
     let reap_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let c = counter.scan();
+        let c = reap_counter.scan();
         if c == 1 {
             break;
         }
