@@ -4,6 +4,7 @@ import { createHighlighter, type Highlighter } from "shiki";
 import type { Message } from "../store/sessions";
 import ToolCallCard from "./ToolCallCard";
 import DiffBlock from "./DiffBlock";
+import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 
 // One shared highlighter for the whole app.
 let highlighterPromise: Promise<Highlighter> | null = null;
@@ -144,7 +145,7 @@ function AgentMarkdown({ text }: { text: string }) {
   );
 }
 
-export default function MessageBubble({ message }: { message: Message }) {
+export default function MessageBubble({ message, isStreaming = false }: { message: Message; isStreaming?: boolean }) {
   switch (message.kind) {
     case "user":
       // The design reference: a plain row — no bubble, no avatar.
@@ -159,6 +160,17 @@ export default function MessageBubble({ message }: { message: Message }) {
         <div className="text-ui-base">
           <AgentMarkdown text={message.text} />
         </div>
+      );
+
+    case "agent-thought":
+      return (
+        <Reasoning
+          isStreaming={isStreaming}
+          autoCollapseKey={isStreaming ? null : "complete"}
+        >
+          <ReasoningTrigger streamingText={message.text} />
+          <ReasoningContent>{message.text}</ReasoningContent>
+        </Reasoning>
       );
 
     case "tool-call":

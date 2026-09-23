@@ -492,6 +492,9 @@ export default function ChatStream() {
             </div>
           )}
         {messages.map((message, i) => {
+          // The key is session-scoped: switching sessions must not reuse the
+          // previous session's component at the same index (a `Reasoning`
+          // would otherwise carry over expanded state, duration, and timers).
           // The `AskQuestionCard` replaces the pending `ask`
           // `ToolCallCard` (correlated via `(source, toolCallId)`/
           // `requestId` — a `main` ask whose `toolCallId` matches this
@@ -503,14 +506,24 @@ export default function ChatStream() {
             if (anchored) {
               return (
                 <AskQuestionCard
-                  key={i}
+                  key={`${activeSessionId}:${i}`}
                   sessionId={activeSessionId}
                   requestId={anchored.requestId}
                 />
               );
             }
           }
-          return <MessageBubble key={i} message={message} />;
+          return (
+            <MessageBubble
+              key={`${activeSessionId}:${i}`}
+              message={message}
+              isStreaming={
+                message.kind === "agent-thought" &&
+                inTurn &&
+                i === messages.length - 1
+              }
+            />
+          );
         })}
         {prompts.map((prompt) => (
           <PermissionPrompt

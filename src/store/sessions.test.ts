@@ -58,10 +58,110 @@ const row = (path: string, lastOpenedAt: number): SpaceRow => ({
   lastOpenedAt,
 });
 
+/**
+ * `MessageRow` helper: override for `MessageRow` fixtures, to distinguish
+ * it from the `SpaceRow` helper `row` above.
+ */
+const msgRow = (
+  overrides: Partial<MessageRow> & { kind: MessageRow["kind"] },
+): MessageRow => ({
+  id: 1,
+  sessionId: "s1",
+  messageKey: null,
+  payloadJson: "{}",
+  createdAt: 1000,
+  ...overrides,
+});
+
 const chunk = (messageId: string, text: string): AcpSessionUpdate => ({
   sessionUpdate: "agent_message_chunk",
   content: { type: "text", text },
   messageId,
+});
+
+describe("applySessionUpdate — agent_message_chunk", () => {
+  const thought = (messageId: string, text: string): AcpSessionUpdate => ({
+    sessionUpdate: "agent_thought_chunk",
+    content: { type: "text", text },
+    messageId,
+  });
+
+  it("accumulates contiguous agent_thought_chunk chunks into one agent-thought message", () => {
+    let messages: Message[] = [];
+    messages = applySessionUpdate(messages, thought("m1", "think"), 1);
+    messages = applySessionUpdate(messages, thought("m1", "ing"), 2);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      kind: "agent-thought",
+      messageId: "m1",
+      text: "thinking",
+    });
+  });
+
+  it("starts a new agent-thought message when messageId changes", () => {
+    let messages: Message[] = [];
+    messages = applySessionUpdate(messages, thought("m1", "think"), 1);
+    messages = applySessionUpdate(messages, thought("m2", "ing"), 2);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({ kind: "agent-thought", messageId: "m1", text: "think" });
+    expect(messages[1]).toMatchObject({ kind: "agent-thought", messageId: "m2", text: "ing" });
+  });
+
+  it("starts a new agent-thought message after an intervening text chunk", () => {
+    let messages: Message[] = [];
+    messages = applySessionUpdate(messages, thought("m1", "t1"), 1);
+    messages = applySessionUpdate(messages, chunk("m1", "text"), 2);
+    messages = applySessionUpdate(messages, thought("m1", "t2"), 3);
+    const thoughts = messages.filter((m) => m.kind === "agent-thought");
+    expect(thoughts).toHaveLength(2);
+    expect(thoughts[0]).toMatchObject({ text: "t1" });
+    expect(thoughts[1]).toMatchObject({ text: "t2" });
+  });
+
+  it("ignores non-text or empty thought chunks", () => {
+    let messages: Message[] = [];
+    messages = applySessionUpdate(
+      messages,
+      {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "image", data: "x" },
+        messageId: "m1",
+      },
+      1,
+    );
+    expect(messages).toHaveLength(0);
+    messages = applySessionUpdate(messages, thought("m1", ""), 2);
+    expect(messages).toHaveLength(0);
+  });
+});
+
+describe("rowToMessages — agent-thought", () => {
+  it("maps an agent-thought row to an agent-thought message", () => {
+    const [msg] = rowToMessages(
+      msgRow({
+        kind: "agent-thought",
+        messageKey: "m9#1",
+        payloadJson: JSON.stringify({ text: "recalled" }),
+        createdAt: 123,
+      }),
+    );
+    expect(msg).toEqual({
+      kind: "agent-thought",
+      messageId: "m9#1",
+      text: "recalled",
+      at: 123,
+    });
+  });
+
+  it("returns empty for an agent-thought row with a non-string payload.text", () => {
+    const messages = rowToMessages(
+      msgRow({
+        kind: "agent-thought",
+        payloadJson: JSON.stringify({ text: 123 }),
+      }),
+    );
+    expect(messages).toHaveLength(0);
+  });
 });
 
 describe("applySessionUpdate — agent_message_chunk", () => {

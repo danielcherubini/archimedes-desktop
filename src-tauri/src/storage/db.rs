@@ -50,7 +50,7 @@ pub struct SessionRow {
 pub struct MessageRow {
     pub id: i64,
     pub session_id: String,
-    /// `'user' | 'agent-text' | 'tool-call' | 'diff'`.
+    /// `'user' | 'agent-text' | 'agent-thought' | 'tool-call' | 'diff'`.
     pub kind: String,
     /// `ContentChunk.messageId` for agent-text; the tool call id for
     /// tool-call rows; `NULL` otherwise.

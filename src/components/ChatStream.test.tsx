@@ -185,6 +185,38 @@ describe("ChatStream", () => {
     expect(screen.getByRole("status")).toBeTruthy();
   });
 
+  it("renders thinking block in transcript", async () => {
+    seedLiveSession();
+    const sessionId = "s1";
+    useSessions.getState().addUserMessage(sessionId, "hi");
+    useSessions.getState().applySessionUpdate(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pondering" }, messageId: "m1" });
+    useSessions.getState().beginTurn(sessionId);
+    
+    render(<ChatStream />);
+    // Verify "Thinking" label
+    expect(screen.getByText("Thinking")).toBeTruthy();
+    
+    // Complete the turn
+    act(() => {
+      useSessions.getState().turnCompleted(sessionId, "end_turn");
+    });
+    
+    // Verify "Thought" label (assert ONLY "Thought")
+    expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
+  it("renders done thinking block in history (not streaming)", () => {
+    seedLiveSession();
+    const sessionId = "s1";
+    useSessions.getState().addUserMessage(sessionId, "hi");
+    useSessions.getState().applySessionUpdate(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "done thought" }, messageId: "m1" });
+    // Not in turn
+    
+    render(<ChatStream />);
+    // Should show "Thought" (it never streamed)
+    expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
   it("renders the working indicator from the bridge agentState alone (no inTurn)", async () => {
     seedLiveSession();
     useSessions.getState().addUserMessage("s1", "hi");
@@ -574,6 +606,46 @@ describe("ChatStream", () => {
     render(<ChatStream />);
     expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "Thinking" })).toBeNull();
+  });
+
+  it("does NOT leak Reasoning state across sessions (per-session key)", () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      sessions: [
+        { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+        { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+      ],
+      spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+      historySessions: [],
+      messages: {
+        s1: [
+          { kind: "user", text: "hi1", at: 1 },
+          { kind: "agent-thought", messageId: "m1", text: "thought-one", at: 2 },
+        ],
+        s2: [
+          { kind: "user", text: "hi2", at: 1 },
+          { kind: "agent-thought", messageId: "m2", text: "thought-two", at: 2 },
+        ],
+      },
+      inTurn: {},
+      stopReasons: {},
+      closeReasons: {},
+      configOptions: {},
+    });
+    render(<ChatStream />);
+    // s1's thinking block is collapsed by default…
+    expect(screen.queryByText("thought-one")).toBeNull();
+    // …and expands on click.
+    fireEvent.click(screen.getByTestId("reasoning-trigger"));
+    expect(screen.getByText("thought-one")).toBeTruthy();
+    // Switching sessions must NOT reuse the same Reasoning instance at
+    // the same index: s2's block starts collapsed (no inherited
+    // expanded state or duration) and s1's content is gone.
+    act(() => {
+      useSessions.setState({ activeSessionId: "s2" });
+    });
+    expect(screen.queryByText("thought-two")).toBeNull();
+    expect(screen.queryByText("thought-one")).toBeNull();
   });
 
   it("a STORED session with configOptions renders neither selector", () => {

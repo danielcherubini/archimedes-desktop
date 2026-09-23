@@ -36,7 +36,7 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
-    TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -141,6 +141,7 @@ pub(crate) struct LiveSession {
     /// by the driver task once `connect_with` returns. For a subagent session
     /// this IS the `ExternalClose`'s kind.
     pub(crate) close_kind: Arc<StdMutex<Option<CloseKind>>>,
+    pub(crate) thought_state: Arc<StdMutex<ThoughtState>>,
 }
 
 /// The external-close handle: the subagent cancel path (main sessions pass
@@ -213,6 +214,18 @@ impl CostAccumulator {
             .unwrap_or(0);
         self.cost += p.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
     }
+}
+
+/// Per-session thinking-persistence state: the accumulated text of the
+/// OPEN segment, the segment's message key (or `None` when the last
+/// update was not a continuing thought chunk), and the next segment
+/// number. `current` is reset when a new segment starts (a closed
+/// segment is never re-appended — see the segmentation rule above).
+#[derive(Debug, Default)]
+pub(crate) struct ThoughtState {
+    current: String,
+    open_key: Option<String>,
+    next: u32,
 }
 
 /// The shared session-driver state. `SessionManager` (main sessions) and
@@ -371,6 +384,10 @@ impl SessionDriver {
             Arc::new(StdMutex::new(HashMap::new()));
         let tool_call_state: Arc<StdMutex<HashMap<String, Value>>> =
             Arc::new(StdMutex::new(HashMap::new()));
+        let thought_state: Arc<StdMutex<ThoughtState>> =
+            Arc::new(StdMutex::new(ThoughtState::default()));
+        // Used in the driver task; moved into the spawned task by the closure.
+        let _thought_state_task = thought_state.clone();
 
         let sessions_arc = self.sessions.clone();
         let pending_permissions_arc = self.pending_permissions.clone();
@@ -381,6 +398,7 @@ impl SessionDriver {
         // the `connect_with` notification handler.
         let text_capture = self.text_capture.clone();
         let last_message_id = self.last_message_id.clone();
+        let thought_capture = thought_state.clone();
         let sink = sink.clone();
         let notify_sink = sink.clone();
         let cwd_owned = cwd.clone();
@@ -428,6 +446,7 @@ impl SessionDriver {
                                 &notif.update,
                                 &agent_text_acc,
                                 &tool_call_state,
+                                &thought_capture,
                             );
                         }
                         // (a) Capture the agent text for the FINAL OUTPUT
@@ -664,6 +683,7 @@ impl SessionDriver {
             agent_id: agent_id.to_string(),
             close_tx: ec_tx.unwrap_or_else(|| close_tx.clone()),
             close_kind: kind,
+            thought_state,
         };
         self.sessions
             .lock()
@@ -716,6 +736,10 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// The configured config directory (useful for tests and diagnostics).
+    pub fn config_dir(&self) -> &PathBuf {
+        &self.config_dir
+    }
     /// Create a manager, loading the agent registry from `config_dir`.
     pub fn new(config_dir: PathBuf) -> Result<Self, ConfigError> {
         let registry = Registry::load(&config_dir)?;
@@ -746,9 +770,19 @@ impl SessionManager {
         self.driver.subagent = Some(m);
     }
 
-    /// The configured config directory (useful for tests and diagnostics).
-    pub fn config_dir(&self) -> &PathBuf {
-        &self.config_dir
+    /// Reset the session's open thinking segment at a prompt boundary. The
+    /// frontend's `addUserMessage` starts a new thinking block on a user
+    /// message, but `persist_update` never sees user messages (they are
+    /// recorded by the `send_prompt` paths, not the notification handler) —
+    /// so the Rust accumulator must be reset here, not in `persist_update`.
+    pub async fn begin_user_turn(&self, session_id: &str) {
+        let sid = SessionId::new(session_id);
+        if let Some(live) = self.driver.sessions.lock().await.get(&sid) {
+            live.thought_state
+                .lock()
+                .expect("thought state poisoned")
+                .open_key = None;
+        }
     }
 
     /// Clone the (cheap) connection handle of a live session.
@@ -1030,6 +1064,7 @@ impl SessionManager {
 
         // Record the user's message in the transcript (the client owns
         // history) before the turn begins.
+        self.begin_user_turn(session_id).await;
         if let Some(db) = &self.driver.db {
             let payload = serde_json::json!({ "text": text });
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
@@ -1202,13 +1237,47 @@ fn persist_update(
     update: &SessionUpdate,
     agent_text_acc: &StdMutex<HashMap<String, String>>,
     tool_call_state: &StdMutex<HashMap<String, Value>>,
+    thought_state: &StdMutex<ThoughtState>,
 ) {
     match update {
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            if let ContentBlock::Text(text) = &chunk.content {
+                if text.text.is_empty() {
+                    return;
+                }
+                let key = chunk
+                    .message_id
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                let mut state = thought_state.lock().expect("thought state poisoned");
+                if state.open_key.as_deref() != Some(key.as_str()) {
+                    // New thinking segment: a new messageId, or an intervening
+                    // segmenting update (see the rule above) cleared `open_key`.
+                    state.next += 1;
+                    state.open_key = Some(key);
+                    state.current = String::new();
+                }
+                state.current.push_str(&text.text);
+                let row_key = format!("{}#{}", state.open_key.as_ref().unwrap(), state.next);
+                let payload = serde_json::json!({ "text": state.current });
+                let _ = db.record_message(
+                    session_id,
+                    "agent-thought",
+                    Some(&row_key),
+                    &payload.to_string(),
+                );
+            }
+        }
         SessionUpdate::AgentMessageChunk(chunk) => {
             if let ContentBlock::Text(text) = &chunk.content {
                 if text.text.is_empty() {
                     return;
                 }
+                thought_state
+                    .lock()
+                    .expect("thought state poisoned")
+                    .open_key = None;
                 let key = chunk
                     .message_id
                     .as_ref()
@@ -1225,6 +1294,10 @@ fn persist_update(
             }
         }
         SessionUpdate::ToolCall(tool_call) => {
+            thought_state
+                .lock()
+                .expect("thought state poisoned")
+                .open_key = None;
             let key = tool_call.tool_call_id.to_string();
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
             state.insert(
@@ -1241,12 +1314,29 @@ fn persist_update(
         SessionUpdate::ToolCallUpdate(tool_call_update) => {
             let key = tool_call_update.tool_call_id.to_string();
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
+            let is_new = !state.contains_key(&key);
+            let has_diff = tool_call_update
+                .fields
+                .content
+                .as_ref()
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| matches!(item, ToolCallContent::Diff(_)))
+                });
             let patch = serde_json::to_value(tool_call_update).unwrap_or(Value::Null);
             let entry = state
                 .entry(key.clone())
                 .or_insert_with(|| Value::Object(Default::default()));
             merge_json(entry, &patch);
             let _ = db.record_message(session_id, "tool-call", Some(&key), &entry.to_string());
+            drop(state);
+            if is_new || has_diff {
+                thought_state
+                    .lock()
+                    .expect("thought state poisoned")
+                    .open_key = None;
+            }
         }
         _ => {}
     }
@@ -1430,11 +1520,169 @@ mod tests {
 mod session_tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
+        ContentChunk, SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
     };
     use std::path::Path;
-
     use tokio::sync::mpsc;
+
+    #[test]
+    fn persist_update_records_agent_thought_chunks() {
+        let dir = temp_config_dir();
+        let db = Db::open(&dir.join("archimedes.db")).expect("db should open");
+        // FK: `messages.session_id REFERENCES sessions(id)` and `Db::open`
+        // enables `PRAGMA foreign_keys` — record the session FIRST, or every
+        // `record_message` fails (and `persist_update` swallows the error).
+        db.record_session(&SessionInfo {
+            session_id: "sess-t1".into(),
+            agent_id: "fake".into(),
+            cwd: dir.clone(),
+            capabilities: AgentCapabilities::default(),
+            config_options: None,
+        })
+        .expect("record_session should succeed");
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought = StdMutex::new(ThoughtState::default());
+
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("thinking "),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("happens"),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        let rows = db
+            .messages_for("sess-t1")
+            .expect("messages_for should work");
+        assert_eq!(rows.len(), 1, "two chunks, one messageId → one row");
+        assert_eq!(rows[0].kind, "agent-thought");
+        assert_eq!(rows[0].message_key.as_deref(), Some("default#1"));
+        assert_eq!(rows[0].payload_json, r#"{"text":"thinking happens"}"#);
+
+        // A non-empty text chunk interrupts the run: a later thought chunk
+        // starts a NEW segment.
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("answer"),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("second run"),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        let rows = db
+            .messages_for("sess-t1")
+            .expect("messages_for should work");
+        assert_eq!(
+            rows.len(),
+            3,
+            "think → text → think → two thought rows + one text row"
+        );
+        assert_eq!(rows.iter().filter(|r| r.kind == "agent-thought").count(), 2);
+
+        // A prompt boundary (the `begin_user_turn` operation — a direct
+        // `open_key = None` reset, since `begin_user_turn` needs a live
+        // SessionManager entry) also starts a new segment.
+        thought.lock().expect("poisoned").open_key = None;
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("third turn"),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        let rows = db
+            .messages_for("sess-t1")
+            .expect("messages_for should work");
+        assert_eq!(rows.len(), 4, "prompt boundary → third thought row");
+
+        // A DISTINCT messageId starts a new segment back-to-back; an EMPTY
+        // chunk (and an empty text chunk) is ignored and does NOT segment.
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("m2 run"))).message_id("m2"),
+            ),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(""),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(""),
+            ))),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        persist_update(
+            &db,
+            "sess-t1",
+            &SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new("still m2")))
+                    .message_id("m2"),
+            ),
+            &text_acc,
+            &tool_state,
+            &thought,
+        );
+        let rows = db
+            .messages_for("sess-t1")
+            .expect("messages_for should work");
+        // The empty text chunk did NOT segment: the last thought chunk
+        // (same "m2" key, open segment) appended to the m2 row.
+        assert_eq!(
+            rows.len(),
+            5,
+            "new messageId → fourth thought row; empty chunks → no rows, no segmentation"
+        );
+        let m2: Vec<_> = rows
+            .iter()
+            .filter(|r| r.message_key.as_deref() == Some("m2#4"))
+            .collect();
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].payload_json, r#"{"text":"m2 runstill m2"}"#);
+    }
 
     pub struct TestSink {
         tx: mpsc::UnboundedSender<Value>,
