@@ -446,21 +446,34 @@ describe("ChatStream", () => {
     expect(toggle.querySelector(".bg-warning")).toBeNull();
   });
 
-  it("keeps the composer consistent when the bridge is idle but the store is inTurn", () => {
+  it("keeps the composer LOCKED when the bridge is idle but the store is inTurn", () => {
     seedLiveSession();
     useSessions.getState().beginTurn("s1");
     useBridge.getState().applyState("s1", { state: "idle" });
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Send a prompt…");
-    // The unified predicate (agentState present → `agentState ===
-    // "working"` → false): the placeholder says idle, the controls are
-    // enabled, and Enter actually sends — ONE consistent state (the
-    // `inTurn` latch is a store follow-up, not a composer concern).
-    fireEvent.change(textarea, { target: { value: "hi" } });
-    expect(sendButton.hasAttribute("disabled")).toBe(false);
-    expect(textarea.hasAttribute("disabled")).toBe(false);
+    // A stale `idle` from the previous turn must not unlock the composer
+    // while a turn is in flight (`inTurn` is the ground truth — the store
+    // does not reset `agentState` on `turnCompleted`, a store follow-up):
+    // the placeholder says working, the controls are disabled, and Enter
+    // no-ops. The working indicator shows (the turn IS in flight).
+    const textarea = screen.getByPlaceholderText("Agent is working…");
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(true);
     fireEvent.keyDown(textarea, { key: "Enter" });
-    expect(sendPrompt).toHaveBeenCalledWith("s1", "hi");
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeTruthy();
+  });
+
+  it("prefers the 'Waiting for your input…' line over the braille loader when blocked AND inTurn", () => {
+    seedLiveSession();
+    useSessions.getState().beginTurn("s1");
+    useBridge.getState().applyState("s1", { state: "blocked" });
+    render(<ChatStream />);
+    // `blocked` + `inTurn` → `workingOrInTurn` is true, but the blocked
+    // line takes precedence: the waiting line renders and the braille
+    // loader (role="status") does NOT (both would render otherwise).
+    expect(screen.getByText("Waiting for your input…")).toBeTruthy();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

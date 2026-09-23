@@ -100,6 +100,28 @@ describe("SpacesList", () => {
     expect(screen.getByText("New space")).toBeTruthy();
   });
 
+  it("opens the Open Space dialog from the New Session button for an orphaned active session (a legacy session that belongs to no current Space)", () => {
+    // The active session's cwd (`/tmp/gamma`) matches NO space in the
+    // fixture, so `activeView` is `undefined` even though
+    // `activeSessionId` is non-null: the button must open the Open Space
+    // dialog instead of silently no-oping (the hook no-ops on an
+    // undefined view).
+    useSessions.setState({
+      sessions: [
+        {
+          sessionId: "s-orphan",
+          agentId: "pi",
+          cwd: "/tmp/gamma",
+          capabilities: {},
+        },
+      ],
+      activeSessionId: "s-orphan",
+    });
+    render(<SpacesList />);
+    fireEvent.click(screen.getByRole("button", { name: /New Session/ }));
+    expect(screen.getByText("New space")).toBeTruthy();
+  });
+
   it("renders a space group with its folder icon and base name; the chevron collapses the rows", () => {
     const { container } = render(<SpacesList />);
     expect(container.querySelector(".lucide-folder")).not.toBeNull();

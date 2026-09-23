@@ -106,18 +106,23 @@ export default function ChatStream() {
   const turnCompleted = useSessions((s) => s.turnCompleted);
   const resumeSession = useSessions((s) => s.resumeSession);
 
-  // The bridge agent state for the active session — the working indicator
-  // uses the `agentState` entry when present, else the `inTurn` fallback
-  // (a bridge agent that hasn't pushed yet — its turn IS in flight).
+  // The bridge agent state for the active session. `inTurn` is the
+  // ground truth for "a turn is in flight" (set by `beginTurn`, cleared
+  // by `turnCompleted`) — a STALE `idle` from the previous turn must
+  // not unlock the composer or hide the working indicator, so `inTurn`
+  // wins alongside `working` (the store does not reset `agentState` on
+  // `turnCompleted` — a store follow-up; a bridge agent that hasn't
+  // pushed yet is covered the same way: its turn IS in flight).
   const agentState = useBridge((s) =>
     activeSessionId ? s.agentState[activeSessionId] : undefined,
   );
-  const workingOrInTurn =
-    agentState === "working" || (agentState === undefined && inTurn);
+  const workingOrInTurn = agentState === "working" || inTurn;
   // A `blocked` bridge agent is mid-turn AWAITING a request response
   // (`inTurn` is true) — the composer must stay locked for the whole
   // wait (pre-branch, `main`'s composer locked on `inTurn`): sending
   // concurrently would double-send and clobber the turn bookkeeping.
+  // (`agentState === "blocked"` also covers a blocked state without an
+  // in-flight turn, where `inTurn` alone would not lock.)
   const composerLocked = workingOrInTurn || agentState === "blocked";
   // Called UNCONDITIONALLY at the top of the component body (the hook
   // contains `useState`/`useEffect` — invoking it inside the `working`
@@ -482,21 +487,25 @@ export default function ChatStream() {
           />
         ))}
         {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
-        {workingOrInTurn && (
-          <div className="flex items-center gap-2">
-            <BrailleLoader
-              variant="typing"
-              speed="normal"
-              fontSize={14}
-              label="Agent working"
-            />
-            <p className="text-ui-sm text-foreground-subtle">{quip}</p>
-          </div>
-        )}
-        {agentState === "blocked" && (
+        {/* `blocked` takes precedence: a blocked agent that is also
+            mid-turn (`inTurn`) shows the waiting line, NOT the braille
+            loader (both would render otherwise). */}
+        {agentState === "blocked" ? (
           <p className="text-ui-sm text-foreground-subtle">
             Waiting for your input…
           </p>
+        ) : (
+          workingOrInTurn && (
+            <div className="flex items-center gap-2">
+              <BrailleLoader
+                variant="typing"
+                speed="normal"
+                fontSize={14}
+                label="Agent working"
+              />
+              <p className="text-ui-sm text-foreground-subtle">{quip}</p>
+            </div>
+          )
         )}
         {!inTurn && stopReason && stopReason !== "end_turn" && (
           <p className="text-ui-sm text-foreground-subtlest">

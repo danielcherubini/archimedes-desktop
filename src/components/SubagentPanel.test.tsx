@@ -42,11 +42,18 @@ describe("SubagentPanel", () => {
   });
 
   it("renders a new entry's section", () => {
-    render(<SubagentPanel />);
+    const { container } = render(<SubagentPanel />);
     act(() => {
       useSubagents.getState().addSession(entry);
     });
     expect(screen.getByText("reviewer")).toBeTruthy();
+    // The card carries a border WIDTH class alongside `border-card-border`
+    // (a color class alone renders no visible border — Tailwind's reset
+    // leaves `border-width: 0`). Assert the standalone `border` class via
+    // a word-boundary match.
+    const card = container.querySelector("section");
+    expect(card).toBeTruthy();
+    expect(card?.className).toMatch(/(^|\s)border(\s|$)/);
   });
 
   it("renders a header with the agentName, the state chip, and the status for a running entry", () => {

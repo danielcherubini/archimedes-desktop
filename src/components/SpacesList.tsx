@@ -86,14 +86,16 @@ export default function SpacesList() {
   // re-subscribes on EVERY render. That is one cheap listener swap per
   // render, and the `e.target` guard makes the churn harmless.
   const handleNewSession = useCallback(() => {
-    // No active session (no view): the button opens the Open Space dialog
+    // No matching Space view — either no active session, or an active
+    // session that belongs to NO current Space (e.g. a legacy session
+    // whose cwd is no longer a Space): open the Open Space dialog
     // instead (the hook itself no-ops on an undefined view).
-    if (activeSessionId === null) {
+    if (activeView === undefined) {
       setDialogOpen(true);
       return;
     }
     void newSession.startNewConversation();
-  }, [activeSessionId, newSession]);
+  }, [activeView, newSession]);
   const handleOpenSpace = useCallback(() => setDialogOpen(true), []);
 
   // ⌘N / Ctrl+N → New Session, ⌘O / Ctrl+O → Open Space. Ignored while the

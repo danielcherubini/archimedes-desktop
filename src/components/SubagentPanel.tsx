@@ -54,7 +54,7 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
   const askRequests = requestList.filter((r) => r.method === "ask");
 
   return (
-    <section className="flex flex-col gap-2 rounded-xl border-card-border bg-card p-3">
+    <section className="flex flex-col gap-2 rounded-xl border border-card-border bg-card p-3">
       {/* Header: the agent's name (the label — the subagent's own `ask`
           cards render in its stream with `source: "main"` from its own
           session id), the `state` push chip (finally rendered), the
