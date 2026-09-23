@@ -694,3 +694,40 @@ body {
 *::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+@layer utilities {
+  .animated-gradient-text {
+    display: inline-block;
+    background: linear-gradient(
+      90deg,
+      var(--animated-gradient-text-strong) 0%,
+      var(--animated-gradient-text-strong) 34%,
+      var(--animated-gradient-text-soft) 50%,
+      var(--animated-gradient-text-strong) 66%,
+      var(--animated-gradient-text-strong) 100%
+    );
+    background-size: 300% 100%;
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    animation: gradient-flow 4s linear infinite;
+    will-change: background-position;
+    transform: translateZ(0);
+    backface-visibility: hidden;
+  }
+
+  @keyframes gradient-flow {
+    0% {
+      background-position: 100% 0;
+    }
+
+    50% {
+      background-position: 0% 0;
+    }
+
+    100% {
+      background-position: 0% 0;
+    }
+  }
+}
