@@ -1,51 +1,62 @@
 import type { CSSProperties } from "react";
 
+const SCROLL_MASK_EDGE_SIZE_PX = 24;
+const SCROLL_MASK_THRESHOLD_PX = 1;
+
 export interface ScrollMetrics {
-  scrollTop: number;
-  scrollHeight: number;
   clientHeight: number;
+  scrollHeight: number;
+  scrollTop: number;
 }
 
 export interface ScrollMaskState {
-  showTop: boolean;
   showBottom: boolean;
+  showTop: boolean;
 }
 
 export const EMPTY_SCROLL_MASK_STATE: ScrollMaskState = {
-  showTop: false,
   showBottom: false,
+  showTop: false,
 };
 
 export function resolveVerticalScrollMaskState({
-  scrollTop,
-  scrollHeight,
   clientHeight,
+  scrollHeight,
+  scrollTop,
 }: ScrollMetrics): ScrollMaskState {
-  const isScrollable = scrollHeight > clientHeight;
-  if (!isScrollable) {
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+  if (maxScrollTop <= SCROLL_MASK_THRESHOLD_PX) {
     return EMPTY_SCROLL_MASK_STATE;
   }
 
-  const showTop = scrollTop > 1;
-  const showBottom = scrollTop < scrollHeight - clientHeight - 1;
-
-  return { showTop, showBottom };
+  return {
+    showTop: scrollTop > SCROLL_MASK_THRESHOLD_PX,
+    showBottom: scrollTop < maxScrollTop - SCROLL_MASK_THRESHOLD_PX,
+  };
 }
 
 export function getVerticalScrollMaskStyle({
-  showTop,
   showBottom,
+  showTop,
 }: ScrollMaskState): CSSProperties | undefined {
   if (!showTop && !showBottom) {
     return undefined;
   }
 
-  const topStop = showTop ? "transparent 0px" : "black 0px";
-  const bottomStop = showBottom ? "transparent 100%" : "black 100%";
+  const topStop = showTop
+    ? `transparent 0px, black ${SCROLL_MASK_EDGE_SIZE_PX}px`
+    : `black 0px, black ${SCROLL_MASK_EDGE_SIZE_PX}px`;
+  const bottomStop = showBottom
+    ? `black calc(100% - ${SCROLL_MASK_EDGE_SIZE_PX}px), transparent 100%`
+    : `black calc(100% - ${SCROLL_MASK_EDGE_SIZE_PX}px), black 100%`;
+  const maskImage = `linear-gradient(to bottom, ${topStop}, ${bottomStop})`;
 
   return {
+    WebkitMaskImage: maskImage,
+    maskImage,
+    WebkitMaskRepeat: "no-repeat",
     maskRepeat: "no-repeat",
+    WebkitMaskSize: "100% 100%",
     maskSize: "100% 100%",
-    maskImage: `linear-gradient(to bottom, ${topStop}, black 24px, black calc(100% - 24px), ${bottomStop})`,
   };
 }

@@ -26,23 +26,32 @@ describe('scrollMask', () => {
     
     // showBottom only
     expect(getVerticalScrollMaskStyle({ showTop: false, showBottom: true })).toEqual({
-      maskRepeat: "no-repeat",
-      maskSize: "100% 100%",
+      WebkitMaskImage: "linear-gradient(to bottom, black 0px, black 24px, black calc(100% - 24px), transparent 100%)",
       maskImage: "linear-gradient(to bottom, black 0px, black 24px, black calc(100% - 24px), transparent 100%)",
+      WebkitMaskRepeat: "no-repeat",
+      maskRepeat: "no-repeat",
+      WebkitMaskSize: "100% 100%",
+      maskSize: "100% 100%",
     });
     
     // showTop only
     expect(getVerticalScrollMaskStyle({ showTop: true, showBottom: false })).toEqual({
-      maskRepeat: "no-repeat",
-      maskSize: "100% 100%",
+      WebkitMaskImage: "linear-gradient(to bottom, transparent 0px, black 24px, black calc(100% - 24px), black 100%)",
       maskImage: "linear-gradient(to bottom, transparent 0px, black 24px, black calc(100% - 24px), black 100%)",
+      WebkitMaskRepeat: "no-repeat",
+      maskRepeat: "no-repeat",
+      WebkitMaskSize: "100% 100%",
+      maskSize: "100% 100%",
     });
     
     // Both
     expect(getVerticalScrollMaskStyle({ showTop: true, showBottom: true })).toEqual({
-      maskRepeat: "no-repeat",
-      maskSize: "100% 100%",
+      WebkitMaskImage: "linear-gradient(to bottom, transparent 0px, black 24px, black calc(100% - 24px), transparent 100%)",
       maskImage: "linear-gradient(to bottom, transparent 0px, black 24px, black calc(100% - 24px), transparent 100%)",
+      WebkitMaskRepeat: "no-repeat",
+      maskRepeat: "no-repeat",
+      WebkitMaskSize: "100% 100%",
+      maskSize: "100% 100%",
     });
   });
 });
