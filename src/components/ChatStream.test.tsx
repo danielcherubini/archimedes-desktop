@@ -185,6 +185,38 @@ describe("ChatStream", () => {
     expect(screen.getByRole("status")).toBeTruthy();
   });
 
+  it("renders thinking block in transcript", async () => {
+    seedLiveSession();
+    const sessionId = "s1";
+    useSessions.getState().addUserMessage(sessionId, "hi");
+    useSessions.getState().applySessionUpdate(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pondering" }, messageId: "m1" });
+    useSessions.getState().beginTurn(sessionId);
+    
+    render(<ChatStream />);
+    // Verify "Thinking" label
+    expect(screen.getByText("Thinking")).toBeTruthy();
+    
+    // Complete the turn
+    act(() => {
+      useSessions.getState().turnCompleted(sessionId, "end_turn");
+    });
+    
+    // Verify "Thought" label (assert ONLY "Thought")
+    expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
+  it("renders done thinking block in history (not streaming)", () => {
+    seedLiveSession();
+    const sessionId = "s1";
+    useSessions.getState().addUserMessage(sessionId, "hi");
+    useSessions.getState().applySessionUpdate(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "done thought" }, messageId: "m1" });
+    // Not in turn
+    
+    render(<ChatStream />);
+    // Should show "Thought" (it never streamed)
+    expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
   it("renders the working indicator from the bridge agentState alone (no inTurn)", async () => {
     seedLiveSession();
     useSessions.getState().addUserMessage("s1", "hi");

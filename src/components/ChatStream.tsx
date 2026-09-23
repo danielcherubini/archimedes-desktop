@@ -510,7 +510,17 @@ export default function ChatStream() {
               );
             }
           }
-          return <MessageBubble key={i} message={message} />;
+          return (
+            <MessageBubble
+              key={i}
+              message={message}
+              isStreaming={
+                message.kind === "agent-thought" &&
+                inTurn &&
+                i === messages.length - 1
+              }
+            />
+          );
         })}
         {prompts.map((prompt) => (
           <PermissionPrompt

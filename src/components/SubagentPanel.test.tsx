@@ -182,6 +182,20 @@ describe("SubagentPanel", () => {
     expect(screen.queryByText("reviewer")).toBeNull();
   });
 
+  it("renders thinking block (streaming)", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pondering" }, messageId: "m1" });
+    render(<SubagentPanel />);
+    expect(screen.getByText("Thinking")).toBeTruthy();
+  });
+
+  it("renders thinking block (completed)", () => {
+    useSubagents.getState().addSession({ ...entry, status: "completed" });
+    useSessions.getState().applySessionUpdate("sub1", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "done" }, messageId: "m1" });
+    render(<SubagentPanel />);
+    expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
   it("styles the status chip per status (running → warning, failed → destructive)", () => {
     useSubagents.getState().addSession(entry);
     useSubagents.getState().addSession({

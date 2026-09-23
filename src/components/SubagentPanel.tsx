@@ -4,6 +4,7 @@ import { useSubagents, type SubagentEntry } from "../store/subagents";
 import { useBridge, type BridgeRequestData } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
+import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 import MessageBubble from "./MessageBubble";
 import ToolCallCard from "./ToolCallCard";
 import DiffBlock from "./DiffBlock";
@@ -92,12 +93,25 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
       {/* The compact stream: the same pipeline, condensed (smaller
           font/spacing — NOT a new message renderer). `MessageBubble` for
           `agent-text`, `ToolCallCard` for `tool-call` (collapsed by
-          default), `DiffBlock` for `diff`. */}
+          default), `DiffBlock` for `diff`, `Reasoning` for thinking. */}
       {messageList.length > 0 && (
         <div className="mt-1 max-h-48 space-y-1 overflow-y-auto rounded-md bg-surface p-2">
           {messageList.map((m, i) => {
             if (m.kind === "agent-text") {
               return <MessageBubble key={i} message={m} />;
+            }
+            if (m.kind === "agent-thought") {
+              const isStreaming = entry.status === "running" && i === messageList.length - 1;
+              return (
+                <Reasoning
+                  key={i}
+                  isStreaming={isStreaming}
+                  autoCollapseKey={isStreaming ? null : "complete"}
+                >
+                  <ReasoningTrigger streamingText={m.text} />
+                  <ReasoningContent>{m.text}</ReasoningContent>
+                </Reasoning>
+              );
             }
             if (m.kind === "tool-call") {
               return (
