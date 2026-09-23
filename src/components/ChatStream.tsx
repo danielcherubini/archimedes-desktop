@@ -135,6 +135,13 @@ export default function ChatStream() {
     subscribeSidePane,
     getSidePaneCollapsed,
   );
+  // Pending subagent requests (the toggle dot) — called UNCONDITIONALLY,
+  // BEFORE the `!activeSessionId` early return below: this hook contains
+  // `useSyncExternalStore` (via zustand), so calling it only on the
+  // full-frame path would change the hook count when the active session
+  // appears/disappears and crash React ("Rendered more hooks than during
+  // the previous render" → white page).
+  const pendingSubagentRequests = usePendingSubagentRequests();
 
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -321,7 +328,6 @@ export default function ChatStream() {
   // ACTIVE session's requests PLUS pending subagent requests (subagent
   // session ids are never active, so the active-session count alone
   // would strand a pending subagent request until the bridge timeout).
-  const pendingSubagentRequests = usePendingSubagentRequests();
   const hasPendingRequest =
     prompts.length > 0 ||
     bridgeRequests.some(

@@ -127,6 +127,25 @@ describe("ChatStream", () => {
     ).toBeTruthy();
   });
 
+  it("survives the no-session → active-session transition (all hooks are called unconditionally, before the early return)", () => {
+    // Render the early-return path first (no active session → the hook
+    // count is N), then seed a live session and re-render (full frame →
+    // the hook count must STILL be N). Any hook called only on the
+    // full-frame path (after the `!activeSessionId` early return) would
+    // throw "Rendered more hooks than during the previous render" here
+    // (the white-page crash) — e.g. `usePendingSubagentRequests`.
+    render(<ChatStream />);
+    expect(
+      screen.getByText(
+        "No active session — open a Space from the list on the left",
+      ),
+    ).toBeTruthy();
+    act(() => {
+      seedLiveSession();
+    });
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+  });
+
   it("renders the fresh-session hint for an empty transcript", () => {
     seedLiveSession();
     render(<ChatStream />);
