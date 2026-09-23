@@ -26,6 +26,7 @@
 //! - `hang`: `initialize` is answered, but `session/new` is ignored forever.
 //!   The client's establishment timeout must fire instead of waiting on the
 //!   agent indefinitely.
+//! - `set_config_option_error`: `session/set_config_option` is rejected.
 //!
 //! **Subagent modes (the `subagent-sessions` E2E, Task 6).** A single registry
 //! entry is used for BOTH the main and subagent spawns (the desktop spawns the
@@ -216,8 +217,68 @@ fn main() -> ExitCode {
 
         let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = frame.get("id").cloned();
+        let mut config_options = fake_config_options();
 
         match method {
+            "session/set_config_option" => {
+                if mode == "set_config_option_error" {
+                    let error = serde_json::json!({
+                        "code": -32602,
+                        "message": "fake set config option failure",
+                    });
+                    write_error(&mut out, &id, &error);
+                } else {
+                    let params = frame.get("params").and_then(|p| p.as_object());
+                    let config_id = params
+                        .and_then(|p| p.get("configId"))
+                        .and_then(|v| v.as_str());
+                    let value = params.and_then(|p| p.get("value")).and_then(|v| v.as_str());
+
+                    if let (Some(cid), Some(val)) = (config_id, value) {
+                        let mut found = false;
+                        if let Some(list) = config_options.as_array_mut() {
+                            for item in list {
+                                if item.get("id").and_then(|i| i.as_str()) == Some(cid) {
+                                    if let Some(opts) =
+                                        item.get_mut("options").and_then(|o| o.as_array_mut())
+                                    {
+                                        for opt in opts {
+                                            if opt.get("value").and_then(|v| v.as_str())
+                                                == Some(val)
+                                            {
+                                                item["currentValue"] = serde_json::json!(val);
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if found {
+                            write_config_update(&mut out, &sid, &config_options);
+                            write_result(
+                                &mut out,
+                                &id,
+                                &serde_json::json!({ "configOptions": config_options }),
+                            );
+                        } else {
+                            let error = serde_json::json!({
+                                "code": -32602,
+                                "message": "unknown config option",
+                            });
+                            write_error(&mut out, &id, &error);
+                        }
+                    } else {
+                        let error = serde_json::json!({
+                            "code": -32602,
+                            "message": "unknown config option",
+                        });
+                        write_error(&mut out, &id, &error);
+                    }
+                }
+            }
             "initialize" => {
                 // `loadSession` is advertised for the `resume` POSITIONAL mode
                 // (the subagent never resumes — `mode` is `subagent` here).
@@ -966,6 +1027,23 @@ fn write_chunk(w: &mut impl Write, sid: &str, message_id: &str, text: &str) {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": text },
                 "messageId": message_id,
+            },
+        },
+    });
+    write_frame(w, &frame);
+}
+
+/// Write a JSON-RPC `session/update` notification with a
+/// config_option_update.
+fn write_config_update(w: &mut impl Write, sid: &str, config: &serde_json::Value) {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": config,
             },
         },
     });

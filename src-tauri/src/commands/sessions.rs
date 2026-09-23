@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, PromptRequest, SessionId, TextContent,
+    AgentCapabilities, ContentBlock, PromptRequest, SessionConfigOption, SessionId, TextContent,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
@@ -186,5 +186,19 @@ pub async fn resume_session(
     }
     state
         .resume_session(&agent_id, &session_id, PathBuf::from(cwd), sink.inner())
+        .await
+}
+
+/// Set a session config option (model / thinking level) on a live
+/// session; returns the agent's updated `configOptions`.
+#[tauri::command]
+pub async fn set_session_config_option(
+    state: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    config_id: String,
+    value: String,
+) -> Result<Vec<SessionConfigOption>, AcpError> {
+    state
+        .set_config_option(&session_id, &config_id, &value)
         .await
 }
