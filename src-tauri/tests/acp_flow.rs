@@ -222,9 +222,11 @@ async fn full_session_flow_streams_and_cleans_up() {
     let cwd = config_dir.clone();
 
     // 1. Start the session (initialize + session/new).
-    let info = start_retrying(&manager, "fake", cwd, &sink)
-        .await
-        .expect("start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
 
     // 2. Send a prompt; the fake agent streams two chunks then end_turn.
@@ -283,9 +285,13 @@ async fn resume_session_round_trips_the_session_id() {
 
     // Resume the stored session id. The fake agent in `resume` mode
     // advertises `loadSession: true` and answers `session/load`.
-    let info = resume_retrying(&manager, "fake", FAKE_SESSION_ID, cwd, &sink)
-        .await
-        .expect("resume_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager
+            .resume_session("fake", FAKE_SESSION_ID, cwd.clone(), &sink)
+            .await
+    })
+    .await
+    .expect("resume_session should succeed");
     assert_eq!(
         info.session_id.to_string(),
         FAKE_SESSION_ID,
@@ -352,7 +358,9 @@ async fn establishment_times_out_when_the_agent_hangs() {
     // still bounds the whole thing.)
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        start_retrying(&manager, "fake", cwd, &sink),
+        archimedes_desktop_lib::test_support::run_with_retry(|| async {
+            manager.start_session("fake", cwd.clone(), &sink).await
+        }),
     )
     .await
     .expect("start_session must not hang past the establishment timeout");
@@ -386,9 +394,11 @@ async fn resume_replaces_stored_transcript() {
     let cwd = config_dir.clone();
 
     // 1. Start the session and populate the stored transcript.
-    start_retrying(&manager, "fake", cwd.clone(), &sink)
-        .await
-        .expect("start_session should succeed");
+    archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("start_session should succeed");
     manager
         .send_prompt(FAKE_SESSION_ID, "hi".to_string())
         .await
@@ -414,9 +424,13 @@ async fn resume_replaces_stored_transcript() {
     // 2. Resume. The fake agent replays one chunk (`m1`: "resumed") on
     //    load — the stored transcript must be REPLACED by it, not
     //    duplicated (no stale `hello world` row, no duplicate `m1` row).
-    resume_retrying(&manager, "fake", FAKE_SESSION_ID, cwd, &sink)
-        .await
-        .expect("resume_session should succeed");
+    archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager
+            .resume_session("fake", FAKE_SESSION_ID, cwd.clone(), &sink)
+            .await
+    })
+    .await
+    .expect("resume_session should succeed");
 
     // Poll the DB until the replayed row is persisted (the restore builder
     // delivers the pre-response chunk right after the load response).
@@ -567,16 +581,20 @@ async fn two_live_sessions_coexist() {
     std::fs::create_dir_all(&cwd_b).unwrap();
 
     // 1. The first session starts.
-    start_retrying(&manager, "c1", cwd_a.clone(), &sink)
-        .await
-        .expect("start_session c1 should succeed");
+    archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("c1", cwd_a.clone(), &sink).await
+    })
+    .await
+    .expect("start_session c1 should succeed");
     assert_eq!(manager.session_count().await, 1);
 
     // 2. A second session starts (a DIFFERENT cwd): the cap is lifted, so it
     //    does NOT close the first.
-    start_retrying(&manager, "c2", cwd_b.clone(), &sink)
-        .await
-        .expect("start_session c2 should succeed");
+    archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("c2", cwd_b.clone(), &sink).await
+    })
+    .await
+    .expect("start_session c2 should succeed");
 
     // 3. The first session did NOT receive a `replaced` close event (the
     //    second session did not supersede it). Drains the queue for the
@@ -710,9 +728,13 @@ async fn resume_does_not_supersede_live() {
     );
 
     // 2. Resume r2 (from stored). The cap is lifted, so r1 STAYS LIVE.
-    resume_retrying(&manager, "r2", "r2", cwd_b, &sink)
-        .await
-        .expect("resume_session r2 should succeed");
+    archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager
+            .resume_session("r2", "r2", cwd_b.clone(), &sink)
+            .await
+    })
+    .await
+    .expect("resume_session r2 should succeed");
 
     // 3. r1 did NOT receive a `replaced` close event; both are live.
     assert_no_closed_event_within(&rx, "r1", "replaced", Duration::from_secs(3)).await;

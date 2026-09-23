@@ -443,10 +443,11 @@ async fn dispatch_success_full_round_trip() {
     manager.set_subagent_manager(subagent_manager);
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt fires the `dispatch_subagent` bridge frame (the
@@ -664,10 +665,11 @@ async fn dispatch_cancellation_tears_down_subagent() {
     manager.set_subagent_manager(subagent_manager);
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt sends the dispatch frame, closes the connection without
@@ -824,10 +826,11 @@ async fn dispatch_subagent_own_bridge_ask_round_trip() {
     manager.set_subagent_manager(subagent_manager.clone());
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt spawns the subagent (the `dispatch` mode). The subagent
@@ -984,10 +987,11 @@ async fn dispatch_concurrent_subagents_get_their_own_output() {
     manager.set_subagent_manager(subagent_manager);
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt fires the TWO `dispatch_subagent` frames (the
@@ -1104,10 +1108,11 @@ async fn dispatch_no_text_after_text_dispatch_returns_empty_output() {
     manager.set_subagent_manager(subagent_manager);
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt fires the two dispatches SEQUENTIALLY (the
@@ -1215,10 +1220,11 @@ async fn dispatch_subagent_cost_push_is_accumulated_into_metrics() {
     manager.set_subagent_manager(subagent_manager);
     let manager = Arc::new(manager);
 
-    let info = manager
-        .start_session("fake", cwd, &sink)
-        .await
-        .expect("main start_session should succeed");
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("main start_session should succeed");
     assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID_MAIN);
 
     // The main prompt fires the `dispatch_subagent` frame (the `dispatch`

@@ -2,7 +2,7 @@ pub mod acp;
 pub mod commands;
 pub mod config;
 pub mod storage;
-#[cfg(test)]
+#[doc(hidden)]
 pub mod test_support;
 
 use std::path::PathBuf;

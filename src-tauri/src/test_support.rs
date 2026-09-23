@@ -1,7 +1,6 @@
 //! Test support utilities for Archimedes Desktop.
 //!
-//! Included only in `#[cfg(test)]` builds to provide helpers for common
-//! patterns in integration and unit testing.
+//! Provides helpers for common patterns in integration and unit testing.
 
 use crate::acp::AcpError;
 use std::time::Duration;
