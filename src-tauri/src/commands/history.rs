@@ -25,6 +25,7 @@ pub async fn list_sessions(state: State<'_, Arc<Db>>) -> Result<Vec<SessionInfo>
             agent_id: row.agent_id,
             cwd: PathBuf::from(row.cwd),
             capabilities: serde_json::from_str(&row.capabilities_json).unwrap_or_default(),
+            config_options: None,
         })
         .collect())
 }

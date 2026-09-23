@@ -156,6 +156,30 @@ fn subagent_variant() -> String {
     std::env::var("FAKE_SUBAGENT_MODE").unwrap_or_else(|_| "subagent".to_string())
 }
 
+fn fake_config_options() -> serde_json::Value {
+    serde_json::json!([
+      { "type": "select", "id": "model", "category": "model", "name": "Model",
+        "description": "Select the model for this session",
+        "currentValue": "acme/alpha",
+        "options": [
+          { "value": "acme/alpha", "name": "acme/Alpha" },
+          { "value": "acme/beta",  "name": "acme/Beta" },
+          { "value": "acme/gamma", "name": "acme/Gamma" }
+        ] },
+      { "type": "select", "id": "thought_level", "category": "thought_level", "name": "Thinking",
+        "description": "Set the reasoning effort for this session",
+        "currentValue": "medium",
+        "options": [
+          { "value": "off", "name": "Thinking: off" },
+          { "value": "minimal", "name": "Thinking: minimal" },
+          { "value": "low", "name": "Thinking: low" },
+          { "value": "medium", "name": "Thinking: medium" },
+          { "value": "high", "name": "Thinking: high" },
+          { "value": "xhigh", "name": "Thinking: xhigh" }
+        ] }
+    ])
+}
+
 fn main() -> ExitCode {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -215,7 +239,10 @@ fn main() -> ExitCode {
                 // Replay one chunk before the response (the client's restore
                 // builder retains notifications that arrive pre-response).
                 write_chunk(&mut out, &sid, "m1", "resumed");
-                let result = serde_json::json!({ "sessionId": sid });
+                let result = serde_json::json!({
+                    "sessionId": sid,
+                    "configOptions": fake_config_options(),
+                });
                 write_result(&mut out, &id, &result);
             }
             "session/new" => {
@@ -224,7 +251,10 @@ fn main() -> ExitCode {
                 // variant hangs on the PROMPT instead (session/new is answered
                 // here — `mode` is `subagent`, not `hang`).
                 if mode != "hang" {
-                    let result = serde_json::json!({ "sessionId": sid });
+                    let result = serde_json::json!({
+                        "sessionId": sid,
+                        "configOptions": fake_config_options(),
+                    });
                     write_result(&mut out, &id, &result);
                 }
             }

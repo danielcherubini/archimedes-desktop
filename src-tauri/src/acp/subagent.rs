@@ -302,6 +302,7 @@ impl SubagentSessionManager {
                                     agent_id: establish_agent_id.clone(),
                                     cwd,
                                     capabilities: init.agent_capabilities,
+                                    config_options: None,
                                 },
                             ))
                         }
@@ -848,6 +849,7 @@ mod tests {
                                 agent_id: "fake".to_string(),
                                 cwd,
                                 capabilities: init.agent_capabilities,
+                                config_options: None,
                             },
                         ))
                     }
@@ -981,6 +983,7 @@ mod tests {
                                     agent_id: "fake".to_string(),
                                     cwd,
                                     capabilities: init.agent_capabilities,
+                                    config_options: None,
                                 },
                             ))
                         }

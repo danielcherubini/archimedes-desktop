@@ -34,8 +34,9 @@ use tokio::sync::{oneshot, watch, Mutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -107,6 +108,11 @@ pub struct SessionInfo {
     pub agent_id: String,
     pub cwd: PathBuf,
     pub capabilities: AgentCapabilities,
+    /// The agent's session configuration options (model / thinking level
+    /// selectors) from the `newSession` / `loadSession` response; `None`
+    /// when the agent does not advertise any (or for stored sessions —
+    /// `list_sessions` always reports `None`).
+    pub config_options: Option<Vec<SessionConfigOption>>,
 }
 
 /// A live, in-memory session handle.
@@ -868,6 +874,7 @@ impl SessionManager {
                             agent_id: agent_id_owned,
                             cwd: cwd_owned,
                             capabilities: init.agent_capabilities,
+                            config_options: new_session.config_options.clone(),
                         },
                     ))
                 },
@@ -976,7 +983,7 @@ impl SessionManager {
                         let _ = db.clear_messages_for(&sid.to_string());
                     }
 
-                    let _restored = cx
+                    let restored = cx
                         .load_session(sid.clone(), cwd_owned.as_path())
                         .block_task()
                         .start_session()
@@ -989,6 +996,7 @@ impl SessionManager {
                             agent_id: agent_id_owned,
                             cwd: cwd_owned,
                             capabilities: init.agent_capabilities,
+                            config_options: restored.response().config_options.clone(),
                         },
                     ))
                 },
@@ -1379,5 +1387,140 @@ mod tests {
         assert_eq!(acc.cache_read_tokens, 0);
         assert_eq!(acc.cache_write_tokens, 0);
         assert_eq!(acc.cost, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
+    };
+    use std::path::Path;
+
+    use tokio::sync::mpsc;
+
+    pub struct TestSink {
+        tx: mpsc::UnboundedSender<Value>,
+    }
+
+    impl EventSink for TestSink {
+        fn emit(&self, event: &str, payload: Value) {
+            let _ = self
+                .tx
+                .send(serde_json::json!({ "event": event, "payload": payload }));
+        }
+    }
+
+    pub fn temp_config_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    pub fn unique_fake_agent(dir: &Path) -> PathBuf {
+        let fake = dir.join("fake_agent");
+        let bin = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_agent"
+        ));
+        std::fs::copy(&bin, &fake).expect("failed to copy fake_agent");
+        fake
+    }
+
+    pub fn write_agents_json_cmd(cmd: &Path, dir: &Path, mode: Option<&str>) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "fake",
+                "name": "Fake Agent",
+                "command": cmd,
+                "args": mode.map(|m| vec![m]).unwrap_or_default(),
+                "env": {}
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_session_returns_config_options_from_new_session_response() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, None);
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = manager
+            .start_session("fake", dir.clone(), &sink)
+            .await
+            .unwrap();
+
+        assert!(info.config_options.is_some());
+        let opts = info.config_options.unwrap();
+        assert_eq!(opts.len(), 2);
+
+        let model = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
+            .unwrap();
+        match &model.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "acme/alpha");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+
+        let thought = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::ThoughtLevel))
+            .unwrap();
+        match &thought.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "medium");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 6),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_session_returns_config_options_from_load_session_response() {
+        let dir = temp_config_dir();
+        let cmd = unique_fake_agent(&dir);
+        write_agents_json_cmd(&cmd, &dir, Some("resume"));
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = manager
+            .resume_session("fake", "fake-session-1", dir.clone(), &sink)
+            .await
+            .unwrap();
+
+        assert!(info.config_options.is_some());
+        let opts = info.config_options.unwrap();
+        assert_eq!(opts.len(), 2);
+
+        let model = opts
+            .iter()
+            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
+            .unwrap();
+        match &model.kind {
+            SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.to_string(), "acme/alpha");
+                match &s.options {
+                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
+                    _ => panic!("expected ungrouped"),
+                }
+            }
+            _ => panic!("expected select"),
+        }
     }
 }

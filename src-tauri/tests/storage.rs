@@ -21,6 +21,7 @@ fn sample_session() -> SessionInfo {
         agent_id: "fake".to_string(),
         cwd: PathBuf::from("/tmp/proj"),
         capabilities: AgentCapabilities::default(),
+        config_options: None,
     }
 }
 
@@ -211,6 +212,7 @@ fn open_backfills_space_rows_from_existing_sessions() {
         agent_id: "fake".to_string(),
         cwd,
         capabilities: AgentCapabilities::default(),
+        config_options: None,
     };
 
     let db1 = Db::open(&db_path).expect("db should open");
