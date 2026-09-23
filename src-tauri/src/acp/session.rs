@@ -1441,28 +1441,28 @@ mod session_tests {
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
     }
 
-    async fn start_with_retry<F, Fut>(
-        manager: &SessionManager,
-        agent_id: &str,
-        cwd: PathBuf,
-        sink: &Arc<dyn EventSink>,
-        mut attempt_fn: F,
-    ) -> Result<SessionInfo, AcpError>
+    async fn start_with_retry<F, Fut>(mut attempt_fn: F) -> Result<SessionInfo, AcpError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<SessionInfo, AcpError>>,
     {
-        for i in 0..3 {
+        let mut last_err = None;
+        for _ in 0..3 {
             match attempt_fn().await {
                 Ok(info) => return Ok(info),
-                Err(AcpError::SpawnFailed { .. }) if i < 2 => {
+                Err(AcpError::SpawnFailed { .. }) => {
+                    last_err = Some(AcpError::SpawnFailed {
+                        hint: "spawn failed".to_string(),
+                    });
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
-        unreachable!()
+        Err(last_err.unwrap_or_else(|| AcpError::Protocol {
+            message: "unreachable".to_string(),
+        }))
     }
 
     #[tokio::test]
@@ -1474,11 +1474,9 @@ mod session_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = start_with_retry(&manager, "fake", dir.clone(), &sink, || {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
+        let info = start_with_retry(|| manager.start_session("fake", dir.clone(), &sink))
+            .await
+            .unwrap();
 
         assert!(info.config_options.is_some());
         let opts = info.config_options.unwrap();
@@ -1525,7 +1523,7 @@ mod session_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = start_with_retry(&manager, "fake", dir.clone(), &sink, || {
+        let info = start_with_retry(|| {
             manager.resume_session("fake", "fake-session-1", dir.clone(), &sink)
         })
         .await
