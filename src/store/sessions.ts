@@ -16,6 +16,7 @@ import {
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { unifiedPatch } from "../lib/diff";
+import type { SessionUpdateBatchItem } from "../lib/batchSessionUpdates";
 import { usePermissions } from "./permissions";
 import { useSubagents } from "./subagents";
 
@@ -470,6 +471,7 @@ interface SessionsState {
   beginTurn: (sessionId: string) => void;
   applyConfigOptions: (sessionId: string, options: SessionConfigOption[]) => void;
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
+  applySessionUpdates: (updates: SessionUpdateBatchItem[]) => void;
   handleSessionClosed: (sessionId: string, reason: CloseReasonStr) => void;
   turnCompleted: (sessionId: string, stopReason: StopReason) => void;
 }
@@ -652,6 +654,60 @@ export const useSessions = create<SessionsState>((set, get) => ({
           [sessionId]: messages,
         },
         configOptions,
+      };
+    }),
+
+  // Batch form of `applySessionUpdate`: applies a frame's worth of updates in
+  // ONE `setState` (one React render per frame, not one per event — see
+  // `createBatchedSessionUpdate`). Grouped per session in arrival order; the
+  // pure reducer returns the SAME reference for no-op updates, so a batch that
+  // changes nothing returns the same state object and notifies nobody.
+  applySessionUpdates: (updates) =>
+    set((state) => {
+      if (updates.length === 0) return state;
+      const now = Date.now();
+
+      const order: string[] = [];
+      const bySession = new Map<string, AcpSessionUpdate[]>();
+      for (const { sessionId, update } of updates) {
+        const list = bySession.get(sessionId);
+        if (list) {
+          list.push(update);
+        } else {
+          bySession.set(sessionId, [update]);
+          order.push(sessionId);
+        }
+      }
+
+      let messages = state.messages;
+      let messagesChanged = false;
+      let configOptions = state.configOptions;
+      let configChanged = false;
+      for (const sessionId of order) {
+        const sessionUpdates = bySession.get(sessionId)!;
+        let sessionMessages = messages[sessionId] ?? [];
+        let sessionChanged = false;
+        for (const update of sessionUpdates) {
+          const next = applySessionUpdate(sessionMessages, update, now);
+          if (next !== sessionMessages) sessionChanged = true;
+          sessionMessages = next;
+          if (update.sessionUpdate === "config_option_update") {
+            configOptions = { ...configOptions, [sessionId]: update.configOptions };
+            configChanged = true;
+          }
+        }
+        if (sessionChanged) {
+          if (!messagesChanged) messages = { ...messages };
+          messages[sessionId] = sessionMessages;
+          messagesChanged = true;
+        }
+      }
+
+      if (!messagesChanged && !configChanged) return state;
+      return {
+        ...state,
+        ...(messagesChanged ? { messages } : {}),
+        ...(configChanged ? { configOptions } : {}),
       };
     }),
 

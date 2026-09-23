@@ -13,6 +13,7 @@ import {
   listSpaces,
 } from "./lib/tauri";
 import { checkForUpdate, installUpdate } from "./lib/updater";
+import { createBatchedSessionUpdate } from "./lib/batchSessionUpdates";
 import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
 import { useBridge } from "./store/bridge";
@@ -28,11 +29,20 @@ function App() {
   // stale listener that never gets unregistered doubles every event.
   useEffect(() => {
     const unlistenPromises: Array<Promise<() => void>> = [];
+    // Coalesce the `session-update` events into one store update per frame:
+    // a local agent at a high thinking level emits ~1000 chunks/sec, and one
+    // React render per event would saturate the webview main thread (the UI
+    // renders at ~1fps while the GPU sits idle — see `batchSessionUpdates.ts`).
+    const batchedSessionUpdate = createBatchedSessionUpdate(
+      (items) => useSessions.getState().applySessionUpdates(items),
+      (fn) => requestAnimationFrame(fn),
+    );
     unlistenPromises.push(
       listenSessionUpdate((payload) =>
-        useSessions
-          .getState()
-          .applySessionUpdate(payload.sessionId, payload.update),
+        batchedSessionUpdate({
+          sessionId: payload.sessionId,
+          update: payload.update,
+        }),
       ),
     );
     unlistenPromises.push(

@@ -854,3 +854,109 @@ describe("configOptions state", () => {
     expect("s1" in useSessions.getState().configOptions).toBe(false);
   });
 });
+
+describe("applySessionUpdates (batch)", () => {
+  // A local agent at xhigh thinking emits ~1000 `session-update` events/sec.
+  // The listener coalesces them into one batch per frame; the batch must
+  // apply them in ONE `setState` (one React render per frame, not one per
+  // event) or the webview main thread stays saturated and the UI renders
+  // at ~1fps.
+  const thought = (text: string): AcpSessionUpdate => ({
+    sessionUpdate: "agent_thought_chunk",
+    content: { type: "text", text },
+  });
+
+  it("applies a burst of updates for one session in a single store update", () => {
+    useSessions.getState().addSession(info("s1", "/x"));
+    let notifications = 0;
+    const unsub = useSessions.subscribe(() => {
+      notifications += 1;
+    });
+
+    useSessions
+      .getState()
+      .applySessionUpdates([
+        { sessionId: "s1", update: thought("a") },
+        { sessionId: "s1", update: thought("b") },
+        { sessionId: "s1", update: thought("c") },
+      ]);
+    unsub();
+
+    expect(notifications).toBe(1);
+    const messages = useSessions.getState().messages.s1;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      kind: "agent-thought",
+      text: "abc",
+    });
+  });
+
+  it("updates several sessions in the same single store update", () => {
+    useSessions.getState().addSession(info("s1", "/x"));
+    useSessions.getState().addSession(info("s2", "/y"));
+    let notifications = 0;
+    const unsub = useSessions.subscribe(() => {
+      notifications += 1;
+    });
+
+    useSessions
+      .getState()
+      .applySessionUpdates([
+        { sessionId: "s1", update: thought("one") },
+        { sessionId: "s2", update: thought("two") },
+      ]);
+    unsub();
+
+    expect(notifications).toBe(1);
+    expect((useSessions.getState().messages.s1[0] as { text: string }).text).toBe("one");
+    expect((useSessions.getState().messages.s2[0] as { text: string }).text).toBe("two");
+  });
+
+  it("keeps the config_option_update side effect inside a batch", () => {
+    useSessions.getState().addSession(info("s1", "/x"));
+    useSessions
+      .getState()
+      .applySessionUpdates([
+        {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [
+              { id: "model", name: "Model", type: "select", currentValue: "m1" },
+            ],
+          },
+        },
+        { sessionId: "s1", update: thought("after") },
+      ]);
+
+    expect(useSessions.getState().configOptions.s1).toEqual([
+      { id: "model", name: "Model", type: "select", currentValue: "m1" },
+    ]);
+    // A `config_option_update` is ignored by the reducer (no message), but
+    // it still updated `configOptions` — the batch applied it in order.
+    expect((useSessions.getState().messages.s1[0] as { text: string }).text).toBe("after");
+  });
+
+  it("does not notify when the batch is a no-op", () => {
+    useSessions.getState().addSession(info("s1", "/x"));
+    const before = useSessions.getState();
+    let notifications = 0;
+    const unsub = useSessions.subscribe(() => {
+      notifications += 1;
+    });
+
+    // Empty chunks are dropped by the reducer (same reference returned),
+    // and unknown types fall through to `default` — the batch must not
+    // notify at all (same state object back, no render).
+    useSessions
+      .getState()
+      .applySessionUpdates([
+        { sessionId: "s1", update: thought("") },
+        { sessionId: "s1", update: { sessionUpdate: "some_future_type" } as unknown as AcpSessionUpdate },
+      ]);
+    unsub();
+
+    expect(notifications).toBe(0);
+    expect(useSessions.getState()).toBe(before);
+  });
+});
