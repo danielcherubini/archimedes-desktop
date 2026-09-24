@@ -224,6 +224,11 @@ export default function AskQuestionCard({
           void respond(false);
         } else if (e.key === "Escape" && !busy) {
           e.preventDefault();
+          // Stop the native event from bubbling to `window`: the global
+          // Esc handler (ChatStream) sends `session/cancel` while a turn is
+          // in flight — an Esc meant for THIS card (dismiss) must not also
+          // cancel the whole turn.
+          e.stopPropagation();
           void respond(true);
         }
       }}

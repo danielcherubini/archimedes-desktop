@@ -387,7 +387,9 @@ export default function ChatStream() {
   // image-ONLY send while `!imageCapable` is blocked (an empty prompt +
   // unsent images is meaningless), while a text-only send simply doesn't
   // attach images.
-  const hasImages = attachments.length > 0 && imageCapable;
+  // `let`: re-derived after `resume()` below — the FRESH agent's
+  // capabilities (not the saved ones) decide whether images ship.
+  let hasImages = attachments.length > 0 && imageCapable;
 
   const send = async () => {
     const text = draft.trim();
@@ -401,6 +403,20 @@ export default function ChatStream() {
       if (!isLive) {
         if (!canResume) return;
         if (!(await resume())) return;
+        // The resume reconnected to a FRESH agent: the SAVED capabilities
+        // that gated `hasImages` above are stale. Re-derive from the live
+        // session's capabilities (the store's `resumeSession` just upserted
+        // the resume result): if the fresh agent doesn't advertise
+        // `promptCapabilities.image`, proceed text-only (the same
+        // fail-closed treatment — an image-ONLY send is blocked, a text
+        // send simply doesn't attach the staged images); if it DOES
+        // advertise images, include them.
+        const fresh = useSessions
+          .getState()
+          .sessions.find((x) => x.sessionId === activeSessionId);
+        hasImages =
+          attachments.length > 0 && agentSupportsImages(fresh?.capabilities);
+        if (!hasImages && text === "") return;
       }
       let images:
         | { id: string; name: string; mimeType: string; sizeBytes: number; data: string }[]
@@ -634,9 +650,17 @@ export default function ChatStream() {
     // A text-only paste is a text paste: `getData("text/plain")` is
     // non-empty, so the fallback is skipped (no stale image staged).
     if (files.length === 0 && !text) {
+      // The read can straddle a session switch (it is a slow IPC round
+      // trip): capture the active session at PASTE time and abort if it
+      // changed — without the guard, `stageFiles` would target the NEW
+      // active session (staging session A's pasted image in session B's
+      // composer; the same cross-session leak `send()`'s
+      // `activeSessionIdRef` guard prevents for sends).
+      const pastedInSession = activeSessionIdRef.current;
       void readClipboardImage()
         .then((bytes) => {
           if (!bytes) return; // no image on the clipboard — nothing to stage
+          if (activeSessionIdRef.current !== pastedInSession) return; // switched
           const file = new File([new Uint8Array(bytes)], "screenshot.png", {
             type: "image/png",
           });

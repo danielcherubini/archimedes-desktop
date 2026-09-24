@@ -11,6 +11,7 @@ import {
   type Message,
 } from "./sessions";
 import { useSubagents } from "./subagents";
+import { loadHistory } from "../lib/tauri";
 import type {
   CloseReasonStr,
   MessageRow,
@@ -1021,5 +1022,78 @@ describe("applySessionUpdates (batch)", () => {
 
     expect(notifications).toBe(0);
     expect(useSessions.getState()).toBe(before);
+  });
+});
+
+describe("resumeSession (history reload race)", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      activeSessionId: null,
+      messages: {},
+      configOptions: {},
+    });
+  });
+
+  it("does not wipe a user message added while the history reload is in flight (merge, not overwrite)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [
+          { kind: "user", text: "one", at: 1 },
+          { kind: "agent-text", messageId: "m1", text: "two", at: 2 },
+        ],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when `send()` adds the user message — the race the
+    // merge exists for.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    // `resumeSession` resolves once the resume IPC settles — the reload is
+    // fire-and-forget (NOT awaited), so it is still in flight.
+    await useSessions.getState().resumeSession("s1");
+    // The user message is added while the reload is in flight (the
+    // `send()` flow: `await resume()` → `addUserMessage` → `sendPrompt`,
+    // which is the FIRST `record_message` of the user message — the
+    // reloaded rows predate it, so the fresh row is NOT in them).
+    useSessions.getState().addUserMessage("s1", "three");
+    // The reload settles with the persisted history.
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "one" }),
+        createdAt: 1,
+      },
+      {
+        id: 2,
+        sessionId: "s1",
+        kind: "agent-text",
+        messageKey: "m1",
+        payloadJson: JSON.stringify({ text: "two" }),
+        createdAt: 2,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // The reloaded history is MERGED with the locally-added message (not
+    // wiped): all three are present, the added one appended after.
+    const msgs = useSessions.getState().messages.s1;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[2]).toMatchObject({ kind: "user", text: "three" });
   });
 });

@@ -70,6 +70,7 @@ vi.mock("../lib/tauri", async () => {
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
     readClipboardImage: vi.fn().mockResolvedValue(null),
     cancelSession: vi.fn().mockResolvedValue(undefined),
+    loadHistory: vi.fn().mockResolvedValue([]),
   };
 });
 
@@ -1460,5 +1461,169 @@ describe("ChatStream", () => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
     expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
+  });
+
+  it("a paste-fallback clipboard read that straddles a session switch stages nothing (session guard)", async () => {
+    seedLiveSessionWithImages();
+    // A second image-capable session to switch TO (its composer would
+    // stage the image without the guard).
+    useSessions.setState({
+      sessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/home/u/proj",
+          capabilities: { promptCapabilities: { image: true } },
+        },
+        {
+          sessionId: "s2",
+          agentId: "a1",
+          cwd: "/home/u/proj",
+          capabilities: { promptCapabilities: { image: true } },
+        },
+      ],
+    });
+    render(<ChatStream />);
+    // Deferred promise: the clipboard read is SLOW (in flight across the
+    // session switch — the race the guard exists for).
+    let resolveRead: (value: number[] | null) => void = () => {};
+    vi.mocked(readClipboardImage).mockImplementationOnce(
+      () => new Promise<number[] | null>((r) => (resolveRead = r)),
+    );
+    // WebKitGTK quirk path: an empty paste event (no files, no text).
+    pasteToComposer([]);
+    expect(vi.mocked(readClipboardImage)).toHaveBeenCalledTimes(1);
+    // Switch the active session WHILE the read is in flight.
+    await act(async () => {
+      useSessions.setState({ activeSessionId: "s2" });
+    });
+    // The session-change effect cleared s1's staged attachments (sanity).
+    expect(screen.queryByAltText("screenshot.png")).toBeNull();
+    // Settle the read: the image was captured for s1 — it must NOT be
+    // staged into the NEW active session (s2).
+    await act(async () => {
+      resolveRead([0x89, 0x50, 0x4e, 0x47]);
+      await Promise.resolve();
+    });
+    expect(screen.queryByAltText("screenshot.png")).toBeNull();
+  });
+
+  it("Esc on a focused agent question card dismisses the card WITHOUT cancelling the turn", async () => {
+    seedLiveSession();
+    // A pending agent question (no `toolCallId` → not queued; unanchored →
+    // the card takes focus on mount, so its root div is the focusable
+    // element an Esc keypress lands on).
+    useBridge.getState().addRequest("s1", {
+      requestId: "req-ask",
+      method: "ask",
+      source: "main",
+      params: {
+        questions: [
+          {
+            id: "q1",
+            question: "Which approach?",
+            options: [{ label: "A" }, { label: "B" }],
+          },
+        ],
+      },
+    });
+    // A turn is in flight (the window Esc listener is active) — the Esc
+    // meant for the card must NOT also cancel the turn.
+    useSessions.getState().beginTurn("s1");
+    render(<ChatStream />);
+    // The listener is registered in an effect — settle the re-render
+    // before the keypress.
+    await act(async () => {});
+    // The card root is the focusable element (`tabIndex={-1}`).
+    const card = screen.getByText("Which approach?").closest(
+      "[tabindex='-1']",
+    );
+    expect(card).toBeTruthy();
+    await act(async () => {
+      fireEvent.keyDown(card!, { key: "Escape" });
+    });
+    // The card's own Esc handler dismissed the request (cancelled)…
+    await waitFor(() =>
+      expect(useBridge.getState().requests["s1"]).toHaveLength(0),
+    );
+    // …and the window listener did NOT fire (no `session/cancel`).
+    expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
+  });
+
+  it("Esc on the sudo password modal's input dismisses the modal WITHOUT cancelling the turn", async () => {
+    seedLiveSession();
+    useBridge.getState().addRequest("s1", {
+      requestId: "req-pw",
+      method: "password",
+      source: "main",
+      params: { command: "apt install ripgrep", reason: "install the tool" },
+    });
+    // A turn is in flight (the window Esc listener is active).
+    useSessions.getState().beginTurn("s1");
+    render(<ChatStream />);
+    await act(async () => {});
+    const input = screen.getByRole("textbox", { name: "Password" });
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+    });
+    // The modal's Esc handler dismissed the request (cancelled)…
+    await waitFor(() =>
+      expect(useBridge.getState().requests["s1"]).toHaveLength(0),
+    );
+    // …and the window listener did NOT fire (no `session/cancel`).
+    expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
+  });
+
+  it("a resumed session whose FRESH agent lacks image capability sends text-only without the staged image (no stale capability)", async () => {
+    // The STORED session's SAVED capabilities advertise images (an older
+    // agent) — so the paste is staged and the send button is enabled.
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    // The FRESH agent (the resume result) does NOT advertise images.
+    vi.mocked(resumeSession).mockResolvedValueOnce({
+      sessionId: "s1",
+      agentId: "a1",
+      cwd: "/home/u/proj",
+      capabilities: { loadSession: true },
+    });
+    render(<ChatStream />);
+    pasteToComposer(
+      [new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" })],
+    );
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "look at this" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() =>
+      expect(resumeSession).toHaveBeenCalledWith("a1", "s1", "/home/u/proj"),
+    );
+    // Fail-closed: the fresh agent can't take images → 2-arg send, the
+    // image is NOT attached (and not sent a second time).
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "look at this"),
+    );
+    expect(vi.mocked(sendPrompt)).toHaveBeenCalledTimes(1);
+  });
+
+  it("an image-only send on a resumed session whose FRESH agent lacks image capability is blocked (fail-closed)", async () => {
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    vi.mocked(resumeSession).mockResolvedValueOnce({
+      sessionId: "s1",
+      agentId: "a1",
+      cwd: "/home/u/proj",
+      capabilities: { loadSession: true },
+    });
+    render(<ChatStream />);
+    pasteToComposer(
+      [new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" })],
+    );
+    // No text — an image-only send (enabled by the SAVED capability).
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() =>
+      expect(resumeSession).toHaveBeenCalledWith("a1", "s1", "/home/u/proj"),
+    );
+    // Blocked: no prompt is sent (an empty prompt + unsent images is
+    // meaningless — the same fail-closed posture as `!imageCapable`).
+    expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
   });
 });

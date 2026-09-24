@@ -9,11 +9,30 @@
 
 use image::ImageEncoder;
 
+use crate::acp::prompt::MAX_IMAGE_BYTES;
+
 /// Re-encodes raw RGBA bytes (length `width * height * 4`) as a PNG buffer.
 ///
 /// Pure (no clipboard access) so the encoding is unit-testable; the
 /// clipboard read itself needs a live display.
+///
+/// BOUNDS THE ALLOCATION (security): `arboard::get_image` has ALREADY
+/// decoded the clipboard image to RGBA (`width * height * 4` bytes — a
+/// 10000 x 10000 image is ~400 MB) INSIDE arboard, which we cannot cap
+/// without forking it. This check (against the prompt path's `MAX_IMAGE_BYTES`
+/// 10 MiB cap, ADR 0008) bounds what WE control: the second allocation
+/// (the `rgba.to_vec()` copy + the PNG encode buffer) and the IPC transfer
+/// of a huge payload past the frontend's 10 MiB cap. An oversized payload
+/// is rejected (no copy, no encode, no IPC transfer).
 pub fn rgba_to_png_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    // `u64` math: `width * height * 4` overflows `u32` for realistic sizes
+    // (a 30000 x 30000 image is ~3.6 GB).
+    let raw_bytes = u64::from(width) * u64::from(height) * 4;
+    if raw_bytes > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "clipboard image is {raw_bytes} bytes ({width}x{height} RGBA), which exceeds the 10 MiB limit"
+        ));
+    }
     let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or_else(|| {
         format!(
             "RGBA byte length {} does not match width({}) * height({}) * 4",
@@ -84,5 +103,29 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("does not match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn oversized_image_is_rejected_at_the_cap() {
+        // 5120 x 513 RGBA = 10_506_240 bytes, just over the 10 MiB cap
+        // (10_485_760): the payload is rejected (no second allocation, no
+        // PNG encode, no IPC transfer of a huge payload). A 10000 x
+        // 10000 image (~400 MB) would be rejected by the same check.
+        let rgba = vec![0u8; 5120 * 513 * 4];
+        let result = rgba_to_png_bytes(5120, 513, &rgba);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("exceeds the 10 MiB"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn exactly_cap_sized_image_is_accepted() {
+        // The boundary: 5120 x 512 RGBA = exactly 10_485_760 bytes = the
+        // cap — accepted, not rejected (`>` not `>=`).
+        let rgba = vec![0u8; 5120 * 512 * 4];
+        assert!(rgba_to_png_bytes(5120, 512, &rgba).is_ok());
     }
 }

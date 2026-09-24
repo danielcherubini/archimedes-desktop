@@ -632,11 +632,23 @@ export const useSessions = create<SessionsState>((set, get) => ({
     // the persisted history so the pane shows the conversation on resume.
     void (async () => {
       try {
+        // The reload is fire-and-forget (NOT awaited by the caller): a
+        // `send()` on the resumed session adds the user message to
+        // `messages[sessionId]` WHILE the reload is in flight. Applying the
+        // reloaded rows verbatim would WIPE that message (the reload
+        // predates its persistence — the user message is `record_message`d
+        // by `send_prompt`, which runs after the reload starts). Merge
+        // instead: the reloaded rows, then any messages added after the
+        // reload started, appended after.
+        const prior = get().messages[sessionId] ?? [];
         const rows = await loadHistory(sessionId);
         // The user may have switched away while the fetch was in flight.
         if (get().activeSessionId !== sessionId) return;
-        const messages = rows.flatMap(rowToMessages);
-        set((st) => ({ messages: { ...st.messages, [sessionId]: messages } }));
+        const reloaded = rows.flatMap(rowToMessages);
+        const added = (get().messages[sessionId] ?? []).slice(prior.length);
+        set((st) => ({
+          messages: { ...st.messages, [sessionId]: [...reloaded, ...added] },
+        }));
       } catch (err) {
         console.error(`failed to load history for ${sessionId}`, err);
       }
