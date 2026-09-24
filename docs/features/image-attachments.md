@@ -1,0 +1,41 @@
+---
+status: live
+last-verified: 2026-09-24
+verified-by: PR #4 (squash-merged to main as f7ae3d9) — pnpm test + pnpm build; cargo test + cargo clippy (0 warnings) + cargo fmt
+---
+
+# Image attachments
+
+The composer accepts image attachments (clipboard paste + drag-and-drop), sends them with the prompt as ACP `ImageContent` blocks, and renders them in the user's transcript bubble across app restarts.
+
+## How it works
+
+- **Frontend (composer, `src/components/ChatStream.tsx`)**: `handlePaste`/`handleDrop` stage images as removable thumbnails via `addImageAttachments` (`src/lib/chatAttachments.ts` — the single home of the caps, the allowlist, and the capability gate). `send()` reads each staged file to base64 at send time only (previews use the object URL), sends `sendPrompt(id, text, images)` (2-arg call for text-only sends), and clears + releases **only the sent** attachments — a failed send keeps them staged (a re-pasted image is costly, a re-typed draft is not). Attachments are cleared + released on session switch and on unmount (object-URL lifecycle is the feature's one leak surface).
+- **Capability gate (FAIL-CLOSED)**: the feature is inert unless the agent advertises `promptCapabilities.image === true` in its initialize response (`agentSupportsImages` — a missing field or missing `promptCapabilities` means "not supported"). Paste/drop fall through to the default text paste, the placeholder drops the "or paste an image" hint, and `send()` never attaches images.
+- **Rust (Client, `src-tauri/src/acp/prompt.rs`)**: `build_prompt_blocks` re-validates every `ImagePayload` (guards against hand-rolled IPC — see the bounds below), builds the content blocks — the text block FIRST, then one `ImageContent` per image (matches pi's own user-content ordering; an empty text block is skipped when images are present, since strict providers reject it) — and `user_message_payload` builds the persisted payload. Both `send_prompt` paths (the Tauri command and `SessionManager::send_prompt_with_images`) validate **before** `begin_user_turn` / `record_message`: a rejected payload is neither persisted nor sent.
+- **Persistence**: images persist inline (base64) in `messages.payload_json` — see [ADR 0008](../decisions/0008-inline-attachment-persistence.md) (the 10 MiB cap bounds DB growth; the escape hatch is a one-off data migration to `path` references). `MessageBubble` renders user-message images as a read-only thumbnail grid (`data:` URLs — safe, the transcript is local).
+- **Resume race (store, `src/store/sessions.ts`)**: `resumeSession` reloads the persisted history fire-and-forget, which races the send's `record_message`. The merge dedupes locally added user messages against the reloaded rows by **text + images** (field-by-field, fixed order — user messages have no id on either side) **plus a timestamp >= guard** (a re-sent identical prompt is an OLDER row and must not be mistaken for the just-committed message; equal timestamps dedup).
+
+## Size / validation bounds
+
+| Bound | Value | Where |
+|-------|-------|-------|
+| Allowed types | `image/png`, `image/jpeg`, `image/gif`, `image/webp` only — deliberately narrower than `image/*`: the destination is LLM vision APIs, which don't take e.g. SVG | `SUPPORTED_IMAGE_TYPES` in both `chatAttachments.ts` and `prompt.rs` |
+| Per-image size | ≤ 10 MiB (`INLINE_IMAGE_ATTACHMENT_MAX_BYTES` / `MAX_IMAGE_BYTES`) — deliberately lower than ZCode's 20 MiB: the desktop persists inline, so the cap bounds DB growth | frontend `file.size` check; Rust decoded-size estimate |
+| Per-message count | ≤ 8 (`MAX_CHAT_ATTACHMENTS` / `MAX_IMAGE_COUNT`) | both sides |
+| Name length | ≤ 255 bytes (`MAX_IMAGE_NAME_LEN` — the OS per-component filename limit; `name` is written verbatim to SQLite) | Rust only |
+| base64 well-formedness | ≤ 2 trailing `=` padding chars (arbitrary `=` padding would bypass the size estimate, which strips them all) | Rust only |
+
+Rust's size check is an **estimate, not a decode**: strip trailing `=` padding, take `len * 3 / 4` (exact for well-formed base64; a safe over-estimate otherwise). `sizeBytes` from the frontend is **not trusted**. Stripping the padding keeps the bound consistent with the frontend's `file.size <= 10 MiB` check — a file the frontend accepted at exactly 10 MiB must not be rejected (no off-by-2).
+
+## Platform-specific behaviors (the real Tauri/WebKitGTK app)
+
+The jsdom tests pass without these; they are the difference between a test that passes and a feature that works.
+
+- **WebKitGTK paste quirk**: a pasted image produces a `paste` event with an EMPTY `DataTransfer` (no file items, no text — verified on webkit2gtk-4.1 2.52.5 on Wayland; the image IS inserted into a contenteditable, just not exposed on the event). So `handlePaste` has a fallback: when the event has **no files AND no text**, it calls the Rust `read_clipboard_image` command (arboard: `wl-clipboard-rs` backend when `WAYLAND_DISPLAY` is set, X11 otherwise), which reads the raw RGBA, re-encodes it as PNG, and returns the bytes (or `None` — a text-only clipboard is not an error). A text-only paste never triggers the fallback (non-empty `text/plain`), so no stale image is ever staged over a text paste. Two extra guards: the read is a slow IPC round trip, so the active session at PASTE time is captured and the stage is aborted on a switch (no cross-session leak); and the clipboard read is two-tier bounded (see next item).
+- **Clipboard read — two-tier bound** (`src-tauri/src/commands/clipboard.rs`): the RAW RGBA (`width * height * 4`, in `u64`) must fit **100 MiB** (tier 1, DoS guard — bounds the copy + PNG-encode allocation + IPC transfer; a 4K screenshot is ~31.7 MiB raw but typically encodes to ~2–8 MiB of PNG, so a 10 MiB raw cap would over-reject it) AND the ENCODED PNG must fit the **10 MiB** feature cap (tier 2 — a raw image that encodes over the cap is still rejected). arboard's INTERNAL decode (inside `get_image()`, which already returns the full RGBA buffer) remains uncapped — capping it would require forking arboard.
+- **Paste file derivation**: pasted images live in `clipboardData.items` (a `ClipboardItem` pulled via `getAsFile()`); `clipboardData.files` is EMPTY in real webviews (WebKit/WebKitGTK, WebView2/Chromium), so the file list is derived from `kind === "file"` items.
+- **Spreadsheet-clipboard heuristic** (`src/lib/chatAttachmentMetadata.ts`): spreadsheet apps put TSV (or Excel HTML) alongside the synthetic image on the clipboard — the TEXT wins: a paste with `text/plain` containing `\t` (or HTML matching `/Excel\.Sheet/i`) is left to the default text paste.
+- **Drag-and-drop needs `dragDropEnabled: false`** (`tauri.conf.json`): with the default `true`, wry intercepts native file drops and the webview never receives them. With it off, the webview's DEFAULT for a file drop is to NAVIGATE to the file (replacing the app) — so a window-level `dragover`/`drop` `preventDefault` backstop swallows drops outside the composer (the composer's own `onDrop` fires first during bubbling).
+- **Esc-to-stop**: the composer textarea is DISABLED during a turn, so the Escape handler is a **global** `keydown` listener, active only while `inTurn` (Esc never hijacks a keypress outside a turn). It calls `cancelSession` → Rust `SessionManager::cancel_session` → ACP `session/cancel` notification (no response expected; a no-op on the agent side if there is no in-flight turn). The agent aborts the turn and resolves the original `session/prompt` request with `stopReason: "cancelled"` — which is what completes the in-flight `sendPrompt` and unlocks the composer.
+- **Auto-resume + capability re-check**: sending to a stored (non-live) session that negotiated `loadSession` auto-resumes it first (a failed resume aborts — error already set). The resume reconnects to a **FRESH agent**: the SAVED capabilities that gated the send are stale, so `hasImages` is **re-derived against the fresh live session's capabilities** after resume (the store's `resumeSession` just upserted the result). If the fresh agent doesn't advertise `promptCapabilities.image`, the send proceeds text-only — the same fail-closed treatment (an image-ONLY send is blocked, a text send simply doesn't attach the staged images).
