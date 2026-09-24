@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatStream from "./ChatStream";
-import { sendPrompt, setSessionConfigOption } from "../lib/tauri";
+import { sendPrompt, setSessionConfigOption, resumeSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -53,6 +53,12 @@ vi.mock("../lib/tauri", async () => {
     }),
     closeSession: vi.fn().mockResolvedValue(undefined),
     sendPrompt: vi.fn().mockResolvedValue("end_turn"),
+    resumeSession: vi.fn().mockResolvedValue({
+      sessionId: "s1",
+      agentId: "a1",
+      cwd: "/home/u/proj",
+      capabilities: { loadSession: true, promptCapabilities: { image: true } },
+    }),
     respondPermission: vi.fn().mockResolvedValue(undefined),
     respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
@@ -414,11 +420,11 @@ describe("ChatStream", () => {
     expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
   });
 
-  it("shows the composer placeholder 'Paused — Resume to reconnect' for a stored resumable session", () => {
+  it("shows the composer placeholder 'Resume this session to send' for a stored resumable session", () => {
     seedStoredSession({ loadSession: true });
     render(<ChatStream />);
     expect(
-      screen.getByPlaceholderText("Paused — Resume to reconnect"),
+      screen.getByPlaceholderText("Resume this session to send"),
     ).toBeTruthy();
   });
 
@@ -426,6 +432,83 @@ describe("ChatStream", () => {
     seedStoredSession();
     render(<ChatStream />);
     expect(screen.getByPlaceholderText("This session is closed")).toBeTruthy();
+  });
+
+  // --- Auto-resume: a RESUMABLE stored session gets an enabled composer that
+  // auto-resumes on send; a NON-RESUMABLE stored session stays fully disabled. ---
+
+  it("enables the composer for a resumable stored session (no live session)", () => {
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox");
+    // The textarea is NOT disabled (it used to be — stored sessions were read-only).
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    // Empty draft → still disabled…
+    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    // …and enabled once there's a draft.
+    fireEvent.change(textarea, { target: { value: "hi" } });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("keeps the composer disabled for a non-resumable stored session", () => {
+    seedStoredSession(); // capabilities {} — no `loadSession`
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox");
+    expect(textarea.hasAttribute("disabled")).toBe(true);
+    // The Send button stays disabled too (no draft can even be typed — a
+    // disabled textarea can't be changed; the capability gate fails closed).
+    expect(
+      screen.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("send in a resumable stored session auto-resumes it, then sends", async () => {
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    render(<ChatStream />);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "resume and send" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // The stored session was resumed FIRST (the store action delegates to the
+    // Tauri `resume_session` command, mocked above)…
+    await waitFor(() =>
+      expect(resumeSession).toHaveBeenCalledWith(
+        "a1",
+        "s1",
+        "/home/u/proj",
+      ),
+    );
+    // …then the prompt was sent (2-arg, text-only).
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "resume and send"),
+    );
+  });
+
+  it("a failed resume aborts the send", async () => {
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    vi.mocked(resumeSession).mockRejectedValueOnce(new Error("nope"));
+    render(<ChatStream />);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "hi" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // The resume failure surfaces its own error line…
+    await waitFor(() => expect(screen.getByText("nope")).toBeTruthy());
+    // …and the send was aborted (no prompt was sent to the stored session).
+    expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
+  });
+
+  it("paste stages a thumbnail in a resumable stored session (capability read from the stored session)", () => {
+    seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
+    render(<ChatStream />);
+    const intercepted = pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    // The paste WAS intercepted — the capability came from the STORED
+    // session's `capabilities` (a live-only read would fail closed).
+    expect(intercepted).toBe(false);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
   });
 
   it("disables the send button while inTurn and when the draft is empty", async () => {

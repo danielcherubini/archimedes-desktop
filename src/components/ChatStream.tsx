@@ -223,7 +223,9 @@ export default function ChatStream() {
   activeSessionIdRef.current = activeSessionId;
   // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
   // advertises `promptCapabilities.image === true`.
-  const imageCapable = agentSupportsImages(liveSession?.capabilities);
+  const imageCapable = agentSupportsImages(
+    liveSession?.capabilities ?? historySession?.capabilities,
+  );
   // Unmount cleanup: revoke the staged object URLs exactly once, on
   // unmount ONLY — revoking on every state change would leak/break live
   // previews (a revoked URL can no longer render the `img`).
@@ -289,6 +291,10 @@ export default function ChatStream() {
   const isHistoryOnly = !isLive && historySession !== undefined;
   const canResume =
     isHistoryOnly && historySession?.capabilities.loadSession === true;
+  // The composer is usable for a live session OR a RESUMABLE stored session
+  // (a non-resumable stored session stays fully disabled):
+  // a resumable stored session auto-resumes on send.
+  const composerEnabled = isLive || canResume;
 
   // The current space's `SpaceView` for `activeSessionId`: the space that
   // owns it — by its live session OR any of its stored sessions (NOT
@@ -360,11 +366,17 @@ export default function ChatStream() {
 
   const send = async () => {
     const text = draft.trim();
-    if ((!text && !hasImages) || composerLocked || !isLive) return;
+    if ((!text && !hasImages) || composerLocked) return;
     if (sendingRef.current) return; // guard: see the ref's comment above
     sendingRef.current = true;
     try {
       setError(null);
+      // Auto-resume a stored (non-live) session before sending. A non-resumable
+      // stored session can't be sent to; a failed resume aborts (error already set).
+      if (!isLive) {
+        if (!canResume) return;
+        if (!(await resume())) return;
+      }
       let images:
         | { id: string; name: string; mimeType: string; sizeBytes: number; data: string }[]
         | undefined;
@@ -450,17 +462,19 @@ export default function ChatStream() {
     }
   };
 
-  const resume = async () => {
-    if (!activeSessionId || resuming) return;
+  const resume = async (): Promise<boolean> => {
+    if (!activeSessionId || resuming) return false;
     setResuming(true);
     setError(null);
     try {
       await resumeSession(activeSessionId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setResuming(false);
     }
+    return true;
   };
 
   // Conversation selector options for the space: the live session first
@@ -583,7 +597,7 @@ export default function ChatStream() {
   };
 
   const handleDrop = (e: React.DragEvent) => {
-    if (!isLive || composerLocked || !imageCapable) return;
+    if (composerLocked || !imageCapable) return;
     e.preventDefault();
     stageFiles(Array.from(e.dataTransfer.files));
   };
@@ -844,11 +858,11 @@ export default function ChatStream() {
                     : "Ask anything…"
                   : "Ask for follow-up changes"
               : canResume
-                ? "Paused — Resume to reconnect"
+                ? "Resume this session to send"
                 : "This session is closed"
           }
           rows={2}
-          disabled={!isLive || composerLocked}
+          disabled={!composerEnabled || composerLocked}
           className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
         />
         <div className="mt-1 flex items-center justify-between gap-2">
@@ -868,7 +882,7 @@ export default function ChatStream() {
               size="icon-md"
               aria-label="Send"
               disabled={
-                !isLive ||
+                !composerEnabled ||
                 composerLocked ||
                 (draft.trim() === "" && !hasImages)
               }
