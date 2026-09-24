@@ -13,6 +13,10 @@ import { getSidePaneCollapsed, setSidePaneCollapsed } from "../lib/sidePaneState
 // then the call throws) — stub a full MediaQueryList so the working
 // indicator renders (the `braille-loader` test's full-stub pattern).
 beforeAll(() => {
+  // Node's global `URL` leaks into jsdom but only accepts Node `Blob`s —
+  // stub the object-URL APIs so staged attachments get deterministic URLs.
+  URL.createObjectURL = vi.fn((file: File) => `blob:mock-${file.name}`);
+  URL.revokeObjectURL = vi.fn();
   Element.prototype.scrollIntoView = vi.fn();
   Element.prototype.hasPointerCapture = vi.fn(() => false);
   Element.prototype.setPointerCapture = vi.fn();
@@ -95,6 +99,56 @@ function seedStoredSession(
     closeReasons: {},
     configOptions: {},
   });
+}
+
+/**
+ * Seed a live session whose agent advertises `promptCapabilities.image`
+ * (the image-attachment capability gate — fail-closed otherwise).
+ */
+function seedLiveSessionWithImages(): void {
+  useSessions.setState({
+    activeSessionId: "s1",
+    sessions: [
+      {
+        sessionId: "s1",
+        agentId: "a1",
+        cwd: "/home/u/proj",
+        capabilities: { promptCapabilities: { image: true } },
+      },
+    ],
+    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+    historySessions: [],
+    messages: { s1: [] },
+    inTurn: {},
+    stopReasons: {},
+    closeReasons: {},
+    configOptions: {},
+  });
+}
+
+// `fireEvent.paste` wraps the dispatch in `act` (a raw `dispatchEvent` does NOT —
+// state changes then need `await act(...)` to become visible) and jsdom has no
+// `DataTransfer`, so the plain `clipboardData` object is attached as-is and
+// reaches React's `onPaste` with `e.clipboardData.files` intact.
+function pasteToComposer(
+  files: File[],
+  extra: { text?: string; html?: string } = {},
+): boolean {
+  const target = screen.getByRole("textbox") as HTMLTextAreaElement;
+  return fireEvent.paste(target, {
+    clipboardData: {
+      files,
+      getData: (type: string) =>
+        type === "text/plain" ? (extra.text ?? "") : (extra.html ?? ""),
+    },
+  });
+}
+
+function dropOnComposer(files: File[]): void {
+  // `getByRole("textbox")`, NOT `getByPlaceholderText(/Ask/i)` — the placeholder
+  // changes with session state (e.g. "Agent is working…" when locked).
+  const target = screen.getByRole("textbox");
+  fireEvent.drop(target, { dataTransfer: { files } });
 }
 
 /**
@@ -695,5 +749,180 @@ describe("ChatStream", () => {
     });
     render(<ChatStream />);
     expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
+  });
+
+  // --- Image attachments: paste / drop / thumbnail strip / capability gate. ---
+
+  it("paste stages a thumbnail", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    const intercepted = pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    // The paste WAS intercepted (`preventDefault` → `defaultPrevented`).
+    expect(intercepted).toBe(false);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+  });
+
+  it("paste of plain text is NOT intercepted", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    const intercepted = pasteToComposer([], { text: "hello" });
+    // Default text paste falls through (jsdom does not implement the browser's
+    // default paste action — no text is inserted; assert on the return value).
+    expect(intercepted).toBe(true);
+    expect(screen.queryByAltText("s.png")).toBeNull();
+  });
+
+  it("spreadsheet TSV is NOT intercepted over the synthetic PNG", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    const intercepted = pasteToComposer(
+      [new File([new Uint8Array([1])], "shot.png", { type: "image/png" })],
+      { text: "a\tb" },
+    );
+    // The text paste wins (the spreadsheet heuristic) — no thumbnail.
+    expect(intercepted).toBe(true);
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+  });
+
+  it("non-image paste is rejected with an error line", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer(
+      [new File([new Uint8Array([1])], "a.txt", { type: "text/plain" })],
+      { text: "x" },
+    );
+    expect(screen.queryByAltText("a.txt")).toBeNull();
+    const errorLine = screen.getByText(/is not a supported image format/);
+    expect(errorLine.className).toContain("text-destructive");
+  });
+
+  it("SVG is rejected (allowlist)", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1])], "a.svg", { type: "image/svg+xml" }),
+    ]);
+    expect(screen.queryByAltText("a.svg")).toBeNull();
+    expect(
+      screen.getByText(/is not a supported image format/).className,
+    ).toContain("text-destructive");
+  });
+
+  it("oversized paste is rejected", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    // 11 MiB > the 10 MiB inline cap.
+    const oversized = new File(
+      [new Uint8Array(11 * 1024 * 1024)],
+      "big.png",
+      { type: "image/png" },
+    );
+    pasteToComposer([oversized]);
+    expect(screen.queryByAltText("big.png")).toBeNull();
+    expect(
+      screen.getByText(/exceeds the 10 MiB limit/).className,
+    ).toContain("text-destructive");
+  });
+
+  it("ninth image is rejected at the cap", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    const firstEight = Array.from({ length: 8 }, (_, i) =>
+      new File([new Uint8Array([1])], `f${i}.png`, { type: "image/png" }),
+    );
+    pasteToComposer(firstEight);
+    // Separate dispatch — the ref-based `stageFiles` keeps the list current
+    // between them.
+    pasteToComposer(
+      [new File([new Uint8Array([1])], "ninth.png", { type: "image/png" })],
+    );
+    // 8 staged, the 9th rejected.
+    expect(screen.getAllByRole("img")).toHaveLength(8);
+    expect(screen.queryByAltText("ninth.png")).toBeNull();
+    expect(
+      screen.getByText(/at most 8/).className,
+    ).toContain("text-destructive");
+  });
+
+  it("remove button un-stages", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove image attachment" }),
+    );
+    expect(screen.queryByAltText("s.png")).toBeNull();
+  });
+
+  it("drop stages a thumbnail", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    dropOnComposer([
+      new File([new Uint8Array([1])], "d.png", { type: "image/png" }),
+    ]);
+    expect(screen.getByAltText("d.png")).toBeTruthy();
+  });
+
+  it("drop is ignored while locked", () => {
+    seedLiveSessionWithImages();
+    // `inTurn` set BEFORE `render` (the store is global) → the textarea is
+    // `disabled` on first render and the drop is swallowed.
+    useSessions.setState({ inTurn: { s1: true } });
+    render(<ChatStream />);
+    dropOnComposer([
+      new File([new Uint8Array([1])], "d.png", { type: "image/png" }),
+    ]);
+    expect(screen.queryByAltText("d.png")).toBeNull();
+  });
+
+  it("placeholder advertises paste when the agent supports images", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    expect(
+      screen.getByPlaceholderText("Ask anything — or paste an image…"),
+    ).toBeTruthy();
+  });
+
+  it("feature is inert without the capability", () => {
+    seedLiveSession(); // capabilities {}
+    render(<ChatStream />);
+    const intercepted = pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    // NOT intercepted (default text paste falls through) and no thumbnail.
+    expect(intercepted).toBe(true);
+    expect(screen.queryByAltText("s.png")).toBeNull();
+    // The plain placeholder (the paste hint is capability-gated too).
+    expect(screen.getByPlaceholderText("Ask anything…")).toBeTruthy();
+  });
+
+  it("switching sessions clears staged attachments", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+    // The `act` wrap is required — the session-change effect's `setAttachments`
+    // only reliably flushes inside `act`.
+    await act(async () => {
+      useSessions.setState({
+        activeSessionId: "s2",
+        sessions: [
+          {
+            sessionId: "s2",
+            agentId: "a1",
+            cwd: "/home/u/proj",
+            capabilities: {},
+          },
+        ],
+      });
+    });
+    expect(screen.queryByAltText("s.png")).toBeNull();
   });
 });

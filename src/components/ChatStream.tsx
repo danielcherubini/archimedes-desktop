@@ -6,13 +6,20 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
+import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon, X } from "lucide-react";
 import {
   closeSession,
   sendPrompt,
   setSessionConfigOption,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
+import {
+  addImageAttachments,
+  agentSupportsImages,
+  releaseAttachment,
+  type ChatComposerAttachment,
+} from "../lib/chatAttachments";
+import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
@@ -186,6 +193,67 @@ export default function ChatStream() {
   const [resuming, setResuming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // Image attachments staged in the composer (CONTEXT.md: Attachment).
+  // ALL of the attachment hooks live HERE, before the `!activeSessionId`
+  // early return below — a hook called only on the full-frame path would
+  // change the hook count when the active session appears/disappears and
+  // crash React (the same bug the `usePendingSubagentRequests` comment
+  // above warns about).
+  const [attachments, setAttachments] = useState<ChatComposerAttachment[]>([]);
+  const attachmentsRef = useRef(attachments);
+  // Re-sync every render: the handlers read the CURRENT list from the ref
+  // (a render closure would be stale for fast successive events — e.g.
+  // pasting 8 files then a 9th in separate dispatches without a re-render
+  // in between). Also read by the unmount-cleanup effect below (the effect
+  // intentionally runs once, so the ref is the only live view it has).
+  attachmentsRef.current = attachments;
+  // Task 5's double-send guard (a hook — must live here, not in `send`).
+  const sendingRef = useRef(false);
+  // Task 5 wires this into `send` (`noUnusedLocals` keeps the bridge honest
+  // until then — the hook itself must exist NOW or the hook count shifts).
+  void sendingRef;
+  // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
+  // advertises `promptCapabilities.image === true`.
+  const imageCapable = agentSupportsImages(liveSession?.capabilities);
+  // Unmount cleanup: revoke the staged object URLs exactly once, on
+  // unmount ONLY — revoking on every state change would leak/break live
+  // previews (a revoked URL can no longer render the `img`).
+  useEffect(
+    () => () => {
+      attachmentsRef.current.forEach(releaseAttachment);
+    },
+    [],
+  );
+  // Session-change guard: `ChatStream` is one long-lived component (no
+  // `key`), so `attachments` would otherwise survive a switch to another
+  // session — images staged in session A (image-capable) could be sent to
+  // session B even if B's agent doesn't advertise `promptCapabilities.image`
+  // (breaking the fail-closed guarantee). Clear + release on switch.
+  const prevSessionIdRef = useRef(activeSessionId);
+  useEffect(() => {
+    if (prevSessionIdRef.current === activeSessionId) return;
+    prevSessionIdRef.current = activeSessionId;
+    attachmentsRef.current.forEach(releaseAttachment);
+    attachmentsRef.current = [];
+    setAttachments([]);
+  }, [activeSessionId]);
+  // Window-level drop backstop: with `dragDropEnabled: false` (tauri.conf.json)
+  // the webview receives native file drops — and the webview DEFAULT for a
+  // file drop is to NAVIGATE to the file (replacing the app). A file dropped
+  // anywhere OUTSIDE the composer must be swallowed: `preventDefault` on
+  // every `dragover` makes the whole page a valid drop target, and this
+  // backstop (the composer's own `onDrop` fires first during bubbling) stops
+  // the navigation. (This also means NO composer-level `onDragOver` is
+  // needed — the window listener covers the composer's dragovers too.)
+  useEffect(() => {
+    const prevent = (e: Event) => e.preventDefault();
+    window.addEventListener("dragover", prevent);
+    window.addEventListener("drop", prevent);
+    return () => {
+      window.removeEventListener("dragover", prevent);
+      window.removeEventListener("drop", prevent);
+    };
+  }, []);
 
   // Auto-grow the composer textarea: reset to `auto`, then the
   // border-box height — `scrollHeight` is the CONTENT height, but
@@ -378,6 +446,59 @@ export default function ChatStream() {
   // render in the stream regardless of the transcript's length) or a
   // working/blocked line is present — otherwise the card would be
   // swallowed by the hint.
+
+  // --- Image-attachment handlers (plain functions, NOT hooks — their
+  // placement is flexible; kept with the other handlers). ---
+  const stageFiles = (files: File[]) => {
+    // Read the CURRENT list from the ref — a render closure would be stale
+    // for fast successive events (e.g. pasting 8 files then a 9th in
+    // separate dispatches without a re-render in between).
+    const { attachments: next, rejected } = addImageAttachments(
+      attachmentsRef.current,
+      files,
+    );
+    if (next !== attachmentsRef.current) {
+      attachmentsRef.current = next;
+      setAttachments(next);
+    }
+    // A successful stage also CLEARS a stale rejection line (null when
+    // nothing was rejected) — otherwise a rejection stays visible after the
+    // user successfully stages a different image.
+    setError(rejected.length > 0 ? rejected.join("; ") : null);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!imageCapable) return; // fall through: default text paste
+    const files = Array.from(e.clipboardData.files);
+    const text = e.clipboardData.getData("text/plain");
+    const html = e.clipboardData.getData("text/html");
+    // A spreadsheet paste carries TSV (or Excel HTML) alongside the
+    // synthetic image — the TEXT wins, so the default paste is untouched.
+    if (
+      files.length === 0 ||
+      shouldPreferSpreadsheetClipboardText(text, html)
+    )
+      return;
+    e.preventDefault();
+    e.stopPropagation();
+    stageFiles(files);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    if (!isLive || composerLocked || !imageCapable) return;
+    e.preventDefault();
+    stageFiles(Array.from(e.dataTransfer.files));
+  };
+
+  const removeAttachment = (id: string) => {
+    // Revoke OUTSIDE the state updater (updaters must be pure — StrictMode
+    // runs them twice; a double revoke is harmless but the wrong pattern).
+    const target = attachmentsRef.current.find((a) => a.id === id);
+    if (target) releaseAttachment(target);
+    const next = attachmentsRef.current.filter((a) => a.id !== id);
+    attachmentsRef.current = next;
+    setAttachments(next);
+  };
 
   return (
     <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
@@ -576,11 +697,39 @@ export default function ChatStream() {
           {error ?? newConversationError}
         </p>
       )}
-      <div className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused">
+      <div
+        className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
+        onDrop={handleDrop}
+      >
+        {attachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-2">
+            {attachments.map((att) => (
+              <div
+                key={att.id}
+                className="group relative size-12 overflow-hidden rounded-lg border border-input-border bg-input"
+              >
+                <img
+                  src={att.objectUrl}
+                  alt={att.filename}
+                  className="size-full object-cover"
+                />
+                <button
+                  type="button"
+                  aria-label="Remove image attachment"
+                  onClick={() => removeAttachment(att.id)}
+                  className="absolute right-0.5 top-0.5 size-4 rounded-full bg-input p-0 opacity-0 transition-opacity group-hover:opacity-100"
+                >
+                  <X className="size-3 text-foreground" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={composerRef}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onPaste={handlePaste}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -592,7 +741,9 @@ export default function ChatStream() {
               ? composerLocked
                 ? "Agent is working…"
                 : messages.length === 0
-                  ? "Ask anything…"
+                  ? imageCapable
+                    ? "Ask anything — or paste an image…"
+                    : "Ask anything…"
                   : "Ask for follow-up changes"
               : canResume
                 ? "Paused — Resume to reconnect"
