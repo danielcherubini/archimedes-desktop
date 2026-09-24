@@ -557,7 +557,17 @@ export default function ChatStream() {
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (!imageCapable) return; // fall through: default text paste
-    const files = Array.from(e.clipboardData.files);
+    // Pasted images live in `clipboardData.items` (a `ClipboardItem` pulled via
+    // `getAsFile()`); `clipboardData.files` is EMPTY in real webviews
+    // (WebKit/WebKitGTK, WebView2/Chromium), so derive the file list from
+    // `items` instead — keep only `kind === "file"` items, drop null results.
+    const files: File[] = [];
+    for (const item of e.clipboardData.items) {
+      if (item.kind === "file") {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
     const text = e.clipboardData.getData("text/plain");
     const html = e.clipboardData.getData("text/html");
     // A spreadsheet paste carries TSV (or Excel HTML) alongside the

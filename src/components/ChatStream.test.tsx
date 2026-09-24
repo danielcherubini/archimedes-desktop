@@ -129,7 +129,10 @@ function seedLiveSessionWithImages(): void {
 // `fireEvent.paste` wraps the dispatch in `act` (a raw `dispatchEvent` does NOT —
 // state changes then need `await act(...)` to become visible) and jsdom has no
 // `DataTransfer`, so the plain `clipboardData` object is attached as-is and
-// reaches React's `onPaste` with `e.clipboardData.files` intact.
+// reaches React's `onPaste` with `e.clipboardData.items` intact. A pasted image
+// lives in `items` as a `ClipboardItem` you pull via `getAsFile()`; `files` is
+// EMPTY in real webviews (WebKit/WebView2), so the stub mirrors that — it builds
+// `items` (NOT `files`) and each item models the real `ClipboardItem` shape.
 function pasteToComposer(
   files: File[],
   extra: { text?: string; html?: string } = {},
@@ -137,7 +140,11 @@ function pasteToComposer(
   const target = screen.getByRole("textbox") as HTMLTextAreaElement;
   return fireEvent.paste(target, {
     clipboardData: {
-      files,
+      items: files.map((f) => ({
+        kind: "file",
+        type: f.type,
+        getAsFile: () => f,
+      })),
       getData: (type: string) =>
         type === "text/plain" ? (extra.text ?? "") : (extra.html ?? ""),
     },
