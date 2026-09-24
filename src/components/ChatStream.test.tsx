@@ -1099,10 +1099,15 @@ describe("ChatStream", () => {
     fireEvent.click(sendButton);
     fireEvent.click(sendButton);
     // Exactly ONE send, even though the composer was not locked during the
-    // first send's FileReader await.
-    await waitFor(() =>
-      expect(vi.mocked(sendPrompt)).toHaveBeenCalledTimes(1),
-    );
+    // first send's FileReader await. Assert the count only AFTER both send
+    // continuations have run: a `toHaveBeenCalledTimes(1)` inside `waitFor`
+    // would pass the moment it first observed one call — a false-green window
+    // if the `sendingRef` guard were removed, since the second send's
+    // continuation lands a few ms after the first while `waitFor` samples
+    // every 50 ms.
+    await waitFor(() => expect(vi.mocked(sendPrompt)).toHaveBeenCalled());
+    await flush();
+    expect(vi.mocked(sendPrompt)).toHaveBeenCalledTimes(1);
   });
 
   it("send is fail-closed without the capability", async () => {

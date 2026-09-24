@@ -24,7 +24,8 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// 8 images per message — mirrors the frontend `MAX_CHAT_ATTACHMENTS` (ADR
 /// 0008): re-validated here so hand-rolled IPC cannot bloat the DB
-/// out-of-band (worst case 8 × 10 MiB ≈ 108 MB per message).
+/// out-of-band (worst case 8 × 10 MiB raw ≈ 108 MB of base64 persisted per
+/// message — base64 expands each image ~4/3×).
 pub const MAX_IMAGE_COUNT: usize = 8;
 
 /// Deliberately NARROWER than `image/*`: the destination is LLM vision APIs
