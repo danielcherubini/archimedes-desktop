@@ -20,7 +20,11 @@ use std::io::{BufRead, Write};
 /// assert on this data). **These are the `data` payloads only — the full
 /// response line (which MUST echo the command's `id` for correlation) is
 /// built in the match arms below.**
-const GET_STATE_DATA: &str = r#"{"sessionId":"fake-pi-1","sessionFile":"/tmp/fake-pi-session.jsonl","model":{"provider":"fake","id":"fake-model","name":"Fake Model","contextWindow":100000,"cost":{}},"thinkingLevel":"off","isStreaming":false,"steeringMode":"all","followUpMode":"all","autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}"#;
+/// The `get_state` payload template: `__SESSION_ID__` is replaced with the
+/// process's session id (a fresh process = a unique `fake-pi-<hex>` id,
+/// mirroring real pi; a `--session <file>` load = the file's stem — the
+/// loaded session's own id, the way real pi reads it from the file).
+const GET_STATE_DATA: &str = r#"{"sessionId":"__SESSION_ID__","sessionFile":"/tmp/fake-pi-session.jsonl","model":{"provider":"__PROVIDER__","id":"__MODEL_ID__","name":"Fake Model","contextWindow":100000,"cost":{}},"thinkingLevel":"__LEVEL__","isStreaming":false,"steeringMode":"all","followUpMode":"all","autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}"#;
 
 const GET_AVAILABLE_MODELS_DATA: &str = r#"{"models":[{"provider":"fake","id":"fake-model","name":"Fake Model","contextWindow":100000,"cost":{}},{"provider":"fake","id":"fake-model-2","name":"Fake Model 2","contextWindow":200000,"cost":{}}]}"#;
 
@@ -47,6 +51,16 @@ const MESSAGE_END: &str = r#"{"type":"message_end","message":{"role":"assistant"
 const AGENT_END: &str = r#"{"type":"agent_end","messages":[],"willRetry":false}"#;
 const AGENT_SETTLED: &str = r#"{"type":"agent_settled"}"#;
 
+/// The `FAKE_PI_TWO_MSGS` turn sequence: a USER `message_start`, then TWO
+/// assistant messages (m1 = "hello", m2 = "world" — each a single
+/// `text_delta` + `message_end`), then `agent_end` + `agent_settled`.
+/// (The subagent text-capture test needs two distinct `messageId`s.)
+const ASSISTANT_MESSAGE_START_2: &str = r#"{"type":"message_start","message":{"role":"assistant","content":[],"api":"fake","provider":"fake","model":"fake-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"timestamp":"2026-09-24T00:00:05.000Z"}}"#;
+const TEXT_DELTA_M1: &str = r#"{"type":"message_update","usage":__USAGE__,"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello"}}"#;
+const MESSAGE_END_M1: &str = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"fake","provider":"fake","model":"fake-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":"2026-09-24T00:00:06.000Z"}}"#;
+const TEXT_DELTA_M2: &str = r#"{"type":"message_update","usage":__USAGE__,"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"world"}}"#;
+const MESSAGE_END_M2: &str = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"world"}],"api":"fake","provider":"fake","model":"fake-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":"2026-09-24T00:00:07.000Z"}}"#;
+
 const USAGE: &str = r#"{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}"#;
 
 /// The `FAKE_PI_GATE` dialog (the `tool_call` → `ctx.ui.confirm` flow the
@@ -61,10 +75,44 @@ fn is_set(var: &str) -> bool {
     matches!(std::env::var(var).as_deref(), Ok("1"))
 }
 
+/// The process's session id: `--session <file>` → the file's STEM (the
+/// loaded session's own id — the way real pi reads it from the session
+/// file); otherwise a UNIQUE `fake-pi-<hex>` id (mirroring real pi's
+/// per-process session ids — two live sessions of the same agent have
+/// distinct ids).
+fn session_id_from_args() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--session" {
+            if let Some(p) = args.next() {
+                let stem = std::path::Path::new(&p)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone());
+                return stem;
+            }
+        }
+    }
+    // A fresh session: a unique id (the `std::process::id` + a counter is
+    // not stable across re-forks; a random hex from the time + pid is
+    // unique enough for tests).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("fake-pi-{:x}{:x}", std::process::id(), nanos)
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+
+    // The session's state (the `set_model` / `set_thinking_level` commands
+    // update it; `get_state` reflects it — the way the real agent does).
+    let mut current_provider = "fake".to_string();
+    let mut current_model_id = "fake-model".to_string();
+    let mut current_level = "off".to_string();
 
     // HANG mode: never respond to ANY command (notably `get_state`) — for
     // the rewritten `establishment_times_out_when_the_agent_hangs` test.
@@ -120,17 +168,34 @@ fn main() {
                     // sequence follows the client's answer (below) — NOT
                     // here (the agent is blocked awaiting the dialog).
                     write_line(&mut out, GATE_REQUEST);
+                } else if is_set("FAKE_PI_TWO_MSGS") {
+                    // Two assistant messages (m1 "hello" + m2 "world").
+                    emit_two_msgs(&mut out);
                 } else {
                     if is_set("FAKE_PI_UNKNOWN") {
                         // An unknown event type before settling (permissive
                         // deserialization check).
                         write_line(&mut out, UNKNOWN_EVENT);
                     }
-                    // The turn's event sequence (the fake "LLM" output).
-                    emit_turn(&mut out);
+                    if is_set("FAKE_PI_WAIT_ABORT") {
+                        // The turn's events WITHOUT the settle: the turn
+                        // stays in-flight until an `abort` arrives (which
+                        // settles it — the cancel test's input).
+                        emit_turn_no_settle(&mut out);
+                    } else {
+                        // The turn's event sequence (the fake "LLM" output).
+                        emit_turn(&mut out);
+                    }
                 }
             }
-            "get_state" => write_line(&mut out, &response_line(id, "get_state", GET_STATE_DATA)),
+            "get_state" => {
+                let data = GET_STATE_DATA
+                    .replace("__SESSION_ID__", &session_id_from_args())
+                    .replace("__PROVIDER__", &current_provider)
+                    .replace("__MODEL_ID__", &current_model_id)
+                    .replace("__LEVEL__", &current_level);
+                write_line(&mut out, &response_line(id, "get_state", &data));
+            }
             "get_available_models" => write_line(
                 &mut out,
                 &response_line(id, "get_available_models", GET_AVAILABLE_MODELS_DATA),
@@ -147,9 +212,9 @@ fn main() {
                 &mut out,
                 &response_line(id, "get_messages", GET_MESSAGES_DATA),
             ),
-            // Echo the REQUESTED provider/modelId in a `Model` object (so a
-            // `set_config_option` round-trip can assert `currentValue` == the
-            // value it sent — NOT a static model).
+            // The REQUESTED provider/modelId (the new current model —
+            // tracked so the next `get_state` reflects it, the way the
+            // real agent does).
             "set_model" => {
                 let data = v
                     .get("provider")
@@ -159,6 +224,8 @@ fn main() {
                             .and_then(|m| m.as_str()),
                     )
                     .map(|(provider, model_id)| {
+                        current_provider = provider.to_string();
+                        current_model_id = model_id.to_string();
                         format!(
                             r#"{{"type":"response","id":"{id}","command":"set_model","success":true,"data":{{"provider":"{provider}","id":"{model_id}","name":"Fake Model","contextWindow":100000,"cost":{{}}}}}}"#
                         )
@@ -168,15 +235,28 @@ fn main() {
                     });
                 write_line(&mut out, &data);
             }
-            "set_thinking_level" => write_line(
-                &mut out,
-                &format!(
-                    r#"{{"type":"response","id":"{id}","command":"set_thinking_level","success":true}}"#
-                ),
-            ),
+            "set_thinking_level" => {
+                if let Some(level) = v.get("level").and_then(|l| l.as_str()) {
+                    current_level = level.to_string();
+                }
+                write_line(
+                    &mut out,
+                    &format!(
+                        r#"{{"type":"response","id":"{id}","command":"set_thinking_level","success":true}}"#
+                    ),
+                );
+            }
             "abort" => {
-                // An aborted turn settles (the client resolves the turn on
-                // `agent_settled`).
+                // The real agent responds to `abort` (rpc-mode.js:329-331:
+                // `await session.abort(); return success(id, "abort")`) and the
+                // aborted turn settles — emit the response FIRST (so the
+                // client's `send(abort)` resolves), then the settle event.
+                write_line(
+                    &mut out,
+                    &format!(
+                        r#"{{"type":"response","id":"{id}","command":"abort","success":true}}"#,
+                    ),
+                );
                 write_line(&mut out, AGENT_SETTLED);
             }
             "__fail" => write_line(
@@ -208,6 +288,34 @@ fn emit_turn(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
     write_line(out, &TEXT_DELTA_1.replace("__USAGE__", USAGE));
     write_line(out, &TEXT_DELTA_2.replace("__USAGE__", USAGE));
     write_line(out, MESSAGE_END);
+    write_line(out, AGENT_END);
+    write_line(out, AGENT_SETTLED);
+    out.flush().expect("flush");
+}
+
+/// The turn's event sequence WITHOUT the `agent_settled` (the
+/// `FAKE_PI_WAIT_ABORT` mode — the turn stays in-flight until an `abort`
+/// arrives, which settles it).
+fn emit_turn_no_settle(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
+    write_line(out, USER_MESSAGE_START);
+    write_line(out, ASSISTANT_MESSAGE_START);
+    write_line(out, &TEXT_DELTA_1.replace("__USAGE__", USAGE));
+    write_line(out, &TEXT_DELTA_2.replace("__USAGE__", USAGE));
+    write_line(out, MESSAGE_END);
+    write_line(out, AGENT_END);
+    out.flush().expect("flush");
+}
+
+/// The `FAKE_PI_TWO_MSGS` turn sequence (two assistant messages, m1 then
+/// m2 — the subagent text-capture test's input).
+fn emit_two_msgs(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
+    write_line(out, USER_MESSAGE_START);
+    write_line(out, ASSISTANT_MESSAGE_START);
+    write_line(out, &TEXT_DELTA_M1.replace("__USAGE__", USAGE));
+    write_line(out, MESSAGE_END_M1);
+    write_line(out, ASSISTANT_MESSAGE_START_2);
+    write_line(out, &TEXT_DELTA_M2.replace("__USAGE__", USAGE));
+    write_line(out, MESSAGE_END_M2);
     write_line(out, AGENT_END);
     write_line(out, AGENT_SETTLED);
     out.flush().expect("flush");

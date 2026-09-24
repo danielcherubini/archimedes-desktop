@@ -1,24 +1,32 @@
-//! The ACP session layer: spawns an agent process, speaks ACP to it, and
-//! drives the session lifecycle.
+//! The pi RPC session layer: spawns a `pi --mode rpc` process, speaks the
+//! pi JSONL RPC protocol to it, and drives the session lifecycle.
 //!
-//! The heart of the design is the **closure-lifecycle mechanism**. The SDK's
-//! `connect_with` closure *is* the connection's lifetime: "the connection
-//! stays active until `main_fn` returns, then shuts down." So we never await
-//! `connect_with` inline in [`SessionManager::start_session`] (it would only
-//! resolve when the session closes). Instead we spawn the connection as a
-//! *driver task* that owns the closure for the whole session. `close_session`
-//! (or a subagent cancel) records the close kind and
-//! flips a `watch` flag that makes the closure return, which drops the
-//! connection and — on Unix — terminates the agent's process group;
+//! The heart of the design is the **driver-task mechanism**. The pi child
+//! is long-lived (it lives for the session), so we never await it inline in
+//! [`SessionManager::start_session`] / [`Self::resume_session`]. Instead we
+//! spawn a *driver task* that owns a handle to the child for the whole
+//! session: it runs the *establisher* (the `get_state` round-trip that turns
+//! a fresh child into an established session), then blocks until the session
+//! closes, streaming `session-update` events as pi's events arrive.
+//! `close_session` (or a subagent cancel) flips a `watch` flag that makes
+//! the driver task return; dropping the last handle closes the child's
+//! stdin (a clean pi shutdown) and reaps the process.
 //!
-//! The same driver is used for `session/new` (start) and `session/load`
-//! (resume): only the *establisher* — the future that turns a fresh
-//! connection into an established session — differs.
+//! The same driver is used for a new session (establisher = `get_state`)
+//! and a resume (establisher = `get_state` + `get_messages` replay — the
+//! child is spawned with `--session <file>` so `get_messages` returns the
+//! loaded session's transcript).
 //!
 //! Multiple live sessions COEXIST (the one-live cap is lifted, ADR 0002):
 //! `start_session` / `resume_session` do NOT close other live sessions; a
 //! session is torn down only by an explicit `close_session`, a subagent
 //! cancel, or the agent process exiting on its own.
+//!
+//! **The `session-update` contract is FROZEN** (ADR 0009): [`normalize`]
+//! maps pi events onto the exact JSON envelopes the frontend consumes
+//! (`agent_message_chunk` / `agent_thought_chunk` / `tool_call` /
+//! `tool_call_update` / `session_info_update` / `config_option_update`), so
+//! the frontend needs no changes for the ACP → pi-RPC swap.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -26,30 +34,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agent_client_protocol::Error as ProtocolError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ClientCapabilities, ClientNotification, ContentBlock,
-    FileSystemCapabilities, InitializeRequest, NewSessionRequest, PromptRequest,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionRequest, RequestPermissionResponse,
-    SessionConfigId, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, ToolCallContent, WriteTextFileRequest,
-    WriteTextFileResponse,
-};
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{
-    on_receive_notification, on_receive_request, AcpAgent, AcpAgentConfig, Agent, Client,
-    ConnectionTo, Responder,
-};
-
 use crate::agent::bridge::{self, PendingBridge};
-use crate::agent::errors::AcpError;
-use crate::agent::fs_backend::FsBackend;
+use crate::agent::errors::RpcError;
 use crate::agent::permission::{self, PendingPermissions};
-use crate::agent::prompt::{self, ImagePayload};
+use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::config::{AgentEntry, ConfigError, Registry};
 use crate::storage::Db;
 
@@ -96,25 +88,154 @@ pub(crate) enum CloseKind {
     User,
 }
 
+/// Why a prompt turn ended.
+///
+/// A LOCAL enum (the ACP crate type dies with the swap): the strings are
+/// exactly what the frontend expects (`end_turn` / `max_tokens` / `refusal`
+/// / `max_turn_requests` / `cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model finished its turn normally.
+    EndTurn,
+    /// The model hit its output token limit.
+    MaxTokens,
+    /// The model (or the provider) refused the prompt.
+    Refusal,
+    /// The agent hit its max turn-request limit.
+    MaxTurnRequests,
+    /// The user (or the app) cancelled the turn.
+    Cancelled,
+}
+
+/// One image attachment over IPC. The frontend sends CAMEL CASE
+/// (`mimeType`, `sizeBytes`) — Tauri camel-cases only the TOP-LEVEL command
+/// args, so this nested struct renames explicitly.
+///
+/// (Moved from `agent/prompt.rs`, which died with the ACP swap — the
+/// `ImagePayload` / `MAX_IMAGE_BYTES` / validation / `user_message_payload`
+/// helpers all live here now.)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePayload {
+    pub mime_type: String,
+    /// base64, WITHOUT a `data:` prefix.
+    pub data: String,
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+/// 10 MiB — mirrors the frontend cap (ADR 0008).
+pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 8 images per message — mirrors the frontend `MAX_CHAT_ATTACHMENTS` (ADR
+/// 0008): re-validated here so hand-rolled IPC cannot bloat the DB
+/// out-of-band (worst case 8 × 10 MiB raw ≈ 108 MB of base64 persisted per
+/// message — base64 expands each image ~4/3×).
+pub const MAX_IMAGE_COUNT: usize = 8;
+
+/// 255 bytes — the OS per-component filename limit: `name` is written verbatim
+/// to SQLite, so re-validated here so hand-rolled IPC cannot bloat a row
+/// out-of-band. (The frontend's `name` comes from a real OS filename and is
+/// already ≤255 bytes on all major OSes.)
+pub const MAX_IMAGE_NAME_LEN: usize = 255;
+
+/// Deliberately NARROWER than `image/*`: the destination is LLM vision APIs
+/// (png/jpeg/gif/webp only — an SVG would fail the whole turn at the
+/// provider). Mirrors the frontend `SUPPORTED_IMAGE_TYPES`.
+const SUPPORTED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Validate image attachments (guards against hand-rolled IPC): the count ≤
+/// `MAX_IMAGE_COUNT`; `name` ≤ `MAX_IMAGE_NAME_LEN` bytes; `mime_type` in
+/// `SUPPORTED_IMAGE_TYPES`; `data` with ≤2 trailing `=` padding chars;
+/// decoded size (the padding-stripped `len * 3 / 4` estimate — `size_bytes`
+/// is NOT trusted) ≤ `MAX_IMAGE_BYTES`.
+fn validate_images(images: &[ImagePayload]) -> Result<(), RpcError> {
+    if images.len() > MAX_IMAGE_COUNT {
+        return Err(RpcError::InvalidPrompt {
+            reason: format!("at most {MAX_IMAGE_COUNT} images per message"),
+        });
+    }
+    for img in images {
+        if img.name.len() > MAX_IMAGE_NAME_LEN {
+            return Err(RpcError::InvalidPrompt {
+                reason: "image name exceeds 255 bytes".to_string(),
+            });
+        }
+        if !SUPPORTED_IMAGE_TYPES.contains(&img.mime_type.as_str()) {
+            return Err(RpcError::InvalidPrompt {
+                reason: format!(
+                    "unsupported image type: {} (expected png, jpeg, gif, webp)",
+                    img.mime_type
+                ),
+            });
+        }
+        let trimmed = img.data.trim_end_matches('=');
+        // Legitimate base64 has 0–2 trailing `=` padding. Rejecting >2 keeps
+        // the stripped-size estimate a real bound on the persisted data
+        // (arbitrary `=` padding would otherwise bypass the size cap).
+        let padding = img.data.len() - trimmed.len();
+        if padding > 2 {
+            return Err(RpcError::InvalidPrompt {
+                reason: "malformed base64 image data".to_string(),
+            });
+        }
+        let decoded_bytes = (trimmed.len() as u64) * 3 / 4;
+        if decoded_bytes > MAX_IMAGE_BYTES {
+            return Err(RpcError::InvalidPrompt {
+                reason: "image exceeds the 10 MiB limit".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The user-message payload persisted in `messages.payload_json` (ADR 0008):
+/// `{ "text": ..., "images": [{ name, mimeType, sizeBytes, data }] }` —
+/// the `images` key is OMITTED when empty (pre-feature rows stay `{"text"}`).
+pub fn user_message_payload(text: &str, images: &[ImagePayload]) -> Value {
+    if images.is_empty() {
+        json!({ "text": text })
+    } else {
+        json!({
+            "text": text,
+            "images": images.iter().map(|img| {
+                json!({
+                    "name": img.name,
+                    "mimeType": img.mime_type,
+                    "sizeBytes": img.size_bytes,
+                    "data": img.data,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// A fully established session, ready to accept prompts.
 ///
 /// `Serialize` so it can cross the IPC boundary as a command return value.
 ///
-/// NOTE: this type must never share a module with
-/// `agent_client_protocol::schema::v1::SessionInfo`; the SDK type is always
-/// referenced by full path.
+/// `capabilities` is the pi session's capability envelope (item 1 of the
+/// swap plan): `piSessionId` / `piSessionFile`? / `model`? /
+/// `thinkingLevel` / `loadSession` / `promptCapabilities` — the `model` key
+/// is ABSENT when `get_state` reports no model, and `piSessionFile` is
+/// ABSENT when the session has no file (`--no-session` runs; the session
+/// is unresumable → `loadSession: false`). The two trailing keys are
+/// load-bearing: `loadSession` gates the frontend's Resume button and
+/// `promptCapabilities.image` gates image sending (fail-closed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
-    pub session_id: SessionId,
+    pub session_id: String,
     pub agent_id: String,
     pub cwd: PathBuf,
-    pub capabilities: AgentCapabilities,
-    /// The agent's session configuration options (model / thinking level
-    /// selectors) from the `newSession` / `loadSession` response; `None`
-    /// when the agent does not advertise any (or for stored sessions —
-    /// `list_sessions` always reports `None`).
-    pub config_options: Option<Vec<SessionConfigOption>>,
+    pub capabilities: Value,
+    /// The session's configuration options (model / thinking level
+    /// selectors) synthesized from `get_state` + `get_available_models` +
+    /// `get_available_thinking_levels`; `None` when the agent advertised
+    /// nothing (or for stored sessions — `list_sessions` always reports
+    /// `None`).
+    pub config_options: Option<Vec<Value>>,
 }
 
 /// A live, in-memory session handle.
@@ -125,25 +246,45 @@ pub struct SessionInfo {
 /// `pub(crate)` + `pub(crate)` fields: `subagent.rs` reads `driver.sessions`
 /// entries (to clone the `cx` for the subagent's task prompt), so the
 /// struct and its fields are visible to the whole crate.
-#[derive(Debug)]
+///
+/// (No `Debug` derive — `PiRpcHandle` does not implement `Debug`.)
 #[allow(dead_code)]
 pub(crate) struct LiveSession {
-    /// Cheap clone of the connection, shared with the driver task.
-    pub(crate) cx: ConnectionTo<Agent>,
-    pub(crate) session_id: SessionId,
+    /// Cheap clone of the pi RPC handle, shared with the driver task.
+    pub(crate) handle: PiRpcHandle,
+    pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
     pub(crate) agent_id: String,
-    /// Set to `true` to make the driver task's closure return, tearing down
-    /// the connection (and the agent's process group on Unix).
+    /// Set to `true` to make the driver task's loop return, tearing the
+    /// session down (dropping the handle closes the child's stdin).
     ///
     /// For a subagent session this IS the `ExternalClose`'s sender (a cancel
     /// flips it); for a main session it is the driver's internal flag.
     pub(crate) close_tx: watch::Sender<bool>,
     /// The close kind, decided by `close_session` (first-set-wins) and read
-    /// by the driver task once `connect_with` returns. For a subagent session
+    /// by the driver task once the loop returns. For a subagent session
     /// this IS the `ExternalClose`'s kind.
     pub(crate) close_kind: Arc<StdMutex<Option<CloseKind>>>,
     pub(crate) thought_state: Arc<StdMutex<ThoughtState>>,
+    /// The in-flight turn's resolver: `send_prompt` stores a sender here
+    /// (last-wins), the driver resolves it on `agent_settled` (a
+    /// `cancel_requested` flag maps a late settle to `Cancelled`).
+    pub(crate) pending_turn: Arc<StdMutex<Option<oneshot::Sender<StopReason>>>>,
+    /// Set by `cancel_session` BEFORE the `abort` is sent: a late
+    /// `agent_settled` after an abort maps to `Cancelled`, not `EndTurn`.
+    pub(crate) cancel_requested: Arc<StdMutex<bool>>,
+    /// The most recent turn settle, watched by `SessionDriver::wait_for_settle`
+    /// (the subagent's prompt wait): the driver sends `(seq, reason)` on
+    /// `agent_settled`; the sequence number forces `changed()` to fire on
+    /// every settle (a watch coalesces equal values). The initial `(0, …)`
+    /// means "no settle yet"; a DROPPED sender (the driver task ended —
+    /// a teardown without a settle) resolves `changed()` too.
+    pub(crate) settle_rx: watch::Receiver<(u64, StopReason)>,
+    /// This driver's generation (assigned from the driver's counter at
+    /// registration): a SUPERSEDED driver (a resume overwrote this entry
+    /// under the same session id) must not clobber the replacement's
+    /// entry on teardown — the removal is guarded by this token.
+    pub(crate) generation: u64,
 }
 
 /// The external-close handle: the subagent cancel path (main sessions pass
@@ -230,6 +371,25 @@ pub(crate) struct ThoughtState {
     next: u32,
 }
 
+/// Per-session turn state for the event normalizer.
+///
+/// `msg_counter` is the `messageId` source: it starts at 0 and is advanced
+/// ONLY when a `message_start` carries an `assistant` message (the wire's
+/// `message_start` carries ANY `AgentMessage` — user and tool-result
+/// messages included — so a role-blind counter would number the first
+/// assistant chunk `m2` and make the `get_messages` replay numbering
+/// irreproducible). `current_message_id` is `format!("m{}", counter)`.
+///
+/// `toolcall_args` is the accumulating partial-args buffer per tool-call id
+/// (the `toolcall_delta` frames are JSON fragments; `toolcall_end` carries
+/// the full `arguments` object and the buffer entry is dropped).
+#[derive(Debug, Default)]
+pub struct TurnState {
+    pub msg_counter: u64,
+    pub current_message_id: Option<String>,
+    pub toolcall_args: HashMap<String, String>,
+}
+
 /// The shared session-driver state. `SessionManager` (main sessions) and
 /// `SubagentSessionManager` (worker runtime) each own one.
 ///
@@ -238,12 +398,11 @@ pub(crate) struct ThoughtState {
 /// text/cost captures, and the subagent dispatch handle). `drive_session`
 /// (the shared driver) is a method on this struct.
 pub struct SessionDriver {
-    pub(crate) sessions: Arc<Mutex<HashMap<SessionId, LiveSession>>>,
+    pub(crate) sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
     pub(crate) pending_permissions: PendingPermissions,
     pub(crate) pending_bridge: PendingBridge,
-    /// How long the establishment phase (agent spawn + `initialize` +
-    /// `session/new` or `session/load`) may run before it is cancelled.
-    /// Default: 30 s.
+    /// How long the establishment phase (agent spawn + `get_state`
+    /// establisher) may run before it is cancelled. Default: 30 s.
     pub(crate) establish_timeout: Duration,
     /// Persistence (main only; `None` for subagents — ephemeral, not stored).
     pub(crate) db: Option<Arc<Db>>,
@@ -261,6 +420,10 @@ pub struct SessionDriver {
     /// for the subagent manager itself (subagents cannot dispatch
     /// subagents — the tool is excluded from their spawn).
     pub(crate) subagent: Option<Arc<crate::agent::subagent::SubagentSessionManager>>,
+    /// The live-session generation counter (monotonic; each
+    /// `drive_session` registration takes the next value — the teardown
+    /// guard).
+    pub(crate) generation_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionDriver {
@@ -269,6 +432,7 @@ impl SessionDriver {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            generation_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_bridge: Arc::new(Mutex::new(HashMap::new())),
             establish_timeout: Duration::from_secs(30),
@@ -280,15 +444,15 @@ impl SessionDriver {
         }
     }
 
-    /// Shared driver: spawn the agent, register the client-side backends,
-    /// run the *establisher* (initialize + `session/new` or `session/load`),
-    /// then block until the session closes.
+    /// Shared driver: run the *establisher* against the (already spawned)
+    /// pi child, then stream the session's events until it closes.
     ///
-    /// `establish` receives the fresh connection and must return the
-    /// established `(session_id, SessionInfo)`. On failure it must return
-    /// `Err` — the error is mapped to an [`AcpError`] (a
-    /// "does not support session/load" marker becomes
-    /// [`AcpError::NotResumable`]).
+    /// `handle` is a cheap clone of the pi RPC handle (the caller spawned
+    /// the `PiRpc` — a dropped `PiRpc` wrapper does NOT kill the child:
+    /// the child lives while ANY handle does). `establisher` receives the
+    /// handle and must return the established `SessionInfo`; on failure it
+    /// returns `Err` (the error is reported to the awaiting command; the
+    /// establish-timeout marker is applied here, not in the establisher).
     ///
     /// `external_close` (subagents only; `None` for main) is the cancel
     /// path: the driver task selects on its receiver in BOTH the establish
@@ -296,20 +460,20 @@ impl SessionDriver {
     /// of the internal kind) for the close reason (one kind, first-set-wins
     /// across the whole session).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn drive_session<F, Fut>(
+    pub(crate) async fn drive_session<Establisher, EstablisherFut>(
         &self,
-        agent: AcpAgent,
+        handle: PiRpcHandle,
         agent_id: &str,
         hint: String,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
         bridge_setup: Option<(String, PathBuf)>,
         external_close: Option<ExternalClose>,
-        establish: F,
-    ) -> Result<SessionInfo, AcpError>
+        establisher: Establisher,
+    ) -> Result<SessionInfo, RpcError>
     where
-        F: FnOnce(ConnectionTo<Agent>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(SessionId, SessionInfo), ProtocolError>> + Send + 'static,
+        Establisher: FnOnce(PiRpcHandle) -> EstablisherFut + Send + 'static,
+        EstablisherFut: Future<Output = Result<SessionInfo, RpcError>> + Send + 'static,
     {
         // Split the external close (the subagent cancel path): the driver
         // task selects on `rx` (establish + block phases) and reads `kind`
@@ -320,11 +484,9 @@ impl SessionDriver {
             None => (None, None, None),
         };
 
-        // Channels that carry values out of the (long-lived) closure.
-        let (ready_tx, ready_rx) = oneshot::channel::<ConnectionTo<Agent>>();
+        // Channels that carry values out of the (long-lived) driver task.
         let (session_ready_tx, session_ready_rx) = oneshot::channel::<SessionInfo>();
-        let (session_id_tx, session_id_rx) = oneshot::channel::<SessionId>();
-        let (error_tx, mut error_rx) = oneshot::channel::<ProtocolError>();
+        let (error_tx, mut error_rx) = oneshot::channel::<RpcError>();
         let (close_tx, close_rx) = watch::channel(false);
         // The internal close kind (main sessions). The driver reads the
         // external kind INSTEAD when `external_close` is present (one kind,
@@ -342,6 +504,13 @@ impl SessionDriver {
         // sender (subagents — a cancel cancels in-flight `ask` waiters),
         // else the driver's internal flag (main sessions).
         let listener_close_tx: &watch::Sender<bool> = ec_tx.as_ref().unwrap_or(&close_tx);
+        // The turn-settle watch: the driver sends `(seq, reason)` on
+        // `agent_settled` (the sequence number forces `changed()` to fire
+        // on every settle — a watch coalesces equal values); the initial
+        // `(0, …)` means "no settle yet". `wait_for_settle` (the subagent's
+        // prompt wait) reads the receiver; a DROPPED sender (a teardown
+        // without a settle) resolves `changed()` too.
+        let (settle_tx, settle_rx) = watch::channel((0u64, StopReason::EndTurn));
 
         // Bridge listener (ADR 0003): started BEFORE the driver task spawns
         // (the push retry window is only ~2 s). The anchor is the desktop's
@@ -373,9 +542,7 @@ impl SessionDriver {
                         cost_capture,
                     )
                     .await
-                    .map_err(|e| AcpError::SpawnFailed {
-                        hint: format!("bridge listener: {e}"),
-                    })?,
+                    .map_err(|e| RpcError::Io(format!("bridge listener: {e}")))?,
                 )
             }
             None => None,
@@ -388,7 +555,12 @@ impl SessionDriver {
             Arc::new(StdMutex::new(HashMap::new()));
         let thought_state: Arc<StdMutex<ThoughtState>> =
             Arc::new(StdMutex::new(ThoughtState::default()));
-        // Used in the driver task; moved into the spawned task by the closure.
+        // The normalizer's per-session turn state (the `messageId` counter +
+        // the tool-call partial-args buffers).
+        let turn_state: Arc<StdMutex<TurnState>> = Arc::new(StdMutex::new(TurnState::default()));
+        // The settle sequence for the turn-settle watch (moved into the
+        // driver task; incremented on every `agent_settled`).
+        let mut settle_seq = 0u64;
         let _thought_state_task = thought_state.clone();
 
         let sessions_arc = self.sessions.clone();
@@ -397,281 +569,281 @@ impl SessionDriver {
         let establish_timeout = self.establish_timeout;
         let db = self.db.clone();
         // The capture hooks (subagents only; `None` for main). Clones for
-        // the `connect_with` notification handler.
+        // the driver task's event handler.
         let text_capture = self.text_capture.clone();
         let last_message_id = self.last_message_id.clone();
         let thought_capture = thought_state.clone();
         let sink = sink.clone();
-        let notify_sink = sink.clone();
-        let cwd_owned = cwd.clone();
         // The external close's receiver for the driver task (cloned per
         // select phase — a `None` receiver is inert).
         let ec_rx_task = ec_rx;
 
-        // SPAWN the connection as a driver task. `connect_with` only resolves
-        // when the closure returns (i.e. at session close), so it must never
-        // be awaited inline here.
+        // SPAWN the driver task. The pi child is long-lived (it lives for
+        // the session), so the task must never be awaited inline here.
+        // The handle is CHEAP to clone (an `Arc`); the child lives while
+        // ANY clone is alive — the task takes a clone, the original moves
+        // into the `LiveSession` value below.
+        // The session's generation token (captured by the driver task —
+        // the teardown guard: a SUPERSEDED driver (a resume overwrote this
+        // entry under the same session id) must not clobber the
+        // replacement's entry).
+        let live_generation = self
+            .generation_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle_task = handle.clone();
         tokio::spawn(async move {
-            // Client-side backends for this session.
-            let fs_backend = FsBackend {
-                root: cwd_owned.clone(),
+            // The event / extension-UI / exit streams (a fresh receiver per
+            // call — the queues buffer until a consumer attaches).
+            let handle = handle_task;
+            let mut events_rx = handle.events();
+            let mut ui_rx = handle.extension_ui();
+            let mut exited_rx = handle.exited();
+
+            // Establish the session (the `get_state` round-trip for a new
+            // session; `get_state` + `get_messages` replay for a resume).
+            // Bounded + external-close aware: a cancel during the establish
+            // window is honored (not deferred to the timeout).
+            let timeout_detail = format!(
+                "agent did not answer get_state within {}s",
+                establish_timeout.as_secs()
+            );
+            let mut establish_rx = ec_rx_task.clone();
+            let established = tokio::select! {
+                r = tokio::time::timeout(establish_timeout, establisher(handle.clone())) => {
+                    match r {
+                        Ok(Ok(info)) => Some(info),
+                        Ok(Err(err)) => {
+                            // Report the failure to the awaiting command,
+                            // then tear the child down.
+                            error_tx.send(err).ok();
+                            None
+                        }
+                        Err(_) => {
+                            error_tx
+                                .send(RpcError::EstablishTimeout {
+                                    detail: timeout_detail,
+                                })
+                                .ok();
+                            None
+                        }
+                    }
+                }
+                // A cancel during the establish window is honored (not
+                // deferred to the timeout); a `None` receiver is inert
+                // (main sessions).
+                _ = changed_or_inert(&mut establish_rx) => None,
+            };
+            let info = match established {
+                Some(info) => info,
+                // The establisher failed (it sent the error first) or a
+                // cancel won the race: tear the child down and exit.
+                None => {
+                    bridge::teardown(bridge_handle);
+                    return;
+                }
             };
 
-            // Cheap clones so each handler closure can own its copy.
-            let fs_read = fs_backend.clone();
-            let fs_write = fs_backend.clone();
-            let perm_sink = sink.clone();
-            let perm_pp = pending_permissions_arc.clone();
-            // A clone for the `connect_with` closure (to call `set_session_id`
-            // once the ACP id is known); the original `bridge_handle` stays
-            // here for the unconditional `teardown` in the cleanup below.
-            let bridge_handle_cx = bridge_handle.clone();
+            session_ready_tx.send(info.clone()).ok();
 
-            let builder = Client
-                .builder()
-                .name("archimedes-desktop")
-                .on_receive_notification(
-                    async move |notif: SessionNotification, _cx: ConnectionTo<Agent>| {
-                        let payload = serde_json::to_value(&notif.update).unwrap_or(Value::Null);
-                        let frame = serde_json::json!({
-                            "sessionId": notif.session_id.to_string(),
-                            "update": payload,
-                        });
-                        notify_sink.emit("session-update", frame);
+            // Hand the pi `session_id` to the bridge handle so
+            // `bridge-request`/`bridge-event` payloads carry the pi id
+            // (bridge requests only occur mid-turn, after establish, so
+            // they always carry the pi id).
+            if let Some(h) = &bridge_handle {
+                h.set_session_id(&info.session_id).await;
+            }
 
-                        // The client owns history: upsert the transcript row
-                        // as the update streams in.
-                        if let Some(db) = &db {
-                            persist_update(
-                                db,
-                                &notif.session_id.to_string(),
-                                &notif.update,
-                                &agent_text_acc,
-                                &tool_call_state,
-                                &thought_capture,
-                            );
+            // BLOCK until close_session OR agent death OR the external
+            // close, streaming the session's events as they arrive.
+            let mut internal_rx = ec_rx_task.is_none().then_some(close_rx);
+            // The internal close flag is inert for SUBAGENTS (the external
+            // close is their cancel path — the internal sender is dropped,
+            // and a dropped sender's `changed()` resolves immediately, which
+            // would tear the session down right after establishment).
+            let mut block_rx = ec_rx_task.clone();
+            loop {
+                tokio::select! {
+                    ev = events_rx.recv() => {
+                        let Some(ev) = ev else {
+                            // The reader task ended (the child's stdout
+                            // closed — treat it as an exit).
+                            break;
+                        };
+                        // A settled turn resolves the pending prompt (a
+                        // `cancel_requested` flag maps it to `Cancelled`) AND
+                        // records the settle on the watch (the subagent's
+                        // prompt wait — `wait_for_settle`).
+                        if matches!(ev, RpcEvent::agent_settled) {
+                            settle_seq += 1;
+                            let reason = {
+                                let sessions = sessions_arc.lock().await;
+                                if let Some(live) = sessions.get(&info.session_id) {
+                                    let cancelled = *live
+                                        .cancel_requested
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner());
+                                    if cancelled {
+                                        StopReason::Cancelled
+                                    } else {
+                                        StopReason::EndTurn
+                                    }
+                                } else {
+                                    StopReason::EndTurn
+                                }
+                            };
+                            let _ = settle_tx.send((settle_seq, reason));
+                            resolve_pending_turn(&sessions_arc, &info.session_id).await;
                         }
-                        // (a) Capture the agent text for the FINAL OUTPUT
-                        // (subagents only; `None` for main — main persists
-                        // to the DB). A plain `HashMap` has no insertion
-                        // order, so the "last message" is tracked separately
-                        // (`last_message_id`), not derived from iteration.
-                        // The capture locks are TOLERANT of a poisoned
-                        // mutex (`into_inner` — a poisoned capture degrades
-                        // to its last good state, not a panic: a panic here
-                        // would chain into the driver task, and on a
-                        // subagent dispatch into a dropped oneshot — a
-                        // crash silently reported as a "cancelled" dispatch).
-                        if let Some(tc) = &text_capture {
-                            if let SessionUpdate::AgentMessageChunk(chunk) = &notif.update {
-                                if let ContentBlock::Text(text) = &chunk.content {
-                                    if !text.text.is_empty() {
-                                        let key = chunk
-                                            .message_id
-                                            .as_ref()
-                                            .map(|m| m.to_string())
-                                            .unwrap_or_else(|| "default".to_string());
-                                        let mut acc = tc.lock().unwrap_or_else(|p| p.into_inner());
-                                        acc.entry(key.clone()).or_default().push_str(&text.text);
-                                        if let Some(lmi) = &last_message_id {
-                                            *lmi.lock().unwrap_or_else(|p| p.into_inner()) =
-                                                Some(key);
+                        // A thinking-level change re-synthesizes the config
+                        // options (the normalizer has no model list — the
+                        // fetch is async, so it lives here, not in the
+                        // pure normalizer).
+                        if matches!(ev, RpcEvent::thinking_level_changed { .. }) {
+                            resynthesize_config_options(&handle, &info.session_id, &sink).await;
+                            continue;
+                        }
+                        let updates = {
+                            let mut turn =
+                                turn_state.lock().unwrap_or_else(|p| p.into_inner());
+                            normalize(&ev, &mut turn)
+                        };
+                        for update in updates {
+                            let frame = json!({
+                                "sessionId": info.session_id,
+                                "update": update,
+                            });
+                            sink.emit("session-update", frame);
+                            // The client owns history: upsert the transcript
+                            // row as the update streams in.
+                            if let Some(db) = &db {
+                                persist_update(
+                                    db,
+                                    &info.session_id,
+                                    &update,
+                                    &agent_text_acc,
+                                    &tool_call_state,
+                                    &thought_capture,
+                                );
+                            }
+                            // (a) Capture the agent text for the FINAL
+                            // OUTPUT (subagents only; `None` for main —
+                            // main persists to the DB). Fed from the
+                            // normalized `agent_message_chunk` frames keyed
+                            // by the derived `messageId`.
+                            if let Some(tc) = &text_capture {
+                                if update
+                                    .get("sessionUpdate")
+                                    .and_then(Value::as_str)
+                                    == Some("agent_message_chunk")
+                                {
+                                    if let Some(text) = update
+                                        .get("content")
+                                        .and_then(|c| c.get("text"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        if !text.is_empty() {
+                                            let key = update
+                                                .get("messageId")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("default")
+                                                .to_string();
+                                            let mut acc = tc
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            acc.entry(key.clone()).or_default().push_str(text);
+                                            if let Some(lmi) = &last_message_id {
+                                                *lmi.lock().unwrap_or_else(
+                                                    |p| p.into_inner(),
+                                                ) = Some(key);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                        Ok(())
-                    },
-                    on_receive_notification!(),
-                )
-                .on_receive_request(
-                    async move |req: ReadTextFileRequest,
-                                responder: Responder<ReadTextFileResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        match fs_read.read(&req.path) {
-                            Ok(content) => {
-                                responder.respond(ReadTextFileResponse::new(content))?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_internal_error(e.to_string())?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: WriteTextFileRequest,
-                                responder: Responder<WriteTextFileResponse>,
-                                _cx: ConnectionTo<Agent>| {
-                        match fs_write.write(&req.path, &req.content) {
-                            Ok(()) => {
-                                responder.respond(WriteTextFileResponse::new())?;
-                            }
-                            Err(e) => {
-                                responder.respond_with_internal_error(e.to_string())?;
-                            }
-                        }
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                )
-                .on_receive_request(
-                    async move |req: RequestPermissionRequest,
-                                responder: Responder<RequestPermissionResponse>,
-                                cx: ConnectionTo<Agent>| {
-                        permission::handle_permission_request(
-                            &req, responder, &cx, &perm_sink, &perm_pp,
+                    }
+                    req = ui_rx.recv() => {
+                        let Some(req) = req else {
+                            break;
+                        };
+                        // The permission gate (the bundled gate extension's
+                        // `ctx.ui.confirm` / `ctx.ui.select` dialogs).
+                        permission::handle_extension_ui_request(
+                            &info.session_id, req, &handle, &sink, &pending_permissions_arc,
                         )
                         .await;
-                        Ok(())
-                    },
-                    on_receive_request!(),
-                );
-
-            let _ = builder
-                .connect_with(agent, |cx: ConnectionTo<Agent>| async move {
-                    // Hand the connection to the manager so it can send prompts.
-                    let cx2 = cx.clone();
-                    ready_tx.send(cx2).ok();
-
-                    // Establish the session (initialize + session/new for a
-                    // new session, initialize + session/load for a resume).
-                    // Bounded + external-close aware: a cancel during the
-                    // establish window is honored (not deferred to the
-                    // timeout).
-                    let timeout_detail = format!(
-                        "agent did not answer initialize within {}s",
-                        establish_timeout.as_secs()
-                    );
-                    let mut establish_rx = ec_rx_task.clone();
-                    let established = tokio::select! {
-                        r = tokio::time::timeout(establish_timeout, establish(cx.clone())) => {
-                            match r {
-                                Ok(Ok(e)) => Some(e),
-                                Ok(Err(err)) => {
-                                    // Report the failure to the awaiting
-                                    // command, then tear the connection down.
-                                    error_tx.send(err).ok();
-                                    None
-                                }
-                                Err(_) => {
-                                    // The detail text doubles as the mapping
-                                    // marker in `map_establish_error`.
-                                    let timeout_err =
-                                        agent_client_protocol::util::internal_error(&timeout_detail);
-                                    error_tx.send(timeout_err).ok();
-                                    None
-                                }
-                            }
-                        }
-                        // A cancel during the establish window is honored
-                        // (not deferred to the timeout); a `None` receiver
-                        // is inert (main sessions).
-                        _ = changed_or_inert(&mut establish_rx) => None,
-                    };
-                    let (session_id, info) = match established {
-                        Some(e) => e,
-                        None => return Ok(()),
-                    };
-
-                    session_id_tx.send(session_id.clone()).ok();
-                    session_ready_tx.send(info).ok();
-
-                    // Hand the ACP `session_id` to the bridge handle so
-                    // `bridge-request`/`bridge-event` payloads carry the ACP
-                    // id (bridge requests only occur mid-turn, after
-                    // establish, so they always carry the ACP id).
-                    if let Some(h) = &bridge_handle_cx {
-                        h.set_session_id(&session_id.to_string()).await;
                     }
+                    // The child exited (reaped by the exit-watcher task).
+                    _ = exited_rx.changed() => break,
+                    // The internal close flag (main sessions).
+                    _ = changed_or_inert(&mut internal_rx) => break,
+                    // The external close (subagent cancel); a `None`
+                    // receiver is inert (main sessions).
+                    _ = changed_or_inert(&mut block_rx) => break,
+                }
+            }
 
-                    // BLOCK until close_session OR agent death OR the
-                    // external close. A clean incoming EOF does NOT cancel
-                    // main_fn, so select on all three.
-                    let mut block_rx = ec_rx_task.clone();
-                    // The internal close flag is inert for SUBAGENTS (the
-                    // external close is their cancel path — the internal
-                    // sender is dropped, and a dropped sender's `changed()`
-                    // resolves immediately, which would tear the session
-                    // down right after establishment).
-                    let mut internal_rx = ec_rx_task.is_none().then_some(close_rx);
-                    tokio::select! {
-                        // The close kind was set by the closer before the
-                        // flag send and read by the task after this returns;
-                        // the closure itself does not decide the reason.
-                        _ = changed_or_inert(&mut internal_rx) => {}
-                        // Agent exited; the kind stays whatever the closer
-                        // (if any) already set — `None` means the agent
-                        // process exited on its own.
-                        _ = cx.incoming_closed() => {}
-                        // The external close (subagent cancel); a `None`
-                        // receiver is inert (main sessions).
-                        _ = changed_or_inert(&mut block_rx) => {}
-                    }
-                    Ok(())
-                })
-                .await;
-
-            // Connection returned (closed, agent died, or error): clean up.
-            // The reason comes from the close kind the closer recorded: a
-            // kind set before the flag send wins; `None` means the agent
-            // process exited on its own and nobody closed it.
+            // The session is over: clean up. The reason comes from the close
+            // kind the closer recorded: a kind set before the flag send
+            // wins; `None` means the agent process exited on its own and
+            // nobody closed it.
             let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
             let reason = match kind {
                 Some(CloseKind::User) => ClosedReason::User,
                 None => ClosedReason::AgentExited,
             };
-            if let Ok(session_id) = session_id_rx.await {
-                sessions_arc.lock().await.remove(&session_id);
-                // Keys are `"{session_id}/{request_id}"` — match on the
-                // trailing-slash prefix so closing "s1" does not cancel
-                // the pending prompt of the longer session "s10".
-                let prefix = permission::session_key_prefix(&session_id.to_string());
-                pending_permissions_arc
-                    .lock()
-                    .await
-                    .retain(|key, _| !key.starts_with(&prefix));
-                // Drain this session's pending bridge requests too (dropping
-                // the senders cancels the spawned waiters, which write the
-                // terminal `error:"cancelled"` frame). The `session_id` is
-                // only known here, so this drain is nested in the guard.
-                let bridge_prefix = bridge::session_key_prefix(&session_id.to_string());
-                pending_bridge_arc
-                    .lock()
-                    .await
-                    .retain(|key, _| !key.starts_with(&bridge_prefix));
-                sink.emit(
-                    "session-closed",
-                    serde_json::json!({
-                        "sessionId": session_id.to_string(),
-                        "reason": reason.as_str(),
-                    }),
-                );
+            // Guard by the generation token (captured above): a
+            // SUPERSEDED driver (a resume overwrote this entry under the
+            // same session id) must not clobber the replacement's entry.
+            let mut sessions = sessions_arc.lock().await;
+            if sessions
+                .get(&info.session_id)
+                .is_some_and(|l| l.generation == live_generation)
+            {
+                sessions.remove(&info.session_id);
             }
+            // Keys are `"{session_id}/{request_id}"` — match on the
+            // trailing-slash prefix so closing "s1" does not cancel
+            // the pending prompt of the longer session "s10".
+            let prefix = permission::session_key_prefix(&info.session_id);
+            pending_permissions_arc
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&prefix));
+            // Drain this session's pending bridge requests too (dropping
+            // the senders cancels the spawned waiters, which write the
+            // terminal `error:"cancelled"` frame).
+            let bridge_prefix = bridge::session_key_prefix(&info.session_id);
+            pending_bridge_arc
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&bridge_prefix));
+            sink.emit(
+                "session-closed",
+                json!({
+                    "sessionId": info.session_id,
+                    "reason": reason.as_str(),
+                }),
+            );
             // Tear the bridge listener down UNCONDITIONALLY (do NOT nest it
-            // inside the `session_id` guard, or a failed `connect_with` /
-            // `session/new` would leak the listener): stop the accept loop +
-            // unlink the socket (Unix; Windows pipes vanish on last close).
+            // inside the session guard, or a failed establisher would leak
+            // the listener): stop the accept loop + unlink the socket
+            // (Unix; Windows pipes vanish on last close).
             bridge::teardown(bridge_handle);
         });
 
-        // Await the connection, then the established session.
-        let cx = ready_rx
-            .await
-            .map_err(|_| AcpError::SpawnFailed { hint: hint.clone() })?;
+        // Await the established session.
         let info = match session_ready_rx.await {
             Ok(info) => info,
             Err(_) => {
-                // The closure never delivered an established session: either
+                // The driver never delivered an established session: either
                 // the establisher failed (it sent the error first) or the
-                // connection died mid-establish.
+                // child died mid-establish.
                 match error_rx.try_recv() {
-                    Ok(err) => return Err(map_establish_error(agent_id, err)),
+                    Ok(err) => return Err(err),
                     Err(_) => {
-                        return Err(AcpError::InitializeFailed {
-                            detail: "agent did not complete initialize/session-new".to_string(),
+                        return Err(RpcError::EstablishTimeout {
+                            detail: format!("agent did not complete establish ({hint})"),
                         })
                     }
                 }
@@ -679,20 +851,120 @@ impl SessionDriver {
         };
 
         let live = LiveSession {
-            cx,
+            handle,
+            generation: live_generation,
             session_id: info.session_id.clone(),
             cwd,
             agent_id: agent_id.to_string(),
             close_tx: ec_tx.unwrap_or_else(|| close_tx.clone()),
             close_kind: kind,
             thought_state,
+            pending_turn: Arc::new(StdMutex::new(None)),
+            cancel_requested: Arc::new(StdMutex::new(false)),
+            settle_rx,
         };
         self.sessions
             .lock()
             .await
-            .insert(info.session_id.clone(), live);
+            .insert(live.session_id.clone(), live);
 
         Ok(info)
+    }
+    /// Await the session's next turn settle (the driver's `agent_settled` watch).
+    ///
+    /// UNBOUNDED (like the ACP subagent prompt await): the wait ends on the
+    /// turn's `agent_settled` OR on a teardown (the driver task ending DROPS
+    /// the watch sender, which resolves `changed()`). `Ok(reason)` when a
+    /// settle was recorded (the `cancel_requested` flag already mapped it to
+    /// `Cancelled`); `Err` when the session vanished or the agent died without
+    /// settling.
+    pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, RpcError> {
+        let mut rx = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .map(|l| l.settle_rx.clone())
+                .ok_or_else(|| RpcError::UnknownSession {
+                    id: session_id.to_string(),
+                })?
+        };
+        // `borrow_and_update` marks the current value as seen: `changed()` then
+        // fires only on a LATER change (or a sender drop).
+        let (seq, _) = *rx.borrow_and_update();
+        if seq == 0 {
+            let _ = rx.changed().await;
+        }
+        let (seq, reason) = *rx.borrow();
+        if seq == 0 {
+            // The sender was dropped without a settle (the agent died
+            // mid-turn, or the session was torn down).
+            Err(RpcError::ProcessExited(None))
+        } else {
+            Ok(reason)
+        }
+    }
+}
+
+/// Resolve the session's pending turn (a `send_prompt` awaiting its
+/// `agent_settled`): a `cancel_requested` flag maps the settle to
+/// `Cancelled`, else `EndTurn`. A no-op when no turn is in flight.
+async fn resolve_pending_turn(
+    sessions: &Arc<Mutex<HashMap<String, LiveSession>>>,
+    session_id: &str,
+) {
+    if let Some(live) = sessions.lock().await.get(session_id) {
+        if let Some(tx) = live
+            .pending_turn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let cancelled = *live
+                .cancel_requested
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let _ = tx.send(if cancelled {
+                StopReason::Cancelled
+            } else {
+                StopReason::EndTurn
+            });
+        }
+    }
+}
+
+/// Re-synthesize the session's config options after a `thinking_level_changed`
+/// (the normalizer has no model list — the fetch is async, so this lives in
+/// the driver task): `get_state` (the current model + level) +
+/// `get_available_models` + `get_available_thinking_levels` → emit a
+/// `config_option_update` with the fresh options. A no-op (silently) when
+/// any fetch fails (a config refresh is a convenience, not a correctness
+/// signal).
+async fn resynthesize_config_options(
+    handle: &PiRpcHandle,
+    session_id: &str,
+    sink: &Arc<dyn EventSink>,
+) {
+    let Ok(state) = handle.send(json!({ "type": "get_state" })).await else {
+        return;
+    };
+    let models = handle
+        .send(json!({ "type": "get_available_models" }))
+        .await
+        .ok()
+        .and_then(|v| v.get("models").cloned());
+    let levels = handle
+        .send(json!({ "type": "get_available_thinking_levels" }))
+        .await
+        .ok()
+        .and_then(|v| v.get("levels").cloned());
+    if let Some(opts) = synthesize_config_options(&state, models.as_ref(), levels.as_ref()) {
+        sink.emit(
+            "session-update",
+            json!({
+                "sessionId": session_id,
+                "update": { "sessionUpdate": "config_option_update", "configOptions": opts },
+            }),
+        );
     }
 }
 
@@ -775,35 +1047,15 @@ impl SessionManager {
     /// Reset the session's open thinking segment at a prompt boundary. The
     /// frontend's `addUserMessage` starts a new thinking block on a user
     /// message, but `persist_update` never sees user messages (they are
-    /// recorded by the `send_prompt` paths, not the notification handler) —
+    /// recorded by the `send_prompt` paths, not the event normalizer) —
     /// so the Rust accumulator must be reset here, not in `persist_update`.
     pub async fn begin_user_turn(&self, session_id: &str) {
-        let sid = SessionId::new(session_id);
-        if let Some(live) = self.driver.sessions.lock().await.get(&sid) {
+        if let Some(live) = self.driver.sessions.lock().await.get(session_id) {
             live.thought_state
                 .lock()
                 .expect("thought state poisoned")
                 .open_key = None;
         }
-    }
-
-    /// Clone the (cheap) connection handle of a live session.
-    ///
-    /// Commands that must NOT hold the manager lock across an await (e.g.
-    /// `send_prompt`, whose turn can span a user-paced permission prompt)
-    /// use this to grab the connection, drop the lock, and then drive the
-    /// request.
-    pub async fn connection(&self, session_id: &str) -> Result<ConnectionTo<Agent>, AcpError> {
-        let sid = SessionId::new(session_id);
-        self.driver
-            .sessions
-            .lock()
-            .await
-            .get(&sid)
-            .map(|live| live.cx.clone())
-            .ok_or_else(|| AcpError::UnknownSession {
-                session_id: session_id.to_string(),
-            })
     }
 
     /// Number of live sessions.
@@ -827,49 +1079,46 @@ impl SessionManager {
         }
     }
 
-    /// Spawn an agent, initialize it, create a session, and register it.
+    /// Spawn a pi agent, establish the session (`get_state`), and register
+    /// it.
     ///
     /// Returns the [`SessionInfo`] once the session is established. The
-    /// connection is driven by a background task that lives for the session's
+    /// child is driven by a background task that lives for the session's
     /// lifetime; it is torn down by [`Self::close_session`] or agent death.
     pub async fn start_session(
         &self,
         agent_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, AcpError> {
+    ) -> Result<SessionInfo, RpcError> {
         // Canonicalize BEFORE the registry lookup and before the space row is
         // touched: the spaces join key is the canonicalized cwd, so a
         // `~/x` / symlink spelling must not produce a different row.
-        let cwd = std::fs::canonicalize(&cwd).map_err(|_| AcpError::FolderMissing {
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| RpcError::FolderMissing {
             path: cwd.display().to_string(),
         })?;
 
         let entry = self
             .registry
             .get(agent_id)
-            .ok_or_else(|| AcpError::UnknownAgent {
-                agent_id: agent_id.to_string(),
+            .ok_or_else(|| RpcError::UnknownAgent {
+                id: agent_id.to_string(),
             })?;
 
         // Bridge wiring (ADR 0003): for a bridge agent (on a platform where
         // the bridge is available — NOT macOS), set the 4 bridge env vars
         // and pass the (client session id, socket path) to the driver so it
         // starts the peer-verified listener before the spawn returns. For a
-        // NEW session the client session id is a fresh UUID (the ACP
-        // `session_id` is agent-generated and does not exist yet).
+        // NEW session the client session id is a fresh UUID (the pi
+        // `sessionId` does not exist until the session is established).
         let client_session_id = uuid::Uuid::new_v4().to_string();
         let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id) {
             Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
             None => (entry.env.clone(), None),
         };
 
-        let agent = AcpAgent::new(
-            AcpAgentConfig::new(entry.command.clone())
-                .args(entry.args.clone())
-                .envs(agent_env),
-        );
-        let hint = spawn_hint(&entry.command);
+        let rpc = PiRpc::spawn(&entry.command, &entry.args, &agent_env, &cwd)?;
+        let handle = rpc.handle();
 
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
@@ -877,42 +1126,44 @@ impl SessionManager {
         let info = self
             .driver
             .drive_session(
-                agent,
+                handle,
                 agent_id,
-                hint,
+                spawn_hint(&entry.command),
                 cwd,
                 sink,
                 bridge_setup,
                 None,
-                move |cx| async move {
-                    let init = cx
-                        .send_request(
-                            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                                ClientCapabilities::default()
-                                    .fs(FileSystemCapabilities::default()
-                                        .read_text_file(true)
-                                        .write_text_file(true))
-                                    .terminal(false),
-                            ),
-                        )
-                        .block_task()
-                        .await?;
-
-                    let new_session = cx
-                        .send_request(NewSessionRequest::new(cwd_owned.clone()))
-                        .block_task()
-                        .await?;
-
-                    Ok((
-                        new_session.session_id.clone(),
-                        SessionInfo {
-                            session_id: new_session.session_id.clone(),
-                            agent_id: agent_id_owned,
-                            cwd: cwd_owned,
-                            capabilities: init.agent_capabilities,
-                            config_options: new_session.config_options.clone(),
-                        },
-                    ))
+                move |handle: PiRpcHandle| async move {
+                    // The establisher: `get_state` (the session's identity)
+                    // + the config-option sources (models / levels —
+                    // lenient: a missing source just means no selectors).
+                    let state = handle.send(json!({ "type": "get_state" })).await?;
+                    let session_id = state
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let models = handle
+                        .send(json!({ "type": "get_available_models" }))
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("models").cloned());
+                    let levels = handle
+                        .send(json!({ "type": "get_available_thinking_levels" }))
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("levels").cloned());
+                    Ok(SessionInfo {
+                        session_id,
+                        agent_id: agent_id_owned,
+                        cwd: cwd_owned,
+                        capabilities: build_capabilities(&state),
+                        config_options: synthesize_config_options(
+                            &state,
+                            models.as_ref(),
+                            levels.as_ref(),
+                        ),
+                    })
                 },
             )
             .await?;
@@ -921,120 +1172,133 @@ impl SessionManager {
         Ok(info)
     }
 
-    /// Resume a stored session: spawn a fresh agent for `agent_id`,
-    /// initialize it (same client capabilities as a new session), then
-    /// `session/load` the given session id — the two-argument form
-    /// (`session_id` + `cwd`) — and consume the returned
-    /// `RestoreSessionBuilder` exactly like the session builder
-    /// (`.block_task().start_session().await`).
+    /// Resume a stored session: spawn a fresh pi for `agent_id` WITH
+    /// `--session <stored pi session file>` (the child loads the stored
+    /// session at startup), then establish (`get_state` + `get_messages`
+    /// replay — `get_messages` returns the LOADED session's transcript).
     ///
     /// The driver-task lifecycle is shared verbatim with
-    /// [`Self::start_session`] (same [`LiveSession`] storage, same
-    /// `select!` on close / agent death, same cleanup and `session-closed`
-    /// emit); only the `NewSessionRequest` is replaced by `session/load`.
+    /// [`Self::start_session`]; only the establisher differs.
     ///
-    /// If the agent does not advertise `agent_capabilities.load_session`,
-    /// this returns [`AcpError::NotResumable`] and the caller should fall
-    /// back to history-only viewing.
+    /// Returns [`RpcError::NotResumable`] when the stored session has no
+    /// pi session file (a legacy ACP row, or a `--no-session` run — the UI
+    /// shows the history-only banner instead).
     pub async fn resume_session(
         &self,
         agent_id: &str,
         session_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, AcpError> {
+    ) -> Result<SessionInfo, RpcError> {
         // Canonicalize BEFORE the registry lookup (same rationale as
-        // `start_session`): everything downstream (the `session/load` cwd,
+        // `start_session`): everything downstream (the spawn cwd,
         // `SessionInfo.cwd`, the space join key) uses the canonical path.
-        let cwd = std::fs::canonicalize(&cwd).map_err(|_| AcpError::FolderMissing {
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| RpcError::FolderMissing {
             path: cwd.display().to_string(),
         })?;
 
         let entry = self
             .registry
             .get(agent_id)
-            .ok_or_else(|| AcpError::UnknownAgent {
-                agent_id: agent_id.to_string(),
+            .ok_or_else(|| RpcError::UnknownAgent {
+                id: agent_id.to_string(),
             })?;
 
+        // Read the stored capability envelope (the `piSessionFile` is the
+        // `--session` argument). A missing row / unparseable envelope /
+        // absent `piSessionFile` is unresumable (a legacy ACP row or a
+        // `--no-session` run).
+        let caps_json = self
+            .driver
+            .db
+            .as_ref()
+            .and_then(|db| db.session(session_id).ok().flatten())
+            .map(|row| row.capabilities_json)
+            .ok_or_else(|| RpcError::NotResumable {
+                id: session_id.to_string(),
+            })?;
+        let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
+        let session_file = caps
+            .get("piSessionFile")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::NotResumable {
+                id: session_id.to_string(),
+            })?;
+
+        // The restored transcript is replaced by the agent's replay, which
+        // doubles as the authoritative history: clear the stored rows
+        // BEFORE the spawn so a replay reusing a known `messageId`
+        // overwrites (rather than clobbers) and a replay under a new id
+        // does not duplicate the stored text.
+        if let Some(db) = &self.driver.db {
+            let _ = db.clear_messages_for(session_id);
+        }
+
         // Bridge wiring (ADR 0003): same as `start_session`, but the client
-        // session id is the STORED `session_id` (a resume re-uses it, so the
-        // agent's `session` push echoes the same id the desktop set).
+        // session id is the STORED `session_id` (a resume re-uses it, so
+        // the agent's `session` push echoes the same id the desktop set).
         let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, session_id) {
             Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
             None => (entry.env.clone(), None),
         };
 
-        let agent = AcpAgent::new(
-            AcpAgentConfig::new(entry.command.clone())
-                .args(entry.args.clone())
-                .envs(agent_env),
-        );
-        let hint = spawn_hint(&entry.command);
+        // The resume spawn LOADS the pi session: `--session <file>` (the
+        // stored `piSessionFile`) so `get_messages` returns the loaded
+        // transcript, not an empty fresh session.
+        let mut args = entry.args.clone();
+        args.push("--session".to_string());
+        args.push(session_file.to_string());
 
-        let sid = SessionId::new(session_id);
+        let rpc = PiRpc::spawn(&entry.command, &args, &agent_env, &cwd)?;
+        let handle = rpc.handle();
+
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
         let db = self.driver.db.clone();
+        let session_id_owned = session_id.to_string();
 
         let info = self
             .driver
             .drive_session(
-                agent,
+                handle,
                 agent_id,
-                hint,
+                spawn_hint(&entry.command),
                 cwd,
                 sink,
                 bridge_setup,
                 None,
-                move |cx| async move {
-                    let init = cx
-                        .send_request(
-                            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                                ClientCapabilities::default()
-                                    .fs(FileSystemCapabilities::default()
-                                        .read_text_file(true)
-                                        .write_text_file(true))
-                                    .terminal(false),
-                            ),
-                        )
-                        .block_task()
-                        .await?;
-
-                    if !init.agent_capabilities.load_session {
-                        // Honest resume semantics: an agent that cannot load a
-                        // session must not pretend to. The UI shows the
-                        // history-only banner instead.
-                        return Err(agent_client_protocol::util::internal_error(
-                            "agent does not support session/load",
-                        ));
-                    }
-
-                    // The restored transcript is replaced by the agent's replay,
-                    // which doubles as the authoritative history: clear the
-                    // stored rows BEFORE `session/load` so a replay reusing a
-                    // known `messageId` overwrites (rather than clobbers) and a
-                    // replay under a new id does not duplicate the stored text.
+                move |handle: PiRpcHandle| async move {
+                    // The establisher: `get_state` (now reflects the loaded
+                    // session) + `get_messages` (the loaded transcript) →
+                    // replay the stored rows (user rows persisted directly;
+                    // assistant / toolResult messages through the
+                    // normalizer per the replay-feed rule).
+                    let state = handle.send(json!({ "type": "get_state" })).await?;
+                    let messages = handle.send(json!({ "type": "get_messages" })).await?;
                     if let Some(db) = &db {
-                        let _ = db.clear_messages_for(&sid.to_string());
+                        replay_messages(db, &session_id_owned, &messages);
                     }
-
-                    let restored = cx
-                        .load_session(sid.clone(), cwd_owned.as_path())
-                        .block_task()
-                        .start_session()
-                        .await?;
-
-                    Ok((
-                        sid.clone(),
-                        SessionInfo {
-                            session_id: sid,
-                            agent_id: agent_id_owned,
-                            cwd: cwd_owned,
-                            capabilities: init.agent_capabilities,
-                            config_options: restored.response().config_options.clone(),
-                        },
-                    ))
+                    let models = handle
+                        .send(json!({ "type": "get_available_models" }))
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("models").cloned());
+                    let levels = handle
+                        .send(json!({ "type": "get_available_thinking_levels" }))
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("levels").cloned());
+                    Ok(SessionInfo {
+                        session_id: session_id_owned,
+                        agent_id: agent_id_owned,
+                        cwd: cwd_owned,
+                        capabilities: build_capabilities(&state),
+                        config_options: synthesize_config_options(
+                            &state,
+                            models.as_ref(),
+                            levels.as_ref(),
+                        ),
+                    })
                 },
             )
             .await?;
@@ -1045,115 +1309,224 @@ impl SessionManager {
 
     /// Send a prompt to a live session and wait for the turn to finish.
     ///
-    /// Returns the [`StopReason`] the agent reported (the frontend needs the
-    /// turn-completion signal).
+    /// Returns the [`StopReason`] the turn resolved to (the frontend needs
+    /// the turn-completion signal).
     pub async fn send_prompt(
         &self,
         session_id: &str,
         text: String,
-    ) -> Result<StopReason, AcpError> {
+    ) -> Result<StopReason, RpcError> {
         self.send_prompt_with_images(session_id, text, Vec::new())
             .await
     }
 
     /// Like `send_prompt`, but with image attachments: validates them
-    /// (`prompt::build_prompt_blocks`), appends `ContentBlock::Image` blocks
-    /// (text first), and persists `{ "text", "images": [...] }` in the
-    /// transcript (the `images` key omitted when empty — ADR 0008).
+    /// (`validate_images`), appends pi `image` content (text first), and
+    /// persists `{ "text", "images": [...] }` in the transcript (the
+    /// `images` key omitted when empty — ADR 0008).
+    ///
+    /// The user-row persistence lives SOLELY here (the command delegates to
+    /// this method and adds NO persistence of its own — a double write
+    /// would show a duplicate user bubble). The turn resolves on
+    /// `agent_settled` (the driver's `pending_turn` oneshot): a
+    /// `success: false` prompt response maps to `Refusal`, a cancel maps to
+    /// `Cancelled` (the `cancel_requested` flag), everything else to
+    /// `EndTurn`.
     pub async fn send_prompt_with_images(
         &self,
         session_id: &str,
         text: String,
         images: Vec<ImagePayload>,
-    ) -> Result<StopReason, AcpError> {
-        let sid = SessionId::new(session_id);
-        // Clone just the (cheap) connection handle, not the whole LiveSession.
-        let cx = {
+    ) -> Result<StopReason, RpcError> {
+        // Clone just the (cheap) handle, not the whole LiveSession.
+        let (handle, pending_turn, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
-            sessions
-                .get(&sid)
-                .map(|live| live.cx.clone())
-                .ok_or_else(|| AcpError::UnknownSession {
-                    session_id: session_id.to_string(),
-                })?
+            let live = sessions
+                .get(session_id)
+                .map(|l| {
+                    (
+                        l.handle.clone(),
+                        l.pending_turn.clone(),
+                        l.cancel_requested.clone(),
+                    )
+                })
+                .ok_or_else(|| RpcError::UnknownSession {
+                    id: session_id.to_string(),
+                })?;
+            live
         };
 
         // Validate the images FIRST: a rejected payload must NOT be written
         // to the transcript and must NOT start a user turn — validating
         // before persisting is what keeps the "cap bounds DB growth"
         // guarantee real.
-        let blocks = prompt::build_prompt_blocks(&text, &images)?;
+        validate_images(&images)?;
 
         // Record the user's message in the transcript (the client owns
         // history) before the turn begins.
         self.begin_user_turn(session_id).await;
         if let Some(db) = &self.driver.db {
-            let payload = prompt::user_message_payload(&text, &images);
+            let payload = user_message_payload(&text, &images);
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
 
-        let request = PromptRequest::new(sid, blocks);
-        let response =
-            cx.send_request(request)
-                .block_task()
-                .await
-                .map_err(|err| AcpError::Protocol {
-                    message: err.message,
-                })?;
-        Ok(response.stop_reason)
+        // Build the prompt command: the text message + the image content
+        // (pi's `ImageContent` = `{type: "image", data, mimeType}` — the
+        // `ImagePayload` maps onto it verbatim; the `name` / `sizeBytes`
+        // are transcript-only, not wire fields).
+        let mut command = json!({ "type": "prompt", "message": text });
+        if !images.is_empty() {
+            command["images"] = Value::Array(
+                images
+                    .iter()
+                    .map(|img| {
+                        json!({
+                            "type": "image",
+                            "data": img.data,
+                            "mimeType": img.mime_type,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        // A prompt while the session is already streaming is a STEER (the
+        // turn continues with the new input — the frontend's composer is
+        // locked until the turn resolves, so a concurrent send means the
+        // previous turn is still running).
+        if let Ok(state) = handle.send(json!({ "type": "get_state" })).await {
+            if state.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+                command["streamingBehavior"] = json!("steer");
+            }
+        }
+
+        // Store the turn's resolver (last-wins: a replaced turn's sender is
+        // dropped → its `send_prompt` resolves `Cancelled` below) and reset
+        // the cancel flag (a fresh turn is not a cancel).
+        let (tx, rx) = oneshot::channel::<StopReason>();
+        {
+            let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+            *slot = Some(tx);
+        }
+        *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = false;
+
+        // Send the prompt. The response arrives after preflight (start of
+        // turn); a `success: false` response is a REFUSAL — emit the error
+        // as a chunk (the user sees it) and resolve the turn `Refusal`
+        // without waiting for a settle that never comes.
+        match handle.send(command).await {
+            Ok(_) => {}
+            Err(RpcError::Command { error }) => {
+                let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(tx) = slot.take() {
+                    let _ = tx.send(StopReason::Refusal);
+                }
+                return Err(RpcError::Command { error });
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Await the turn (unbounded — the turn can block on a user-paced
+        // permission prompt). A dropped resolver (replaced by a new prompt,
+        // or the session died) maps to `Cancelled`.
+        match rx.await {
+            Ok(reason) => Ok(reason),
+            Err(_) => Ok(StopReason::Cancelled),
+        }
     }
 
-    /// Cancel the session's in-flight prompt turn (ACP `session/cancel`
-    /// notification — no response expected). The agent aborts the turn and
-    /// resolves the original `session/prompt` request with
-    /// `StopReason::Cancelled` (which is what completes the in-flight
-    /// `send_prompt` and unlocks the composer). Fire-and-forget on the agent
-    /// side: a no-op if there is no in-flight turn.
-    pub async fn cancel_session(&self, session_id: &str) -> Result<(), AcpError> {
-        let cx = self.connection(session_id).await?;
-        cx.send_notification(ClientNotification::CancelNotification(
-            CancelNotification::new(SessionId::new(session_id)),
-        ))
-        .map_err(|err| AcpError::Protocol {
-            message: err.message,
-        })?;
+    /// Cancel the session's in-flight prompt turn (the pi `abort` command —
+    /// the agent aborts the turn and settles it). The `cancel_requested`
+    /// flag is set BEFORE the `abort` is sent so a fast settle maps to
+    /// `Cancelled`, not `EndTurn`. Fire-and-forget on the agent side: a
+    /// no-op if there is no in-flight turn.
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), RpcError> {
+        let (handle, cancel_requested) = {
+            let sessions = self.driver.sessions.lock().await;
+            let live = sessions
+                .get(session_id)
+                .map(|l| (l.handle.clone(), l.cancel_requested.clone()))
+                .ok_or_else(|| RpcError::UnknownSession {
+                    id: session_id.to_string(),
+                })?;
+            live
+        };
+        *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        handle.send(json!({ "type": "abort" })).await?;
         Ok(())
     }
-
-    /// Set a session config option (e.g. the model) on a live session.
+    /// Set a session config option (the model or the thinking level) on a
+    /// live session.
     ///
-    /// Clones the (cheap) connection handle, drops the lock, sends
-    /// `session/set_config_option`, and returns the agent's updated
-    /// `configOptions` (the agent also emits a `config_option_update`
-    /// notification — the two paths converge to the same state).
+    /// Sends the pi command (`set_model` — the value is parsed as
+    /// `"<provider>/<modelId>"`; `set_thinking_level`), then re-synthesizes
+    /// the config options from the fresh `get_state` and emits a
+    /// `config_option_update` (pi does not emit one itself — the client
+    /// owns the frame).
     pub async fn set_config_option(
         &self,
         session_id: &str,
         config_id: &str,
         value: &str,
-    ) -> Result<Vec<SessionConfigOption>, AcpError> {
-        let sid = SessionId::new(session_id);
-        let cx = {
+        sink: &Arc<dyn EventSink>,
+    ) -> Result<Vec<Value>, RpcError> {
+        let handle = {
             let sessions = self.driver.sessions.lock().await;
             sessions
-                .get(&sid)
-                .map(|live| live.cx.clone())
-                .ok_or_else(|| AcpError::UnknownSession {
-                    session_id: session_id.to_string(),
+                .get(session_id)
+                .map(|l| l.handle.clone())
+                .ok_or_else(|| RpcError::UnknownSession {
+                    id: session_id.to_string(),
                 })?
         };
-        // `SessionConfigId` has `From` ONLY for `Arc<str>` / `String` /
-        // `&'static str` — a borrowed `&str` does NOT convert; wrap it.
-        let request =
-            SetSessionConfigOptionRequest::new(sid, SessionConfigId::new(config_id), value);
-        let response =
-            cx.send_request(request)
-                .block_task()
-                .await
-                .map_err(|err| AcpError::Protocol {
-                    message: err.message,
-                })?;
-        Ok(response.config_options)
+
+        // The config id → the pi command. `model` values are
+        // `"<provider>/<modelId>"` (the synthesizer's option values).
+        let command = match config_id {
+            "model" => {
+                let (provider, model_id) =
+                    value
+                        .split_once('/')
+                        .ok_or_else(|| RpcError::InvalidPrompt {
+                            reason: format!(
+                                "invalid model value: {value} (expected provider/modelId)"
+                            ),
+                        })?;
+                json!({ "type": "set_model", "provider": provider, "modelId": model_id })
+            }
+            "thought_level" => json!({ "type": "set_thinking_level", "level": value }),
+            other => {
+                return Err(RpcError::Command {
+                    error: format!("unknown config option: {other}"),
+                })
+            }
+        };
+        handle.send(command).await?;
+
+        // Re-synthesize + emit (the agent does not emit a
+        // `config_option_update` itself).
+        let state = handle.send(json!({ "type": "get_state" })).await?;
+        let models = handle
+            .send(json!({ "type": "get_available_models" }))
+            .await
+            .ok()
+            .and_then(|v| v.get("models").cloned());
+        let levels = handle
+            .send(json!({ "type": "get_available_thinking_levels" }))
+            .await
+            .ok()
+            .and_then(|v| v.get("levels").cloned());
+        let options = synthesize_config_options(&state, models.as_ref(), levels.as_ref())
+            .ok_or_else(|| RpcError::Command {
+                error: "no config options available".to_string(),
+            })?;
+        sink.emit(
+            "session-update",
+            json!({
+                "sessionId": session_id,
+                "update": { "sessionUpdate": "config_option_update", "configOptions": options },
+            }),
+        );
+        Ok(options)
     }
 
     /// Deliver the user's answer to a pending permission request.
@@ -1168,7 +1541,7 @@ impl SessionManager {
         session_id: &str,
         request_id: &str,
         outcome: permission::PermissionOutcome,
-    ) -> Result<bool, AcpError> {
+    ) -> Result<bool, RpcError> {
         let key = permission::permission_key(session_id, request_id);
         let sender = self.driver.pending_permissions.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the prompt was
@@ -1197,7 +1570,7 @@ impl SessionManager {
         session_id: &str,
         request_id: &str,
         result: serde_json::Value,
-    ) -> Result<bool, AcpError> {
+    ) -> Result<bool, RpcError> {
         let key = bridge::bridge_key(session_id, request_id);
         let sender = self.driver.pending_bridge.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the request was
@@ -1217,19 +1590,19 @@ impl SessionManager {
     /// `async` because it must lock the sessions map to find the session.
     /// Records the `User` close kind (first-set-wins) and sends the close
     /// flag; the driver task performs the map removal and the
-    /// `session-closed` emit.
-    pub async fn close_session(&self, session_id: &str) -> Result<(), AcpError> {
-        let sid = SessionId::new(session_id);
-        // Clone just the close flag's sender and the shared close kind (both
-        // cheaply cloneable).
-        let (close_tx, close_kind) = {
+    /// `session-closed` emit. The handle's `close` is idempotent (the
+    /// driver teardown may also call it): closing the child's stdin is the
+    /// clean pi shutdown (its `onInputEnd` → exit 0).
+    pub async fn close_session(&self, session_id: &str) -> Result<(), RpcError> {
+        let (close_tx, close_kind, handle) = {
             let sessions = self.driver.sessions.lock().await;
-            sessions
-                .get(&sid)
-                .map(|live| (live.close_tx.clone(), live.close_kind.clone()))
-                .ok_or_else(|| AcpError::UnknownSession {
-                    session_id: session_id.to_string(),
-                })?
+            let live = sessions
+                .get(session_id)
+                .map(|l| (l.close_tx.clone(), l.close_kind.clone(), l.handle.clone()))
+                .ok_or_else(|| RpcError::UnknownSession {
+                    id: session_id.to_string(),
+                })?;
+            live
         };
         // Decide the kind BEFORE starting the close. First-set-wins: a kind
         // already present means the close is in progress (another setter won
@@ -1241,108 +1614,621 @@ impl SessionManager {
                 *kind = Some(CloseKind::User);
             }
         }
-        close_tx.send(true).map_err(|_| AcpError::Protocol {
-            message: "session already closed".to_string(),
-        })?;
+        close_tx
+            .send(true)
+            .map_err(|_| RpcError::Io("session already closed".to_string()))?;
+        // Close the child's stdin (idempotent — the driver teardown may
+        // close it too): a clean pi shutdown.
+        handle.close().await;
         Ok(())
     }
 }
 
-/// Map an establisher failure to an [`AcpError`]. The
-/// "does not support session/load" marker becomes [`AcpError::NotResumable`];
-/// the establishment-timeout marker becomes [`AcpError::InitializeFailed`].
-fn map_establish_error(agent_id: &str, err: ProtocolError) -> AcpError {
-    let data = err.data.as_ref().and_then(Value::as_str);
-    if data == Some("agent does not support session/load") {
-        return AcpError::NotResumable {
-            agent_id: agent_id.to_string(),
-        };
+/// The session's capability envelope (item 1 of the swap plan) built from a
+/// `get_state` payload:
+///
+/// ```json
+/// {
+///   "piSessionId": "<sessionId>",
+///   "piSessionFile": "<sessionFile>",        // ABSENT when get_state omits it
+///   "model": "<provider>/<modelId>",        // ABSENT when the model is absent
+///   "thinkingLevel": "<level>",
+///   "loadSession": <sessionFile was present>,
+///   "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false }
+/// }
+/// ```
+///
+/// The two trailing keys are load-bearing, not decoration: the frontend's
+/// Resume button gates on `loadSession === true` and image sending
+/// fail-closes on `promptCapabilities.image === true`.
+fn build_capabilities(state: &Value) -> Value {
+    let mut caps = json!({
+        "piSessionId": state.get("sessionId").cloned().unwrap_or(Value::Null),
+        "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": false,
+        },
+    });
+    if let Some(file) = state.get("sessionFile") {
+        caps["piSessionFile"] = file.clone();
     }
-    if data.is_some_and(|d| d.starts_with("agent did not answer initialize within")) {
-        return AcpError::InitializeFailed {
-            detail: data.unwrap().to_string(),
-        };
+    // `model` is OPTIONAL in `RpcSessionState` (absent for a session with no
+    // model — e.g. a fresh `--no-session` run before the first model
+    // selection): the key is omitted, not nulled.
+    if let Some(model) = state.get("model") {
+        let provider = model
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+        caps["model"] = Value::String(format!("{provider}/{id}"));
     }
-    AcpError::Protocol {
-        message: err.message,
+    if let Some(level) = state.get("thinkingLevel") {
+        caps["thinkingLevel"] = level.clone();
+    }
+    // `loadSession` is the frontend's Resume-button gate: a session with no
+    // file (`--no-session`) is unresumable.
+    caps["loadSession"] = json!(state.get("sessionFile").is_some());
+    caps
+}
+
+/// Synthesize the session's config options (the model / thinking-level
+/// selectors) from a `get_state` payload + the available models / levels.
+///
+/// The field names mirror the frontend's `SessionConfigOption` type
+/// (`tauri.ts`); the frontend also supports GROUPED options, but the
+/// synthesizer emits flat lists only (parity with what the agent
+/// advertises). `None` when there is nothing to synthesize (no model AND
+/// no levels).
+fn synthesize_config_options(
+    state: &Value,
+    models: Option<&Value>,
+    levels: Option<&Value>,
+) -> Option<Vec<Value>> {
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(models) = models.and_then(Value::as_array) {
+        // The current model is `"<provider>/<modelId>"` (the option value
+        // form); absent → no model selector (nothing to select).
+        if let Some(current) = state.get("model").and_then(|m| {
+            m.get("provider")
+                .and_then(Value::as_str)
+                .zip(m.get("id").and_then(Value::as_str))
+                .map(|(p, i)| format!("{p}/{i}"))
+        }) {
+            let options: Vec<Value> = models
+                .iter()
+                .filter_map(|m| {
+                    m.get("provider")
+                        .and_then(Value::as_str)
+                        .zip(m.get("id").and_then(Value::as_str))
+                        .map(|(p, i)| {
+                            json!({
+                                "value": format!("{p}/{i}"),
+                                "name": m.get("name").and_then(Value::as_str).unwrap_or(i),
+                            })
+                        })
+                })
+                .collect();
+            out.push(json!({
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": current,
+                "options": options,
+            }));
+        }
+    }
+    if let Some(levels) = levels.and_then(Value::as_array) {
+        let current = state
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let options: Vec<Value> = levels
+            .iter()
+            .filter_map(|l| l.as_str().map(|s| s.to_string()))
+            .map(|s| {
+                // The display name is the capitalized level
+                // (`"medium"` → `"Medium"`).
+                let mut name = s.clone();
+                if let Some(c0) = name.chars().next() {
+                    name = format!("{}{}", c0.to_uppercase(), &name[c0.len_utf8()..]);
+                }
+                json!({ "value": s, "name": name })
+            })
+            .collect();
+        out.push(json!({
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": current,
+            "options": options,
+        }));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Map one pi event onto the FROZEN `session-update` JSON the frontend
+/// consumes (the ACP-era envelope shapes — `agent_message_chunk` /
+/// `agent_thought_chunk` / `tool_call` / `tool_call_update` /
+/// `session_info_update` / `config_option_update`). A pure function (no
+/// I/O): the driver feeds it the event + the session's `TurnState` and
+/// emits / persists the frames it returns.
+///
+/// No-frame events are bookkeeping (`agent_start` / `agent_end` /
+/// `turn_start` / `turn_end` / `queue_update` / `entry_appended` /
+/// `bash_execution_update` / `message_end` / `text_end` / `thinking_end` —
+/// the delta stream already delivered the content, and the authoritative
+/// `message_end` text is NOT re-emitted) or the turn's resolution signal
+/// (`agent_settled` — the driver resolves the pending turn, not a frame).
+fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
+    match e {
+        // `message_start` carries ANY `AgentMessage` (user / assistant /
+        // toolResult): advance the counter ONLY for `assistant` messages
+        // (a role-blind counter would number the first assistant chunk
+        // `m2` and make the `get_messages` replay numbering irreproducible).
+        RpcEvent::message_start { message } => {
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                st.msg_counter += 1;
+                st.current_message_id = Some(format!("m{}", st.msg_counter));
+            }
+            Vec::new()
+        }
+        RpcEvent::message_update {
+            assistant_message_event: ev,
+            ..
+        } => {
+            let mid = st
+                .current_message_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            match ev.get("type").and_then(Value::as_str) {
+                Some("text_delta") => vec![json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": ev.get("delta") },
+                    "messageId": mid,
+                })],
+                Some("thinking_delta") => vec![json!({
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": ev.get("delta") },
+                    "messageId": mid,
+                })],
+                // The `*_end` / `*_start` frames carry the authoritative
+                // (already streamed) content — no frame (re-emitting would
+                // double the text).
+                Some("text_start")
+                | Some("text_end")
+                | Some("thinking_start")
+                | Some("thinking_end") => Vec::new(),
+                Some("toolcall_start") => vec![json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": ev.get("id"),
+                    "title": ev.get("toolName"),
+                    "status": "in_progress",
+                    "rawInput": {},
+                })],
+                // Accumulate the partial-args JSON fragments; a complete
+                // object is sent as `rawInput`, an incomplete one as
+                // `partialArgs` (mirrors the pi-acp adapter's behavior).
+                Some("toolcall_delta") => {
+                    let Some(id) = ev.get("id").and_then(Value::as_str) else {
+                        return Vec::new();
+                    };
+                    let delta = ev.get("delta").and_then(Value::as_str).unwrap_or_default();
+                    st.toolcall_args
+                        .entry(id.to_string())
+                        .or_default()
+                        .push_str(delta);
+                    let acc = st.toolcall_args.get(id).unwrap();
+                    match serde_json::from_str::<Value>(acc) {
+                        Ok(v) => vec![json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": id,
+                            "rawInput": v,
+                        })],
+                        Err(_) => vec![json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": id,
+                            "partialArgs": acc,
+                        })],
+                    }
+                }
+                // The full `arguments` object (the wire `toolCall` field —
+                // `{id, name, arguments}`); clear the partial-args buffer.
+                Some("toolcall_end") => {
+                    let Some(tc) = ev.get("toolCall") else {
+                        return Vec::new();
+                    };
+                    let Some(id) = tc.get("id").and_then(Value::as_str) else {
+                        return Vec::new();
+                    };
+                    st.toolcall_args.remove(id);
+                    vec![json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": id,
+                        "rawInput": tc.get("arguments"),
+                        "status": "in_progress",
+                    })]
+                }
+                _ => Vec::new(),
+            }
+        }
+        RpcEvent::tool_execution_start { tool_call_id, .. } => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": "in_progress",
+        })],
+        // `rawOutput` is persisted-only (the frontend's `AcpSessionUpdate`
+        // has no `rawOutput` field — it lands in the persisted payload via
+        // `merge_json` and is harmless).
+        RpcEvent::tool_execution_update {
+            tool_call_id,
+            partial_result,
+            ..
+        } => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "rawOutput": partial_result,
+        })],
+        RpcEvent::tool_execution_end {
+            tool_call_id,
+            result,
+            is_error,
+            ..
+        } => vec![json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_call_id,
+            "status": if *is_error { "failed" } else { "completed" },
+            "rawOutput": result,
+        })],
+        RpcEvent::session_info_changed { name } => vec![json!({
+            "sessionUpdate": "session_info_update",
+            "title": name,
+        })],
+        // Bookkeeping / de-structured one-liners (the adapter's parity; the
+        // strings are stable for tests). They carry a `messageId` of
+        // `"system"` (a dedicated key — never mixed into a real message's
+        // accumulated text).
+        RpcEvent::compaction_start { .. } => vec![system_chunk("Compacting context…")],
+        RpcEvent::compaction_end { .. } => vec![system_chunk("Compaction finished")],
+        RpcEvent::auto_retry_start {
+            attempt,
+            max_attempts,
+            ..
+        } => vec![system_chunk(format!(
+            "Retrying (attempt {attempt}/{max_attempts}…)"
+        ))],
+        RpcEvent::auto_retry_end { success, .. } => {
+            vec![if *success {
+                system_chunk("Retry succeeded")
+            } else {
+                system_chunk("Retry failed")
+            }]
+        }
+        RpcEvent::extension_error { error, .. } => {
+            vec![system_chunk(format!("Extension error: {error}"))]
+        }
+        // Bookkeeping (no frame): the turn's resolution signal
+        // (`agent_settled` — the driver resolves the pending turn), the
+        // turn / message boundaries, the queue / entry / bash bookkeeping,
+        // and unknown event types (permissive — debug-logged by the
+        // reader, never an error).
+        _ => Vec::new(),
     }
 }
 
-/// Persist one session update into the transcript (see the module docs for
-/// the upsert semantics).
+/// A one-line `agent_message_chunk` with the dedicated `"system"` messageId
+/// (the bookkeeping one-liners — never mixed into a real message's
+/// accumulated text).
+fn system_chunk(text: impl Into<String>) -> Value {
+    let text = text.into();
+    json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": text },
+        "messageId": "system",
+    })
+}
+
+/// Replay a stored transcript (`get_messages` payload) through the
+/// normalizer (the resume establisher's persistence step).
+///
+/// Per the replay-feed rule, the replay synthesizes the DELTA events the
+/// live stream would have produced (a literal replay fed as
+/// `message_end` would produce ZERO frames — the no-re-emit rule is
+/// live-stream-only, and `message_end` is never fed):
+///
+/// - an **assistant** message → a `message_start` (advancing the counter
+///   per the role rule) + one `message_update` per content block: a
+///   `text_delta` with the block's full text as a SINGLE delta, a
+///   `thinking_delta` per thinking block, and `toolcall_start` +
+///   `toolcall_end` (arguments = the block's `arguments` object) per
+///   toolCall. No `message_end` / `text_end` / `thinking_end`.
+/// - a **toolResult** message → a `tool_execution_end` (`toolCallId` from
+///   the message's own `toolCallId`, `result` = the content, `isError`
+///   from the message).
+/// - a **user** message → persisted DIRECTLY as a `kind: "user"` row with
+///   the `{ "text": …, "images": […]? }` payload shape (the normalizer has
+///   no user-message input) — an explicit improvement over the ACP replay,
+///   which dropped user rows.
+fn replay_messages(db: &Db, session_id: &str, messages: &Value) {
+    let Some(msgs) = messages.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    let mut turn = TurnState::default();
+    let text_acc = StdMutex::new(HashMap::new());
+    let tool_state = StdMutex::new(HashMap::new());
+    let thought = StdMutex::new(ThoughtState::default());
+
+    for msg in msgs {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+        match role {
+            "user" => {
+                let payload = user_replay_payload(msg.get("content").unwrap_or(&Value::Null));
+                let _ = db.record_message(session_id, "user", None, &payload.to_string());
+            }
+            "assistant" => {
+                // The `message_start` (advances the counter per the role
+                // rule — the replay uses the SAME rule in message order so
+                // the live and replay `messageId`s match).
+                let start: RpcEvent =
+                    serde_json::from_value(json!({ "type": "message_start", "message": msg }))
+                        .expect("message_start is always parseable");
+                let _ = normalize(&start, &mut turn);
+                for block in msg
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&Vec::new())
+                {
+                    let block_type = block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let update = match block_type {
+                        "text" => json!({
+                            "type": "message_update",
+                            "usage": null,
+                            "assistantMessageEvent": {
+                                "type": "text_delta",
+                                "contentIndex": 0,
+                                "delta": block.get("text"),
+                            },
+                        }),
+                        "thinking" => json!({
+                            "type": "message_update",
+                            "usage": null,
+                            "assistantMessageEvent": {
+                                "type": "thinking_delta",
+                                "contentIndex": 0,
+                                "delta": block.get("thinking"),
+                            },
+                        }),
+                        "toolCall" => {
+                            // `toolcall_start` + `toolcall_end` (the block IS
+                            // the wire `toolCall` object: `{id, name,
+                            // arguments}`).
+                            let start: RpcEvent = serde_json::from_value(json!({
+                                "type": "message_update",
+                                "usage": null,
+                                "assistantMessageEvent": {
+                                    "type": "toolcall_start",
+                                    "contentIndex": 0,
+                                    "id": block.get("id"),
+                                    "toolName": block.get("name"),
+                                },
+                            }))
+                            .expect("toolcall_start is always parseable");
+                            let end: RpcEvent = serde_json::from_value(json!({
+                                "type": "message_update",
+                                "usage": null,
+                                "assistantMessageEvent": { "type": "toolcall_end", "toolCall": block },
+                            }))
+                            .expect("toolcall_end is always parseable");
+                            for u in normalize(&start, &mut turn) {
+                                persist_update(
+                                    db,
+                                    session_id,
+                                    &u,
+                                    &text_acc,
+                                    &tool_state,
+                                    &thought,
+                                );
+                            }
+                            for u in normalize(&end, &mut turn) {
+                                persist_update(
+                                    db,
+                                    session_id,
+                                    &u,
+                                    &text_acc,
+                                    &tool_state,
+                                    &thought,
+                                );
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let ev: RpcEvent =
+                        serde_json::from_value(update).expect("message_update is always parseable");
+                    for u in normalize(&ev, &mut turn) {
+                        persist_update(db, session_id, &u, &text_acc, &tool_state, &thought);
+                    }
+                }
+                // NO `message_end` / `text_end` / `thinking_end` (the
+                // authoritative content is not re-emitted).
+            }
+            "toolResult" => {
+                let ev: RpcEvent = serde_json::from_value(json!({
+                    "type": "tool_execution_end",
+                    "toolCallId": msg.get("toolCallId"),
+                    "toolName": msg.get("toolName"),
+                    "result": msg.get("content"),
+                    "isError": msg.get("isError").cloned().unwrap_or(Value::Bool(false)),
+                }))
+                .expect("tool_execution_end is always parseable");
+                for u in normalize(&ev, &mut turn) {
+                    persist_update(db, session_id, &u, &text_acc, &tool_state, &thought);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The `kind: "user"` replay payload from a stored user message's content
+/// (`string | (TextContent | ImageContent)[]`): `{ "text": … }` (the
+/// `images` key omitted when absent) — the same shape `user_message_payload`
+/// writes at `send_prompt` time (the frontend's `rowToMessages` reads it).
+/// A stored image block is `{type, data, mimeType}` (no `name` /
+/// `sizeBytes` on the wire — they are omitted).
+fn user_replay_payload(content: &Value) -> Value {
+    if let Some(s) = content.as_str() {
+        return json!({ "text": s });
+    }
+    let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
+    for block in content.as_array().unwrap_or(&Vec::new()) {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                text.push_str(
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+            }
+            Some("image") => images.push(json!({
+                "mimeType": block.get("mimeType"),
+                "data": block.get("data"),
+            })),
+            _ => {}
+        }
+    }
+    if images.is_empty() {
+        json!({ "text": text })
+    } else {
+        json!({ "text": text, "images": images })
+    }
+}
+
+/// Normalize a stored `capabilities_json` before it reaches the frontend
+/// (the `list_sessions` path — NOT `load_history`, which returns raw
+/// `MessageRow`s and never touches `capabilities_json`): an envelope that
+/// (a) fails to parse as JSON, or (b) parses but lacks the `loadSession`
+/// key (a pre-swap ACP row) is normalized to `loadSession: false` — so a
+/// legacy row shows NO Resume button (the history-only banner is a
+/// FRONTEND-side decision driven by `capabilities.loadSession`; there is no
+/// error-kind matching in the frontend, so the normalized capabilities are
+/// the honest path).
+pub fn normalize_capabilities(raw: &str) -> Value {
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return json!({ "loadSession": false }),
+    };
+    if v.get("loadSession").is_some() {
+        v
+    } else {
+        json!({ "loadSession": false })
+    }
+}
+
+/// Persist one `session-update` (the FROZEN JSON shapes the normalizer
+/// emits) into the transcript.
+///
+/// The persistence semantics are the ACP-era ones, unchanged: upsert keys
+/// (`(session_id, kind, message_key)`), agent-text accumulation per
+/// `messageId`, thought segmentation (`{messageId}#{segment}` boundaries),
+/// tool-call `merge_json` shallow-merge. (The ACP `content:
+/// ToolCallContent[]` diff channel has no RPC input in Phase 1 — pi's tool
+/// results carry no diff-structured content — so the `has_diff` branch is
+/// gone with the crate types.)
 fn persist_update(
     db: &Db,
     session_id: &str,
-    update: &SessionUpdate,
+    update: &Value,
     agent_text_acc: &StdMutex<HashMap<String, String>>,
     tool_call_state: &StdMutex<HashMap<String, Value>>,
     thought_state: &StdMutex<ThoughtState>,
 ) {
-    match update {
-        SessionUpdate::AgentThoughtChunk(chunk) => {
-            if let ContentBlock::Text(text) = &chunk.content {
-                if text.text.is_empty() {
-                    return;
-                }
-                let key = chunk
-                    .message_id
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "default".to_string());
-                let mut state = thought_state.lock().expect("thought state poisoned");
-                if state.open_key.as_deref() != Some(key.as_str()) {
-                    // New thinking segment: a new messageId, or an intervening
-                    // segmenting update (see the rule above) cleared `open_key`.
-                    state.next += 1;
-                    state.open_key = Some(key);
-                    state.current = String::new();
-                }
-                state.current.push_str(&text.text);
-                let row_key = format!("{}#{}", state.open_key.as_ref().unwrap(), state.next);
-                let payload = serde_json::json!({ "text": state.current });
-                let _ = db.record_message(
-                    session_id,
-                    "agent-thought",
-                    Some(&row_key),
-                    &payload.to_string(),
-                );
+    let kind = update.get("sessionUpdate").and_then(Value::as_str);
+    match kind {
+        Some("agent_thought_chunk") => {
+            let Some(text) = update
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            if text.is_empty() {
+                return;
             }
-        }
-        SessionUpdate::AgentMessageChunk(chunk) => {
-            if let ContentBlock::Text(text) = &chunk.content {
-                if text.text.is_empty() {
-                    return;
-                }
-                thought_state
-                    .lock()
-                    .expect("thought state poisoned")
-                    .open_key = None;
-                let key = chunk
-                    .message_id
-                    .as_ref()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "default".to_string());
-                let mut acc = agent_text_acc
-                    .lock()
-                    .expect("agent-text accumulator poisoned");
-                let entry = acc.entry(key.clone()).or_default();
-                entry.push_str(&text.text);
-                let payload = serde_json::json!({ "text": entry });
-                let _ =
-                    db.record_message(session_id, "agent-text", Some(&key), &payload.to_string());
+            let key = update
+                .get("messageId")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let mut state = thought_state.lock().expect("thought state poisoned");
+            if state.open_key.as_deref() != Some(key.as_str()) {
+                // New thinking segment: a new messageId, or an intervening
+                // segmenting update (see the rule above) cleared `open_key`.
+                state.next += 1;
+                state.open_key = Some(key);
+                state.current = String::new();
             }
+            state.current.push_str(text);
+            let row_key = format!("{}#{}", state.open_key.as_ref().unwrap(), state.next);
+            let payload = json!({ "text": state.current });
+            let _ = db.record_message(
+                session_id,
+                "agent-thought",
+                Some(&row_key),
+                &payload.to_string(),
+            );
         }
-        SessionUpdate::ToolCall(tool_call) => {
+        Some("agent_message_chunk") => {
+            let Some(text) = update
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            if text.is_empty() {
+                return;
+            }
             thought_state
                 .lock()
                 .expect("thought state poisoned")
                 .open_key = None;
-            let key = tool_call.tool_call_id.to_string();
+            let key = update
+                .get("messageId")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let mut acc = agent_text_acc
+                .lock()
+                .expect("agent-text accumulator poisoned");
+            let entry = acc.entry(key.clone()).or_default();
+            entry.push_str(text);
+            let payload = json!({ "text": entry });
+            let _ = db.record_message(session_id, "agent-text", Some(&key), &payload.to_string());
+        }
+        Some("tool_call") => {
+            let Some(key) = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            thought_state
+                .lock()
+                .expect("thought state poisoned")
+                .open_key = None;
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
-            state.insert(
-                key.clone(),
-                serde_json::to_value(tool_call).unwrap_or(Value::Null),
-            );
+            state.insert(key.clone(), update.clone());
             let _ = db.record_message(
                 session_id,
                 "tool-call",
@@ -1350,27 +2236,26 @@ fn persist_update(
                 &state[&key].to_string(),
             );
         }
-        SessionUpdate::ToolCallUpdate(tool_call_update) => {
-            let key = tool_call_update.tool_call_id.to_string();
+        Some("tool_call_update") => {
+            let Some(key) = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
             let is_new = !state.contains_key(&key);
-            let has_diff = tool_call_update
-                .fields
-                .content
-                .as_ref()
-                .is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|item| matches!(item, ToolCallContent::Diff(_)))
-                });
-            let patch = serde_json::to_value(tool_call_update).unwrap_or(Value::Null);
             let entry = state
                 .entry(key.clone())
                 .or_insert_with(|| Value::Object(Default::default()));
-            merge_json(entry, &patch);
+            merge_json(entry, update);
             let _ = db.record_message(session_id, "tool-call", Some(&key), &entry.to_string());
             drop(state);
-            if is_new || has_diff {
+            // A first-seen tool-call update segments the thought stream
+            // (the same rule as the ACP `has_diff` branch — a new tool
+            // result interrupts the run).
+            if is_new {
                 thought_state
                     .lock()
                     .expect("thought state poisoned")
@@ -1392,13 +2277,13 @@ fn merge_json(base: &mut Value, patch: &Value) {
     }
 }
 
-/// Build a remediation hint for a spawn failure, mentioning the pi / pi-acp
-/// install path.
+/// Build a remediation hint for a spawn failure, mentioning the pi install
+/// path.
 fn spawn_hint(command: &str) -> String {
     format!(
-        "could not spawn '{}'. If this is the 'pi' agent, make sure `pi` and the \
-         `pi-acp` adapter are installed and on PATH (e.g. `npm install -g pi-acp`), \
-         then retry.",
+        "could not spawn '{}'. If this is the 'pi' agent, make sure `pi` is \
+         installed and on PATH (e.g. `npm install -g \
+         @earendil-works/pi-coding-agent`), then retry.",
         command
     )
 }
@@ -1556,173 +2441,340 @@ mod tests {
 }
 
 #[cfg(test)]
+mod normalize_tests {
+    use serde_json::json;
+
+    use super::{build_capabilities, normalize, synthesize_config_options, TurnState};
+    use crate::agent::rpc::RpcEvent;
+
+    fn ev(v: serde_json::Value) -> RpcEvent {
+        serde_json::from_value(v).expect("event should parse")
+    }
+
+    /// The `messageId` role rule: a USER `message_start` does NOT advance
+    /// the counter; the following ASSISTANT `message_start` numbers the
+    /// first assistant chunk `m1` (a role-blind counter would make it
+    /// `m2` and break the replay numbering).
+    #[test]
+    fn message_id_advances_only_for_assistant_messages() {
+        let mut st = TurnState::default();
+        let user = ev(json!({
+            "type": "message_start",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+        }));
+        assert!(normalize(&user, &mut st).is_empty());
+        assert_eq!(
+            st.msg_counter, 0,
+            "a user message_start must NOT advance the counter"
+        );
+        assert!(st.current_message_id.is_none());
+
+        let assistant = ev(json!({
+            "type": "message_start",
+            "message": { "role": "assistant", "content": [] },
+        }));
+        assert!(normalize(&assistant, &mut st).is_empty());
+        assert_eq!(st.msg_counter, 1);
+        assert_eq!(st.current_message_id.as_deref(), Some("m1"));
+
+        let delta = ev(json!({
+            "type": "message_update",
+            "usage": null,
+            "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "Hel" },
+        }));
+        let frames = normalize(&delta, &mut st);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            frames[0]["messageId"], "m1",
+            "the first assistant chunk keys m1"
+        );
+        assert_eq!(frames[0]["content"]["text"], "Hel");
+    }
+
+    /// A second assistant message advances the counter to `m2`; the
+    /// `*_end` / `*_start` frames carry NO frame (the delta stream already
+    /// delivered the content — re-emitting would double the text).
+    #[test]
+    fn end_and_start_frames_emit_nothing() {
+        let mut st = TurnState::default();
+        let _ = normalize(
+            &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
+            &mut st,
+        );
+        let _ = normalize(
+            &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
+            &mut st,
+        );
+        assert_eq!(st.current_message_id.as_deref(), Some("m2"));
+
+        for t in ["text_end", "thinking_end", "text_start", "thinking_start"] {
+            let frames = normalize(
+                &ev(json!({
+                    "type": "message_update",
+                    "usage": null,
+                    "assistantMessageEvent": { "type": t, "contentIndex": 0, "content": "x", "delta": "x" },
+                })),
+                &mut st,
+            );
+            assert!(frames.is_empty(), "{t} must emit no frame");
+        }
+    }
+
+    /// `thinking_delta` → `agent_thought_chunk` (the same `messageId` keying
+    /// as text deltas).
+    #[test]
+    fn thinking_delta_maps_to_agent_thought_chunk() {
+        let mut st = TurnState::default();
+        let _ = normalize(
+            &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
+            &mut st,
+        );
+        let frames = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "thinking_delta", "contentIndex": 0, "delta": "hmm" },
+            })),
+            &mut st,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(frames[0]["content"]["text"], "hmm");
+        assert_eq!(frames[0]["messageId"], "m1");
+    }
+
+    /// The tool-call frame sequence: `toolcall_start` → `tool_call` (empty
+    /// `rawInput`), `toolcall_delta` → `tool_call_update` (partial args as
+    /// `partialArgs` while incomplete, `rawInput` once the accumulated
+    /// string parses as JSON), `toolcall_end` → `tool_call_update` with the
+    /// full `arguments` object + the buffer cleared.
+    #[test]
+    fn toolcall_frames_accumulate_args() {
+        let mut st = TurnState::default();
+        let _ = normalize(
+            &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
+            &mut st,
+        );
+
+        let start = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "toolcall_start", "contentIndex": 0, "id": "tc1", "toolName": "bash" },
+            })),
+            &mut st,
+        );
+        assert_eq!(start[0]["sessionUpdate"], "tool_call");
+        assert_eq!(start[0]["toolCallId"], "tc1");
+        assert_eq!(start[0]["title"], "bash");
+        assert_eq!(start[0]["rawInput"], json!({}));
+
+        // An incomplete JSON fragment → `partialArgs` (the adapter's
+        // behavior — the frontend shows the raw string while parsing).
+        let partial = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "toolcall_delta", "contentIndex": 0, "id": "tc1", "delta": "{\"cmd\":" },
+            })),
+            &mut st,
+        );
+        assert_eq!(partial[0]["partialArgs"], "{\"cmd\":");
+        assert!(partial[0].get("rawInput").is_none());
+
+        // The fragment completes → `rawInput` (the accumulated string
+        // parses as JSON).
+        let done = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "toolcall_delta", "contentIndex": 0, "id": "tc1", "delta": "\"ls\"}" },
+            })),
+            &mut st,
+        );
+        assert_eq!(done[0]["rawInput"], json!({ "cmd": "ls" }));
+
+        // `toolcall_end` → the full `arguments` object + the buffer
+        // cleared (a later delta for the same id starts fresh).
+        let end = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "toolCall": { "id": "tc1", "name": "bash", "arguments": { "cmd": "ls" } },
+                },
+            })),
+            &mut st,
+        );
+        assert_eq!(end[0]["rawInput"], json!({ "cmd": "ls" }));
+        assert_eq!(end[0]["status"], "in_progress");
+        assert!(
+            !st.toolcall_args.contains_key("tc1"),
+            "the buffer must be cleared"
+        );
+    }
+
+    /// `tool_execution_*` → `tool_call_update` (in_progress / partial
+    /// `rawOutput` / completed-or-failed + `rawOutput`).
+    #[test]
+    fn tool_execution_frames_map_to_updates() {
+        let mut st = TurnState::default();
+        let start = normalize(
+            &ev(
+                json!({ "type": "tool_execution_start", "toolCallId": "tc1", "toolName": "bash", "args": {} }),
+            ),
+            &mut st,
+        );
+        assert_eq!(
+            start[0],
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tc1", "status": "in_progress" })
+        );
+
+        let update = normalize(
+            &ev(
+                json!({ "type": "tool_execution_update", "toolCallId": "tc1", "toolName": "bash", "args": {}, "partialResult": "out" }),
+            ),
+            &mut st,
+        );
+        assert_eq!(update[0]["rawOutput"], "out");
+
+        let end_ok = normalize(
+            &ev(
+                json!({ "type": "tool_execution_end", "toolCallId": "tc1", "toolName": "bash", "result": "done", "isError": false }),
+            ),
+            &mut st,
+        );
+        assert_eq!(end_ok[0]["status"], "completed");
+        assert_eq!(end_ok[0]["rawOutput"], "done");
+
+        let end_err = normalize(
+            &ev(
+                json!({ "type": "tool_execution_end", "toolCallId": "tc1", "toolName": "bash", "result": "boom", "isError": true }),
+            ),
+            &mut st,
+        );
+        assert_eq!(end_err[0]["status"], "failed");
+    }
+
+    /// The bookkeeping one-liners (stable strings for tests) + the
+    /// no-frame bookkeeping events (`agent_settled` / `turn_end` / …).
+    #[test]
+    fn bookkeeping_events_and_one_liners() {
+        let mut st = TurnState::default();
+        let compacting = normalize(
+            &ev(json!({ "type": "compaction_start", "reason": "auto" })),
+            &mut st,
+        );
+        assert_eq!(compacting[0]["content"]["text"], "Compacting context…");
+        assert_eq!(
+            compacting[0]["messageId"], "system",
+            "the one-liners key the dedicated system id"
+        );
+
+        let done = normalize(
+            &ev(
+                json!({ "type": "compaction_end", "reason": "auto", "aborted": false, "willRetry": false }),
+            ),
+            &mut st,
+        );
+        assert_eq!(done[0]["content"]["text"], "Compaction finished");
+
+        let retry = normalize(
+            &ev(
+                json!({ "type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 1000, "errorMessage": "x" }),
+            ),
+            &mut st,
+        );
+        assert_eq!(retry[0]["content"]["text"], "Retrying (attempt 1/3…)");
+
+        for t in [
+            "agent_start",
+            "agent_end",
+            "agent_settled",
+            "turn_start",
+            "queue_update",
+            "bash_execution_update",
+        ] {
+            let v = match t {
+                "turn_start" => json!({ "type": t }),
+                "agent_end" => json!({ "type": t, "messages": [], "willRetry": false }),
+                _ => {
+                    json!({ "type": t, "toolCallId": "x", "toolName": "bash", "args": {}, "partialResult": "p", "result": "r", "isError": false, "steering": [], "followUp": [], "entry": {}, "id": "x", "delta": "d", "message": { "role": "assistant" }, "toolResults": [] })
+                }
+            };
+            assert!(
+                normalize(&ev(v), &mut st).is_empty(),
+                "{t} must emit no frame"
+            );
+        }
+    }
+
+    /// The capability envelope: `piSessionFile` / `model` keys ABSENT when
+    /// `get_state` omits them; `loadSession: false` when the session file is
+    /// absent; the load-bearing `promptCapabilities` always present.
+    #[test]
+    fn capabilities_envelope_shape() {
+        let full = build_capabilities(&json!({
+            "sessionId": "s1",
+            "sessionFile": "/tmp/s1.jsonl",
+            "model": { "provider": "fake", "id": "m1", "name": "M1" },
+            "thinkingLevel": "medium",
+        }));
+        assert_eq!(full["piSessionId"], "s1");
+        assert_eq!(full["piSessionFile"], "/tmp/s1.jsonl");
+        assert_eq!(full["model"], "fake/m1");
+        assert_eq!(full["thinkingLevel"], "medium");
+        assert_eq!(full["loadSession"], true);
+        assert_eq!(
+            full["promptCapabilities"],
+            json!({ "image": true, "audio": false, "embeddedContext": false })
+        );
+
+        // A `--no-session` run (no sessionFile, no model): the keys are
+        // ABSENT (not nulled) and the session is unresumable.
+        let bare = build_capabilities(&json!({ "sessionId": "s2" }));
+        assert!(bare.get("piSessionFile").is_none(), "no file → key absent");
+        assert!(bare.get("model").is_none(), "no model → key absent");
+        assert_eq!(bare["loadSession"], false, "no file → unresumable");
+    }
+
+    /// The config synthesizer: model + thinking selectors (the flat shape
+    /// the frontend's `SessionConfigOption` reads); `None` when there is
+    /// nothing to synthesize.
+    #[test]
+    fn config_synthesizer_shape() {
+        let state = json!({
+            "model": { "provider": "fake", "id": "m1" },
+            "thinkingLevel": "medium",
+        });
+        let models = json!([{ "provider": "fake", "id": "m1", "name": "M1" }, { "provider": "fake", "id": "m2", "name": "M2" }]);
+        let levels = json!(["off", "medium"]);
+        let opts = synthesize_config_options(&state, Some(&models), Some(&levels)).unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["id"], "model");
+        assert_eq!(opts[0]["currentValue"], "fake/m1");
+        assert_eq!(opts[0]["options"].as_array().unwrap().len(), 2);
+        assert_eq!(opts[1]["id"], "thought_level");
+        assert_eq!(opts[1]["currentValue"], "medium");
+        assert_eq!(
+            opts[1]["options"][0]["name"], "Off",
+            "levels are capitalized"
+        );
+
+        // No model AND no levels → `None`.
+        assert!(synthesize_config_options(&json!({}), None, None).is_none());
+    }
+}
+
+#[cfg(test)]
 mod session_tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
-        ContentChunk, SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
-        TextContent,
-    };
+    use crate::agent::permission::PermissionOutcome;
+    use crate::storage::Db;
     use std::path::Path;
     use tokio::sync::mpsc;
-
-    #[test]
-    fn persist_update_records_agent_thought_chunks() {
-        let dir = temp_config_dir();
-        let db = Db::open(&dir.join("archimedes.db")).expect("db should open");
-        // FK: `messages.session_id REFERENCES sessions(id)` and `Db::open`
-        // enables `PRAGMA foreign_keys` — record the session FIRST, or every
-        // `record_message` fails (and `persist_update` swallows the error).
-        db.record_session(&SessionInfo {
-            session_id: "sess-t1".into(),
-            agent_id: "fake".into(),
-            cwd: dir.clone(),
-            capabilities: AgentCapabilities::default(),
-            config_options: None,
-        })
-        .expect("record_session should succeed");
-        let text_acc = StdMutex::new(HashMap::new());
-        let tool_state = StdMutex::new(HashMap::new());
-        let thought = StdMutex::new(ThoughtState::default());
-
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new("thinking "),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new("happens"),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        let rows = db
-            .messages_for("sess-t1")
-            .expect("messages_for should work");
-        assert_eq!(rows.len(), 1, "two chunks, one messageId → one row");
-        assert_eq!(rows[0].kind, "agent-thought");
-        assert_eq!(rows[0].message_key.as_deref(), Some("default#1"));
-        assert_eq!(rows[0].payload_json, r#"{"text":"thinking happens"}"#);
-
-        // A non-empty text chunk interrupts the run: a later thought chunk
-        // starts a NEW segment.
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new("answer"),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new("second run"),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        let rows = db
-            .messages_for("sess-t1")
-            .expect("messages_for should work");
-        assert_eq!(
-            rows.len(),
-            3,
-            "think → text → think → two thought rows + one text row"
-        );
-        assert_eq!(rows.iter().filter(|r| r.kind == "agent-thought").count(), 2);
-
-        // A prompt boundary (the `begin_user_turn` operation — a direct
-        // `open_key = None` reset, since `begin_user_turn` needs a live
-        // SessionManager entry) also starts a new segment.
-        thought.lock().expect("poisoned").open_key = None;
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new("third turn"),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        let rows = db
-            .messages_for("sess-t1")
-            .expect("messages_for should work");
-        assert_eq!(rows.len(), 4, "prompt boundary → third thought row");
-
-        // A DISTINCT messageId starts a new segment back-to-back; an EMPTY
-        // chunk (and an empty text chunk) is ignored and does NOT segment.
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new("m2 run"))).message_id("m2"),
-            ),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(""),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(""),
-            ))),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        persist_update(
-            &db,
-            "sess-t1",
-            &SessionUpdate::AgentThoughtChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new("still m2")))
-                    .message_id("m2"),
-            ),
-            &text_acc,
-            &tool_state,
-            &thought,
-        );
-        let rows = db
-            .messages_for("sess-t1")
-            .expect("messages_for should work");
-        // The empty text chunk did NOT segment: the last thought chunk
-        // (same "m2" key, open segment) appended to the m2 row.
-        assert_eq!(
-            rows.len(),
-            5,
-            "new messageId → fourth thought row; empty chunks → no rows, no segmentation"
-        );
-        let m2: Vec<_> = rows
-            .iter()
-            .filter(|r| r.message_key.as_deref() == Some("m2#4"))
-            .collect();
-        assert_eq!(m2.len(), 1);
-        assert_eq!(m2[0].payload_json, r#"{"text":"m2 runstill m2"}"#);
-    }
 
     pub struct TestSink {
         tx: mpsc::UnboundedSender<Value>,
@@ -1742,34 +2794,266 @@ mod session_tests {
         dir
     }
 
-    pub fn unique_fake_agent(dir: &Path) -> PathBuf {
-        let fake = dir.join("fake_agent");
-        let bin = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_agent"
-        ));
-        std::fs::copy(&bin, &fake).expect("failed to copy fake_agent");
-        fake
+    /// The `fake_pi` binary path. These tests spawn it DIRECTLY (no copy):
+    /// they never reap processes by binary path (the driver kills via the
+    /// child handle `PiRpc` owns), so a shared path cannot false-positive —
+    /// and a copy races the kernel's ETXTBSY check (the copy's write-fd
+    /// can still be in flight when the forked child execs).
+    fn fake_pi_bin() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/fake_pi"))
     }
 
-    pub fn write_agents_json_cmd(cmd: &Path, dir: &Path, mode: Option<&str>) {
+    /// Write an `agents.json` with a single `fake` entry pointing at
+    /// `fake_pi` + the given mode env vars (e.g. `FAKE_PI_PROMPT=1`).
+    fn write_agents_json_pi(dir: &Path, env: &[(&str, &str)]) {
+        // `env` is a JSON OBJECT (a `BTreeMap` on the wire) — the slice
+        // form would serialize as an array of pairs and fail to
+        // deserialize.
+        let env_map: serde_json::Map<String, serde_json::Value> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
         let agents = serde_json::json!({
             "agents": [{
                 "id": "fake",
-                "name": "Fake Agent",
-                "command": cmd,
-                "args": mode.map(|m| vec![m]).unwrap_or_default(),
-                "env": {}
+                "name": "Fake Pi",
+                "command": fake_pi_bin(),
+                "args": [],
+                "env": env_map,
             }]
         });
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
     }
 
+    fn open_db(dir: &Path) -> std::sync::Arc<Db> {
+        std::sync::Arc::new(Db::open(&dir.join("archimedes.db")).expect("db should open"))
+    }
+
+    /// (start) `start_session` + `send_prompt` against `fake_pi`
+    /// (`FAKE_PI_PROMPT=1`): the turn streams 2 `agent_message_chunk`
+    /// frames keyed `m1` (the `messageId` role rule — the user
+    /// `message_start` does not advance the counter), resolves `EndTurn`,
+    /// persists ONE accumulated `agent-text` row ("Hello"), and stores a
+    /// `capabilities_json` carrying the load-bearing keys
+    /// (`piSessionFile` + `loadSession: true` + `promptCapabilities.image:
+    /// true`).
     #[tokio::test]
-    async fn start_session_returns_config_options_from_new_session_response() {
+    async fn start_session_streams_and_persists() {
         let dir = temp_config_dir();
-        let cmd = unique_fake_agent(&dir);
-        write_agents_json_cmd(&cmd, &dir, None);
+        write_agents_json_pi(&dir, &[("FAKE_PI_PROMPT", "1")]);
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+
+        // The capability envelope (item 1 — the load-bearing keys). The
+        // session id is UNIQUE per process (mirroring real pi — the fake
+        // derives it from the process's time + pid).
+        assert!(
+            info.session_id.starts_with("fake-pi-"),
+            "a fresh session gets a unique pi id, got {}",
+            info.session_id
+        );
+        assert_eq!(
+            info.capabilities["piSessionId"],
+            Value::String(info.session_id.clone())
+        );
+        assert_eq!(
+            info.capabilities["piSessionFile"],
+            "/tmp/fake-pi-session.jsonl"
+        );
+        assert_eq!(info.capabilities["model"], "fake/fake-model");
+        assert_eq!(info.capabilities["loadSession"], true);
+        assert_eq!(
+            info.capabilities["promptCapabilities"]["image"], true,
+            "the image-send gate key must be present (fail-closed)"
+        );
+        // The config options (the synthesizer — 2 selectors).
+        assert_eq!(info.config_options.as_ref().unwrap().len(), 2);
+
+        // The turn: 2 `agent_message_chunk` frames keyed `m1`, then
+        // `EndTurn`.
+        let reason = manager
+            .send_prompt(&info.session_id, "hi".to_string())
+            .await
+            .unwrap();
+        assert_eq!(reason, StopReason::EndTurn);
+
+        let mut chunks: Vec<Value> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && chunks.len() < 2 {
+            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                let msg = msg.unwrap();
+                if msg["event"] == "session-update" {
+                    let update = &msg["payload"]["update"];
+                    if update["sessionUpdate"] == "agent_message_chunk" {
+                        chunks.push(update.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(chunks.len(), 2, "two text deltas (Hel + lo)");
+        assert_eq!(
+            chunks[0]["messageId"], "m1",
+            "the role rule keys the first assistant chunk m1"
+        );
+        assert_eq!(chunks[1]["messageId"], "m1");
+        assert_eq!(chunks[0]["content"]["text"], "Hel");
+        assert_eq!(chunks[1]["content"]["text"], "lo");
+
+        // Persistence: ONE `agent-text` row with the accumulated "Hello" +
+        // the `user` row written by `send_prompt`.
+        let rows = db
+            .messages_for(&info.session_id)
+            .expect("messages_for should work");
+        let agent_rows: Vec<_> = rows.iter().filter(|r| r.kind == "agent-text").collect();
+        assert_eq!(agent_rows.len(), 1, "two chunks, one messageId → one row");
+        assert_eq!(agent_rows[0].message_key.as_deref(), Some("m1"));
+        assert_eq!(agent_rows[0].payload_json, r#"{"text":"Hello"}"#);
+        let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
+        assert_eq!(user_rows.len(), 1, "exactly ONE user row (no double write)");
+        assert_eq!(user_rows[0].payload_json, r#"{"text":"hi"}"#);
+
+        // The stored `capabilities_json` (the sessions row).
+        let stored = db
+            .session(&info.session_id)
+            .expect("session should work")
+            .unwrap();
+        let stored_caps: Value = serde_json::from_str(&stored.capabilities_json).unwrap();
+        assert_eq!(stored_caps["loadSession"], true);
+        assert_eq!(stored_caps["promptCapabilities"]["image"], true);
+        assert_eq!(stored_caps["piSessionFile"], "/tmp/fake-pi-session.jsonl");
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (resume) `resume_session` against a pre-seeded stored row
+    /// (`capabilities_json` = the item-1 shape with a `piSessionFile`):
+    /// the stored rows are cleared then re-populated from `get_messages` —
+    /// 2+ rows, including a `kind: "user"` row (the explicit improvement
+    /// over the ACP replay, which dropped user rows) and an accumulated
+    /// `agent-text` row keyed by the SAME `messageId` rule. A legacy row
+    /// WITHOUT `loadSession` → `list_sessions`-normalized capabilities have
+    /// `loadSession: false` (item 6b) and `resume_session` →
+    /// `NotResumable`.
+    #[tokio::test]
+    async fn resume_replays_messages() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        // Pre-seed the stored row: the item-1 capability envelope (a
+        // resumption of a session with a file).
+        db.record_session(&SessionInfo {
+            session_id: "resume-1".to_string(),
+            agent_id: "fake".to_string(),
+            cwd: dir.clone(),
+            capabilities: serde_json::json!({
+                "piSessionId": "resume-1",
+                // The file's STEM is the loaded session's id (the fake
+                // models real pi: `--session <file>` → the file's stem) —
+                // it must match the stored id for the resume to round-trip.
+                "piSessionFile": "/tmp/resume-1.jsonl",
+                "model": "fake/fake-model",
+                "thinkingLevel": "off",
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+            }),
+            config_options: None,
+        })
+        .expect("record_session should succeed");
+        // Two stored rows the resume must CLEAR (the replay re-populates).
+        db.record_message("resume-1", "agent-text", Some("m1"), r#"{"text":"stale"}"#)
+            .expect("record_message should succeed");
+        db.record_message("resume-1", "user", None, r#"{"text":"stale-user"}"#)
+            .expect("record_message should succeed");
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.resume_session("fake", "resume-1", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+        assert_eq!(info.session_id, "resume-1");
+
+        // The replay re-populated the transcript: 2+ rows, including a
+        // `kind: "user"` row with the `{"text": "hello"}` payload (the
+        // stored "stale" rows are gone — the clear happened first).
+        let rows = db
+            .messages_for("resume-1")
+            .expect("messages_for should work");
+        assert!(
+            rows.len() >= 2,
+            "the replay re-populated the transcript: {rows:?}"
+        );
+        let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
+        assert_eq!(user_rows.len(), 1, "exactly ONE user row (the replay's)");
+        assert_eq!(user_rows[0].payload_json, r#"{"text":"hello"}"#);
+        let agent_rows: Vec<_> = rows.iter().filter(|r| r.kind == "agent-text").collect();
+        assert_eq!(
+            agent_rows.len(),
+            1,
+            "one assistant message → one agent-text row"
+        );
+        assert_eq!(
+            agent_rows[0].message_key.as_deref(),
+            Some("m1"),
+            "the replay uses the same messageId rule as the live stream"
+        );
+        assert_eq!(agent_rows[0].payload_json, r#"{"text":"world"}"#);
+        assert!(
+            !rows.iter().any(|r| r.payload_json.contains("stale")),
+            "the stale rows were cleared"
+        );
+
+        // (item 6b) A legacy row WITHOUT `loadSession` → normalized
+        // capabilities have `loadSession: false` + `resume_session` →
+        // `NotResumable`.
+        db.record_session(&SessionInfo {
+            session_id: "legacy-1".to_string(),
+            agent_id: "fake".to_string(),
+            cwd: dir.clone(),
+            capabilities: serde_json::json!({ "promptCapabilities": { "image": true } }),
+            config_options: None,
+        })
+        .expect("record_session should succeed");
+        assert_eq!(
+            normalize_capabilities(&db.session("legacy-1").unwrap().unwrap().capabilities_json)
+                ["loadSession"],
+            false,
+            "a legacy row (no loadSession key) normalizes to loadSession: false"
+        );
+        let result = manager
+            .resume_session("fake", "legacy-1", dir.clone(), &sink)
+            .await;
+        assert!(
+            matches!(result, Err(RpcError::NotResumable { .. })),
+            "a legacy row is NotResumable, got: {result:?}"
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (cancel) `send_prompt` + `cancel_session` (`FAKE_PI_WAIT_ABORT=1` —
+    /// the turn stays in-flight until the `abort`): the `abort` settles
+    /// the turn and the in-flight `send_prompt` resolves `Cancelled` (the
+    /// `cancel_requested` flag — set BEFORE the abort).
+    #[tokio::test]
+    async fn cancel_resolves_cancelled() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[("FAKE_PI_WAIT_ABORT", "1")]);
         let manager = SessionManager::new(dir.clone()).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -1780,88 +3064,36 @@ mod session_tests {
         .await
         .unwrap();
 
-        assert!(info.config_options.is_some());
-        let opts = info.config_options.unwrap();
-        assert_eq!(opts.len(), 2);
+        // The prompt + the cancel, CONCURRENTLY (`join!` — the `send_prompt`
+        // awaits the turn's `agent_settled`, which the fake emits on the
+        // `abort` the cancel sends; the `cancel_requested` flag set BEFORE
+        // the abort maps the settle to `Cancelled`).
+        let sid = info.session_id.clone();
+        let (reason, cancel_res) = tokio::join!(
+            async { manager.send_prompt(&sid, "hi".to_string()).await },
+            async {
+                // A head start for the prompt (the fake answers the prompt
+                // preflight immediately, then waits for the abort).
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                manager.cancel_session(&sid).await
+            },
+        );
+        assert_eq!(cancel_res, Ok(()), "cancel should succeed");
+        assert_eq!(reason, Ok(StopReason::Cancelled));
 
-        let model = opts
-            .iter()
-            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
-            .unwrap();
-        match &model.kind {
-            SessionConfigKind::Select(s) => {
-                assert_eq!(s.current_value.to_string(), "acme/alpha");
-                match &s.options {
-                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
-                    _ => panic!("expected ungrouped"),
-                }
-            }
-            _ => panic!("expected select"),
-        }
-
-        let thought = opts
-            .iter()
-            .find(|o| o.category == Some(SessionConfigOptionCategory::ThoughtLevel))
-            .unwrap();
-        match &thought.kind {
-            SessionConfigKind::Select(s) => {
-                assert_eq!(s.current_value.to_string(), "medium");
-                match &s.options {
-                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 6),
-                    _ => panic!("expected ungrouped"),
-                }
-            }
-            _ => panic!("expected select"),
-        }
+        let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (config) `set_config_option("model", "fake/fake-model-2")`: the
+    /// `set_model` command reaches the agent (the fake echoes the requested
+    /// provider/modelId), the response's re-synthesized options come back
+    /// (`currentValue` moved to `fake/fake-model-2`), AND a
+    /// `config_option_update` event arrives with the same options.
     #[tokio::test]
-    async fn resume_session_returns_config_options_from_load_session_response() {
+    async fn set_config_option_roundtrip() {
         let dir = temp_config_dir();
-        let cmd = unique_fake_agent(&dir);
-        write_agents_json_cmd(&cmd, &dir, Some("resume"));
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.resume_session("fake", "fake-session-1", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-
-        assert!(info.config_options.is_some());
-        let opts = info.config_options.unwrap();
-        assert_eq!(opts.len(), 2);
-
-        let model = opts
-            .iter()
-            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
-            .unwrap();
-        match &model.kind {
-            SessionConfigKind::Select(s) => {
-                assert_eq!(s.current_value.to_string(), "acme/alpha");
-                match &s.options {
-                    SessionConfigSelectOptions::Ungrouped(o) => assert_eq!(o.len(), 3),
-                    _ => panic!("expected ungrouped"),
-                }
-            }
-            _ => panic!("expected select"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (set) `set_config_option` round-trips: the request reaches the agent,
-    /// the response's updated `configOptions` come back (model current value
-    /// moved to `acme/beta`, the thinking entry unchanged), AND the agent's
-    /// `config_option_update` notification arrives as a `session-update`
-    /// event with the same updated options.
-    #[tokio::test]
-    async fn set_config_option_round_trips_and_notifies() {
-        let dir = temp_config_dir();
-        let cmd = unique_fake_agent(&dir);
-        write_agents_json_cmd(&cmd, &dir, None);
+        write_agents_json_pi(&dir, &[]);
         let manager = SessionManager::new(dir.clone()).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -1873,53 +3105,57 @@ mod session_tests {
         .unwrap();
 
         let updated = manager
-            .set_config_option(&info.session_id.to_string(), "model", "acme/beta")
+            .set_config_option(&info.session_id, "model", "fake/fake-model-2", &sink)
             .await
             .unwrap();
-
-        assert_eq!(updated.len(), 2);
         let model = updated
             .iter()
-            .find(|o| o.category == Some(SessionConfigOptionCategory::Model))
-            .unwrap();
-        match &model.kind {
-            SessionConfigKind::Select(s) => {
-                assert_eq!(s.current_value.to_string(), "acme/beta");
-            }
-            _ => panic!("expected select"),
-        }
+            .find(|o| o["id"] == "model")
+            .expect("the model selector");
+        assert_eq!(
+            model["currentValue"], "fake/fake-model-2",
+            "the echoed model becomes the current value"
+        );
 
-        // Wait for the notification
+        // The `config_option_update` event (the client owns the frame — pi
+        // does not emit one itself).
         let mut found = false;
-        for _ in 0..10 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !found {
             if let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
                 let msg = msg.unwrap();
-                if msg["event"] == "session-update" {
-                    let payload = &msg["payload"]["update"];
-                    if payload["sessionUpdate"] == "config_option_update" {
-                        found = true;
-                        assert_eq!(
-                            payload["configOptions"],
-                            serde_json::to_value(&updated).unwrap()
-                        );
-                        break;
-                    }
+                if msg["event"] == "session-update"
+                    && msg["payload"]["update"]["sessionUpdate"] == "config_option_update"
+                {
+                    found = true;
+                    let opts = &msg["payload"]["update"]["configOptions"];
+                    let model = opts
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|o| o["id"] == "model")
+                        .unwrap();
+                    assert_eq!(model["currentValue"], "fake/fake-model-2");
                 }
             }
         }
-        assert!(found, "notification not received");
+        assert!(found, "the config_option_update event was not emitted");
+
+        let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (error) `set_config_option_error` mode: the agent's rejection maps to
-    /// `AcpError::Protocol`.
+    /// (permission) `FAKE_PI_GATE=1`: the `prompt` turn fires the gate
+    /// dialog (`extension_ui_request` `confirm` → a `permission-request`
+    /// event with the `[Allow, Block]` options) → `respond_permission`
+    /// (`Selected("allow")` → `confirmed: true`) → the turn still resolves
+    /// `EndTurn` (the fake only settles after the response).
     #[tokio::test]
-    async fn set_config_option_rejection_maps_to_protocol_error() {
+    async fn permission_gate_roundtrip() {
         let dir = temp_config_dir();
-        let cmd = unique_fake_agent(&dir);
-        write_agents_json_cmd(&cmd, &dir, Some("set_config_option_error"));
+        write_agents_json_pi(&dir, &[("FAKE_PI_GATE", "1")]);
         let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
         let info = crate::test_support::run_with_retry(|| {
@@ -1928,26 +3164,71 @@ mod session_tests {
         .await
         .unwrap();
 
-        let result = manager
-            .set_config_option(&info.session_id.to_string(), "model", "acme/beta")
-            .await;
+        // The prompt + the gate answer, CONCURRENTLY (`join!` — the
+        // `send_prompt` awaits the turn's `agent_settled`, which the fake
+        // emits only AFTER the client's `confirmed: true` response; the
+        // `permission-request` event arrives mid-turn, and the pending
+        // entry is registered BEFORE the event is emitted, so
+        // `respond_permission` finds it by the time the event is seen).
+        let sid = info.session_id.clone();
+        let (reason, answer) = tokio::join!(
+            async { manager.send_prompt(&sid, "hi".to_string()).await },
+            async {
+                // The `permission-request` event (the synthesized shape —
+                // the `request` sub-object mirrors the frontend's
+                // `PermissionRequest` type; `confirm` frames offer
+                // `[Allow, Block]`).
+                let mut request_id = None;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline && request_id.is_none() {
+                    if let Ok(msg) =
+                        tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                    {
+                        let msg = msg.unwrap();
+                        if msg["event"] == "permission-request" {
+                            let request = &msg["payload"]["request"];
+                            let options: Vec<String> = request["options"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|o| o["optionId"].as_str().unwrap().to_string())
+                                .collect();
+                            assert_eq!(
+                                options,
+                                vec!["allow", "reject"],
+                                "confirm frames offer [Allow, Block]"
+                            );
+                            assert_eq!(request["sessionId"], sid);
+                            request_id =
+                                Some(msg["payload"]["requestId"].as_str().unwrap().to_string());
+                        }
+                    }
+                }
+                let request_id = request_id.expect("the permission-request event was not emitted");
+                // The user allows → the fake receives `confirmed: true`
+                // and settles the turn.
+                let hit = manager
+                    .respond_permission(
+                        &sid,
+                        &request_id,
+                        PermissionOutcome::Selected {
+                            option_id: "allow".to_string(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(hit, "the pending entry must be resolved");
+                Ok::<(), RpcError>(())
+            },
+        );
+        assert!(answer.is_ok());
+        assert_eq!(
+            reason,
+            Ok(StopReason::EndTurn),
+            "the turn settles after the allowed gate"
+        );
 
-        assert!(matches!(result, Err(AcpError::Protocol { .. })));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (unknown) `set_config_option` on an unknown session id maps to
-    /// `AcpError::UnknownSession`.
-    #[tokio::test]
-    async fn set_config_option_unknown_session() {
-        let dir = temp_config_dir();
-        let manager = SessionManager::new(dir.clone()).unwrap();
-
-        let result = manager
-            .set_config_option("nope", "model", "acme/beta")
-            .await;
-
-        assert!(matches!(result, Err(AcpError::UnknownSession { .. })));
+        let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

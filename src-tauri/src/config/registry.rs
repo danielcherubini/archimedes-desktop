@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single agent the desktop can launch.
 ///
-/// `command` is the executable (e.g. `pi-acp`); `args` and `env` are optional
+/// `command` is the executable (e.g. `pi`); `args` and `env` are optional
 /// extras passed through to the spawned process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEntry {
@@ -39,7 +39,8 @@ impl Registry {
     /// Load the registry from `<dir>/agents.json`.
     ///
     /// A missing file yields the default registry (a single `pi` entry
-    /// pointing at `pi-acp`), so a fresh install works out of the box.
+    /// pointing at the `pi` binary in its own RPC mode), so a fresh
+    /// install works out of the box.
     pub fn load(dir: &Path) -> Result<Self, ConfigError> {
         let path = dir.join("agents.json");
         if !path.exists() {
@@ -60,8 +61,8 @@ impl Registry {
             agents: vec![AgentEntry {
                 id: "pi".to_string(),
                 name: "Pi".to_string(),
-                command: "pi-acp".to_string(),
-                args: Vec::new(),
+                command: "pi".to_string(),
+                args: vec!["--mode".to_string(), "rpc".to_string()],
                 env: BTreeMap::new(),
                 bridge: true,
             }],

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use archimedes_desktop_lib::agent::{AcpError, FsBackend};
+use archimedes_desktop_lib::agent::{FsBackend, FsError};
 
 /// Create a fresh temp directory to act as the sandbox root.
 fn temp_root() -> PathBuf {
@@ -65,7 +65,7 @@ fn path_escape_via_dotdot_is_rejected() {
         .read(&escape)
         .expect_err("reading ../etc/passwd must be rejected");
     assert!(
-        matches!(err, AcpError::PathEscape { .. }),
+        matches!(err, FsError::PathEscape { .. }),
         "dotdot escape should be PathEscape, got {err:?}"
     );
 
@@ -75,7 +75,7 @@ fn path_escape_via_dotdot_is_rejected() {
         .write(&write_escape, "nope")
         .expect_err("writing ../evil.txt must be rejected");
     assert!(
-        matches!(err, AcpError::PathEscape { .. }),
+        matches!(err, FsError::PathEscape { .. }),
         "dotdot write escape should be PathEscape, got {err:?}"
     );
 
@@ -95,7 +95,7 @@ fn path_escape_via_symlink_is_rejected() {
         .read(&link)
         .expect_err("reading through an escaping symlink must be rejected");
     assert!(
-        matches!(err, AcpError::PathEscape { .. }),
+        matches!(err, FsError::PathEscape { .. }),
         "symlink escape should be PathEscape, got {err:?}"
     );
 
@@ -113,7 +113,7 @@ fn absolute_path_outside_root_is_rejected() {
         .read(outside)
         .expect_err("absolute path outside root must be rejected");
     assert!(
-        matches!(err, AcpError::PathEscape { .. }),
+        matches!(err, FsError::PathEscape { .. }),
         "absolute outside path should be PathEscape, got {err:?}"
     );
 

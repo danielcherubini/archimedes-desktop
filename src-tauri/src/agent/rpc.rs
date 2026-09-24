@@ -794,7 +794,13 @@ mod tests {
             .send(serde_json::json!({ "type": "get_state" }))
             .await
             .unwrap();
-        assert_eq!(data["sessionId"], "fake-pi-1");
+        // The session id is UNIQUE per process (mirroring real pi); the
+        // prefix is the stable part.
+        assert!(
+            data["sessionId"].as_str().unwrap().starts_with("fake-pi-"),
+            "a fresh session gets a unique pi id, got {}",
+            data["sessionId"]
+        );
         assert_eq!(data["sessionFile"], "/tmp/fake-pi-session.jsonl");
         handle.close().await;
     }
@@ -843,7 +849,13 @@ mod tests {
             handle.send(serde_json::json!({ "type": "get_state" })),
             handle.send(serde_json::json!({ "type": "get_available_models" })),
         );
-        assert_eq!(state.unwrap()["sessionId"], "fake-pi-1");
+        assert!(
+            state.unwrap()["sessionId"]
+                .as_str()
+                .unwrap()
+                .starts_with("fake-pi-"),
+            "a fresh session gets a unique pi id"
+        );
         assert_eq!(models.unwrap()["models"].as_array().unwrap().len(), 2);
         handle.close().await;
     }

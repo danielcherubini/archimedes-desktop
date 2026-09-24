@@ -1,22 +1,24 @@
-//! ACP session core: spawn an agent, speak ACP, drive the session lifecycle.
+//! Pi-RPC session core: spawn a pi agent, speak its JSONL RPC protocol,
+//! drive the session lifecycle.
 
 pub mod bridge;
 mod errors;
 mod fs_backend;
 pub mod launch_wrapper;
 mod permission;
-pub mod prompt;
 pub mod rpc;
 mod session;
 pub mod subagent;
 pub mod worker_runtime;
 
 pub use bridge::{bridge_key, PendingBridge};
-pub use errors::{AcpError, RpcError};
-pub use fs_backend::FsBackend;
+pub use errors::RpcError;
+pub use fs_backend::{FsBackend, FsError};
 pub use permission::{permission_key, PendingPermissions, PermissionOutcome};
-pub use prompt::ImagePayload;
 pub use rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, PiRpcHandle, RpcEvent};
-pub use session::{ClosedReason, EventSink, SessionInfo, SessionManager, SubagentSpawn};
+pub use session::{
+    normalize_capabilities, user_message_payload, ClosedReason, EventSink, ImagePayload,
+    SessionInfo, SessionManager, StopReason, SubagentSpawn, MAX_IMAGE_BYTES,
+};
 pub use subagent::{SubagentMetrics, SubagentOutcome, SubagentSessionManager};
 pub use worker_runtime::WorkerRuntime;

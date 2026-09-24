@@ -1,9 +1,9 @@
-//! End-to-end IPC test for the Task 5 command surface (history, settings,
-//! resume) — runs the REAL Tauri command handlers, the real SQLite file, and
-//! the real fake agent, without a GUI (Tauri's mock runtime).
+//! End-to-end IPC test for the command surface (history, settings, resume)
+//! — runs the REAL Tauri command handlers, the real SQLite file, and the
+//! `fake_pi` agent, without a GUI (Tauri's mock runtime).
 //!
-//! Flow: settings defaults + round-trip → start a session with the fake
-//! agent → prompt → the transcript is persisted → `list_sessions` /
+//! Flow: settings defaults + round-trip → start a session with `fake_pi`
+//! → prompt → the transcript is persisted → `list_sessions` /
 //! `load_history` see it → `delete_session` removes it (cascade).
 
 use std::path::PathBuf;
@@ -17,9 +17,10 @@ use tauri::{Manager, WebviewWindow, WebviewWindowBuilder};
 use archimedes_desktop_lib::agent::EventSink;
 use archimedes_desktop_lib::storage::Db;
 
-/// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).
-const FAKE_SESSION_ID: &str = "fake-session-1";
-const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_fake_agent");
+/// The session-id PREFIX `fake_pi` reports for a fresh session (the id
+/// itself is UNIQUE per process — see `bin/fake_pi.rs`).
+const FAKE_SESSION_PREFIX: &str = "fake-pi-";
+const FAKE_PI: &str = env!("CARGO_BIN_EXE_fake_pi");
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("archimedes-ipc-{}-{}", tag, uuid::Uuid::new_v4()));
@@ -32,8 +33,8 @@ fn write_agents_json(dir: &std::path::Path) {
         "agents": [
             {
                 "id": "fake",
-                "name": "Fake Agent",
-                "command": FAKE_AGENT,
+                "name": "Fake Pi",
+                "command": FAKE_PI,
                 "args": [],
                 "env": {}
             }
@@ -181,14 +182,18 @@ fn history_settings_and_resume_commands_round_trip() {
         "start_session",
         serde_json::json!({ "agentId": "fake", "cwd": config_dir.to_string_lossy() }),
     );
-    assert_eq!(info["sessionId"], FAKE_SESSION_ID);
-    assert!(info["capabilities"]["loadSession"].as_bool() == Some(false));
+    let session_id = info["sessionId"].as_str().unwrap().to_string();
+    assert!(
+        session_id.starts_with(FAKE_SESSION_PREFIX),
+        "a fresh session gets a unique pi id, got {session_id}"
+    );
+    assert!(info["capabilities"]["loadSession"].as_bool() == Some(true));
 
     // --- prompt → the fake agent streams two chunks ---
     let stop = invoke(
         &webview,
         "send_prompt",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID, "text": "hi" }),
+        serde_json::json!({ "sessionId": session_id, "text": "hi" }),
     );
     assert_eq!(stop, "end_turn");
 
@@ -198,7 +203,7 @@ fn history_settings_and_resume_commands_round_trip() {
     let db = Db::open(&app_data_dir.join("archimedes.db")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let agent = loop {
-        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        let rows = db.messages_for(&session_id).unwrap();
         let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
         if kinds == vec!["user", "agent-text"] {
             break rows
@@ -212,19 +217,19 @@ fn history_settings_and_resume_commands_round_trip() {
         std::thread::sleep(Duration::from_millis(50));
     };
     let payload: serde_json::Value = serde_json::from_str(&agent.payload_json).unwrap();
-    assert_eq!(payload["text"], "hello world");
+    assert_eq!(payload["text"], "Hello");
 
     // --- list_sessions + load_history see the session ---
     let sessions = invoke(&webview, "list_sessions", serde_json::json!({}));
     let arr = sessions.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["sessionId"], FAKE_SESSION_ID);
+    assert_eq!(arr[0]["sessionId"], session_id);
     assert_eq!(arr[0]["agentId"], "fake");
 
     let history = invoke(
         &webview,
         "load_history",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     let kinds: Vec<String> = history
         .as_array()
@@ -234,35 +239,29 @@ fn history_settings_and_resume_commands_round_trip() {
         .collect();
     assert_eq!(kinds, vec!["user".to_string(), "agent-text".to_string()]);
 
-    // --- resume is refused: the fake agent does not advertise loadSession ---
-    let err = get_ipc_response(
+    // --- resume SUCCEEDS: the fake reports a session file (a loadable
+    // session) — the resume spawn loads it and replays the transcript.
+    // The resumed session KEEPS the stored session id (the desktop's
+    // resume contract — the client session id is preserved).
+    let resumed = invoke(
         &webview,
-        InvokeRequest {
-            cmd: "resume_session".into(),
-            callback: CallbackFn(0),
-            error: CallbackFn(1),
-            url: "tauri://localhost".parse().unwrap(),
-            body: InvokeBody::Json(serde_json::json!({
-                "agentId": "fake",
-                "sessionId": FAKE_SESSION_ID,
-                "cwd": config_dir.to_string_lossy()
-            })),
-            headers: Default::default(),
-            invoke_key: INVOKE_KEY.to_string(),
-        },
-    )
-    .expect_err("resume must fail for a non-loadSession agent");
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("not") && err_str.to_lowercase().contains("resum"),
-        "expected a NotResumable error, got: {err_str}"
+        "resume_session",
+        serde_json::json!({
+            "agentId": "fake",
+            "sessionId": session_id,
+            "cwd": config_dir.to_string_lossy()
+        }),
+    );
+    assert_eq!(
+        resumed["sessionId"], session_id,
+        "a resume keeps the stored session id"
     );
 
     // --- close the session and wait for the driver task's teardown ---
     invoke(
         &webview,
         "close_session",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -276,14 +275,16 @@ fn history_settings_and_resume_commands_round_trip() {
     invoke(
         &webview,
         "delete_session",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     let sessions = invoke(&webview, "list_sessions", serde_json::json!({}));
+    // The resumed session re-uses the stored id, so deleting it removed
+    // the only row.
     assert!(sessions.as_array().unwrap().is_empty());
     let history = invoke(
         &webview,
         "load_history",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     assert!(history.as_array().unwrap().is_empty());
 
@@ -332,7 +333,7 @@ fn spaces_and_agents_commands_round_trip() {
     let agents = invoke(&webview, "list_agents", serde_json::json!({}));
     assert_eq!(
         agents,
-        serde_json::json!([{ "id": "fake", "name": "Fake Agent" }])
+        serde_json::json!([{ "id": "fake", "name": "Fake Pi" }])
     );
 
     // --- start a session in that folder (record_session → upsert_space hook) ---
@@ -341,7 +342,11 @@ fn spaces_and_agents_commands_round_trip() {
         "start_session",
         serde_json::json!({ "agentId": "fake", "cwd": newproj.to_string_lossy() }),
     );
-    assert_eq!(info["sessionId"], FAKE_SESSION_ID);
+    let session_id = info["sessionId"].as_str().unwrap().to_string();
+    assert!(
+        session_id.starts_with(FAKE_SESSION_PREFIX),
+        "a fresh session gets a unique pi id, got {session_id}"
+    );
 
     // list_spaces: exactly one row, the canonicalized path.
     let canonical = std::fs::canonicalize(&newproj)
@@ -374,7 +379,7 @@ fn spaces_and_agents_commands_round_trip() {
     let sessions = invoke(&webview, "list_sessions", serde_json::json!({}));
     let arr = sessions.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["sessionId"], FAKE_SESSION_ID);
+    assert_eq!(arr[0]["sessionId"], session_id);
 
     // space_for_path on a nonexistent folder: an ERROR, not a None (the
     // dialog shows the reason inline).
@@ -404,7 +409,7 @@ fn spaces_and_agents_commands_round_trip() {
     invoke(
         &webview,
         "close_session",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -462,7 +467,11 @@ fn send_prompt_images_ipc() {
         "start_session",
         serde_json::json!({ "agentId": "fake", "cwd": config_dir.to_string_lossy() }),
     );
-    assert_eq!(info["sessionId"], FAKE_SESSION_ID);
+    let session_id = info["sessionId"].as_str().unwrap().to_string();
+    assert!(
+        session_id.starts_with(FAKE_SESSION_PREFIX),
+        "a fresh session gets a unique pi id, got {session_id}"
+    );
 
     // --- invalid image FIRST (validation-before-persistence proof) ---
     // An SVG from hand-rolled IPC must be rejected BEFORE anything is
@@ -471,7 +480,7 @@ fn send_prompt_images_ipc() {
         &webview,
         "send_prompt",
         serde_json::json!({
-            "sessionId": FAKE_SESSION_ID,
+            "sessionId": session_id,
             "text": "look at this",
             "images": [{ "mimeType": "image/svg+xml", "data": "AQID", "name": "a.svg", "sizeBytes": 3 }]
         }),
@@ -482,7 +491,7 @@ fn send_prompt_images_ipc() {
         "expected an invalid-payload error, got: {err_str}"
     );
     let db = Db::open(&app_data_dir.join("archimedes.db")).unwrap();
-    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+    let rows = db.messages_for(&session_id).unwrap();
     assert!(
         rows.iter().all(|r| r.kind != "user"),
         "a rejected image payload must not be persisted, got: {:?}",
@@ -497,7 +506,7 @@ fn send_prompt_images_ipc() {
         &webview,
         "send_prompt",
         serde_json::json!({
-            "sessionId": FAKE_SESSION_ID,
+            "sessionId": session_id,
             "text": "look",
             "images": [{ "mimeType": "image/png", "data": "AQID", "name": "a.png", "sizeBytes": 3 }]
         }),
@@ -507,7 +516,7 @@ fn send_prompt_images_ipc() {
     // draining — same deadline pattern as the existing test).
     let deadline = Instant::now() + Duration::from_secs(10);
     let user = loop {
-        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        let rows = db.messages_for(&session_id).unwrap();
         if let Some(row) = rows.iter().find(|r| r.kind == "user") {
             break row.clone();
         }
@@ -542,7 +551,7 @@ fn send_prompt_images_ipc() {
         &webview,
         "send_prompt",
         serde_json::json!({
-            "sessionId": FAKE_SESSION_ID,
+            "sessionId": session_id,
             "text": "look",
             "images": nine
         }),
@@ -552,7 +561,7 @@ fn send_prompt_images_ipc() {
         err_str.contains("at most 8"),
         "expected the image-count cap error, got: {err_str}"
     );
-    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+    let rows = db.messages_for(&session_id).unwrap();
     let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
     assert_eq!(
         user_rows.len(),
@@ -569,7 +578,7 @@ fn send_prompt_images_ipc() {
         &webview,
         "send_prompt",
         serde_json::json!({
-            "sessionId": FAKE_SESSION_ID,
+            "sessionId": session_id,
             "text": "",
             "images": [{ "mimeType": "image/png", "data": "AQID", "name": "only.png", "sizeBytes": 3 }]
         }),
@@ -578,7 +587,7 @@ fn send_prompt_images_ipc() {
     // Poll for the image-only user row (distinct from the one above by name).
     let deadline = Instant::now() + Duration::from_secs(10);
     let user = loop {
-        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        let rows = db.messages_for(&session_id).unwrap();
         if let Some(row) = rows
             .iter()
             .find(|r| r.kind == "user" && r.payload_json.contains("only.png"))
@@ -602,7 +611,7 @@ fn send_prompt_images_ipc() {
     invoke(
         &webview,
         "close_session",
-        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+        serde_json::json!({ "sessionId": session_id }),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

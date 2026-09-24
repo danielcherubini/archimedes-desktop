@@ -8,23 +8,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::SessionId;
 use tauri::State;
 
-use crate::agent::SessionInfo;
+use crate::agent::{normalize_capabilities, SessionInfo};
 use crate::storage::{Db, MessageRow};
 
 /// All stored sessions, newest first, as `SessionInfo` (camelCase over IPC).
+///
+/// The stored `capabilities_json` is NORMALIZED on the way out (item 6b of
+/// the swap plan): a pre-swap ACP row (or an unparseable blob) becomes
+/// `{ "loadSession": false }` — the frontend's Resume button then stays
+/// hidden and the history-only banner is the honest view.
 #[tauri::command]
 pub async fn list_sessions(state: State<'_, Arc<Db>>) -> Result<Vec<SessionInfo>, String> {
     let rows = state.list_sessions().map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|row| SessionInfo {
-            session_id: SessionId::new(row.id),
+            session_id: row.id,
             agent_id: row.agent_id,
             cwd: PathBuf::from(row.cwd),
-            capabilities: serde_json::from_str(&row.capabilities_json).unwrap_or_default(),
+            capabilities: normalize_capabilities(&row.capabilities_json),
             config_options: None,
         })
         .collect())

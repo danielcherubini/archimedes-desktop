@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::v1::{AgentCapabilities, SessionId};
 use archimedes_desktop_lib::agent::SessionInfo;
 use archimedes_desktop_lib::storage::Db;
 
@@ -17,10 +16,14 @@ fn temp_db_path() -> PathBuf {
 
 fn sample_session() -> SessionInfo {
     SessionInfo {
-        session_id: SessionId::new("sess-1"),
+        session_id: "sess-1".to_string(),
         agent_id: "fake".to_string(),
         cwd: PathBuf::from("/tmp/proj"),
-        capabilities: AgentCapabilities::default(),
+        capabilities: serde_json::json!({
+            "piSessionId": "sess-1",
+            "loadSession": true,
+            "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+        }),
         config_options: None,
     }
 }
@@ -208,10 +211,14 @@ fn open_backfills_space_rows_from_existing_sessions() {
     let db_path = base.join("archimedes.db");
 
     let mk_session = |id: &str, cwd: std::path::PathBuf| SessionInfo {
-        session_id: SessionId::new(id),
+        session_id: id.to_string(),
         agent_id: "fake".to_string(),
         cwd,
-        capabilities: AgentCapabilities::default(),
+        capabilities: serde_json::json!({
+            "piSessionId": id,
+            "loadSession": true,
+            "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+        }),
         config_options: None,
     };
 

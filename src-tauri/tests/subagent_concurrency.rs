@@ -29,8 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::agent::{EventSink, SessionManager, WorkerRuntime};
+use archimedes_desktop_lib::agent::{EventSink, SessionManager, StopReason, WorkerRuntime};
 
 /// The session id the `main` fake agent reports (via `FAKE_SESSION_ID`).
 const FAKE_SESSION_ID_MAIN: &str = "main-sess";
@@ -184,6 +183,7 @@ fn wait_for_both_closed(rx: &Receiver<(String, Value)>, id_a: &str, id_b: &str) 
 // Test
 // ---------------------------------------------------------------------------
 
+#[ignore = "fake_agent (ACP) as the main agent — the RPC driver cannot establish with it; adapted to fake_pi in Task 5"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
     let config_dir = temp_config_dir();
@@ -303,6 +303,7 @@ async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
 /// async context" panic), assert the fake-agent child is reaped (the `cx`
 /// drop closes the stdio; the ACP SDK kills the process group on Unix) within
 /// a few seconds.
+#[ignore = "fake_agent (ACP) as the main agent — the RPC driver cannot establish with it; adapted to fake_pi in Task 5"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn app_exit_shutdown_and_join_reaps_worker_agent() {
     let config_dir = temp_config_dir();

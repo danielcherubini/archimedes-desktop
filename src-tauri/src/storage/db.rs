@@ -171,6 +171,29 @@ impl Db {
         Ok(())
     }
 
+    /// One stored session by id (`None` when absent) — the resume path
+    /// reads the stored `capabilities_json` (the `piSessionFile` is the
+    /// `--session` argument of the resume spawn).
+    pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = guard
+            .prepare("SELECT id, agent_id, cwd, created_at, title, capabilities_json FROM sessions WHERE id = ?1")?;
+        let row = stmt
+            .query_map(params![id], |row| {
+                Ok(SessionRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    cwd: row.get(2)?,
+                    created_at: row.get(3)?,
+                    title: row.get(4)?,
+                    capabilities_json: row.get(5)?,
+                })
+            })?
+            .next()
+            .transpose()?;
+        Ok(row)
+    }
+
     /// All stored sessions, newest first.
     pub fn list_sessions(&self) -> Result<Vec<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
