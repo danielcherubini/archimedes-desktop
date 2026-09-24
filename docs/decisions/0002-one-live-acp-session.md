@@ -1,8 +1,8 @@
 ---
 status: superseded
 date: 2026-09-16
-superseded-by:
-superseded-date: 2026-09-22
+superseded-by: 0009-rpc-replaces-acp.md
+superseded-date: 2026-09-24
 ---
 
 # Cap live ACP sessions at one app-wide (v1)

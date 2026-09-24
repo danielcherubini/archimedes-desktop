@@ -1852,7 +1852,8 @@ fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 })],
                 // Accumulate the partial-args JSON fragments; a complete
                 // object is sent as `rawInput`, an incomplete one as
-                // `partialArgs` (mirrors the pi-acp adapter's behavior).
+                // `partialArgs` (the adapter-era behavior, kept for the
+                // streaming tool-call frames).
                 Some("toolcall_delta") => {
                     let Some(id) = ev.get("id").and_then(Value::as_str) else {
                         return Vec::new();

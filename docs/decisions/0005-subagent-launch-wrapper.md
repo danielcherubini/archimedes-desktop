@@ -1,7 +1,8 @@
 ---
-status: accepted
+status: superseded
 date: 2026-09-16
-superseded-by:
+superseded-by: 0009-rpc-replaces-acp.md
+superseded-date: 2026-09-24
 ---
 
 # Subagent launch config via a per-dispatch PI_ACP_PI_COMMAND wrapper

@@ -1,9 +1,10 @@
 # AGENTS.md
 
-Archimedes Desktop — a cross-platform (Windows / macOS / Linux) Tauri 2 app that
-connects to coding agents over the Agent Client Protocol (ACP). Rust backend
-(`src-tauri/`) + React 19 / TypeScript frontend (`src/`). See `CONTEXT.md` for
-terminology and `docs/decisions/` for ADRs.
+Archimedes Desktop — a cross-platform (Windows / macOS / Linux) Tauri 2 app
+that connects to coding agents. The Rust core speaks pi's RPC mode natively
+(`pi --mode rpc` — JSONL over stdio; ADR 0009). Rust backend (`src-tauri/`)
++ React 19 / TypeScript frontend (`src/`). See `CONTEXT.md` for terminology
+and `docs/decisions/` for ADRs.
 
 ## Build & Testing
 

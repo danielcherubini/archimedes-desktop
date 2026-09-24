@@ -18,8 +18,10 @@
 //! **Peer verification (fail-closed):** a connection is accepted only if the
 //! connecting process is a **descendant of the desktop itself** — the anchor
 //! is the desktop's own pid (`std::process::id()`, always alive). The
-//! topology is desktop (D) → `pi-acp` (A, a direct child of D) → `pi` (P, a
-//! grandchild); the peer connecting to the desktop's socket is `pi` (P). On
+//! topology is desktop (D) → `pi` (A, a direct child of D — the desktop
+//! spawns `pi --mode rpc` directly; the subagent dispatch spawns the same
+//! binary with the `ARCHIMEDES_SUBAGENT=1` env); the peer connecting to the
+//! desktop's socket is `pi` (A). On
 //! Linux the peer's pid comes from `SO_PEERCRED` and the parent chain is
 //! walked via `/proc/<pid>/status` (bounded ≤8 hops). On **macOS** (no
 //! `SO_PEERCRED`/`ucred`) the listener is **not started** (fail-closed — the
@@ -368,7 +370,7 @@ pub enum DescendantCheck {
 /// Walk the parent chain from `peer` up to `anchor` (bounded ≤8 hops).
 ///
 /// The 8-hop bound assumes the bridge topology is shallow (desktop →
-/// `pi-acp` → `pi` is 3 levels); a chain deeper than 8 is rejected
+/// `pi` is 2 levels); a chain deeper than 8 is rejected
 /// (fail-closed). The bound is also the CYCLE GUARD: a cycle in the chain
 /// (42 → 7 → 42 → …) cannot loop forever.
 ///

@@ -5,8 +5,9 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
-# Two binaries exist (the app + the dev-only fake_agent fixture); tell cargo
-# which one `cargo run` (and thus `tauri dev`) should launch.
+# Two binaries exist (the app + the dev-only `fake_pi` fixture — a
+# stand-in for the real `pi --mode rpc` agent in integration tests); tell
+# cargo which one `cargo run` (and thus `tauri dev`) should launch.
 default-run = "archimedes-desktop"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -30,7 +31,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "time", "net", "rt"] }
 thiserror = "2"
-agent-client-protocol = "2"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -41,7 +41,6 @@ image = { version = "0.25", features = ["png"] }
 
 [dev-dependencies]
 serde_json = "1"
-agent-client-protocol = "2"
 # Enables `tauri::test` (mock runtime) for the headless IPC test.
 tauri = { version = "2", features = ["test"] }
 

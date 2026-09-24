@@ -446,9 +446,11 @@ pub struct PiRpc {
 }
 
 impl PiRpc {
-    /// Spawn `program` with `args`/`env`/`cwd`. `env` is ADDITIVE (the child
-    /// inherits the desktop's environment, matching how the ACP agent was
-    /// spawned) and is typed `&BTreeMap<String, String>` to match the existing
+    /// Spawn `program` with `args`/`env`/`cwd`. `env` is ADDITIVE (the
+    /// child inherits the desktop's environment — the real `pi` needs the
+    /// user's API keys / `PATH` from it — then the caller's map is layered
+    /// on top: the registry entry's env + the bridge + the gate) and is
+    /// typed `&BTreeMap<String, String>` to match the existing
     /// `AgentEntry.env` / `bridge_spawn_setup` flow.
     pub fn spawn(
         program: &str,
@@ -459,7 +461,15 @@ impl PiRpc {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args);
         cmd.current_dir(cwd);
-        cmd.envs(env);
+        // ADDITIVE: start from the desktop's own environment, then layer
+        // the caller's map on top. (`Command::envs` alone would REPLACE the
+        // inherited environment — the child would lose the user's API
+        // keys and `PATH`, and the real `pi` could not authenticate.)
+        let mut child_env: BTreeMap<String, String> = std::env::vars().collect();
+        for (k, v) in env.iter() {
+            child_env.insert(k.clone(), v.clone());
+        }
+        cmd.envs(&child_env);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         // stderr is inherited (diagnostics go to the desktop's console; the
@@ -684,8 +694,7 @@ impl PiRpcHandle {
             }
             return Err(e);
         }
-        rx.await
-            .unwrap_or_else(|_| Err(RpcError::ProcessExited(None)))
+        rx.await.unwrap_or(Err(RpcError::ProcessExited(None)))
     }
 
     /// Answer an `extension_ui_request` (written to stdin; the agent's

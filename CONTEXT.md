@@ -1,16 +1,16 @@
 # Archimedes Desktop
 
-A cross-platform (Windows/macOS/Linux) desktop app, built with Tauri 2, that connects to coding agents over the Agent Client Protocol (ACP). Pi is the first-class agent in v1; other ACP agents follow.
+A cross-platform (Windows/macOS/Linux) desktop app, built with Tauri 2, that connects to coding agents. The Rust core speaks pi's RPC mode natively (`pi --mode rpc` — JSONL over stdio, ADR 0009). Pi is the first-class agent in v1.
 
 ## Language
 
 **Client**:
-The Archimedes Desktop application itself — the ACP *client* role: it spawns agent processes, renders the conversation, and provides file/terminal/permission backends.
+The Archimedes Desktop application itself — the RPC *client* role: it spawns agent processes (`pi --mode rpc`), renders the conversation, and provides file/terminal/permission backends.
 _Avoid_: App, frontend, IDE
 
 **Agent**:
-An external ACP-speaking coding agent process (pi, Claude Code, Codex, …), spawned by the Client as a subprocess and communicated with over stdio JSON-RPC.
-_Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated ACP session — see its entry below.)
+An external coding agent process (pi, …) that speaks pi's RPC mode (`--mode rpc`), spawned by the Client as a subprocess and communicated with over stdio JSONL (one JSON object per line, both directions).
+_Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated pi RPC session — see its entry below.)
 
 **Space**:
 A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: one active conversation per Space — its most recent live **Session** (multiple live Sessions may coexist app-wide: the one-live policy was lifted 2026-09-22, ADR 0002 superseded); stored conversations of a Space survive.
@@ -21,7 +21,7 @@ One live conversation between the Client and one agent process, backed by exactl
 _Avoid_: Conversation, chat, thread, run
 
 **Subagent session**:
-A desktop-spawned ACP session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same ACP pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
+A desktop-spawned pi RPC session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
 _Avoid_: Worker, delegated task, child session, background session
 
 **Agent registry**:
@@ -29,7 +29,7 @@ The Client's list of known agents — each entry is a spawn command (program + a
 _Avoid_: Agent list, agent config, agent profile
 
 **Permission prompt**:
-The Client's UI response to an ACP `session/request_permission` request from an agent — the user approves or denies a tool call.
+The Client's UI response to a tool-call permission gate from an agent (the bundled gate extension's `tool_call` hook → `ctx.ui.confirm` → the RPC `extension_ui_request` subprotocol, ADR 0009) — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
 
 **Bridge**:
@@ -37,11 +37,11 @@ The mechanism by which the archimedes suite (running inside an Agent process man
 _Avoid_: Side channel, socket bridge, client mode, host mode
 
 **Config option**:
-A per-session selector the agent advertises over ACP (e.g. model, thinking level) — a `select` (or `boolean`) with a current value and choices. Delivered in the `newSession`/`loadSession` response, updated via `config_option_update` notifications, and set by the Client via `session/set_config_option`. The agent is the source of truth: the Client does not persist config options; a resume re-fetches fresh state from the agent.
+A per-session selector the agent advertises over the RPC `get_state` response (e.g. model, thinking level) — a `select` (or `boolean`) with a current value and choices. Updated via the RPC's config-option events, and set by the Client via `set_model` / `set_thinking_level` commands. The agent is the source of truth: the Client does not persist config options; a resume re-fetches fresh state from the agent.
 _Avoid_: Model list, model picker, settings, preferences
 
 **Thinking block**:
-The collapsible UI unit that shows the agent's streamed internal reasoning (ACP `agent_thought_chunk`) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
+The collapsible UI unit that shows the agent's streamed internal reasoning (the RPC's `thinking_start` / `thinking_delta` / `thinking_end` events) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
 _Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZCode's term; the Client's UI says "Thinking…"/"Thought")
 
 **Attachment**:

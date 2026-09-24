@@ -1,13 +1,13 @@
 //! Errors for the session layer: `RpcError` is the only error type (the
-//! ACP `AcpError` died with the pi-RPC swap; the read-only pre-approval
-//! `FsBackend` has its own local `FsError` in `fs_backend.rs`).
+//! protocol layer's error type died with the pi-RPC swap; the read-only
+//! pre-approval `FsBackend` has its own local `FsError` in `fs_backend.rs`).
 
 use serde::Serialize;
 /// Errors surfaced by the pi RPC session layer.
 ///
 /// Derives `Serialize` so it can cross the Tauri IPC boundary as a command
-/// error (the same set of derives + `Display`/`Error` impls as `AcpError`, so
-/// it can replace `AcpError` in command signatures in the swap task).
+/// error (the same set of derives + `Display`/`Error` impls the protocol
+/// error type had, so it replaces it in command signatures).
 #[derive(Debug, thiserror::Error, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RpcError {
@@ -25,8 +25,8 @@ pub enum RpcError {
     ProcessExited(Option<i32>),
 
     /// The establish (session start / resume) did not complete in time —
-    /// replaces `AcpError::InitializeFailed` (the kept establish-timeout
-    /// mechanism).
+    /// replaces the protocol layer's initialize-failed error (the kept
+    /// establish-timeout mechanism).
     #[error("establish timeout: {detail}")]
     EstablishTimeout { detail: String },
 

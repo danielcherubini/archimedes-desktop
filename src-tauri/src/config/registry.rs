@@ -13,7 +13,8 @@ pub struct AgentEntry {
     pub id: String,
     /// Display name shown in the UI.
     pub name: String,
-    /// Executable to spawn (parsed by the ACP transport).
+    /// Executable to spawn (the desktop spawns it directly in its RPC mode
+    /// — `pi --mode rpc`; see ADR 0009).
     pub command: String,
     /// Optional extra command-line arguments.
     #[serde(default)]
