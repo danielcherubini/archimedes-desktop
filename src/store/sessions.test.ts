@@ -1122,10 +1122,17 @@ describe("resumeSession (history reload race)", () => {
     // `send()` adds the user message while the reload is in flight, then
     // `send_prompt`'s `record_message` COMMITS it BEFORE the history query
     // reads — so the reloaded rows INCLUDE the new user message (the race
-    // that made the prompt render twice, attachments included).
+    // that made the prompt render twice, attachments included). The reloaded
+    // row's `createdAt` is >= the local message's creation time (`at`):
+    // the DB commit happens AFTER the client-side `addUserMessage` (which
+    // stamps `at = Date.now()`), so the reloaded row is the SAME message
+    // committed slightly later — the timestamp rule dedups it (equal or
+    // newer timestamps both dedup: the safe direction).
     useSessions.getState().addUserMessage("s1", "two", [
       { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
     ]);
+    const added = useSessions.getState().messages.s1;
+    const addedAt = added[added.length - 1].at;
     resolveRows([
       {
         id: 1,
@@ -1146,15 +1153,67 @@ describe("resumeSession (history reload race)", () => {
             { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
           ],
         }),
-        createdAt: 100,
+        createdAt: addedAt,
       },
     ]);
     // Let the fire-and-forget reload's continuation run.
     await new Promise((r) => setTimeout(r, 0));
     // The prompt appears ONCE, not twice: the locally-added copy is
-    // deduped against the reloaded row (text + images match).
+    // deduped against the reloaded row (text + images match AND the
+    // reloaded row's timestamp is >= the local creation time).
     const msgs = useSessions.getState().messages.s1;
     expect(msgs).toHaveLength(2);
     expect(msgs.filter((m) => m.kind === "user" && m.text === "two")).toHaveLength(1);
+  });
+
+  it("keeps a re-sent identical prompt when the matching reloaded row is OLDER (repeated prompt, not a duplicate)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [{ kind: "user", text: "hi", at: 1 }],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when the user re-sends the SAME prompt.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    await useSessions.getState().resumeSession("s1");
+    // The user re-sent the identical prompt while the reload is in flight:
+    // the persisted (reloaded) "hi" is the OLDER one (committed long ago,
+    // `createdAt = 1`) and the new local "hi" (`at = Date.now()`) is NOT
+    // in the snapshot yet. The content match is a false positive for the
+    // new turn — it must NOT be deduped.
+    useSessions.getState().addUserMessage("s1", "hi");
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "hi" }),
+        createdAt: 1,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // BOTH the older reloaded "hi" AND the new local "hi" survive: the
+    // matching reloaded row's timestamp (1) is EARLIER than the new
+    // message's creation time, so it is the older prompt, not a duplicate.
+    const msgs = useSessions.getState().messages.s1;
+    const hi = msgs.filter((m) => m.kind === "user" && m.text === "hi");
+    expect(hi).toHaveLength(2);
+    // The new local copy (created just now, NOT the reloaded row's `at: 1`)
+    // is present.
+    expect(hi.some((m) => m.at > 1)).toBe(true);
   });
 });

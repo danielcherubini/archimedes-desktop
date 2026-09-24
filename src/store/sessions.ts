@@ -228,6 +228,12 @@ export function discardSessionMessages(sessionId: string): void {
  * text + images; the image entries are compared field-by-field in a FIXED
  * order so key-order differences in the two constructions never break the
  * match. A `diff` matches on path + patch.
+ *
+ * NOTE: for a `user` message this key is content ONLY and is therefore
+ * ambiguous — the merge must additionally require the matching reloaded
+ * row's timestamp to be >= the added message's `at` (see the dedup in
+ * `resumeSession`) so a re-sent identical prompt (an OLDER matching row)
+ * is not mistaken for the just-committed message.
  */
 function mergeDedupeKey(m: Message): string {
   switch (m.kind) {
@@ -678,11 +684,40 @@ export const useSessions = create<SessionsState>((set, get) => ({
         // the new user message BEFORE the history query reads — then the
         // reloaded rows INCLUDE it while `added` still holds its local
         // copy, and appending verbatim would render the prompt TWICE
-        // (attachments included). Exclude any `added` message already
-        // present in the reloaded rows (stable match key: an id when one
-        // exists on both sides, otherwise role + content equality).
-        const reloadedKeys = new Set(reloaded.map(mergeDedupeKey));
-        const fresh = added.filter((m) => !reloadedKeys.has(mergeDedupeKey(m)));
+        // (attachments included). Drop an `added` message already present
+        // in the reloaded rows: by id when one exists on both sides
+        // (agent-text/agent-thought `messageId`, tool-call `id`), and for
+        // a `user` message (NO id on either side) by text + images — but
+        // ONLY when the matching reloaded row is NEWER-OR-EQUAL by
+        // timestamp. Content alone is ambiguous because user messages have
+        // no stable id: the matching reloaded row is either the SAME
+        // message committed after the local copy was created (committed-
+        // before-read: the DB commit's `createdAt` >= the local `at` =
+        // `Date.now()` at `addUserMessage` time → dedup, no duplicate)
+        // or an OLDER re-sent prompt (the reloaded row predates the new
+        // message's creation time → the new turn is NOT a duplicate and
+        // must be kept). Equal timestamps dedup (the safe direction).
+        const reloadedKeys = new Set<string>();
+        const reloadedUserAt = new Map<string, number>();
+        for (const m of reloaded) {
+          const key = mergeDedupeKey(m);
+          if (m.kind === "user") {
+            // Several reloaded rows can share a content key (the prompt was
+            // re-sent earlier): the LATEST one is the only one that could
+            // be the just-committed message.
+            reloadedUserAt.set(key, Math.max(reloadedUserAt.get(key) ?? 0, m.at));
+          } else {
+            reloadedKeys.add(key);
+          }
+        }
+        const fresh = added.filter((m) => {
+          const key = mergeDedupeKey(m);
+          if (m.kind === "user") {
+            const reloadedAt = reloadedUserAt.get(key);
+            return reloadedAt === undefined || reloadedAt < m.at;
+          }
+          return !reloadedKeys.has(key);
+        });
         set((st) => ({
           messages: { ...st.messages, [sessionId]: [...reloaded, ...fresh] },
         }));
