@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatStream from "./ChatStream";
-import { sendPrompt, setSessionConfigOption, resumeSession } from "../lib/tauri";
+import { sendPrompt, setSessionConfigOption, resumeSession, readClipboardImage } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -62,6 +62,7 @@ vi.mock("../lib/tauri", async () => {
     respondPermission: vi.fn().mockResolvedValue(undefined),
     respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
+    readClipboardImage: vi.fn().mockResolvedValue(null),
   };
 });
 
@@ -869,6 +870,64 @@ describe("ChatStream", () => {
     // default paste action — no text is inserted; assert on the return value).
     expect(intercepted).toBe(true);
     expect(screen.queryByAltText("s.png")).toBeNull();
+  });
+
+  it("paste of plain text does NOT trigger the Rust clipboard read", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([], { text: "hello" });
+    await flush();
+    // A text paste is a text paste — no image read (no stale image staged).
+    expect(vi.mocked(readClipboardImage)).not.toHaveBeenCalled();
+    expect(screen.queryByAltText("s.png")).toBeNull();
+  });
+
+  it("paste with file items does NOT trigger the Rust clipboard read", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1])], "s.png", { type: "image/png" }),
+    ]);
+    await flush();
+    // The standard `items` path handles it — no fallback read.
+    expect(vi.mocked(readClipboardImage)).not.toHaveBeenCalled();
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+  });
+
+  it("WebKitGTK quirk: empty paste event falls back to the Rust clipboard read", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    // WebKitGTK: a pasted image produces a `paste` event with NO items and
+    // NO text (the DataTransfer is empty). The composer reads the image
+    // from the system clipboard (Rust/arboard) instead.
+    vi.mocked(readClipboardImage).mockResolvedValueOnce([0x89, 0x50, 0x4e, 0x47]);
+    pasteToComposer([]);
+    await flush();
+    expect(vi.mocked(readClipboardImage)).toHaveBeenCalledTimes(1);
+    // The read image is staged as a thumbnail (`screenshot.png`).
+    expect(screen.getByAltText("screenshot.png")).toBeTruthy();
+  });
+
+  it("WebKitGTK quirk fallback: no image on the clipboard stages nothing", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    vi.mocked(readClipboardImage).mockResolvedValueOnce(null);
+    pasteToComposer([]);
+    await flush();
+    expect(vi.mocked(readClipboardImage)).toHaveBeenCalledTimes(1);
+    expect(screen.queryByAltText("screenshot.png")).toBeNull();
+  });
+
+  it("WebKitGTK quirk fallback: a read error stages nothing (silent)", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    vi.mocked(readClipboardImage).mockRejectedValueOnce(new Error("no display"));
+    pasteToComposer([]);
+    await flush();
+    expect(screen.queryByAltText("screenshot.png")).toBeNull();
+    // No error line for a silent fallback miss (an empty-clipboard paste is
+    // not an error condition).
+    expect(screen.queryByText(/clipboard/i)).toBeNull();
   });
 
   it("spreadsheet TSV is NOT intercepted over the synthetic PNG", () => {

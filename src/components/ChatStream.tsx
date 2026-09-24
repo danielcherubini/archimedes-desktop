@@ -9,6 +9,7 @@ import {
 import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon, X } from "lucide-react";
 import {
   closeSession,
+  readClipboardImage,
   sendPrompt,
   setSessionConfigOption,
 } from "../lib/tauri";
@@ -587,13 +588,36 @@ export default function ChatStream() {
     // A spreadsheet paste carries TSV (or Excel HTML) alongside the
     // synthetic image — the TEXT wins, so the default paste is untouched.
     if (
-      files.length === 0 ||
-      shouldPreferSpreadsheetClipboardText(text, html)
-    )
+      files.length > 0 &&
+      !shouldPreferSpreadsheetClipboardText(text, html)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      stageFiles(files);
       return;
-    e.preventDefault();
-    e.stopPropagation();
-    stageFiles(files);
+    }
+    // WebKitGTK quirk: a pasted image produces a `paste` event with NO file
+    // items and NO text (the DataTransfer is empty — verified on
+    // webkit2gtk-4.1 2.52.5 on Wayland; the image IS inserted into a
+    // contenteditable, just not exposed on the event). When the event has
+    // no content at all, the likely cause is a clipboard image WebKit can't
+    // surface — read it from the system clipboard (Rust/arboard) instead.
+    // A text-only paste is a text paste: `getData("text/plain")` is
+    // non-empty, so the fallback is skipped (no stale image staged).
+    if (files.length === 0 && !text) {
+      void readClipboardImage()
+        .then((bytes) => {
+          if (!bytes) return; // no image on the clipboard — nothing to stage
+          const file = new File([new Uint8Array(bytes)], "screenshot.png", {
+            type: "image/png",
+          });
+          stageFiles([file]);
+        })
+        .catch(() => {
+          // Silent: clipboard access failed (or no image) — an empty-clipboard
+          // paste is not an error condition.
+        });
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {

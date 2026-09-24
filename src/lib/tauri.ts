@@ -362,6 +362,19 @@ export async function setSessionConfigOption(
   });
 }
 
+/**
+ * The current system-clipboard image (if any) as PNG bytes.
+ *
+ * WebKitGTK's `paste` event does not expose clipboard images as
+ * `DataTransfer` file items (`items`/`files` are empty for a pasted image —
+ * verified on webkit2gtk-4.1 2.52.5 on Wayland), so the composer reads the
+ * image from the system clipboard directly (Rust/arboard) as a fallback.
+ * `null` when the clipboard has no image (text-only or empty).
+ */
+export async function readClipboardImage(): Promise<number[] | null> {
+  return invoke<number[] | null>("read_clipboard_image");
+}
+
 // ---------------------------------------------------------------------------
 // History (SQLite) + settings commands
 // ---------------------------------------------------------------------------

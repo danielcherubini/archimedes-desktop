@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod history;
 pub mod sessions;
 pub mod settings;

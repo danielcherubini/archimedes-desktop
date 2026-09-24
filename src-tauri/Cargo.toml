@@ -34,6 +34,10 @@ agent-client-protocol = "2"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# System-clipboard image read for the WebKitGTK paste fallback (Wayland
+# `wl-clipboard-rs` backend when `WAYLAND_DISPLAY` is set, X11 otherwise).
+arboard = { version = "3.6", features = ["wayland-data-control"] }
+image = { version = "0.25", features = ["png"] }
 
 [dev-dependencies]
 serde_json = "1"

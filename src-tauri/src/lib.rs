@@ -91,7 +91,8 @@ pub fn run() {
             commands::spaces::list_agents,
             commands::spaces::list_spaces,
             commands::spaces::delete_space,
-            commands::spaces::space_for_path
+            commands::spaces::space_for_path,
+            commands::clipboard::read_clipboard_image
         ])
         .setup(|app| {
             let config_dir = app
