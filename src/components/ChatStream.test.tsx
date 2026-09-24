@@ -1388,6 +1388,44 @@ describe("ChatStream", () => {
     expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
   });
 
+  it("a draft edited during the read is not sent and is not wiped", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "original" },
+    });
+    // Fake timers BEFORE the send: the read is macrotask-based in jsdom, so
+    // faking the timer and advancing it settles the read deterministically
+    // (a bare `waitFor` on a negative predicate would pass on the first poll
+    // — false green — because the read hasn't settled yet).
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // SYNCHRONOUSLY (before the read settles) edit the draft — the composer
+    // isn't locked until `beginTurn`, so the edit happens during the read.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "original + more" },
+    });
+    // Let the pending FileReader read settle (the continuation then runs and
+    // sees the live draft differs from the stale captured `text` → aborts).
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // `send()` aborted (the draft changed during the read): `sendPrompt` was
+    // NEVER called — neither the stale text nor the new one was sent.
+    expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
+    // The NEW draft is PRESERVED (the abort `return` runs before
+    // `setDraft("")`): the textarea still holds the edited text.
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      "original + more",
+    );
+    // NO user message was added to the transcript.
+    const msgs = useSessions.getState().messages;
+    expect((msgs.s1 ?? []).some((m) => m.kind === "user")).toBe(false);
+  });
+
   it("Esc while a turn is in flight calls cancelSession for the active session", async () => {
     seedLiveSession();
     render(<ChatStream />);

@@ -223,6 +223,13 @@ export default function ChatStream() {
   // mismatch (no send, no draft wipe, no turn).
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
+  // The LIVE draft, re-synced every render (the same pattern as `attachmentsRef`
+  // above): `send()` captures `draft` at click time and the composer is not
+  // locked until `beginTurn`, so the user can edit the draft during the
+  // `resume()`/FileReader awaits. The ref is the live value `send()` checks
+  // after the read and aborts on a mismatch (no stale send, no draft wipe).
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
   // advertises `promptCapabilities.image === true`.
   const imageCapable = agentSupportsImages(
@@ -422,6 +429,11 @@ export default function ChatStream() {
       // beginTurn): the closure's `activeSessionId` is stale — abort without
       // sending, without wiping the draft, without completing a turn.
       if (activeSessionIdRef.current !== activeSessionId) return;
+      // Draft edited during the read (the composer isn't locked until
+      // `beginTurn`): sending the stale text and wiping the new draft is a
+      // silent data loss — abort without sending, without wiping the draft,
+      // without completing a turn (the user simply sends again).
+      if (draftRef.current.trim() !== text) return;
       // Every staged image was removed during the read (the composer isn't
       // locked until `beginTurn`, so a thumbnail can be removed during the
       // read): with no text there's nothing meaningful left to send; with
