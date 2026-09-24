@@ -32,11 +32,12 @@ use serde_json::Value;
 use tokio::sync::{oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
-    NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
-    ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
+    AgentCapabilities, CancelNotification, ClientCapabilities, ClientNotification, ContentBlock,
+    FileSystemCapabilities, InitializeRequest, NewSessionRequest, PromptRequest,
+    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionRequest, RequestPermissionResponse,
+    SessionConfigId, SessionConfigOption, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, ToolCallContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -1100,6 +1101,23 @@ impl SessionManager {
                     message: err.message,
                 })?;
         Ok(response.stop_reason)
+    }
+
+    /// Cancel the session's in-flight prompt turn (ACP `session/cancel`
+    /// notification — no response expected). The agent aborts the turn and
+    /// resolves the original `session/prompt` request with
+    /// `StopReason::Cancelled` (which is what completes the in-flight
+    /// `send_prompt` and unlocks the composer). Fire-and-forget on the agent
+    /// side: a no-op if there is no in-flight turn.
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), AcpError> {
+        let cx = self.connection(session_id).await?;
+        cx.send_notification(ClientNotification::CancelNotification(
+            CancelNotification::new(SessionId::new(session_id)),
+        ))
+        .map_err(|err| AcpError::Protocol {
+            message: err.message,
+        })?;
+        Ok(())
     }
 
     /// Set a session config option (e.g. the model) on a live session.

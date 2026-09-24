@@ -83,6 +83,7 @@ pub fn run() {
             commands::sessions::respond_bridge_request,
             commands::sessions::resume_session,
             commands::sessions::set_session_config_option,
+            commands::sessions::cancel_session,
             commands::history::list_sessions,
             commands::history::load_history,
             commands::history::delete_session,

@@ -8,6 +8,7 @@ import {
 } from "react";
 import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon, X } from "lucide-react";
 import {
+  cancelSession,
   closeSession,
   readClipboardImage,
   sendPrompt,
@@ -236,6 +237,22 @@ export default function ChatStream() {
     },
     [],
   );
+  // Esc stops inference: while a turn is in flight, Escape sends
+  // `session/cancel` (the agent resolves the open prompt with
+  // `stopReason: "cancelled"`, which completes `sendPrompt` and unlocks the
+  // composer). The textarea is DISABLED during a turn (the composer is
+  // locked), so the listener is global — and active only while `inTurn`,
+  // so Esc never hijacks a keypress outside a turn.
+  useEffect(() => {
+    if (!inTurn || !activeSessionId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        void cancelSession(activeSessionId);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [inTurn, activeSessionId]);
   // Session-change guard: `ChatStream` is one long-lived component (no
   // `key`), so `attachments` would otherwise survive a switch to another
   // session — images staged in session A (image-capable) could be sent to

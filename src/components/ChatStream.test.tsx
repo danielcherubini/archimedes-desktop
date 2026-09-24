@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatStream from "./ChatStream";
-import { sendPrompt, setSessionConfigOption, resumeSession, readClipboardImage } from "../lib/tauri";
+import {
+  sendPrompt,
+  setSessionConfigOption,
+  resumeSession,
+  readClipboardImage,
+  cancelSession,
+} from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -63,6 +69,7 @@ vi.mock("../lib/tauri", async () => {
     respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
     readClipboardImage: vi.fn().mockResolvedValue(null),
+    cancelSession: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -1379,5 +1386,41 @@ describe("ChatStream", () => {
     // NEVER called. (A bare `waitFor` on the negative would be false green —
     // the fake-timer advance guarantees the read has settled first.)
     expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
+  });
+
+  it("Esc while a turn is in flight calls cancelSession for the active session", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // A turn is in flight (the composer is locked, `inTurn` true). The
+    // re-render must settle BEFORE the keypress (the listener is registered
+    // in an effect that runs on the re-render).
+    useSessions.getState().beginTurn("s1");
+    await act(async () => {});
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(vi.mocked(cancelSession)).toHaveBeenCalledWith("s1");
+  });
+
+  it("Esc with no turn in flight does NOT call cancelSession", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
+  });
+
+  it("Esc while a turn is in flight of ANOTHER session does NOT call cancelSession", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // The turn is in flight for a DIFFERENT session (not the active one):
+    // the listener is gated on the ACTIVE session's `inTurn`, so it is
+    // not active and nothing is cancelled.
+    useSessions.getState().beginTurn("other");
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
   });
 });

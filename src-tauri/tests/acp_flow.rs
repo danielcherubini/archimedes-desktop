@@ -1128,3 +1128,47 @@ async fn permission_round_trip_is_answerable_and_nonblocking() {
 
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_session_resolves_an_in_flight_prompt_with_cancelled() {
+    let config_dir = temp_config_dir();
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("cancel"));
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let manager = Arc::new(SessionManager::new(config_dir.clone()).unwrap());
+    let cwd = config_dir.clone();
+
+    let info = start_retrying(&manager, "fake", cwd, &sink)
+        .await
+        .expect("start_session should succeed");
+    assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
+
+    // Spawn the prompt; the fake agent holds it open until it sees
+    // `session/cancel` (the ACP cancellation contract).
+    let manager2 = Arc::clone(&manager);
+    let prompt_task = tokio::spawn(async move {
+        manager2
+            .send_prompt(FAKE_SESSION_ID, "hi".to_string())
+            .await
+    });
+
+    // Give the prompt a moment to be in flight, then cancel it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    manager
+        .cancel_session(FAKE_SESSION_ID)
+        .await
+        .expect("cancel_session should succeed");
+
+    // The in-flight prompt must resolve with the cancelled stop reason
+    // (NOT hang, NOT error) — that is what unlocks the composer.
+    let result = tokio::time::timeout(Duration::from_secs(5), prompt_task)
+        .await
+        .expect("the prompt should resolve after the cancel")
+        .expect("the prompt task should not panic");
+    assert_eq!(result, Ok(StopReason::Cancelled));
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}

@@ -208,3 +208,15 @@ pub async fn set_session_config_option(
         .set_config_option(&session_id, &config_id, &value)
         .await
 }
+
+/// Cancel the session's in-flight prompt turn (the user pressed Esc).
+/// The agent resolves the open `session/prompt` with `stopReason:
+/// "cancelled"`, which completes the in-flight `send_prompt` and unlocks
+/// the composer.
+#[tauri::command]
+pub async fn cancel_session(
+    state: State<'_, Arc<SessionManager>>,
+    session_id: String,
+) -> Result<(), AcpError> {
+    state.cancel_session(&session_id).await
+}

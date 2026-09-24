@@ -349,6 +349,11 @@ export async function resumeSession(
   return invoke<SessionInfo>("resume_session", { agentId, sessionId, cwd });
 }
 
+/** Cancel the session's in-flight prompt turn (Esc). The agent resolves the open prompt with `stopReason: "cancelled"`. */
+export async function cancelSession(sessionId: string): Promise<void> {
+  return invoke("cancel_session", { sessionId });
+}
+
 /** Set a session config option (model / thinking level); returns the agent's updated `configOptions`. */
 export async function setSessionConfigOption(
   sessionId: string,
