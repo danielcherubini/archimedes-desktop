@@ -1096,4 +1096,65 @@ describe("resumeSession (history reload race)", () => {
     expect(msgs).toHaveLength(3);
     expect(msgs[2]).toMatchObject({ kind: "user", text: "three" });
   });
+
+  it("does not render a resumed prompt twice when record_message commits before the history query reads (dedup)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [{ kind: "user", text: "one", at: 1 }],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when `send()` adds the user message.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    await useSessions.getState().resumeSession("s1");
+    // `send()` adds the user message while the reload is in flight, then
+    // `send_prompt`'s `record_message` COMMITS it BEFORE the history query
+    // reads — so the reloaded rows INCLUDE the new user message (the race
+    // that made the prompt render twice, attachments included).
+    useSessions.getState().addUserMessage("s1", "two", [
+      { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
+    ]);
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "one" }),
+        createdAt: 1,
+      },
+      {
+        id: 2,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({
+          text: "two",
+          images: [
+            { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
+          ],
+        }),
+        createdAt: 100,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // The prompt appears ONCE, not twice: the locally-added copy is
+    // deduped against the reloaded row (text + images match).
+    const msgs = useSessions.getState().messages.s1;
+    expect(msgs).toHaveLength(2);
+    expect(msgs.filter((m) => m.kind === "user" && m.text === "two")).toHaveLength(1);
+  });
 });

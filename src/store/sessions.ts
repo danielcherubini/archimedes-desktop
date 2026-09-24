@@ -220,6 +220,34 @@ export function discardSessionMessages(sessionId: string): void {
 }
 
 /**
+ * A stable key for deduping a merge of reloaded history rows with locally
+ * added messages (the resume race above): an id when one exists on both
+ * sides (`agent-text`/`agent-thought` `messageId`, `tool-call` `id`),
+ * otherwise role + content equality. A `user` message has NO id on either
+ * side (the local copy and the `record_message`d row), so it matches on
+ * text + images; the image entries are compared field-by-field in a FIXED
+ * order so key-order differences in the two constructions never break the
+ * match. A `diff` matches on path + patch.
+ */
+function mergeDedupeKey(m: Message): string {
+  switch (m.kind) {
+    case "user": {
+      const images = (m.images ?? [])
+        .map((img) => `${img.name}|${img.mimeType}|${img.sizeBytes}|${img.data}`)
+        .join("\u0000");
+      return `user|${m.text}|${images}`;
+    }
+    case "agent-text":
+    case "agent-thought":
+      return `${m.kind}|${m.messageId}|${m.text}`;
+    case "tool-call":
+      return `tool-call|${m.id}|${m.title}|${m.status}`;
+    case "diff":
+      return `diff|${m.path}|${m.patch}`;
+  }
+}
+
+/**
  * Map a persisted `MessageRow` back to transcript messages. A tool-call row
  * also re-derives its standalone diff messages (diffs are stored inside the
  * tool call's content, not as separate rows).
@@ -646,8 +674,17 @@ export const useSessions = create<SessionsState>((set, get) => ({
         if (get().activeSessionId !== sessionId) return;
         const reloaded = rows.flatMap(rowToMessages);
         const added = (get().messages[sessionId] ?? []).slice(prior.length);
+        // DEDUPE the merge: `send_prompt`'s `record_message` can commit
+        // the new user message BEFORE the history query reads — then the
+        // reloaded rows INCLUDE it while `added` still holds its local
+        // copy, and appending verbatim would render the prompt TWICE
+        // (attachments included). Exclude any `added` message already
+        // present in the reloaded rows (stable match key: an id when one
+        // exists on both sides, otherwise role + content equality).
+        const reloadedKeys = new Set(reloaded.map(mergeDedupeKey));
+        const fresh = added.filter((m) => !reloadedKeys.has(mergeDedupeKey(m)));
         set((st) => ({
-          messages: { ...st.messages, [sessionId]: [...reloaded, ...added] },
+          messages: { ...st.messages, [sessionId]: [...reloaded, ...fresh] },
         }));
       } catch (err) {
         console.error(`failed to load history for ${sessionId}`, err);
