@@ -89,9 +89,14 @@ fn wait_for_events(
     let mut events = Vec::new();
     let deadline = std::time::Instant::now() + timeout;
     while events.len() < count && std::time::Instant::now() < deadline {
+        // `Timeout` = no event yet (KEEP waiting until the deadline —
+        // breaking on the first 100 ms timeout would return an empty vec
+        // the instant the first event is slightly late); `Disconnected`
+        // = the sender is gone (stop).
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(e) => events.push(e),
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     events
@@ -350,7 +355,7 @@ async fn agent_death_produces_session_closed() {
 
     // The `session-closed` event arrives with the `agent-exited` reason
     // (and the session's id).
-    let events = wait_for_events(&rx, 1, Duration::from_secs(15));
+    let events = wait_for_events(&rx, 5, Duration::from_secs(15));
     let closed = events
         .iter()
         .find(|(event, _)| event == "session-closed")

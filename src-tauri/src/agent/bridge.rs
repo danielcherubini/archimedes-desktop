@@ -37,8 +37,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use crate::agent::launch_wrapper::LaunchConfig;
 use crate::agent::session::{CostAccumulator, EventSink, SubagentSpawn};
+use crate::agent::subagent::LaunchConfig;
 use crate::agent::subagent::{SubagentMetrics, SubagentOutcome};
 
 /// The manager's map of pending bridge-request senders.

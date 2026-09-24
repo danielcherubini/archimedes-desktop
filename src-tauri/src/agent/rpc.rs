@@ -410,11 +410,9 @@ impl<T> QueuedEvents<T> {
     fn attach(&mut self, tx: mpsc::UnboundedSender<T>) {
         assert!(self.consumer.is_none(), "attach called more than once");
         self.consumer = Some(tx.clone());
-        let n = self.buffered.len();
         for ev in self.buffered.drain(..) {
             let _ = tx.send(ev); // the receiver is alive — cannot fail
         }
-        eprintln!("[attach] flushed {n} buffered events");
     }
 }
 
@@ -517,7 +515,6 @@ impl PiRpc {
                         let Some(t) = v.get("type").and_then(|t| t.as_str()) else {
                             continue;
                         };
-                        eprintln!("[reader] line: {t}");
                         if t == "response" {
                             let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
                                 // A `response` without an `id` is not
@@ -561,7 +558,6 @@ impl PiRpc {
                             // receiver (teardown); a pre-attach event is
                             // buffered (the reader keeps reading).
                             let delivered = reader_inner.events.lock().unwrap().deliver(event);
-                            eprintln!("[reader] event delivered={delivered}");
                             if !delivered {
                                 return;
                             }
@@ -589,7 +585,24 @@ impl PiRpc {
                 .take()
                 .expect("child moved exactly once");
             let status = child.wait().await;
-            let code = status.ok().and_then(|s| s.code());
+            // A signal-killed child has NO exit code (`code()` is
+            // `None`); publish the shell convention (128 + signal) so a
+            // `Some` value always means "exited" (`None` = still running
+            // — the `send()` error mapping relies on the distinction).
+            let code = match status {
+                Ok(s) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        s.code().or_else(|| s.signal().map(|sig| 128 + sig))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        s.code()
+                    }
+                }
+                Err(_) => None,
+            };
             fail_pending(&watcher_inner, RpcError::ProcessExited(code)).await;
             let _ = watcher_inner.exited.send(code);
         });
@@ -735,15 +748,17 @@ impl PiRpcHandle {
         // EOF on stdin (`onInputEnd` → `shutdown()` → clean exit). (tokio's
         // `AsyncWriteExt` has no `close()` in 1.51.)
         self.inner.stdin.lock().await.take();
+        // Wait (version-based — the exit-watcher's single `send` bumps the
+        // version even when the value stays `None`, which a VALUE-based
+        // wait on `is_none()` would miss) for the exit, capped at 5 s.
+        // A child that ALREADY exited before the `subscribe` (the value is
+        // `Some` — including a signal kill's `Some(128+sig)`) skips the
+        // wait entirely (its version already bumped before we subscribed,
+        // so a bare `changed()` would block until the cap).
         let mut exited = self.inner.exited.subscribe();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while exited.borrow().is_none() {
-                if exited.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-        .await;
+        if exited.borrow().is_none() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), exited.changed()).await;
+        }
         let mut child = self.inner.child.lock().await;
         if let Some(c) = child.as_mut() {
             // `start_kill` is sync (sends SIGKILL); `wait` reaps.

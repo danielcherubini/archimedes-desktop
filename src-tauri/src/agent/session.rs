@@ -787,6 +787,16 @@ impl SessionDriver {
             // kind the closer recorded: a kind set before the flag send
             // wins; `None` means the agent process exited on its own and
             // nobody closed it.
+            //
+            // Close the child's stdin EXPLICITLY (idempotent — `close_session`
+            // may have done it already): dropping this task's handle clone
+            // is NOT enough to close the stdin, because the exit-watcher
+            // task holds its own `Arc<Inner>` clone for the whole
+            // `child.wait()` — and `wait()` only returns once the child
+            // exits, which (for a well-behaved agent) only happens on the
+            // stdin EOF. Without this explicit close the cycle would leak
+            // the agent process (and the exit-watcher task) forever.
+            handle.close().await;
             let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
             let reason = match kind {
                 Some(CloseKind::User) => ClosedReason::User,
@@ -795,12 +805,14 @@ impl SessionDriver {
             // Guard by the generation token (captured above): a
             // SUPERSEDED driver (a resume overwrote this entry under the
             // same session id) must not clobber the replacement's entry.
-            let mut sessions = sessions_arc.lock().await;
-            if sessions
-                .get(&info.session_id)
-                .is_some_and(|l| l.generation == live_generation)
             {
-                sessions.remove(&info.session_id);
+                let mut sessions = sessions_arc.lock().await;
+                if sessions
+                    .get(&info.session_id)
+                    .is_some_and(|l| l.generation == live_generation)
+                {
+                    sessions.remove(&info.session_id);
+                }
             }
             // Keys are `"{session_id}/{request_id}"` — match on the
             // trailing-slash prefix so closing "s1" does not cancel

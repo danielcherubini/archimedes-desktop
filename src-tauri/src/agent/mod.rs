@@ -5,7 +5,6 @@ pub mod bridge;
 mod errors;
 mod fs_backend;
 pub mod gate;
-pub mod launch_wrapper;
 mod permission;
 pub mod rpc;
 mod session;
