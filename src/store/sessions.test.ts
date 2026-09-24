@@ -675,6 +675,61 @@ describe("discardSessionMessages (ephemeral subagent cleanup)", () => {
   });
 });
 
+describe("user message with image attachments", () => {
+  it("(a) stores a user message with image attachments", () => {
+    useSessions.getState().addUserMessage("s1", "hi", [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }]);
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      kind: "user",
+      text: "hi",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+
+  it("(b) stores a user message without images without the key", () => {
+    // Reset messages for this test
+    useSessions.setState({ messages: { s1: [] } });
+    useSessions.getState().addUserMessage("s1", "hi");
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect("images" in messages[0]).toBe(false);
+  });
+
+  it("(c) hydrates a user row with image attachments (round-trip)", () => {
+    const payload = JSON.stringify({
+      text: "old",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({
+      kind: "user",
+      text: "old",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+
+  it("(d) hydrates a user row without images", () => {
+    const payload = JSON.stringify({ text: "old" });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({ kind: "user", text: "old" });
+    expect("images" in msg).toBe(false);
+  });
+
+  it("(e) drops malformed image entries during hydration", () => {
+    const payload = JSON.stringify({
+      text: "x",
+      images: [{ data: 42 }, { name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({
+      kind: "user",
+      text: "x",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+});
+
 describe("rowToMessages (history replay from the database)", () => {
   const row = (
     overrides: Partial<MessageRow> & { kind: MessageRow["kind"] },

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { ImageRef } from "../lib/chatAttachments";
 import {
   deleteSession as deleteSessionCommand,
   deleteSpace as deleteSpaceCommand,
@@ -31,7 +32,7 @@ export interface DiffRef {
 }
 
 export type Message =
-  | { kind: "user"; text: string; at: number }
+  | { kind: "user"; text: string; at: number; images?: ImageRef[] }
   | { kind: "agent-text"; messageId: string; text: string; at: number }
   | { kind: "agent-thought"; messageId: string; text: string; at: number }
   | {
@@ -231,10 +232,32 @@ export function rowToMessages(row: MessageRow): Message[] {
     return [];
   }
   switch (row.kind) {
-    case "user":
-      return typeof payload.text === "string"
-        ? [{ kind: "user", text: payload.text, at: row.createdAt }]
-        : [];
+    case "user": {
+      if (typeof payload.text !== "string") return [];
+      const rawImages = Array.isArray(payload.images) ? payload.images : [];
+      const images = rawImages
+        .filter(
+          (img): img is Record<string, unknown> =>
+            img !== null &&
+            typeof img === "object" &&
+            typeof (img as Record<string, unknown>).data === "string" &&
+            typeof (img as Record<string, unknown>).mimeType === "string",
+        )
+        .map((img) => ({
+          name: typeof img.name === "string" ? img.name : "",
+          mimeType: img.mimeType as string,
+          sizeBytes: typeof img.sizeBytes === "number" ? img.sizeBytes : 0,
+          data: img.data as string,
+        }));
+      return [
+        {
+          kind: "user",
+          text: payload.text,
+          at: row.createdAt,
+          ...(images.length > 0 ? { images } : {}),
+        },
+      ];
+    }
     case "agent-text":
       return typeof payload.text === "string"
         ? [
@@ -467,7 +490,7 @@ interface SessionsState {
    * is the source of truth (the database keeps the persistent record).
    */
   resumeSession: (sessionId: string) => Promise<SessionInfo>;
-  addUserMessage: (sessionId: string, text: string) => void;
+  addUserMessage: (sessionId: string, text: string, images?: ImageRef[]) => void;
   beginTurn: (sessionId: string) => void;
   applyConfigOptions: (sessionId: string, options: SessionConfigOption[]) => void;
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
@@ -621,13 +644,18 @@ export const useSessions = create<SessionsState>((set, get) => ({
     return info;
   },
 
-  addUserMessage: (sessionId, text) =>
+  addUserMessage: (sessionId, text, images) =>
     set((state) => ({
       messages: {
         ...state.messages,
         [sessionId]: [
           ...(state.messages[sessionId] ?? []),
-          { kind: "user" as const, text, at: Date.now() },
+          {
+            kind: "user" as const,
+            text,
+            at: Date.now(),
+            ...(images ? { images } : {}),
+          },
         ],
       },
     })),
