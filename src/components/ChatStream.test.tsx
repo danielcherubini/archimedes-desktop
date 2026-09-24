@@ -883,6 +883,48 @@ describe("ChatStream", () => {
     expect(screen.queryByAltText("d.png")).toBeNull();
   });
 
+  it("window-level drop backstop prevents navigation (drop outside the composer)", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    // The window `drop` listener (registered in `useEffect`, present after
+    // `render`'s `act` flush) swallows file drops OUTSIDE the composer — the
+    // webview's default for a file drop would otherwise NAVIGATE to the file
+    // (replacing the app; the reason `dragDropEnabled: false` + this
+    // backstop exist). `fireEvent` returns `!defaultPrevented` → `false`
+    // when the listener's `preventDefault` marked the event.
+    const intercepted = fireEvent.drop(window, {
+      dataTransfer: {
+        files: [
+          new File([new Uint8Array([1])], "w.png", { type: "image/png" }),
+        ],
+      },
+    });
+    expect(intercepted).toBe(false);
+    // The event targeted `window` (the top of the tree — it does NOT bubble
+    // down through the composer), so the composer's `onDrop` (`handleDrop`)
+    // never fired: the drop was swallowed, NOT staged.
+    expect(screen.queryByAltText("w.png")).toBeNull();
+    // `dragover` variant: a file drag anywhere on the page must make the
+    // page a valid drop target (otherwise the browser shows the "no-drop"
+    // cursor and the drop would navigate).
+    expect(fireEvent.dragOver(window, { dataTransfer: {} })).toBe(false);
+  });
+
+  it("unmount releases staged object URLs", () => {
+    seedLiveSessionWithImages();
+    const { unmount } = render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+    // The unmount-cleanup effect revokes the staged object URLs exactly once
+    // (a revoked URL can no longer render the `img` — the effect runs on
+    // unmount ONLY, never on state changes).
+    unmount();
+    // The `beforeAll` stub: `createObjectURL(file) => \`blob:mock-${file.name}\``.
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-s.png");
+  });
+
   it("placeholder advertises paste when the agent supports images", () => {
     seedLiveSessionWithImages();
     render(<ChatStream />);
@@ -927,6 +969,12 @@ describe("ChatStream", () => {
       });
     });
     expect(screen.queryByAltText("s.png")).toBeNull();
+    // The session-change effect released the staged attachment (NOT just
+    // cleared the strip) — the object URL was revoked. `toHaveBeenCalledWith`
+    // (NOT `toHaveBeenCalledTimes`): `beforeEach`'s `vi.clearAllMocks()`
+    // clears the call history per test, but a `some`-style assertion stays
+    // robust if that ever changes.
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-s.png");
   });
 
   // --- Send wiring: images ride along with the prompt (Task 5). ---
@@ -1030,6 +1078,31 @@ describe("ChatStream", () => {
     expect(
       screen.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
     ).toBe(true);
+  });
+
+  it("double-send is guarded by sendingRef", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    expect(screen.getByAltText("s.png")).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "hi" },
+    });
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    // Two synchronous clicks BEFORE the first send's FileReader `await`
+    // resolves: `beginTurn` (which would lock the composer) runs only AFTER
+    // the read, so the composer is still unlocked for the second click —
+    // the race the `sendingRef` guard exists for. Without it, both `send()`
+    // calls would reach `sendPrompt`.
+    fireEvent.click(sendButton);
+    fireEvent.click(sendButton);
+    // Exactly ONE send, even though the composer was not locked during the
+    // first send's FileReader await.
+    await waitFor(() =>
+      expect(vi.mocked(sendPrompt)).toHaveBeenCalledTimes(1),
+    );
   });
 
   it("send is fail-closed without the capability", async () => {
