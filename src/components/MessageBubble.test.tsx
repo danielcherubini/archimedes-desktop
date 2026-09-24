@@ -60,6 +60,39 @@ describe("MessageBubble", () => {
     expect(screen.getByText("hello")).toBeTruthy();
   });
 
+  // --- User-message images: read-only thumbnail grid (the transcript is
+  // history — no remove buttons). ---
+
+  it("renders a user message's images as a read-only thumbnail grid", () => {
+    const message: Message = {
+      kind: "user",
+      text: "look",
+      at: 1,
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "AQID" }],
+    };
+    render(<MessageBubble message={message} />);
+    const img = screen.getByAltText("a.png");
+    expect(img.getAttribute("src")).toBe("data:image/png;base64,AQID");
+  });
+
+  it("renders an image-only user message (empty text)", () => {
+    const message: Message = {
+      kind: "user",
+      text: "",
+      at: 1,
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "AQID" }],
+    };
+    render(<MessageBubble message={message} />);
+    expect(screen.getByAltText("a.png")).toBeTruthy();
+  });
+
+  it("renders a plain user message (no images) without an <img>", () => {
+    const message: Message = { kind: "user", text: "hello", at: 1 };
+    render(<MessageBubble message={message} />);
+    expect(screen.getByText("hello")).toBeTruthy();
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
   it("skips re-rendering when the message reference is unchanged (streaming perf)", () => {
     // A live thought chunk replaces ONLY the trailing message object in the
     // reducer; every other bubble gets the SAME reference. Re-rendering all

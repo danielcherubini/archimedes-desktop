@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatStream from "./ChatStream";
 import { sendPrompt, setSessionConfigOption } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
@@ -165,6 +165,9 @@ async function flush(): Promise<void> {
 beforeEach(() => {
   setSidePaneCollapsed(false);
   localStorage.clear();
+  // `clearAllMocks` clears the call history (the `URL` stub implementations
+  // from `beforeAll` survive — `mockClear` semantics, not `mockReset`).
+  vi.clearAllMocks();
   useSessions.setState({
     activeSessionId: null,
     sessions: [],
@@ -924,5 +927,126 @@ describe("ChatStream", () => {
       });
     });
     expect(screen.queryByAltText("s.png")).toBeNull();
+  });
+
+  // --- Send wiring: images ride along with the prompt (Task 5). ---
+
+  it("send delivers images with the prompt", async () => {
+    seedLiveSessionWithImages();
+    const { container } = render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "look at this" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // `send()` is ASYNC (it awaits the FileReader read before `sendPrompt`) —
+    // wait on the outcome, never assert synchronously.
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "look at this", [
+        { name: "s.png", mimeType: "image/png", sizeBytes: 3, data: "AQID" },
+      ]),
+    );
+    // The store's last user message carries the images.
+    const msgs = useSessions.getState().messages.s1;
+    const last = msgs[msgs.length - 1];
+    expect(last).toMatchObject({ kind: "user", text: "look at this" });
+    if (last?.kind === "user") {
+      expect(last.images).toEqual([
+        { name: "s.png", mimeType: "image/png", sizeBytes: 3, data: "AQID" },
+      ]);
+    } else {
+      expect(last).toBeNull();
+    }
+    // The composer thumbnail is GONE after success (released + cleared —
+    // scoped to the composer: the transcript now renders the image too).
+    const composer = container.querySelector(".rounded-2xl")!;
+    const remaining = screen.getAllByAltText("s.png");
+    expect(remaining.some((el) => composer.contains(el))).toBe(false);
+    // …while the transcript renders it (the `data:` URL, read-only).
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].getAttribute("src")).toBe(
+      "data:image/png;base64,AQID",
+    );
+  });
+
+  it("a failed send keeps attachments staged", async () => {
+    seedLiveSessionWithImages();
+    const { container } = render(<ChatStream />);
+    vi.mocked(sendPrompt).mockRejectedValueOnce(new Error("boom"));
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // Wait on the OUTCOME (the error line) — NOT on the Send button being
+    // enabled: with a staged attachment it is enabled before the click and
+    // stays enabled right after (the composer isn't locked until `beginTurn`,
+    // which runs only after the FileReader `await`), so a button-state wait
+    // would pass immediately and make the test flaky.
+    await waitFor(() => expect(screen.getByText("boom")).toBeTruthy());
+    // The attachment was NOT released/cleared (a failed send keeps it) —
+    // the composer thumbnail is still present.
+    const composer = container.querySelector(".rounded-2xl")!;
+    const matches = screen.getAllByAltText("s.png");
+    expect(matches.some((el) => composer.contains(el))).toBe(true);
+  });
+
+  it("a non-Error rejection shows the message, not [object Object]", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    // Tauri IPC errors arrive as plain objects, not `Error` instances.
+    vi.mocked(sendPrompt).mockRejectedValueOnce({
+      kind: "error",
+      message: "proto",
+    });
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(screen.getByText("proto")).toBeTruthy());
+  });
+
+  it("image-only send is allowed", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    // No text typed — the send button is enabled for an image-only send.
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    expect(sendButton.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(sendButton);
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "", [
+        { name: "s.png", mimeType: "image/png", sizeBytes: 3, data: "AQID" },
+      ]),
+    );
+  });
+
+  it("empty composer with no attachments: send stays disabled", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    expect(
+      screen.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("send is fail-closed without the capability", async () => {
+    seedLiveSession(); // capabilities {}
+    render(<ChatStream />);
+    // Task 4: NOT staged (the helper returns `true` — default paste).
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "text" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // A 2-arg call with NO images argument, even though a `File` was on the
+    // clipboard (the `imageCapable` guard in `send()`).
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "text"),
+    );
   });
 });

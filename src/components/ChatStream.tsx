@@ -16,8 +16,10 @@ import { basenameOfPath } from "../lib/paths";
 import {
   addImageAttachments,
   agentSupportsImages,
+  readAttachmentAsBase64,
   releaseAttachment,
   type ChatComposerAttachment,
+  type ImageRef,
 } from "../lib/chatAttachments";
 import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
@@ -207,11 +209,11 @@ export default function ChatStream() {
   // in between). Also read by the unmount-cleanup effect below (the effect
   // intentionally runs once, so the ref is the only live view it has).
   attachmentsRef.current = attachments;
-  // Task 5's double-send guard (a hook — must live here, not in `send`).
+  // Task 5's double-send guard (a hook — must live here, not in `send`):
+  // `beginTurn` runs AFTER an `await` (the base64 read), so the composer is
+  // not locked until then and a second Enter/click during the read would
+  // otherwise double-send.
   const sendingRef = useRef(false);
-  // Task 5 wires this into `send` (`noUnusedLocals` keeps the bridge honest
-  // until then — the hook itself must exist NOW or the hook count shifts).
-  void sendingRef;
   // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
   // advertises `promptCapabilities.image === true`.
   const imageCapable = agentSupportsImages(liveSession?.capabilities);
@@ -340,25 +342,81 @@ export default function ChatStream() {
     );
   }
 
+  // `hasImages`: a staged attachment AND the capability — the last line of
+  // the fail-closed defense. Staged attachments are already cleared on
+  // session switch (Task 4), but a same-session capability regression must
+  // not ship images to an agent that can't take them. With it, an
+  // image-ONLY send while `!imageCapable` is blocked (an empty prompt +
+  // unsent images is meaningless), while a text-only send simply doesn't
+  // attach images.
+  const hasImages = attachments.length > 0 && imageCapable;
+
   const send = async () => {
     const text = draft.trim();
-    // The UNIFIED composer lock (the same as the placeholder, the
-    // textarea's `disabled`, and the send button below — `agentState`
-    // when present, else the `inTurn` fallback; `blocked` locks too —
-    // the agent is mid-turn awaiting a request response): sending while
-    // the agent is working or blocked is not possible (no
-    // `session/cancel` backend — follow-up).
-    if (!text || composerLocked || !isLive) return;
-    setDraft("");
-    setError(null);
-    addUserMessage(activeSessionId, text);
-    beginTurn(activeSessionId);
+    if ((!text && !hasImages) || composerLocked || !isLive) return;
+    if (sendingRef.current) return; // guard: see the ref's comment above
+    sendingRef.current = true;
     try {
-      const stopReason = await sendPrompt(activeSessionId, text);
+      setError(null);
+      let images: ImageRef[] | undefined;
+      if (hasImages) {
+        try {
+          images = await Promise.all(
+            attachments.map(async (att) => ({
+              name: att.filename,
+              mimeType: att.mimeType,
+              sizeBytes: att.sizeBytes,
+              data: await readAttachmentAsBase64(att),
+            })),
+          );
+        } catch {
+          setError("Failed to read an attached image");
+          return; // attachments stay staged; `sendingRef` resets in `finally`
+        }
+      }
+      // Snapshot the ids being sent: on success, release/clear ONLY these.
+      // Anything staged after this snapshot — e.g. a drop during the
+      // FileReader `await` (the composer isn't locked until `beginTurn`),
+      // or attachments staged in ANOTHER session while this turn was
+      // running — must survive.
+      const sentIds = new Set(attachments.map((a) => a.id));
+      setDraft("");
+      addUserMessage(activeSessionId, text, images);
+      beginTurn(activeSessionId);
+      // Pass the third arg ONLY when there are images: a text-only send
+      // calls `sendPrompt(id, text)` — the pre-existing 2-arg call the
+      // existing tests assert (`toHaveBeenCalledWith("s1", "hello")`; vitest
+      // compares arg arrays by length, so an explicit `undefined` third arg
+      // would break it).
+      const stopReason = images
+        ? await sendPrompt(activeSessionId, text, images)
+        : await sendPrompt(activeSessionId, text);
+      // Release/clear ONLY the sent attachments, OUTSIDE the state updater
+      // (updaters must be pure — StrictMode runs them twice).
+      const still = attachmentsRef.current.filter((a) => !sentIds.has(a.id));
+      attachmentsRef.current
+        .filter((a) => sentIds.has(a.id))
+        .forEach(releaseAttachment);
+      attachmentsRef.current = still;
+      setAttachments(still);
       turnCompleted(activeSessionId, stopReason);
     } catch (err) {
       turnCompleted(activeSessionId, "end_turn");
-      setError(err instanceof Error ? err.message : String(err));
+      // Tauri IPC errors are plain objects (`{ kind, message }`), not `Error`
+      // instances — `String(err)` would show `[object Object]` (a pre-existing
+      // gap the new `InvalidPrompt` validation error would hit; fix it here).
+      const msg =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === "object" && "message" in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+      setError(msg);
+      // Attachments deliberately stay staged (a failed send keeps them — a
+      // re-pasted image is costly, a re-typed draft is not). The draft is
+      // lost on failure (pre-existing behavior, unchanged).
+    } finally {
+      sendingRef.current = false;
     }
   };
 
@@ -769,7 +827,11 @@ export default function ChatStream() {
             <Button
               size="icon-md"
               aria-label="Send"
-              disabled={!isLive || composerLocked || draft.trim() === ""}
+              disabled={
+                !isLive ||
+                composerLocked ||
+                (draft.trim() === "" && !hasImages)
+              }
               onClick={() => void send()}
               className="bg-primary text-primary-foreground"
             >
