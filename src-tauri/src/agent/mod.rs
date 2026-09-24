@@ -4,6 +4,7 @@
 pub mod bridge;
 mod errors;
 mod fs_backend;
+pub mod gate;
 pub mod launch_wrapper;
 mod permission;
 pub mod rpc;
@@ -14,6 +15,7 @@ pub mod worker_runtime;
 pub use bridge::{bridge_key, PendingBridge};
 pub use errors::RpcError;
 pub use fs_backend::{FsBackend, FsError};
+pub use gate::{gate_env, gate_spawn_args, install_gate_extension};
 pub use permission::{permission_key, PendingPermissions, PermissionOutcome};
 pub use rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, PiRpcHandle, RpcEvent};
 pub use session::{

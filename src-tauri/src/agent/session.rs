@@ -1007,6 +1007,10 @@ pub struct SessionManager {
     driver: SessionDriver,
     registry: Registry,
     config_dir: PathBuf,
+    /// The installed gate extension's path (`None` when the install
+    /// failed — the spawn then skips the gate args/env, and the session
+    /// runs ungated rather than broken).
+    gate_path: Option<PathBuf>,
 }
 
 impl SessionManager {
@@ -1017,10 +1021,22 @@ impl SessionManager {
     /// Create a manager, loading the agent registry from `config_dir`.
     pub fn new(config_dir: PathBuf) -> Result<Self, ConfigError> {
         let registry = Registry::load(&config_dir)?;
+        // Install the bundled gate extension (idempotent; both managers
+        // install the same file — the write is skipped when it matches).
+        // A failure is NON-fatal: the session runs ungated rather than
+        // broken at startup.
+        let gate_path = match crate::agent::gate::install_gate_extension(&config_dir) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("gate extension install failed: {e} (sessions run ungated)");
+                None
+            }
+        };
         Ok(Self {
             driver: SessionDriver::new(),
             registry,
             config_dir,
+            gate_path,
         })
     }
 
@@ -1117,7 +1133,14 @@ impl SessionManager {
             None => (entry.env.clone(), None),
         };
 
-        let rpc = PiRpc::spawn(&entry.command, &entry.args, &agent_env, &cwd)?;
+        // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`
+        // (the extension is inert without the env var).
+        let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &entry.args);
+        let mut agent_env = agent_env;
+        if self.gate_path.is_some() {
+            crate::agent::gate::gate_env(&mut agent_env);
+        }
+        let rpc = PiRpc::spawn(&entry.command, &args, &agent_env, &cwd)?;
         let handle = rpc.handle();
 
         let agent_id_owned = agent_id.to_string();
@@ -1249,6 +1272,12 @@ impl SessionManager {
         args.push("--session".to_string());
         args.push(session_file.to_string());
 
+        // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`.
+        let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &args);
+        let mut agent_env = agent_env;
+        if self.gate_path.is_some() {
+            crate::agent::gate::gate_env(&mut agent_env);
+        }
         let rpc = PiRpc::spawn(&entry.command, &args, &agent_env, &cwd)?;
         let handle = rpc.handle();
 
@@ -3155,6 +3184,15 @@ mod session_tests {
         let dir = temp_config_dir();
         write_agents_json_pi(&dir, &[("FAKE_PI_GATE", "1")]);
         let manager = SessionManager::new(dir.clone()).unwrap();
+        // The injection (Task 4): `new` installed the bundled gate
+        // extension (the spawn passes `-e <path>` + `PI_ARCHIMEDES_GATE=1`;
+        // the fake's `FAKE_PI_GATE=1` mode plays the extension's part —
+        // it emits the `extension_ui_request` the extension would cause).
+        let gate_file = dir.join("pi-gate").join("gate.ts");
+        assert!(
+            gate_file.exists(),
+            "SessionManager::new installs the gate extension"
+        );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
@@ -3199,6 +3237,13 @@ mod session_tests {
                                 "confirm frames offer [Allow, Block]"
                             );
                             assert_eq!(request["sessionId"], sid);
+                            // The tool name is in the title (the frontend's
+                            // `PermissionPrompt` renders it).
+                            let title = request["toolCall"]["title"].as_str().unwrap_or("");
+                            assert!(
+                                title.contains("bash"),
+                                "the title carries the gated tool name, got {title:?}"
+                            );
                             request_id =
                                 Some(msg["payload"]["requestId"].as_str().unwrap().to_string());
                         }
