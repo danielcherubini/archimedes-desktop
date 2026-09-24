@@ -163,6 +163,10 @@ async function flush(): Promise<void> {
 }
 
 beforeEach(() => {
+  // Restore real timers in case a previous test installed fake ones (the
+  // mid-read tests below use `vi.useFakeTimers()` to settle the macrotask-
+  // based `FileReader` deterministically) — a no-op for tests that don't.
+  vi.useRealTimers();
   setSidePaneCollapsed(false);
   localStorage.clear();
   // `clearAllMocks` clears the call history (the `URL` stub implementations
@@ -1126,5 +1130,105 @@ describe("ChatStream", () => {
     await waitFor(() =>
       expect(sendPrompt).toHaveBeenCalledWith("s1", "text"),
     );
+  });
+
+  // --- Mid-read races: the composer is NOT locked until `beginTurn` (which
+  // runs only AFTER the FileReader `await`), so the session can switch and
+  // thumbnails can be removed DURING the read. `send()` must reconcile
+  // against the LIVE state after the `await`, not the stale closure. ---
+
+  it("send is aborted if the session switches during the read", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "hi" },
+    });
+    // Fake timers BEFORE the send: the read is macrotask-based in jsdom, so
+    // faking the timer and advancing it settles the read deterministically
+    // (a bare `waitFor` on a negative predicate would pass on the first poll
+    // — false green — because the read hasn't settled yet).
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // SYNCHRONOUSLY (before the read settles) switch sessions — the same
+    // `act` pattern as `switching sessions clears staged attachments`.
+    await act(async () => {
+      useSessions.setState({
+        activeSessionId: "s2",
+        sessions: [
+          {
+            sessionId: "s2",
+            agentId: "a1",
+            cwd: "/home/u/proj",
+            capabilities: {},
+          },
+        ],
+      });
+    });
+    // Let the pending FileReader read settle (the continuation then runs and
+    // sees the live `activeSessionIdRef` changed → aborts).
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // `send()` aborted: it never reached `sendPrompt` (no send to the stale
+    // `s1`).
+    expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
+    // The draft is PRESERVED (the abort `return` runs before `setDraft("")`):
+    // the textarea (now `s2`'s) still holds "hi".
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("hi");
+    // NO user message was added to either session's transcript.
+    const msgs = useSessions.getState().messages;
+    expect((msgs.s1 ?? []).some((m) => m.kind === "user")).toBe(false);
+    expect((msgs.s2 ?? []).some((m) => m.kind === "user")).toBe(false);
+  });
+
+  it("an image removed during the read is not sent", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "text" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // SYNCHRONOUSLY (before the FileReader resolves) remove the thumbnail —
+    // the composer isn't locked until `beginTurn`, so the removal happens
+    // during the read.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove image attachment" }),
+    );
+    // `send()` is ASYNC (it awaits the FileReader read before `sendPrompt`) —
+    // wait on the outcome (a 2-arg `sendPrompt` call, images filtered out),
+    // never assert synchronously.
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "text"),
+    );
+  });
+
+  it("an image-only send with the image removed during the read sends nothing", async () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    pasteToComposer([
+      new File([new Uint8Array([1, 2, 3])], "s.png", { type: "image/png" }),
+    ]);
+    // No text typed — an image-only send.
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // SYNCHRONOUSLY (before the read settles) remove the thumbnail.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove image attachment" }),
+    );
+    // Let the pending FileReader read settle (the continuation then runs and
+    // sees every image removed + no text → nothing left to send).
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // `send()` aborted (nothing meaningful left to send): `sendPrompt` was
+    // NEVER called. (A bare `waitFor` on the negative would be false green —
+    // the fake-timer advance guarantees the read has settled first.)
+    expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
   });
 });

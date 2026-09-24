@@ -28,6 +28,12 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// message — base64 expands each image ~4/3×).
 pub const MAX_IMAGE_COUNT: usize = 8;
 
+/// 255 bytes — the OS per-component filename limit: `name` is written verbatim
+/// to SQLite, so re-validated here so hand-rolled IPC cannot bloat a row
+/// out-of-band. (The frontend's `name` comes from a real OS filename and is
+/// already ≤255 bytes on all major OSes.)
+pub const MAX_IMAGE_NAME_LEN: usize = 255;
+
 /// Deliberately NARROWER than `image/*`: the destination is LLM vision APIs
 /// (png/jpeg/gif/webp only — an SVG would fail the whole turn at the
 /// provider). Mirrors the frontend `SUPPORTED_IMAGE_TYPES`.
@@ -38,6 +44,11 @@ const SUPPORTED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif",
 ///
 /// Validation (guards against hand-rolled IPC):
 /// - `mime_type` must be in `SUPPORTED_IMAGE_TYPES`;
+/// - `name` must be ≤ `MAX_IMAGE_NAME_LEN` bytes (it is written verbatim to
+///   SQLite — an unbounded `name` could bloat a row out-of-band);
+/// - `data` must have ≤2 trailing `=` padding chars (legitimate base64 has
+///   0–2; more would bypass the size cap, since the estimate strips them all
+///   when measuring and the full string is persisted);
 /// - decoded size must be ≤ `MAX_IMAGE_BYTES`. The estimate strips trailing
 ///   `=` padding first, then takes `len * 3 / 4` (exact for well-formed
 ///   base64; a safe over-estimate otherwise; `size_bytes` is NOT trusted).
@@ -62,6 +73,11 @@ pub fn build_prompt_blocks(
         blocks.push(ContentBlock::Text(TextContent::new(text)));
     }
     for img in images {
+        if img.name.len() > MAX_IMAGE_NAME_LEN {
+            return Err(AcpError::InvalidPrompt {
+                message: "image name exceeds 255 bytes".to_string(),
+            });
+        }
         if !SUPPORTED_IMAGE_TYPES.contains(&img.mime_type.as_str()) {
             return Err(AcpError::InvalidPrompt {
                 message: format!(
@@ -71,6 +87,15 @@ pub fn build_prompt_blocks(
             });
         }
         let trimmed = img.data.trim_end_matches('=');
+        // Legitimate base64 has 0–2 trailing `=` padding. Rejecting >2 keeps
+        // the stripped-size estimate a real bound on the persisted data
+        // (arbitrary `=` padding would otherwise bypass the size cap).
+        let padding = img.data.len() - trimmed.len();
+        if padding > 2 {
+            return Err(AcpError::InvalidPrompt {
+                message: "malformed base64 image data".to_string(),
+            });
+        }
         let decoded_bytes = (trimmed.len() as u64) * 3 / 4;
         if decoded_bytes > MAX_IMAGE_BYTES {
             return Err(AcpError::InvalidPrompt {
@@ -222,6 +247,55 @@ mod tests {
             build_prompt_blocks("x", &[im]).is_ok(),
             "exactly 10 MiB (the cap) must be accepted, not rejected"
         );
+    }
+
+    #[test]
+    fn excessive_padding_is_rejected() {
+        // Legitimate base64 has 0–2 trailing `=` padding. A hand-rolled IPC
+        // payload can append arbitrarily many `=` to small data: the size
+        // estimate strips them ALL when measuring, so without this check the
+        // 10 MiB cap would not bound the persisted data. 5 padding chars on
+        // small data (decoded estimate well under the cap) must be rejected.
+        let data = "AQID".repeat(25) + "====="; // 5 padding chars, small data
+        let im = ImagePayload {
+            mime_type: "image/png".into(),
+            data,
+            name: "p.png".into(),
+            size_bytes: 25,
+        };
+        assert!(matches!(
+            build_prompt_blocks("x", &[im]),
+            Err(AcpError::InvalidPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn name_over_255_bytes_is_rejected() {
+        // `name` is written verbatim to SQLite: an unbounded `name` from
+        // hand-rolled IPC could bloat a row. 256 bytes must be rejected.
+        let im = ImagePayload {
+            mime_type: "image/png".into(),
+            data: "AQID".into(),
+            name: "a".repeat(256),
+            size_bytes: 3,
+        };
+        assert!(matches!(
+            build_prompt_blocks("x", &[im]),
+            Err(AcpError::InvalidPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn name_exactly_255_bytes_is_accepted() {
+        // The boundary: exactly 255 bytes is the OS per-component filename
+        // limit and must be accepted, not rejected.
+        let im = ImagePayload {
+            mime_type: "image/png".into(),
+            data: "AQID".into(),
+            name: "a".repeat(255),
+            size_bytes: 3,
+        };
+        assert!(build_prompt_blocks("x", &[im]).is_ok());
     }
 
     #[test]

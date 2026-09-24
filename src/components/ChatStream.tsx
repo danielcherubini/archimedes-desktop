@@ -19,7 +19,6 @@ import {
   readAttachmentAsBase64,
   releaseAttachment,
   type ChatComposerAttachment,
-  type ImageRef,
 } from "../lib/chatAttachments";
 import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
@@ -214,6 +213,14 @@ export default function ChatStream() {
   // not locked until then and a second Enter/click during the read would
   // otherwise double-send.
   const sendingRef = useRef(false);
+  // Re-sync every render (the same pattern as `attachmentsRef` above): `send()`
+  // is async and reads the attachment via a FileReader `await` BEFORE
+  // `beginTurn`, so the composer is unlocked during the read. If the session
+  // switches during the read, the closure's `activeSessionId` is stale — this
+  // ref is the LIVE value `send()` checks after the read and aborts on a
+  // mismatch (no send, no draft wipe, no turn).
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
   // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
   // advertises `promptCapabilities.image === true`.
   const imageCapable = agentSupportsImages(liveSession?.capabilities);
@@ -358,38 +365,61 @@ export default function ChatStream() {
     sendingRef.current = true;
     try {
       setError(null);
-      let images: ImageRef[] | undefined;
+      let images:
+        | { id: string; name: string; mimeType: string; sizeBytes: number; data: string }[]
+        | undefined;
       if (hasImages) {
         try {
-          images = await Promise.all(
+          const read = await Promise.all(
             attachments.map(async (att) => ({
+              id: att.id,
               name: att.filename,
               mimeType: att.mimeType,
               sizeBytes: att.sizeBytes,
               data: await readAttachmentAsBase64(att),
             })),
           );
+          // Reconcile against the LIVE list: the composer isn't locked until
+          // beginTurn, so a thumbnail removed during the read must not be sent.
+          const liveIds = new Set(attachmentsRef.current.map((a) => a.id));
+          images = read.filter((i) => liveIds.has(i.id));
         } catch {
           setError("Failed to read an attached image");
           return; // attachments stay staged; `sendingRef` resets in `finally`
         }
       }
-      // Snapshot the ids being sent: on success, release/clear ONLY these.
-      // Anything staged after this snapshot — e.g. a drop during the
-      // FileReader `await` (the composer isn't locked until `beginTurn`),
-      // or attachments staged in ANOTHER session while this turn was
-      // running — must survive.
-      const sentIds = new Set(attachments.map((a) => a.id));
+      // Session switched during the read (the composer isn't locked until
+      // beginTurn): the closure's `activeSessionId` is stale — abort without
+      // sending, without wiping the draft, without completing a turn.
+      if (activeSessionIdRef.current !== activeSessionId) return;
+      // Every staged image was removed during the read (the composer isn't
+      // locked until `beginTurn`, so a thumbnail can be removed during the
+      // read): with no text there's nothing meaningful left to send; with
+      // text, normalize to `undefined` so the 2-arg `sendPrompt` path is taken
+      // (an empty `[]` is truthy and would take the 3-arg path, sending an
+      // empty images array).
+      if (images !== undefined && images.length === 0) {
+        if (!text) return;
+        images = undefined;
+      }
+      // `sentIds` is derived from what was ACTUALLY sent (the reconciled
+      // `images`), not the stale closure list: on success, release/clear ONLY
+      // these. Anything staged after the read — e.g. a drop during the
+      // FileReader `await`, or attachments staged in ANOTHER session while
+      // this turn was running — must survive.
+      const sentIds = new Set(images?.map((i) => i.id) ?? []);
+      // `ImageRef` has no `id` field — strip it before use.
+      const imageRefs = images?.map(({ id, ...ref }) => ref); // ImageRef[] | undefined
       setDraft("");
-      addUserMessage(activeSessionId, text, images);
+      addUserMessage(activeSessionId, text, imageRefs);
       beginTurn(activeSessionId);
-      // Pass the third arg ONLY when there are images: a text-only send
-      // calls `sendPrompt(id, text)` — the pre-existing 2-arg call the
-      // existing tests assert (`toHaveBeenCalledWith("s1", "hello")`; vitest
-      // compares arg arrays by length, so an explicit `undefined` third arg
-      // would break it).
-      const stopReason = images
-        ? await sendPrompt(activeSessionId, text, images)
+      // Pass the third arg ONLY when there are images: a text-only send (and
+      // an all-images-removed send, normalized above) calls
+      // `sendPrompt(id, text)` — the pre-existing 2-arg call the existing tests
+      // assert (`toHaveBeenCalledWith("s1", "hello")`; vitest compares arg
+      // arrays by length, so an explicit `undefined` third arg would break it).
+      const stopReason = imageRefs
+        ? await sendPrompt(activeSessionId, text, imageRefs)
         : await sendPrompt(activeSessionId, text);
       // Release/clear ONLY the sent attachments, OUTSIDE the state updater
       // (updaters must be pure — StrictMode runs them twice).
