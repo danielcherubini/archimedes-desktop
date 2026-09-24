@@ -16,7 +16,7 @@ use agent_client_protocol::schema::v1::{
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::acp::{
+use crate::agent::{
     prompt, AcpError, EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager,
     SubagentSessionManager,
 };

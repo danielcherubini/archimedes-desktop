@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::acp::errors::AcpError;
+use crate::agent::errors::AcpError;
 
 /// A sandboxed view over a directory tree.
 ///

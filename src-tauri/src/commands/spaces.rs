@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
-use crate::acp::SessionManager;
+use crate::agent::SessionManager;
 use crate::storage::Db;
 
 /// A registry entry (camelCase over IPC) — the agent dropdown's data.

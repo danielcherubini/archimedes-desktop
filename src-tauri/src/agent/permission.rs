@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
-use crate::acp::session::EventSink;
+use crate::agent::session::EventSink;
 
 /// The user's decision on a permission prompt, as chosen via the
 /// `respond_permission` Tauri command.

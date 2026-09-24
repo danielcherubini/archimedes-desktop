@@ -24,14 +24,14 @@ use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
 
-use crate::acp::bridge;
-use crate::acp::launch_wrapper::{self, LaunchConfig};
-use crate::acp::permission::{self, PermissionOutcome};
-use crate::acp::session::{
+use crate::agent::bridge;
+use crate::agent::launch_wrapper::{self, LaunchConfig};
+use crate::agent::permission::{self, PermissionOutcome};
+use crate::agent::session::{
     bridge_spawn_setup, CloseKind, CostAccumulator, EventSink, ExternalClose, SessionDriver,
     SessionInfo,
 };
-use crate::acp::worker_runtime::WorkerRuntime;
+use crate::agent::worker_runtime::WorkerRuntime;
 use crate::config::{ConfigError, Registry};
 use crate::storage::Db;
 
@@ -617,8 +617,8 @@ mod tests {
     use agent_client_protocol::{AcpAgent, AcpAgentConfig, ConnectionTo};
     use tokio::sync::oneshot;
 
-    use crate::acp::permission::PermissionOutcome;
-    use crate::acp::session::{CloseKind, EventSink, ExternalClose, SessionDriver, SessionInfo};
+    use crate::agent::permission::PermissionOutcome;
+    use crate::agent::session::{CloseKind, EventSink, ExternalClose, SessionDriver, SessionInfo};
     use crate::config::Registry;
 
     use super::{SubagentCancel, SubagentSessionManager};
@@ -1007,11 +1007,11 @@ mod tests {
             };
 
             match final_res {
-                Ok(Err(crate::acp::errors::AcpError::SpawnFailed { .. })) if attempts < 3 => {
+                Ok(Err(crate::agent::errors::AcpError::SpawnFailed { .. })) if attempts < 3 => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
-                Ok(Err(crate::acp::errors::AcpError::InitializeFailed { detail })) => {
+                Ok(Err(crate::agent::errors::AcpError::InitializeFailed { detail })) => {
                     assert!(
                         detail.contains("agent did not complete initialize/session-new"),
                         "Expected teardown (User), but got: {}",
@@ -1028,10 +1028,10 @@ mod tests {
 
     async fn drive_with_retry<F, Fut>(
         attempt_fn: F,
-    ) -> Result<SessionInfo, crate::acp::errors::AcpError>
+    ) -> Result<SessionInfo, crate::agent::errors::AcpError>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<SessionInfo, crate::acp::errors::AcpError>>,
+        Fut: std::future::Future<Output = Result<SessionInfo, crate::agent::errors::AcpError>>,
     {
         crate::test_support::run_with_retry(attempt_fn).await
     }

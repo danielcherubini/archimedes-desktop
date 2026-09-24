@@ -1,4 +1,4 @@
-pub mod acp;
+pub mod agent;
 pub mod commands;
 pub mod config;
 pub mod storage;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::{Emitter, Manager};
 
-use crate::acp::{EventSink, SessionManager, SubagentSessionManager};
+use crate::agent::{EventSink, SessionManager, SubagentSessionManager};
 use crate::storage::Db;
 
 /// The shared app setup: agent registry from `config_dir`, persistence

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{EventSink, SessionManager, WorkerRuntime};
+use archimedes_desktop_lib::agent::{EventSink, SessionManager, WorkerRuntime};
 
 /// The session id the `main` fake agent reports (via `FAKE_SESSION_ID`).
 const FAKE_SESSION_ID_MAIN: &str = "main-sess";

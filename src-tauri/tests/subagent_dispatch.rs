@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{EventSink, SessionManager, SubagentSessionManager};
+use archimedes_desktop_lib::agent::{EventSink, SessionManager, SubagentSessionManager};
 use serde_json::Value;
 
 /// The session id the main fake agent reports (its default; the subagent
@@ -152,7 +152,7 @@ async fn drive_dispatch_success_scenario(
     manager: &Arc<SessionManager>,
     events: &Arc<StdMutex<Vec<(String, Value)>>>,
     bin: &Path,
-    info: archimedes_desktop_lib::acp::SessionInfo,
+    info: archimedes_desktop_lib::agent::SessionInfo,
 ) -> Result<(), String> {
     let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
     {
@@ -298,7 +298,7 @@ async fn drive_dispatch_cancellation_scenario(
     manager: &Arc<SessionManager>,
     events: &Arc<StdMutex<Vec<(String, Value)>>>,
     bin: &Path,
-    info: archimedes_desktop_lib::acp::SessionInfo,
+    info: archimedes_desktop_lib::agent::SessionInfo,
 ) -> Result<(), String> {
     let (prompt_tx, mut prompt_rx) = tokio::sync::oneshot::channel();
     {

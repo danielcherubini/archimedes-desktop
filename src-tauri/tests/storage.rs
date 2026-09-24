@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{AgentCapabilities, SessionId};
-use archimedes_desktop_lib::acp::SessionInfo;
+use archimedes_desktop_lib::agent::SessionInfo;
 use archimedes_desktop_lib::storage::Db;
 
 fn temp_db_path() -> PathBuf {

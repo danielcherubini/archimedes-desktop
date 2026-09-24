@@ -14,7 +14,7 @@ use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{Manager, WebviewWindow, WebviewWindowBuilder};
 
-use archimedes_desktop_lib::acp::EventSink;
+use archimedes_desktop_lib::agent::EventSink;
 use archimedes_desktop_lib::storage::Db;
 
 /// The fixed session id reported by the fake agent (see `bin/fake_agent.rs`).

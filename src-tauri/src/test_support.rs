@@ -2,7 +2,7 @@
 //!
 //! Provides helpers for common patterns in integration and unit testing.
 
-use crate::acp::AcpError;
+use crate::agent::AcpError;
 use std::time::Duration;
 
 /// A helper to run an async attempt function with retries on `SpawnFailed`.

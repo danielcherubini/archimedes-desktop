@@ -37,9 +37,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use crate::acp::launch_wrapper::LaunchConfig;
-use crate::acp::session::{CostAccumulator, EventSink, SubagentSpawn};
-use crate::acp::subagent::{SubagentMetrics, SubagentOutcome};
+use crate::agent::launch_wrapper::LaunchConfig;
+use crate::agent::session::{CostAccumulator, EventSink, SubagentSpawn};
+use crate::agent::subagent::{SubagentMetrics, SubagentOutcome};
 
 /// The manager's map of pending bridge-request senders.
 ///
@@ -1061,7 +1061,7 @@ mod tests {
         last_seq: Arc<AtomicU64>,
         close_tx: Arc<watch::Sender<bool>>,
         timeout: Duration,
-        subagent: Option<crate::acp::session::SubagentSpawn>,
+        subagent: Option<crate::agent::session::SubagentSpawn>,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1411,9 +1411,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::acp::subagent::SubagentSessionManager::new(dir.clone())
+        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone())
             .expect("subagent manager should build");
-        let spawn = crate::acp::session::SubagentSpawn {
+        let spawn = crate::agent::session::SubagentSpawn {
             manager: Arc::new(manager),
             parent_cwd: dir.clone(),
             parent_agent_id: "fake".to_string(),
@@ -1480,9 +1480,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::acp::subagent::SubagentSessionManager::new(dir.clone())
+        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone())
             .expect("subagent manager should build");
-        let spawn = crate::acp::session::SubagentSpawn {
+        let spawn = crate::agent::session::SubagentSpawn {
             manager: Arc::new(manager),
             parent_cwd: dir.clone(),
             parent_agent_id: "fake".to_string(),

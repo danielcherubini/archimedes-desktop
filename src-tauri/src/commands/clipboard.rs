@@ -9,7 +9,7 @@
 
 use image::ImageEncoder;
 
-use crate::acp::prompt::MAX_IMAGE_BYTES;
+use crate::agent::prompt::MAX_IMAGE_BYTES;
 
 /// 100 MiB — tier 1 (DoS guard) for the RAW clipboard RGBA: `width *
 /// height * 4` must not exceed this. This bounds OUR copy + PNG-encode

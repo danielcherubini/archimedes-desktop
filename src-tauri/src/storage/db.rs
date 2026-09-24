@@ -16,7 +16,7 @@ use std::sync::Mutex as StdMutex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::acp::SessionInfo;
+use crate::agent::SessionInfo;
 
 /// Errors surfaced by the persistence layer.
 #[derive(Debug, thiserror::Error)]

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
-use crate::acp::SessionManager;
+use crate::agent::SessionManager;
 
 /// The persisted app settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]

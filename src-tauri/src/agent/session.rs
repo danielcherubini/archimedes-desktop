@@ -45,11 +45,11 @@ use agent_client_protocol::{
     ConnectionTo, Responder,
 };
 
-use crate::acp::bridge::{self, PendingBridge};
-use crate::acp::errors::AcpError;
-use crate::acp::fs_backend::FsBackend;
-use crate::acp::permission::{self, PendingPermissions};
-use crate::acp::prompt::{self, ImagePayload};
+use crate::agent::bridge::{self, PendingBridge};
+use crate::agent::errors::AcpError;
+use crate::agent::fs_backend::FsBackend;
+use crate::agent::permission::{self, PendingPermissions};
+use crate::agent::prompt::{self, ImagePayload};
 use crate::config::{AgentEntry, ConfigError, Registry};
 use crate::storage::Db;
 
@@ -180,7 +180,7 @@ pub(crate) struct ExternalClose {
 /// `pi` entry in production).
 #[derive(Clone)]
 pub struct SubagentSpawn {
-    pub manager: Arc<crate::acp::subagent::SubagentSessionManager>,
+    pub manager: Arc<crate::agent::subagent::SubagentSessionManager>,
     pub parent_cwd: PathBuf,
     pub parent_agent_id: String,
 }
@@ -260,7 +260,7 @@ pub struct SessionDriver {
     /// The subagent dispatch handle (main manager only — `Some`); `None`
     /// for the subagent manager itself (subagents cannot dispatch
     /// subagents — the tool is excluded from their spawn).
-    pub(crate) subagent: Option<Arc<crate::acp::subagent::SubagentSessionManager>>,
+    pub(crate) subagent: Option<Arc<crate::agent::subagent::SubagentSessionManager>>,
 }
 
 impl SessionDriver {
@@ -768,7 +768,7 @@ impl SessionManager {
     /// `dispatch_subagent` frames). The subagent manager needs nothing from
     /// the main manager; only this field points at it (intra-crate type
     /// cycles are fine in Rust).
-    pub fn set_subagent_manager(&mut self, m: Arc<crate::acp::subagent::SubagentSessionManager>) {
+    pub fn set_subagent_manager(&mut self, m: Arc<crate::agent::subagent::SubagentSessionManager>) {
         self.driver.subagent = Some(m);
     }
 

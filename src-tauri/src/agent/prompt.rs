@@ -4,7 +4,7 @@
 
 use agent_client_protocol::schema::v1::{ContentBlock, ImageContent, TextContent};
 
-use crate::acp::AcpError;
+use crate::agent::AcpError;
 
 /// One image attachment over IPC. The frontend sends CAMEL CASE
 /// (`mimeType`, `sizeBytes`) — Tauri camel-cases only the TOP-LEVEL command
@@ -134,7 +134,7 @@ pub fn user_message_payload(text: &str, images: &[ImagePayload]) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::SessionInfo;
+    use crate::agent::SessionInfo;
     use crate::storage::Db;
     use agent_client_protocol::schema::v1::AgentCapabilities;
 

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
-use archimedes_desktop_lib::acp::{
+use archimedes_desktop_lib::agent::{
     AcpError, EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager,
 };
 use archimedes_desktop_lib::storage::Db;

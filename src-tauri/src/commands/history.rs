@@ -11,7 +11,7 @@ use std::sync::Arc;
 use agent_client_protocol::schema::v1::SessionId;
 use tauri::State;
 
-use crate::acp::SessionInfo;
+use crate::agent::SessionInfo;
 use crate::storage::{Db, MessageRow};
 
 /// All stored sessions, newest first, as `SessionInfo` (camelCase over IPC).

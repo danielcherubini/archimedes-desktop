@@ -1,4 +1,4 @@
-//! Integration test: drive the REAL `acp::bridge::start_listener` with a real
+//! Integration test: drive the REAL `agent::bridge::start_listener` with a real
 //! external (Python) stub agent speaking the bridge protocol — the
 //! end-to-end validation gate (Task 6).
 //!
@@ -42,8 +42,8 @@ mod bridge_integration {
     use serde_json::{json, Value};
     use tokio::sync::{watch, Mutex};
 
-    use archimedes_desktop_lib::acp::bridge::{self, BridgeHandle};
-    use archimedes_desktop_lib::acp::{EventSink, PendingBridge};
+    use archimedes_desktop_lib::agent::bridge::{self, BridgeHandle};
+    use archimedes_desktop_lib::agent::{EventSink, PendingBridge};
 
     /// The Python stub. It writes its result to the file given as arg 3.
     ///
