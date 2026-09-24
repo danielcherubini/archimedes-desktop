@@ -22,6 +22,11 @@ pub struct ImagePayload {
 /// 10 MiB — mirrors the frontend cap (ADR 0008).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// 8 images per message — mirrors the frontend `MAX_CHAT_ATTACHMENTS` (ADR
+/// 0008): re-validated here so hand-rolled IPC cannot bloat the DB
+/// out-of-band (worst case 8 × 10 MiB ≈ 108 MB per message).
+pub const MAX_IMAGE_COUNT: usize = 8;
+
 /// Deliberately NARROWER than `image/*`: the destination is LLM vision APIs
 /// (png/jpeg/gif/webp only — an SVG would fail the whole turn at the
 /// provider). Mirrors the frontend `SUPPORTED_IMAGE_TYPES`.
@@ -33,14 +38,28 @@ const SUPPORTED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif",
 /// Validation (guards against hand-rolled IPC):
 /// - `mime_type` must be in `SUPPORTED_IMAGE_TYPES`;
 /// - decoded size must be ≤ `MAX_IMAGE_BYTES`. The estimate strips trailing
-///   `=` padding first, then takes `len * 3 / 4` (an upper bound; `size_bytes`
-///   is NOT trusted). Stripping the padding keeps the bound consistent with
-///   the frontend's `file.size <= 10 MiB` cap (no off-by-2 rejections).
+///   `=` padding first, then takes `len * 3 / 4` (exact for well-formed
+///   base64; a safe over-estimate otherwise; `size_bytes` is NOT trusted).
+///   Stripping the padding keeps the bound consistent with the frontend's
+///   `file.size <= 10 MiB` cap (no off-by-2 rejections).
+/// - the image count must be ≤ `MAX_IMAGE_COUNT`.
 pub fn build_prompt_blocks(
     text: &str,
     images: &[ImagePayload],
 ) -> Result<Vec<ContentBlock>, AcpError> {
-    let mut blocks = vec![ContentBlock::Text(TextContent::new(text))];
+    if images.len() > MAX_IMAGE_COUNT {
+        return Err(AcpError::InvalidPrompt {
+            message: format!("at most {MAX_IMAGE_COUNT} images per message"),
+        });
+    }
+    // Skip the text block when it would be EMPTY and images are present
+    // (the frontend supports image-only sends; strict providers reject an
+    // empty text block). Keep the text block when there are no images, so a
+    // text-only call is byte-identical to before.
+    let mut blocks = Vec::new();
+    if !text.is_empty() || images.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(text)));
+    }
     for img in images {
         if !SUPPORTED_IMAGE_TYPES.contains(&img.mime_type.as_str()) {
             return Err(AcpError::InvalidPrompt {
@@ -182,6 +201,60 @@ mod tests {
             build_prompt_blocks("x", &[im]),
             Err(AcpError::InvalidPrompt { .. })
         ));
+    }
+
+    #[test]
+    fn exactly_max_size_image_is_accepted() {
+        // The boundary: the padding-stripped estimate is EXACTLY 10 MiB
+        // (13_981_014 * 3 / 4 = 10_485_760) — accepted, not rejected. This
+        // is the whole reason the `=` padding is stripped: a refactor to
+        // un-stripped `len * 3 / 4` or `>=` would silently regress the
+        // boundary (the frontend already accepted this file).
+        let data = "A".repeat(13_981_014) + "==";
+        let im = ImagePayload {
+            mime_type: "image/png".into(),
+            data,
+            name: "max.png".into(),
+            size_bytes: MAX_IMAGE_BYTES,
+        };
+        assert!(
+            build_prompt_blocks("x", &[im]).is_ok(),
+            "exactly 10 MiB (the cap) must be accepted, not rejected"
+        );
+    }
+
+    #[test]
+    fn too_many_images_are_rejected() {
+        // Mirrors the frontend `MAX_CHAT_ATTACHMENTS` (ADR 0008): a 9th valid
+        // image from hand-rolled IPC must be rejected, not just the oversized
+        // or wrong-mime cases.
+        let images: Vec<ImagePayload> = (0..9)
+            .map(|i| img("image/png", 4, &format!("a{i}.png")))
+            .collect();
+        assert!(matches!(
+            build_prompt_blocks("x", &images),
+            Err(AcpError::InvalidPrompt { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_text_with_images_ships_no_text_block() {
+        // The frontend supports image-only sends (empty draft + staged
+        // images): a strict provider (e.g. Anthropic) rejects an empty text
+        // block, so the client must not ship one. Exactly one block (the
+        // image), no text block.
+        let im = img("image/png", 4, "a.png");
+        let blocks = build_prompt_blocks("", &[im]).expect("an image-only prompt should be valid");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "exactly one block (the image; no empty text block)"
+        );
+        let agent_client_protocol::schema::v1::ContentBlock::Image(i) = &blocks[0] else {
+            panic!("expected the single block to be the image block");
+        };
+        assert_eq!(i.mime_type, "image/png");
+        assert_eq!(i.data, "AAAA");
     }
 
     #[test]

@@ -524,6 +524,80 @@ fn send_prompt_images_ipc() {
     assert_eq!(payload["images"][0]["mimeType"], "image/png");
     assert_eq!(payload["images"][0]["data"], "AQID");
 
+    // --- too many images (the count-cap proof over the REAL IPC wire) ---
+    // 9 valid images exceed the `MAX_IMAGE_COUNT` (8) cap: rejected BEFORE
+    // anything is persisted (same validation-before-persistence proof as the
+    // SVG case above) — exactly one `user` row (the valid one above) exists.
+    let nine: Vec<serde_json::Value> = (0..9)
+        .map(|i| {
+            serde_json::json!({
+                "mimeType": "image/png",
+                "data": "AQID",
+                "name": format!("a{i}.png"),
+                "sizeBytes": 3
+            })
+        })
+        .collect();
+    let err = invoke_err(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "look",
+            "images": nine
+        }),
+    );
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("at most 8"),
+        "expected the image-count cap error, got: {err_str}"
+    );
+    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+    let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the 9-image payload must not add a user row, got {:?}",
+        rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+    );
+
+    // --- image-only prompt (empty text + 1 valid image) ---
+    // The frontend supports image-only sends; the persisted row is
+    // `{"text": "", "images": [...]}` (the client must not ship an empty
+    // text block to the provider — the unit test proves the block shape).
+    let stop = invoke(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "",
+            "images": [{ "mimeType": "image/png", "data": "AQID", "name": "only.png", "sizeBytes": 3 }]
+        }),
+    );
+    assert_eq!(stop, "end_turn");
+    // Poll for the image-only user row (distinct from the one above by name).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let user = loop {
+        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind == "user" && r.payload_json.contains("only.png"))
+        {
+            break row.clone();
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "image-only user row did not appear; got {:?}",
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let payload: serde_json::Value = serde_json::from_str(&user.payload_json).unwrap();
+    assert_eq!(payload["text"], "");
+    assert_eq!(payload["images"][0]["name"], "only.png");
+    assert_eq!(payload["images"][0]["data"], "AQID");
+
     // --- close the session and wait for the driver task's teardown ---
     invoke(
         &webview,
