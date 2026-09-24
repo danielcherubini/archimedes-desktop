@@ -654,7 +654,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
             kind: "user" as const,
             text,
             at: Date.now(),
-            ...(images ? { images } : {}),
+            ...(images && images.length > 0 ? { images } : {}),
           },
         ],
       },

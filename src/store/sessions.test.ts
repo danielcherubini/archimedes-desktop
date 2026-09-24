@@ -696,6 +696,14 @@ describe("user message with image attachments", () => {
     expect("images" in messages[0]).toBe(false);
   });
 
+  it("(b2) omits the images key when an empty array is passed", () => {
+    useSessions.setState({ messages: { s1: [] } });
+    useSessions.getState().addUserMessage("s1", "hi", []);
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect("images" in messages[0]).toBe(false);
+  });
+
   it("(c) hydrates a user row with image attachments (round-trip)", () => {
     const payload = JSON.stringify({
       text: "old",
