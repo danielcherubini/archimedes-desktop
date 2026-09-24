@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use agent_client_protocol::schema::v1::StopReason;
 use archimedes_desktop_lib::acp::{
-    AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager,
+    AcpError, EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager,
 };
 use archimedes_desktop_lib::storage::Db;
 
@@ -911,6 +911,85 @@ async fn transcript_is_persisted_with_upsert_semantics() {
     let _ = std::fs::remove_dir_all(&config_dir);
 }
 
+/// `send_prompt_with_images` (the image path of the `SessionManager` —
+/// validation → `begin_user_turn` → transcript row → `PromptRequest` with
+/// image blocks → `StopReason`): a valid image completes the turn and the
+/// `{ "text", "images" }` user row is persisted (the 2-arg `send_prompt`
+/// wrapper only ever passes an empty image list, so without this test the
+/// image branch had zero integration coverage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_prompt_with_images_completes_and_persists_the_image() {
+    let config_dir = temp_config_dir();
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, None);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+
+    let cwd = config_dir.clone();
+    start_retrying(&manager, "fake", cwd, &sink)
+        .await
+        .expect("start_session should succeed");
+
+    // The image path: an empty text + one valid image (the image-only send
+    // the frontend supports). The turn must complete (the fake agent
+    // answers `session/prompt` with two chunks + `end_turn`).
+    let reason = manager
+        .send_prompt_with_images(
+            FAKE_SESSION_ID,
+            String::new(),
+            vec![ImagePayload {
+                mime_type: "image/png".into(),
+                data: "AQID".into(),
+                name: "a.png".into(),
+                size_bytes: 3,
+            }],
+        )
+        .await
+        .expect("send_prompt_with_images should succeed");
+    assert_eq!(reason, StopReason::EndTurn);
+
+    // Both chunks have been delivered (persistence runs in the same
+    // notification handler, right after the emit, so the rows exist by now).
+    wait_for_events(&rx, 2, Duration::from_secs(5));
+
+    // The transcript holds the `{ "text", "images" }` user row.
+    let messages = db
+        .messages_for(FAKE_SESSION_ID)
+        .expect("messages_for should succeed");
+    let user = messages
+        .iter()
+        .find(|m| m.kind == "user")
+        .expect("a user row should exist");
+    let payload: serde_json::Value = serde_json::from_str(&user.payload_json).unwrap();
+    assert_eq!(payload["text"], "");
+    let arr = payload["images"]
+        .as_array()
+        .expect("the images key should be persisted");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "a.png");
+    assert_eq!(arr[0]["mimeType"], "image/png");
+    assert_eq!(arr[0]["data"], "AQID");
+
+    manager
+        .close_session(FAKE_SESSION_ID)
+        .await
+        .expect("close_session should succeed");
+    let events = wait_for_events(&rx, 1, Duration::from_secs(10));
+    assert!(events.iter().any(|(event, _)| event == "session-closed"));
+
+    assert!(
+        wait_for_process_gone(&agent_bin, Duration::from_secs(10)),
+        "fake_agent process should have been reaped after close"
+    );
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_death_produces_session_closed() {
     let config_dir = temp_config_dir();
@@ -1046,6 +1125,50 @@ async fn permission_round_trip_is_answerable_and_nonblocking() {
         .close_session(FAKE_SESSION_ID)
         .await
         .expect("close_session should succeed");
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_session_resolves_an_in_flight_prompt_with_cancelled() {
+    let config_dir = temp_config_dir();
+    let agent_bin = unique_fake_agent(&config_dir);
+    write_agents_json_cmd(&agent_bin, &config_dir, Some("cancel"));
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let manager = Arc::new(SessionManager::new(config_dir.clone()).unwrap());
+    let cwd = config_dir.clone();
+
+    let info = start_retrying(&manager, "fake", cwd, &sink)
+        .await
+        .expect("start_session should succeed");
+    assert_eq!(info.session_id.to_string(), FAKE_SESSION_ID);
+
+    // Spawn the prompt; the fake agent holds it open until it sees
+    // `session/cancel` (the ACP cancellation contract).
+    let manager2 = Arc::clone(&manager);
+    let prompt_task = tokio::spawn(async move {
+        manager2
+            .send_prompt(FAKE_SESSION_ID, "hi".to_string())
+            .await
+    });
+
+    // Give the prompt a moment to be in flight, then cancel it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    manager
+        .cancel_session(FAKE_SESSION_ID)
+        .await
+        .expect("cancel_session should succeed");
+
+    // The in-flight prompt must resolve with the cancelled stop reason
+    // (NOT hang, NOT error) — that is what unlocks the composer.
+    let result = tokio::time::timeout(Duration::from_secs(5), prompt_task)
+        .await
+        .expect("the prompt should resolve after the cancel")
+        .expect("the prompt task should not panic");
+    assert_eq!(result, Ok(StopReason::Cancelled));
 
     let _ = std::fs::remove_dir_all(&config_dir);
 }

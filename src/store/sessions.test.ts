@@ -11,6 +11,7 @@ import {
   type Message,
 } from "./sessions";
 import { useSubagents } from "./subagents";
+import { loadHistory } from "../lib/tauri";
 import type {
   CloseReasonStr,
   MessageRow,
@@ -675,6 +676,69 @@ describe("discardSessionMessages (ephemeral subagent cleanup)", () => {
   });
 });
 
+describe("user message with image attachments", () => {
+  it("(a) stores a user message with image attachments", () => {
+    useSessions.getState().addUserMessage("s1", "hi", [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }]);
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      kind: "user",
+      text: "hi",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+
+  it("(b) stores a user message without images without the key", () => {
+    // Reset messages for this test
+    useSessions.setState({ messages: { s1: [] } });
+    useSessions.getState().addUserMessage("s1", "hi");
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect("images" in messages[0]).toBe(false);
+  });
+
+  it("(b2) omits the images key when an empty array is passed", () => {
+    useSessions.setState({ messages: { s1: [] } });
+    useSessions.getState().addUserMessage("s1", "hi", []);
+    const messages = useSessions.getState().messages["s1"];
+    expect(messages).toHaveLength(1);
+    expect("images" in messages[0]).toBe(false);
+  });
+
+  it("(c) hydrates a user row with image attachments (round-trip)", () => {
+    const payload = JSON.stringify({
+      text: "old",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({
+      kind: "user",
+      text: "old",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+
+  it("(d) hydrates a user row without images", () => {
+    const payload = JSON.stringify({ text: "old" });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({ kind: "user", text: "old" });
+    expect("images" in msg).toBe(false);
+  });
+
+  it("(e) drops malformed image entries during hydration", () => {
+    const payload = JSON.stringify({
+      text: "x",
+      images: [{ data: 42 }, { name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+    const [msg] = rowToMessages(msgRow({ kind: "user", payloadJson: payload }));
+    expect(msg).toMatchObject({
+      kind: "user",
+      text: "x",
+      images: [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }],
+    });
+  });
+});
+
 describe("rowToMessages (history replay from the database)", () => {
   const row = (
     overrides: Partial<MessageRow> & { kind: MessageRow["kind"] },
@@ -958,5 +1022,198 @@ describe("applySessionUpdates (batch)", () => {
 
     expect(notifications).toBe(0);
     expect(useSessions.getState()).toBe(before);
+  });
+});
+
+describe("resumeSession (history reload race)", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      activeSessionId: null,
+      messages: {},
+      configOptions: {},
+    });
+  });
+
+  it("does not wipe a user message added while the history reload is in flight (merge, not overwrite)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [
+          { kind: "user", text: "one", at: 1 },
+          { kind: "agent-text", messageId: "m1", text: "two", at: 2 },
+        ],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when `send()` adds the user message — the race the
+    // merge exists for.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    // `resumeSession` resolves once the resume IPC settles — the reload is
+    // fire-and-forget (NOT awaited), so it is still in flight.
+    await useSessions.getState().resumeSession("s1");
+    // The user message is added while the reload is in flight (the
+    // `send()` flow: `await resume()` → `addUserMessage` → `sendPrompt`,
+    // which is the FIRST `record_message` of the user message — the
+    // reloaded rows predate it, so the fresh row is NOT in them).
+    useSessions.getState().addUserMessage("s1", "three");
+    // The reload settles with the persisted history.
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "one" }),
+        createdAt: 1,
+      },
+      {
+        id: 2,
+        sessionId: "s1",
+        kind: "agent-text",
+        messageKey: "m1",
+        payloadJson: JSON.stringify({ text: "two" }),
+        createdAt: 2,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // The reloaded history is MERGED with the locally-added message (not
+    // wiped): all three are present, the added one appended after.
+    const msgs = useSessions.getState().messages.s1;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[2]).toMatchObject({ kind: "user", text: "three" });
+  });
+
+  it("does not render a resumed prompt twice when record_message commits before the history query reads (dedup)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [{ kind: "user", text: "one", at: 1 }],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when `send()` adds the user message.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    await useSessions.getState().resumeSession("s1");
+    // `send()` adds the user message while the reload is in flight, then
+    // `send_prompt`'s `record_message` COMMITS it BEFORE the history query
+    // reads — so the reloaded rows INCLUDE the new user message (the race
+    // that made the prompt render twice, attachments included). The reloaded
+    // row's `createdAt` is >= the local message's creation time (`at`):
+    // the DB commit happens AFTER the client-side `addUserMessage` (which
+    // stamps `at = Date.now()`), so the reloaded row is the SAME message
+    // committed slightly later — the timestamp rule dedups it (equal or
+    // newer timestamps both dedup: the safe direction).
+    useSessions.getState().addUserMessage("s1", "two", [
+      { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
+    ]);
+    const added = useSessions.getState().messages.s1;
+    const addedAt = added[added.length - 1].at;
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "one" }),
+        createdAt: 1,
+      },
+      {
+        id: 2,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({
+          text: "two",
+          images: [
+            { name: "shot.png", mimeType: "image/png", sizeBytes: 12, data: "AAAA" },
+          ],
+        }),
+        createdAt: addedAt,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // The prompt appears ONCE, not twice: the locally-added copy is
+    // deduped against the reloaded row (text + images match AND the
+    // reloaded row's timestamp is >= the local creation time).
+    const msgs = useSessions.getState().messages.s1;
+    expect(msgs).toHaveLength(2);
+    expect(msgs.filter((m) => m.kind === "user" && m.text === "two")).toHaveLength(1);
+  });
+
+  it("keeps a re-sent identical prompt when the matching reloaded row is OLDER (repeated prompt, not a duplicate)", async () => {
+    useSessions.setState({
+      activeSessionId: "s1",
+      historySessions: [
+        {
+          sessionId: "s1",
+          agentId: "a1",
+          cwd: "/x",
+          capabilities: { loadSession: true },
+        },
+      ],
+      messages: {
+        s1: [{ kind: "user", text: "hi", at: 1 }],
+      },
+    });
+    // The history reload is slow (the resume IPC spawns the agent): it is
+    // still in flight when the user re-sends the SAME prompt.
+    let resolveRows: (rows: MessageRow[]) => void = () => {};
+    vi.mocked(loadHistory).mockImplementationOnce(
+      () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+    );
+    await useSessions.getState().resumeSession("s1");
+    // The user re-sent the identical prompt while the reload is in flight:
+    // the persisted (reloaded) "hi" is the OLDER one (committed long ago,
+    // `createdAt = 1`) and the new local "hi" (`at = Date.now()`) is NOT
+    // in the snapshot yet. The content match is a false positive for the
+    // new turn — it must NOT be deduped.
+    useSessions.getState().addUserMessage("s1", "hi");
+    resolveRows([
+      {
+        id: 1,
+        sessionId: "s1",
+        kind: "user",
+        messageKey: null,
+        payloadJson: JSON.stringify({ text: "hi" }),
+        createdAt: 1,
+      },
+    ]);
+    // Let the fire-and-forget reload's continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    // BOTH the older reloaded "hi" AND the new local "hi" survive: the
+    // matching reloaded row's timestamp (1) is EARLIER than the new
+    // message's creation time, so it is the older prompt, not a duplicate.
+    const msgs = useSessions.getState().messages.s1;
+    const hi = msgs.filter((m) => m.kind === "user" && m.text === "hi");
+    expect(hi).toHaveLength(2);
+    // The new local copy (created just now, NOT the reloaded row's `at: 1`)
+    // is present.
+    expect(hi.some((m) => m.at > 1)).toBe(true);
   });
 });

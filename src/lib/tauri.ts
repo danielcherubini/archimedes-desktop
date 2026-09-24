@@ -13,6 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ImageRef } from "./chatAttachments";
 
 // ---------------------------------------------------------------------------
 // Types mirroring the Rust side
@@ -323,8 +324,9 @@ export async function startSession(
 export async function sendPrompt(
   sessionId: string,
   text: string,
+  images?: ImageRef[],
 ): Promise<StopReason> {
-  return invoke<StopReason>("send_prompt", { sessionId, text });
+  return invoke<StopReason>("send_prompt", { sessionId, text, images: images ?? [] });
 }
 
 export async function closeSession(sessionId: string): Promise<void> {
@@ -347,6 +349,11 @@ export async function resumeSession(
   return invoke<SessionInfo>("resume_session", { agentId, sessionId, cwd });
 }
 
+/** Cancel the session's in-flight prompt turn (Esc). The agent resolves the open prompt with `stopReason: "cancelled"`. */
+export async function cancelSession(sessionId: string): Promise<void> {
+  return invoke("cancel_session", { sessionId });
+}
+
 /** Set a session config option (model / thinking level); returns the agent's updated `configOptions`. */
 export async function setSessionConfigOption(
   sessionId: string,
@@ -358,6 +365,19 @@ export async function setSessionConfigOption(
     configId,
     value,
   });
+}
+
+/**
+ * The current system-clipboard image (if any) as PNG bytes.
+ *
+ * WebKitGTK's `paste` event does not expose clipboard images as
+ * `DataTransfer` file items (`items`/`files` are empty for a pasted image —
+ * verified on webkit2gtk-4.1 2.52.5 on Wayland), so the composer reads the
+ * image from the system clipboard directly (Rust/arboard) as a fallback.
+ * `null` when the clipboard has no image (text-only or empty).
+ */
+export async function readClipboardImage(): Promise<number[] | null> {
+  return invoke<number[] | null>("read_clipboard_image");
 }
 
 // ---------------------------------------------------------------------------

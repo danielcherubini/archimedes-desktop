@@ -96,6 +96,12 @@ export default function SudoPasswordModal({
               void respond(false);
             } else if (e.key === "Escape") {
               e.preventDefault();
+              // Stop the native event from bubbling to `window`: the global
+              // Esc handler (ChatStream) sends `session/cancel` while a turn
+              // is in flight — an Esc meant for THIS modal (cancel) must
+              // not also cancel the whole turn (the `AskQuestionCard`
+              // Esc handler has the same treatment).
+              e.stopPropagation();
               void respond(true);
             }
           }}

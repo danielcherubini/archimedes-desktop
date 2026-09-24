@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { ImageRef } from "../lib/chatAttachments";
 import {
   deleteSession as deleteSessionCommand,
   deleteSpace as deleteSpaceCommand,
@@ -31,7 +32,7 @@ export interface DiffRef {
 }
 
 export type Message =
-  | { kind: "user"; text: string; at: number }
+  | { kind: "user"; text: string; at: number; images?: ImageRef[] }
   | { kind: "agent-text"; messageId: string; text: string; at: number }
   | { kind: "agent-thought"; messageId: string; text: string; at: number }
   | {
@@ -219,6 +220,40 @@ export function discardSessionMessages(sessionId: string): void {
 }
 
 /**
+ * A stable key for deduping a merge of reloaded history rows with locally
+ * added messages (the resume race above): an id when one exists on both
+ * sides (`agent-text`/`agent-thought` `messageId`, `tool-call` `id`),
+ * otherwise role + content equality. A `user` message has NO id on either
+ * side (the local copy and the `record_message`d row), so it matches on
+ * text + images; the image entries are compared field-by-field in a FIXED
+ * order so key-order differences in the two constructions never break the
+ * match. A `diff` matches on path + patch.
+ *
+ * NOTE: for a `user` message this key is content ONLY and is therefore
+ * ambiguous — the merge must additionally require the matching reloaded
+ * row's timestamp to be >= the added message's `at` (see the dedup in
+ * `resumeSession`) so a re-sent identical prompt (an OLDER matching row)
+ * is not mistaken for the just-committed message.
+ */
+function mergeDedupeKey(m: Message): string {
+  switch (m.kind) {
+    case "user": {
+      const images = (m.images ?? [])
+        .map((img) => `${img.name}|${img.mimeType}|${img.sizeBytes}|${img.data}`)
+        .join("\u0000");
+      return `user|${m.text}|${images}`;
+    }
+    case "agent-text":
+    case "agent-thought":
+      return `${m.kind}|${m.messageId}|${m.text}`;
+    case "tool-call":
+      return `tool-call|${m.id}|${m.title}|${m.status}`;
+    case "diff":
+      return `diff|${m.path}|${m.patch}`;
+  }
+}
+
+/**
  * Map a persisted `MessageRow` back to transcript messages. A tool-call row
  * also re-derives its standalone diff messages (diffs are stored inside the
  * tool call's content, not as separate rows).
@@ -231,10 +266,32 @@ export function rowToMessages(row: MessageRow): Message[] {
     return [];
   }
   switch (row.kind) {
-    case "user":
-      return typeof payload.text === "string"
-        ? [{ kind: "user", text: payload.text, at: row.createdAt }]
-        : [];
+    case "user": {
+      if (typeof payload.text !== "string") return [];
+      const rawImages = Array.isArray(payload.images) ? payload.images : [];
+      const images = rawImages
+        .filter(
+          (img): img is Record<string, unknown> =>
+            img !== null &&
+            typeof img === "object" &&
+            typeof (img as Record<string, unknown>).data === "string" &&
+            typeof (img as Record<string, unknown>).mimeType === "string",
+        )
+        .map((img) => ({
+          name: typeof img.name === "string" ? img.name : "",
+          mimeType: img.mimeType as string,
+          sizeBytes: typeof img.sizeBytes === "number" ? img.sizeBytes : 0,
+          data: img.data as string,
+        }));
+      return [
+        {
+          kind: "user",
+          text: payload.text,
+          at: row.createdAt,
+          ...(images.length > 0 ? { images } : {}),
+        },
+      ];
+    }
     case "agent-text":
       return typeof payload.text === "string"
         ? [
@@ -467,7 +524,7 @@ interface SessionsState {
    * is the source of truth (the database keeps the persistent record).
    */
   resumeSession: (sessionId: string) => Promise<SessionInfo>;
-  addUserMessage: (sessionId: string, text: string) => void;
+  addUserMessage: (sessionId: string, text: string, images?: ImageRef[]) => void;
   beginTurn: (sessionId: string) => void;
   applyConfigOptions: (sessionId: string, options: SessionConfigOption[]) => void;
   applySessionUpdate: (sessionId: string, update: AcpSessionUpdate) => void;
@@ -609,11 +666,61 @@ export const useSessions = create<SessionsState>((set, get) => ({
     // the persisted history so the pane shows the conversation on resume.
     void (async () => {
       try {
+        // The reload is fire-and-forget (NOT awaited by the caller): a
+        // `send()` on the resumed session adds the user message to
+        // `messages[sessionId]` WHILE the reload is in flight. Applying the
+        // reloaded rows verbatim would WIPE that message (the reload
+        // predates its persistence — the user message is `record_message`d
+        // by `send_prompt`, which runs after the reload starts). Merge
+        // instead: the reloaded rows, then any messages added after the
+        // reload started, appended after.
+        const prior = get().messages[sessionId] ?? [];
         const rows = await loadHistory(sessionId);
         // The user may have switched away while the fetch was in flight.
         if (get().activeSessionId !== sessionId) return;
-        const messages = rows.flatMap(rowToMessages);
-        set((st) => ({ messages: { ...st.messages, [sessionId]: messages } }));
+        const reloaded = rows.flatMap(rowToMessages);
+        const added = (get().messages[sessionId] ?? []).slice(prior.length);
+        // DEDUPE the merge: `send_prompt`'s `record_message` can commit
+        // the new user message BEFORE the history query reads — then the
+        // reloaded rows INCLUDE it while `added` still holds its local
+        // copy, and appending verbatim would render the prompt TWICE
+        // (attachments included). Drop an `added` message already present
+        // in the reloaded rows: by id when one exists on both sides
+        // (agent-text/agent-thought `messageId`, tool-call `id`), and for
+        // a `user` message (NO id on either side) by text + images — but
+        // ONLY when the matching reloaded row is NEWER-OR-EQUAL by
+        // timestamp. Content alone is ambiguous because user messages have
+        // no stable id: the matching reloaded row is either the SAME
+        // message committed after the local copy was created (committed-
+        // before-read: the DB commit's `createdAt` >= the local `at` =
+        // `Date.now()` at `addUserMessage` time → dedup, no duplicate)
+        // or an OLDER re-sent prompt (the reloaded row predates the new
+        // message's creation time → the new turn is NOT a duplicate and
+        // must be kept). Equal timestamps dedup (the safe direction).
+        const reloadedKeys = new Set<string>();
+        const reloadedUserAt = new Map<string, number>();
+        for (const m of reloaded) {
+          const key = mergeDedupeKey(m);
+          if (m.kind === "user") {
+            // Several reloaded rows can share a content key (the prompt was
+            // re-sent earlier): the LATEST one is the only one that could
+            // be the just-committed message.
+            reloadedUserAt.set(key, Math.max(reloadedUserAt.get(key) ?? 0, m.at));
+          } else {
+            reloadedKeys.add(key);
+          }
+        }
+        const fresh = added.filter((m) => {
+          const key = mergeDedupeKey(m);
+          if (m.kind === "user") {
+            const reloadedAt = reloadedUserAt.get(key);
+            return reloadedAt === undefined || reloadedAt < m.at;
+          }
+          return !reloadedKeys.has(key);
+        });
+        set((st) => ({
+          messages: { ...st.messages, [sessionId]: [...reloaded, ...fresh] },
+        }));
       } catch (err) {
         console.error(`failed to load history for ${sessionId}`, err);
       }
@@ -621,13 +728,18 @@ export const useSessions = create<SessionsState>((set, get) => ({
     return info;
   },
 
-  addUserMessage: (sessionId, text) =>
+  addUserMessage: (sessionId, text, images) =>
     set((state) => ({
       messages: {
         ...state.messages,
         [sessionId]: [
           ...(state.messages[sessionId] ?? []),
-          { kind: "user" as const, text, at: Date.now() },
+          {
+            kind: "user" as const,
+            text,
+            at: Date.now(),
+            ...(images && images.length > 0 ? { images } : {}),
+          },
         ],
       },
     })),

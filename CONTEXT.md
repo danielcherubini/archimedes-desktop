@@ -43,3 +43,7 @@ _Avoid_: Model list, model picker, settings, preferences
 **Thinking block**:
 The collapsible UI unit that shows the agent's streamed internal reasoning (ACP `agent_thought_chunk`) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
 _Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZCode's term; the Client's UI says "Thinking…"/"Thought")
+
+**Attachment**:
+An image staged in the composer (via clipboard paste or drag-and-drop) that is sent with the next prompt. Previewed as a removable thumbnail in a strip above the composer's textarea; persisted inline in the user message's payload.
+_Avoid_: File, image, media, clip, paperclip

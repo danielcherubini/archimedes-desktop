@@ -6,7 +6,7 @@ use serde::Serialize;
 ///
 /// Derives `Serialize` so it can cross the Tauri IPC boundary as a command
 /// error.
-#[derive(Debug, thiserror::Error, Serialize)]
+#[derive(Debug, thiserror::Error, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AcpError {
     /// The requested `agent_id` is not present in the registry.
@@ -56,4 +56,9 @@ pub enum AcpError {
     /// A filesystem operation failed (I/O error, permission, encoding, …).
     #[error("file operation failed: {detail}")]
     Io { detail: String },
+
+    /// A user prompt payload failed validation (invalid image mime type,
+    /// oversized image).
+    #[error("invalid prompt payload: {message}")]
+    InvalidPrompt { message: String },
 }

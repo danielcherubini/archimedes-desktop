@@ -155,9 +155,25 @@ export default memo(
     switch (message.kind) {
       case "user":
         // The design reference: a plain row — no bubble, no avatar.
+        // Images render as a read-only thumbnail grid (the transcript is
+        // history — NO remove buttons). `data:` URLs are safe here: the
+        // transcript is local.
         return (
           <div className="whitespace-pre-wrap text-ui-base text-foreground">
             {message.text}
+            {message.images && message.images.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {message.images.map((img, i) => (
+                  <img
+                    key={i}
+                    src={`data:${img.mimeType};base64,${img.data}`}
+                    alt={img.name}
+                    title={img.name}
+                    className="max-h-48 max-w-64 rounded-lg border border-input-border object-contain"
+                  />
+                ))}
+              </div>
+            )}
           </div>
         );
 

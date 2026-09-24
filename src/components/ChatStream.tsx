@@ -6,13 +6,23 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon } from "lucide-react";
+import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon, X } from "lucide-react";
 import {
+  cancelSession,
   closeSession,
+  readClipboardImage,
   sendPrompt,
   setSessionConfigOption,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
+import {
+  addImageAttachments,
+  agentSupportsImages,
+  readAttachmentAsBase64,
+  releaseAttachment,
+  type ChatComposerAttachment,
+} from "../lib/chatAttachments";
+import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
@@ -186,6 +196,100 @@ export default function ChatStream() {
   const [resuming, setResuming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // Image attachments staged in the composer (CONTEXT.md: Attachment).
+  // ALL of the attachment hooks live HERE, before the `!activeSessionId`
+  // early return below — a hook called only on the full-frame path would
+  // change the hook count when the active session appears/disappears and
+  // crash React (the same bug the `usePendingSubagentRequests` comment
+  // above warns about).
+  const [attachments, setAttachments] = useState<ChatComposerAttachment[]>([]);
+  const attachmentsRef = useRef(attachments);
+  // Re-sync every render: the handlers read the CURRENT list from the ref
+  // (a render closure would be stale for fast successive events — e.g.
+  // pasting 8 files then a 9th in separate dispatches without a re-render
+  // in between). Also read by the unmount-cleanup effect below (the effect
+  // intentionally runs once, so the ref is the only live view it has).
+  attachmentsRef.current = attachments;
+  // Task 5's double-send guard (a hook — must live here, not in `send`):
+  // `beginTurn` runs AFTER an `await` (the base64 read), so the composer is
+  // not locked until then and a second Enter/click during the read would
+  // otherwise double-send.
+  const sendingRef = useRef(false);
+  // Re-sync every render (the same pattern as `attachmentsRef` above): `send()`
+  // is async and reads the attachment via a FileReader `await` BEFORE
+  // `beginTurn`, so the composer is unlocked during the read. If the session
+  // switches during the read, the closure's `activeSessionId` is stale — this
+  // ref is the LIVE value `send()` checks after the read and aborts on a
+  // mismatch (no send, no draft wipe, no turn).
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  // The LIVE draft, re-synced every render (the same pattern as `attachmentsRef`
+  // above): `send()` captures `draft` at click time and the composer is not
+  // locked until `beginTurn`, so the user can edit the draft during the
+  // `resume()`/FileReader awaits. The ref is the live value `send()` checks
+  // after the read and aborts on a mismatch (no stale send, no draft wipe).
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  // Capability gate (FAIL-CLOSED): the feature is inert unless the agent
+  // advertises `promptCapabilities.image === true`.
+  const imageCapable = agentSupportsImages(
+    liveSession?.capabilities ?? historySession?.capabilities,
+  );
+  // Unmount cleanup: revoke the staged object URLs exactly once, on
+  // unmount ONLY — revoking on every state change would leak/break live
+  // previews (a revoked URL can no longer render the `img`).
+  useEffect(
+    () => () => {
+      attachmentsRef.current.forEach(releaseAttachment);
+    },
+    [],
+  );
+  // Esc stops inference: while a turn is in flight, Escape sends
+  // `session/cancel` (the agent resolves the open prompt with
+  // `stopReason: "cancelled"`, which completes `sendPrompt` and unlocks the
+  // composer). The textarea is DISABLED during a turn (the composer is
+  // locked), so the listener is global — and active only while `inTurn`,
+  // so Esc never hijacks a keypress outside a turn.
+  useEffect(() => {
+    if (!inTurn || !activeSessionId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        void cancelSession(activeSessionId);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [inTurn, activeSessionId]);
+  // Session-change guard: `ChatStream` is one long-lived component (no
+  // `key`), so `attachments` would otherwise survive a switch to another
+  // session — images staged in session A (image-capable) could be sent to
+  // session B even if B's agent doesn't advertise `promptCapabilities.image`
+  // (breaking the fail-closed guarantee). Clear + release on switch.
+  const prevSessionIdRef = useRef(activeSessionId);
+  useEffect(() => {
+    if (prevSessionIdRef.current === activeSessionId) return;
+    prevSessionIdRef.current = activeSessionId;
+    attachmentsRef.current.forEach(releaseAttachment);
+    attachmentsRef.current = [];
+    setAttachments([]);
+  }, [activeSessionId]);
+  // Window-level drop backstop: with `dragDropEnabled: false` (tauri.conf.json)
+  // the webview receives native file drops — and the webview DEFAULT for a
+  // file drop is to NAVIGATE to the file (replacing the app). A file dropped
+  // anywhere OUTSIDE the composer must be swallowed: `preventDefault` on
+  // every `dragover` makes the whole page a valid drop target, and this
+  // backstop (the composer's own `onDrop` fires first during bubbling) stops
+  // the navigation. (This also means NO composer-level `onDragOver` is
+  // needed — the window listener covers the composer's dragovers too.)
+  useEffect(() => {
+    const prevent = (e: Event) => e.preventDefault();
+    window.addEventListener("dragover", prevent);
+    window.addEventListener("drop", prevent);
+    return () => {
+      window.removeEventListener("dragover", prevent);
+      window.removeEventListener("drop", prevent);
+    };
+  }, []);
 
   // Auto-grow the composer textarea: reset to `auto`, then the
   // border-box height — `scrollHeight` is the CONTENT height, but
@@ -212,6 +316,10 @@ export default function ChatStream() {
   const isHistoryOnly = !isLive && historySession !== undefined;
   const canResume =
     isHistoryOnly && historySession?.capabilities.loadSession === true;
+  // The composer is usable for a live session OR a RESUMABLE stored session
+  // (a non-resumable stored session stays fully disabled):
+  // a resumable stored session auto-resumes on send.
+  const composerEnabled = isLive || canResume;
 
   // The current space's `SpaceView` for `activeSessionId`: the space that
   // owns it — by its live session OR any of its stored sessions (NOT
@@ -272,39 +380,147 @@ export default function ChatStream() {
     );
   }
 
+  // `hasImages`: a staged attachment AND the capability — the last line of
+  // the fail-closed defense. Staged attachments are already cleared on
+  // session switch (Task 4), but a same-session capability regression must
+  // not ship images to an agent that can't take them. With it, an
+  // image-ONLY send while `!imageCapable` is blocked (an empty prompt +
+  // unsent images is meaningless), while a text-only send simply doesn't
+  // attach images.
+  // `let`: re-derived after `resume()` below — the FRESH agent's
+  // capabilities (not the saved ones) decide whether images ship.
+  let hasImages = attachments.length > 0 && imageCapable;
+
   const send = async () => {
     const text = draft.trim();
-    // The UNIFIED composer lock (the same as the placeholder, the
-    // textarea's `disabled`, and the send button below — `agentState`
-    // when present, else the `inTurn` fallback; `blocked` locks too —
-    // the agent is mid-turn awaiting a request response): sending while
-    // the agent is working or blocked is not possible (no
-    // `session/cancel` backend — follow-up).
-    if (!text || composerLocked || !isLive) return;
-    setDraft("");
-    setError(null);
-    addUserMessage(activeSessionId, text);
-    beginTurn(activeSessionId);
+    if ((!text && !hasImages) || composerLocked) return;
+    if (sendingRef.current) return; // guard: see the ref's comment above
+    sendingRef.current = true;
     try {
-      const stopReason = await sendPrompt(activeSessionId, text);
+      setError(null);
+      // Auto-resume a stored (non-live) session before sending. A non-resumable
+      // stored session can't be sent to; a failed resume aborts (error already set).
+      if (!isLive) {
+        if (!canResume) return;
+        if (!(await resume())) return;
+        // The resume reconnected to a FRESH agent: the SAVED capabilities
+        // that gated `hasImages` above are stale. Re-derive from the live
+        // session's capabilities (the store's `resumeSession` just upserted
+        // the resume result): if the fresh agent doesn't advertise
+        // `promptCapabilities.image`, proceed text-only (the same
+        // fail-closed treatment — an image-ONLY send is blocked, a text
+        // send simply doesn't attach the staged images); if it DOES
+        // advertise images, include them.
+        const fresh = useSessions
+          .getState()
+          .sessions.find((x) => x.sessionId === activeSessionId);
+        hasImages =
+          attachments.length > 0 && agentSupportsImages(fresh?.capabilities);
+        if (!hasImages && text === "") return;
+      }
+      let images:
+        | { id: string; name: string; mimeType: string; sizeBytes: number; data: string }[]
+        | undefined;
+      if (hasImages) {
+        try {
+          const read = await Promise.all(
+            attachments.map(async (att) => ({
+              id: att.id,
+              name: att.filename,
+              mimeType: att.mimeType,
+              sizeBytes: att.sizeBytes,
+              data: await readAttachmentAsBase64(att),
+            })),
+          );
+          // Reconcile against the LIVE list: the composer isn't locked until
+          // beginTurn, so a thumbnail removed during the read must not be sent.
+          const liveIds = new Set(attachmentsRef.current.map((a) => a.id));
+          images = read.filter((i) => liveIds.has(i.id));
+        } catch {
+          setError("Failed to read an attached image");
+          return; // attachments stay staged; `sendingRef` resets in `finally`
+        }
+      }
+      // Session switched during the read (the composer isn't locked until
+      // beginTurn): the closure's `activeSessionId` is stale — abort without
+      // sending, without wiping the draft, without completing a turn.
+      if (activeSessionIdRef.current !== activeSessionId) return;
+      // Draft edited during the read (the composer isn't locked until
+      // `beginTurn`): sending the stale text and wiping the new draft is a
+      // silent data loss — abort without sending, without wiping the draft,
+      // without completing a turn (the user simply sends again).
+      if (draftRef.current.trim() !== text) return;
+      // Every staged image was removed during the read (the composer isn't
+      // locked until `beginTurn`, so a thumbnail can be removed during the
+      // read): with no text there's nothing meaningful left to send; with
+      // text, normalize to `undefined` so the 2-arg `sendPrompt` path is taken
+      // (an empty `[]` is truthy and would take the 3-arg path, sending an
+      // empty images array).
+      if (images !== undefined && images.length === 0) {
+        if (!text) return;
+        images = undefined;
+      }
+      // `sentIds` is derived from what was ACTUALLY sent (the reconciled
+      // `images`), not the stale closure list: on success, release/clear ONLY
+      // these. Anything staged after the read — e.g. a drop during the
+      // FileReader `await`, or attachments staged in ANOTHER session while
+      // this turn was running — must survive.
+      const sentIds = new Set(images?.map((i) => i.id) ?? []);
+      // `ImageRef` has no `id` field — strip it before use.
+      const imageRefs = images?.map(({ id, ...ref }) => ref); // ImageRef[] | undefined
+      setDraft("");
+      addUserMessage(activeSessionId, text, imageRefs);
+      beginTurn(activeSessionId);
+      // Pass the third arg ONLY when there are images: a text-only send (and
+      // an all-images-removed send, normalized above) calls
+      // `sendPrompt(id, text)` — the pre-existing 2-arg call the existing tests
+      // assert (`toHaveBeenCalledWith("s1", "hello")`; vitest compares arg
+      // arrays by length, so an explicit `undefined` third arg would break it).
+      const stopReason = imageRefs
+        ? await sendPrompt(activeSessionId, text, imageRefs)
+        : await sendPrompt(activeSessionId, text);
+      // Release/clear ONLY the sent attachments, OUTSIDE the state updater
+      // (updaters must be pure — StrictMode runs them twice).
+      const still = attachmentsRef.current.filter((a) => !sentIds.has(a.id));
+      attachmentsRef.current
+        .filter((a) => sentIds.has(a.id))
+        .forEach(releaseAttachment);
+      attachmentsRef.current = still;
+      setAttachments(still);
       turnCompleted(activeSessionId, stopReason);
     } catch (err) {
       turnCompleted(activeSessionId, "end_turn");
-      setError(err instanceof Error ? err.message : String(err));
+      // Tauri IPC errors are plain objects (`{ kind, message }`), not `Error`
+      // instances — `String(err)` would show `[object Object]` (a pre-existing
+      // gap the new `InvalidPrompt` validation error would hit; fix it here).
+      const msg =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === "object" && "message" in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+      setError(msg);
+      // Attachments deliberately stay staged (a failed send keeps them — a
+      // re-pasted image is costly, a re-typed draft is not). The draft is
+      // lost on failure (pre-existing behavior, unchanged).
+    } finally {
+      sendingRef.current = false;
     }
   };
 
-  const resume = async () => {
-    if (!activeSessionId || resuming) return;
+  const resume = async (): Promise<boolean> => {
+    if (!activeSessionId || resuming) return false;
     setResuming(true);
     setError(null);
     try {
       await resumeSession(activeSessionId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setResuming(false);
     }
+    return true;
   };
 
   // Conversation selector options for the space: the live session first
@@ -378,6 +594,100 @@ export default function ChatStream() {
   // render in the stream regardless of the transcript's length) or a
   // working/blocked line is present — otherwise the card would be
   // swallowed by the hint.
+
+  // --- Image-attachment handlers (plain functions, NOT hooks — their
+  // placement is flexible; kept with the other handlers). ---
+  const stageFiles = (files: File[]) => {
+    // Read the CURRENT list from the ref — a render closure would be stale
+    // for fast successive events (e.g. pasting 8 files then a 9th in
+    // separate dispatches without a re-render in between).
+    const { attachments: next, rejected } = addImageAttachments(
+      attachmentsRef.current,
+      files,
+    );
+    if (next !== attachmentsRef.current) {
+      attachmentsRef.current = next;
+      setAttachments(next);
+    }
+    // A successful stage also CLEARS a stale rejection line (null when
+    // nothing was rejected) — otherwise a rejection stays visible after the
+    // user successfully stages a different image.
+    setError(rejected.length > 0 ? rejected.join("; ") : null);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!imageCapable) return; // fall through: default text paste
+    // Pasted images live in `clipboardData.items` (a `ClipboardItem` pulled via
+    // `getAsFile()`); `clipboardData.files` is EMPTY in real webviews
+    // (WebKit/WebKitGTK, WebView2/Chromium), so derive the file list from
+    // `items` instead — keep only `kind === "file"` items, drop null results.
+    const files: File[] = [];
+    for (const item of e.clipboardData.items) {
+      if (item.kind === "file") {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    const text = e.clipboardData.getData("text/plain");
+    const html = e.clipboardData.getData("text/html");
+    // A spreadsheet paste carries TSV (or Excel HTML) alongside the
+    // synthetic image — the TEXT wins, so the default paste is untouched.
+    if (
+      files.length > 0 &&
+      !shouldPreferSpreadsheetClipboardText(text, html)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      stageFiles(files);
+      return;
+    }
+    // WebKitGTK quirk: a pasted image produces a `paste` event with NO file
+    // items and NO text (the DataTransfer is empty — verified on
+    // webkit2gtk-4.1 2.52.5 on Wayland; the image IS inserted into a
+    // contenteditable, just not exposed on the event). When the event has
+    // no content at all, the likely cause is a clipboard image WebKit can't
+    // surface — read it from the system clipboard (Rust/arboard) instead.
+    // A text-only paste is a text paste: `getData("text/plain")` is
+    // non-empty, so the fallback is skipped (no stale image staged).
+    if (files.length === 0 && !text) {
+      // The read can straddle a session switch (it is a slow IPC round
+      // trip): capture the active session at PASTE time and abort if it
+      // changed — without the guard, `stageFiles` would target the NEW
+      // active session (staging session A's pasted image in session B's
+      // composer; the same cross-session leak `send()`'s
+      // `activeSessionIdRef` guard prevents for sends).
+      const pastedInSession = activeSessionIdRef.current;
+      void readClipboardImage()
+        .then((bytes) => {
+          if (!bytes) return; // no image on the clipboard — nothing to stage
+          if (activeSessionIdRef.current !== pastedInSession) return; // switched
+          const file = new File([new Uint8Array(bytes)], "screenshot.png", {
+            type: "image/png",
+          });
+          stageFiles([file]);
+        })
+        .catch(() => {
+          // Silent: clipboard access failed (or no image) — an empty-clipboard
+          // paste is not an error condition.
+        });
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    if (composerLocked || !imageCapable) return;
+    e.preventDefault();
+    stageFiles(Array.from(e.dataTransfer.files));
+  };
+
+  const removeAttachment = (id: string) => {
+    // Revoke OUTSIDE the state updater (updaters must be pure — StrictMode
+    // runs them twice; a double revoke is harmless but the wrong pattern).
+    const target = attachmentsRef.current.find((a) => a.id === id);
+    if (target) releaseAttachment(target);
+    const next = attachmentsRef.current.filter((a) => a.id !== id);
+    attachmentsRef.current = next;
+    setAttachments(next);
+  };
 
   return (
     <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
@@ -576,11 +886,39 @@ export default function ChatStream() {
           {error ?? newConversationError}
         </p>
       )}
-      <div className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused">
+      <div
+        className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
+        onDrop={handleDrop}
+      >
+        {attachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-2">
+            {attachments.map((att) => (
+              <div
+                key={att.id}
+                className="group relative size-12 overflow-hidden rounded-lg border border-input-border bg-input"
+              >
+                <img
+                  src={att.objectUrl}
+                  alt={att.filename}
+                  className="size-full object-cover"
+                />
+                <button
+                  type="button"
+                  aria-label="Remove image attachment"
+                  onClick={() => removeAttachment(att.id)}
+                  className="absolute right-0.5 top-0.5 size-4 rounded-full bg-input p-0 opacity-0 transition-opacity group-hover:opacity-100"
+                >
+                  <X className="size-3 text-foreground" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={composerRef}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onPaste={handlePaste}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -592,14 +930,16 @@ export default function ChatStream() {
               ? composerLocked
                 ? "Agent is working…"
                 : messages.length === 0
-                  ? "Ask anything…"
+                  ? imageCapable
+                    ? "Ask anything — or paste an image…"
+                    : "Ask anything…"
                   : "Ask for follow-up changes"
               : canResume
-                ? "Paused — Resume to reconnect"
+                ? "Resume this session to send"
                 : "This session is closed"
           }
           rows={2}
-          disabled={!isLive || composerLocked}
+          disabled={!composerEnabled || composerLocked}
           className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
         />
         <div className="mt-1 flex items-center justify-between gap-2">
@@ -618,7 +958,11 @@ export default function ChatStream() {
             <Button
               size="icon-md"
               aria-label="Send"
-              disabled={!isLive || composerLocked || draft.trim() === ""}
+              disabled={
+                !composerEnabled ||
+                composerLocked ||
+                (draft.trim() === "" && !hasImages)
+              }
               onClick={() => void send()}
               className="bg-primary text-primary-foreground"
             >

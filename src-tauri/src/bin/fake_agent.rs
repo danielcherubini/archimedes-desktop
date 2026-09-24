@@ -23,6 +23,9 @@
 //! - `resume`: `initialize` advertises `loadSession: true`; `session/load`
 //!   replays one chunk (`"resumed"`) and then responds, so the client can
 //!   verify the `session/load` round-trip.
+//! - `cancel`: `session/prompt` is held open until a `session/cancel`
+//!   notification arrives, then resolved with `stopReason: "cancelled"`
+//!   (the ACP cancellation contract).
 //! - `hang`: `initialize` is answered, but `session/new` is ignored forever.
 //!   The client's establishment timeout must fire instead of waiting on the
 //!   agent indefinitely.
@@ -326,6 +329,7 @@ fn main() -> ExitCode {
                 } else {
                     match mode.as_str() {
                         "permission" => handle_prompt_permission(&mut reader, &mut out, &id, &sid),
+                        "cancel" => handle_prompt_cancel(&mut reader, &mut out, &id, &sid),
                         "two-msgs" => handle_prompt_two_msgs(&mut out, &id, &sid),
                         "dispatch" => handle_prompt_dispatch(&mut out, &id, &sid, false),
                         "dispatch-cancel" => handle_prompt_dispatch(&mut out, &id, &sid, true),
@@ -423,6 +427,46 @@ fn handle_prompt_permission(
         prompt_id,
         &serde_json::json!({ "stopReason": "end_turn" }),
     );
+}
+
+/// `cancel` mode: hold the prompt open until a `session/cancel`
+/// notification arrives, then resolve it with `stopReason: "cancelled"`
+/// (the ACP cancellation contract: the agent responds to the original
+/// `session/prompt` request with the cancelled stop reason). A closed
+/// connection WITHOUT a cancel resolves with an error (no client hang).
+fn handle_prompt_cancel(
+    reader: &mut impl BufRead,
+    out: &mut impl Write,
+    prompt_id: &Option<serde_json::Value>,
+    _sid: &str,
+) {
+    loop {
+        let mut line = String::new();
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("fake_agent: cancel mode read error: {e}");
+                let error = serde_json::json!({ "code": -32000, "message": "connection closed" });
+                write_error(out, prompt_id, &error);
+                return;
+            }
+        };
+        if n == 0 {
+            let error = serde_json::json!({ "code": -32000, "message": "connection closed" });
+            write_error(out, prompt_id, &error);
+            return;
+        }
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if frame.get("method").and_then(|m| m.as_str()) == Some("session/cancel") {
+            // A notification (no `id`) — no response owed; resolve the prompt.
+            let result = serde_json::json!({ "stopReason": "cancelled" });
+            write_result(out, prompt_id, &result);
+            return;
+        }
+        // Ignore other frames (notifications owe no response).
+    }
 }
 
 /// `dispatch` mode (the MAIN agent): connect to the bridge socket, send a

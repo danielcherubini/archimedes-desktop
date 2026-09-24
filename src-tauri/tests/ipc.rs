@@ -420,3 +420,201 @@ fn spaces_and_agents_commands_round_trip() {
     let _ = std::fs::remove_dir_all(&config_dir);
     let _ = std::fs::remove_dir_all(&app_data_dir);
 }
+
+/// The `invoke` helper `.expect`s success — this variant does NOT, and
+/// returns the error payload (`get_ipc_response`'s error is the payload
+/// `Value` itself).
+fn invoke_err(
+    webview: &WebviewWindow<MockRuntime>,
+    cmd: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    get_ipc_response(
+        webview,
+        InvokeRequest {
+            cmd: cmd.into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(body),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_string(),
+        },
+    )
+    .expect_err("the invalid image should be rejected")
+}
+
+#[test]
+fn send_prompt_images_ipc() {
+    let config_dir = temp_dir("config");
+    let app_data_dir = temp_dir("data");
+    write_agents_json(&config_dir);
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let app = build_app(config_dir.clone(), app_data_dir.clone(), events_tx);
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview should build");
+
+    // --- start a session with the fake agent ---
+    let info = invoke(
+        &webview,
+        "start_session",
+        serde_json::json!({ "agentId": "fake", "cwd": config_dir.to_string_lossy() }),
+    );
+    assert_eq!(info["sessionId"], FAKE_SESSION_ID);
+
+    // --- invalid image FIRST (validation-before-persistence proof) ---
+    // An SVG from hand-rolled IPC must be rejected BEFORE anything is
+    // written to SQLite: no `user` row may exist afterwards.
+    let err = invoke_err(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "look at this",
+            "images": [{ "mimeType": "image/svg+xml", "data": "AQID", "name": "a.svg", "sizeBytes": 3 }]
+        }),
+    );
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("unsupported image type"),
+        "expected an invalid-payload error, got: {err_str}"
+    );
+    let db = Db::open(&app_data_dir.join("archimedes.db")).unwrap();
+    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+    assert!(
+        rows.iter().all(|r| r.kind != "user"),
+        "a rejected image payload must not be persisted, got: {:?}",
+        rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+    );
+
+    // --- valid image (nested camelCase deserialization proof) ---
+    // The nested `mimeType` / `sizeBytes` keys reach the `ImagePayload`
+    // `#[serde(rename_all = "camelCase")]` over the REAL Tauri IPC wire —
+    // the unit tests never exercise Tauri's argument deserialization.
+    let stop = invoke(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "look",
+            "images": [{ "mimeType": "image/png", "data": "AQID", "name": "a.png", "sizeBytes": 3 }]
+        }),
+    );
+    assert_eq!(stop, "end_turn");
+    // Poll until the user row lands (the persistence hook may still be
+    // draining — same deadline pattern as the existing test).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let user = loop {
+        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        if let Some(row) = rows.iter().find(|r| r.kind == "user") {
+            break row.clone();
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "user row did not appear; got {:?}",
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let payload: serde_json::Value = serde_json::from_str(&user.payload_json).unwrap();
+    assert_eq!(payload["text"], "look");
+    assert_eq!(payload["images"][0]["mimeType"], "image/png");
+    assert_eq!(payload["images"][0]["data"], "AQID");
+
+    // --- too many images (the count-cap proof over the REAL IPC wire) ---
+    // 9 valid images exceed the `MAX_IMAGE_COUNT` (8) cap: rejected BEFORE
+    // anything is persisted (same validation-before-persistence proof as the
+    // SVG case above) — exactly one `user` row (the valid one above) exists.
+    let nine: Vec<serde_json::Value> = (0..9)
+        .map(|i| {
+            serde_json::json!({
+                "mimeType": "image/png",
+                "data": "AQID",
+                "name": format!("a{i}.png"),
+                "sizeBytes": 3
+            })
+        })
+        .collect();
+    let err = invoke_err(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "look",
+            "images": nine
+        }),
+    );
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("at most 8"),
+        "expected the image-count cap error, got: {err_str}"
+    );
+    let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+    let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the 9-image payload must not add a user row, got {:?}",
+        rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+    );
+
+    // --- image-only prompt (empty text + 1 valid image) ---
+    // The frontend supports image-only sends; the persisted row is
+    // `{"text": "", "images": [...]}` (the client must not ship an empty
+    // text block to the provider — the unit test proves the block shape).
+    let stop = invoke(
+        &webview,
+        "send_prompt",
+        serde_json::json!({
+            "sessionId": FAKE_SESSION_ID,
+            "text": "",
+            "images": [{ "mimeType": "image/png", "data": "AQID", "name": "only.png", "sizeBytes": 3 }]
+        }),
+    );
+    assert_eq!(stop, "end_turn");
+    // Poll for the image-only user row (distinct from the one above by name).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let user = loop {
+        let rows = db.messages_for(FAKE_SESSION_ID).unwrap();
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind == "user" && r.payload_json.contains("only.png"))
+        {
+            break row.clone();
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "image-only user row did not appear; got {:?}",
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let payload: serde_json::Value = serde_json::from_str(&user.payload_json).unwrap();
+    assert_eq!(payload["text"], "");
+    assert_eq!(payload["images"][0]["name"], "only.png");
+    assert_eq!(payload["images"][0]["data"], "AQID");
+
+    // --- close the session and wait for the driver task's teardown ---
+    invoke(
+        &webview,
+        "close_session",
+        serde_json::json!({ "sessionId": FAKE_SESSION_ID }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match events_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((event, _)) if event == "session-closed" => break,
+            Ok(_) => continue,
+            Err(_) => panic!("session-closed event should arrive after close"),
+        }
+    }
+
+    // Clean up (best effort).
+    drop(app);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&app_data_dir);
+}
