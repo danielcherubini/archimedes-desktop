@@ -56,4 +56,9 @@ pub enum AcpError {
     /// A filesystem operation failed (I/O error, permission, encoding, …).
     #[error("file operation failed: {detail}")]
     Io { detail: String },
+
+    /// A user prompt payload failed validation (invalid image mime type,
+    /// oversized image).
+    #[error("invalid prompt payload: {message}")]
+    InvalidPrompt { message: String },
 }

@@ -11,13 +11,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, PromptRequest, SessionConfigOption, SessionId, TextContent,
+    AgentCapabilities, PromptRequest, SessionConfigOption, SessionId,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::acp::{
-    AcpError, EventSink, PermissionOutcome, SessionInfo, SessionManager, SubagentSessionManager,
+    prompt, AcpError, EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager,
+    SubagentSessionManager,
 };
 use crate::storage::Db;
 
@@ -52,6 +53,7 @@ pub async fn send_prompt(
     db: State<'_, Arc<Db>>,
     session_id: String,
     text: String,
+    images: Option<Vec<ImagePayload>>,
 ) -> Result<agent_client_protocol::schema::v1::StopReason, AcpError> {
     // Grab the (cheap) connection clone, then drop it before awaiting the
     // turn: the turn can block on a user-paced permission prompt, and
@@ -60,13 +62,16 @@ pub async fn send_prompt(
     // The client owns history: record the user's message before the turn.
     // (The `SessionManager::send_prompt` method does the same for direct
     // callers; the command path never goes through that method.)
+    let images = images.unwrap_or_default();
+    // Validate the images FIRST: a rejected payload (e.g. an SVG or an
+    // oversized image from hand-rolled IPC) must NOT be written to SQLite
+    // and must NOT start a user turn — validating before persisting is
+    // what keeps the "cap bounds DB growth" guarantee real.
+    let blocks = prompt::build_prompt_blocks(&text, &images)?;
     state.begin_user_turn(&session_id).await;
-    let payload = serde_json::json!({ "text": text });
+    let payload = prompt::user_message_payload(&text, &images);
     let _ = db.record_message(&session_id, "user", None, &payload.to_string());
-    let request = PromptRequest::new(
-        SessionId::new(session_id.as_str()),
-        vec![ContentBlock::Text(TextContent::new(text))],
-    );
+    let request = PromptRequest::new(SessionId::new(session_id.as_str()), blocks);
     let response =
         cx.send_request(request)
             .block_task()

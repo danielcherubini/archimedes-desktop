@@ -13,6 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ImageRef } from "./chatAttachments";
 
 // ---------------------------------------------------------------------------
 // Types mirroring the Rust side
@@ -323,8 +324,9 @@ export async function startSession(
 export async function sendPrompt(
   sessionId: string,
   text: string,
+  images?: ImageRef[],
 ): Promise<StopReason> {
-  return invoke<StopReason>("send_prompt", { sessionId, text });
+  return invoke<StopReason>("send_prompt", { sessionId, text, images: images ?? [] });
 }
 
 export async function closeSession(sessionId: string): Promise<void> {

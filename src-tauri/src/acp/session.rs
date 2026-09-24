@@ -36,7 +36,7 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
-    TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
+    ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -48,6 +48,7 @@ use crate::acp::bridge::{self, PendingBridge};
 use crate::acp::errors::AcpError;
 use crate::acp::fs_backend::FsBackend;
 use crate::acp::permission::{self, PendingPermissions};
+use crate::acp::prompt::{self, ImagePayload};
 use crate::config::{AgentEntry, ConfigError, Registry};
 use crate::storage::Db;
 
@@ -1050,6 +1051,20 @@ impl SessionManager {
         session_id: &str,
         text: String,
     ) -> Result<StopReason, AcpError> {
+        self.send_prompt_with_images(session_id, text, Vec::new())
+            .await
+    }
+
+    /// Like `send_prompt`, but with image attachments: validates them
+    /// (`prompt::build_prompt_blocks`), appends `ContentBlock::Image` blocks
+    /// (text first), and persists `{ "text", "images": [...] }` in the
+    /// transcript (the `images` key omitted when empty — ADR 0008).
+    pub async fn send_prompt_with_images(
+        &self,
+        session_id: &str,
+        text: String,
+        images: Vec<ImagePayload>,
+    ) -> Result<StopReason, AcpError> {
         let sid = SessionId::new(session_id);
         // Clone just the (cheap) connection handle, not the whole LiveSession.
         let cx = {
@@ -1062,15 +1077,21 @@ impl SessionManager {
                 })?
         };
 
+        // Validate the images FIRST: a rejected payload must NOT be written
+        // to the transcript and must NOT start a user turn — validating
+        // before persisting is what keeps the "cap bounds DB growth"
+        // guarantee real.
+        let blocks = prompt::build_prompt_blocks(&text, &images)?;
+
         // Record the user's message in the transcript (the client owns
         // history) before the turn begins.
         self.begin_user_turn(session_id).await;
         if let Some(db) = &self.driver.db {
-            let payload = serde_json::json!({ "text": text });
+            let payload = prompt::user_message_payload(&text, &images);
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
 
-        let request = PromptRequest::new(sid, vec![ContentBlock::Text(TextContent::new(text))]);
+        let request = PromptRequest::new(sid, blocks);
         let response =
             cx.send_request(request)
                 .block_task()
@@ -1521,6 +1542,7 @@ mod session_tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
         ContentChunk, SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
+        TextContent,
     };
     use std::path::Path;
     use tokio::sync::mpsc;
