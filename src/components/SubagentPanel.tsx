@@ -120,6 +120,8 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
                   title={m.title}
                   status={m.status}
                   diff={m.diff}
+                  rawInput={m.rawInput}
+                  rawOutput={m.rawOutput}
                 />
               );
             }
