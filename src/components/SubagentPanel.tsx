@@ -88,6 +88,11 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
         className="flex cursor-pointer items-center gap-1.5"
         onClick={() => setOpen((o) => !o)}
         onKeyDown={(event) => {
+          // Only act when the HEADER ITSELF is focused — a keydown on a
+          // nested button (the dismiss `X`) bubbles here, and
+          // `preventDefault` would cancel the button's native activation,
+          // so keyboard users could never dismiss.
+          if (event.target !== event.currentTarget) return;
           if (event.key === "Enter" || event.key === " ") {
             // `preventDefault` for space — avoid the page scroll.
             event.preventDefault();

@@ -188,6 +188,39 @@ describe("ChangesGroupCard", () => {
     expect(container.querySelector(".border-l")).not.toBeNull();
   });
 
+  it("keeps a manual close when the group already started open", () => {
+    const input = {
+      t1: { path: "/a/b/c.ts" },
+      t2: { path: "/a/b/d.ts" },
+    };
+    const { container, rerender } = render(
+      <ChangesGroupCard
+        messages={[
+          tool("t1", "write", 1, "completed", input.t1),
+          tool("t2", "write", 2, "pending", input.t2),
+        ]}
+      />,
+    );
+    // One member already finished → the group starts OPEN — the member
+    // cards are visible without clicking.
+    expect(container.querySelector(".border-l")).not.toBeNull();
+    // The user closes it.
+    fireEvent.click(screen.getByRole("button", { name: /Changes/ }));
+    expect(container.querySelector(".border-l")).toBeNull();
+    // The pending member finishes (`anyPending` true → false edge) — a
+    // group that started open has already "auto-opened", so the edge
+    // effect must NOT re-open it: the manual close sticks.
+    rerender(
+      <ChangesGroupCard
+        messages={[
+          tool("t1", "write", 1, "completed", input.t1),
+          tool("t2", "write", 2, "completed", input.t2),
+        ]}
+      />,
+    );
+    expect(container.querySelector(".border-l")).toBeNull();
+  });
+
   it("auto-opens once when the last pending member finishes", () => {
     const input = {
       t1: { path: "/a/b/c.ts" },

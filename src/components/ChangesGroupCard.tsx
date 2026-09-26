@@ -75,7 +75,12 @@ export default function ChangesGroupCard({
   const anyPending = messages.some((m) => m.status === "pending");
   const anyFailed = messages.some((m) => m.status === "failed");
   const prevAnyPendingRef = useRef(anyPending);
-  const hasAutoOpenedRef = useRef(false);
+  // A group that STARTS OPEN has already "auto-opened" — the `anyPending`
+  // edge must never re-open it (a user close sticks). A group that starts
+  // closed keeps `false` and can edge-auto-open exactly once.
+  const hasAutoOpenedRef = useRef(
+    messages.some((m) => m.status !== "pending"),
+  );
   useEffect(() => {
     const was = prevAnyPendingRef.current;
     prevAnyPendingRef.current = anyPending;
