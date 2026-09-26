@@ -1,6 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
-import ToolCallCard, { summarizeToolCall, normalizeToolOutput } from "./ToolCallCard";
+import { describe, it, expect, vi } from "vitest";
+import ToolCallCard from "./ToolCallCard";
+import {
+  summarizeToolCall,
+  normalizeToolOutput,
+} from "../lib/toolOutput";
+import * as toolOutput from "../lib/toolOutput";
 
 describe("summarizeToolCall", () => {
   it("summarizes bash by its command", () => {
@@ -57,6 +62,16 @@ describe("normalizeToolOutput", () => {
     expect(normalizeToolOutput(undefined)).toBeUndefined();
     expect(normalizeToolOutput({})).toBeUndefined();
   });
+  it("treats an empty text item as no output (no metadata fallback)", () => {
+    // e.g. a successful sudo_exec with empty stdout: an empty text item
+    // plus command metadata in details.
+    expect(
+      normalizeToolOutput({
+        content: [{ type: "text", text: "" }],
+        details: { command: "true", exitCode: 0 },
+      }),
+    ).toBeUndefined();
+  });
 });
 
 describe("ToolCallCard (rendering)", () => {
@@ -105,5 +120,34 @@ describe("ToolCallCard (rendering)", () => {
     render(<ToolCallCard title="bash" status="completed" />);
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("(no output)")).toBeTruthy();
+  });
+  it("renders (no output) for a result with only an empty text item", () => {
+    render(
+      <ToolCallCard
+        title="sudo_exec"
+        status="completed"
+        rawInput={{ command: "true" }}
+        rawOutput={{
+          content: [{ type: "text", text: "" }],
+          details: { command: "true", exitCode: 0 },
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("(no output)")).toBeTruthy();
+  });
+  it("defers output normalization until the card is expanded", () => {
+    const spy = vi.spyOn(toolOutput, "normalizeToolOutput");
+    render(
+      <ToolCallCard
+        title="bash"
+        status="completed"
+        rawOutput={"x".repeat(50000)}
+      />,
+    );
+    expect(spy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button"));
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
   });
 });
