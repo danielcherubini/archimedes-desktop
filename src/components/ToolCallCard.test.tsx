@@ -88,7 +88,7 @@ describe("normalizeToolOutput", () => {
 });
 
 describe("ToolCallCard (rendering)", () => {
-  it("renders the summary next to the title", () => {
+  it("renders the verb + command for a known tool", () => {
     render(
       <ToolCallCard
         title="bash"
@@ -96,8 +96,120 @@ describe("ToolCallCard (rendering)", () => {
         rawInput={{ command: "ls -la" }}
       />,
     );
-    expect(screen.getByText("bash")).toBeTruthy();
+    expect(screen.getByText("Ran")).toBeTruthy();
     expect(screen.getByText("ls -la")).toBeTruthy();
+  });
+  it("shows the running verb with the shimmer while pending", () => {
+    const { container } = render(
+      <ToolCallCard
+        title="bash"
+        status="pending"
+        rawInput={{ command: "ls" }}
+      />,
+    );
+    expect(screen.getByText("Running")).toBeTruthy();
+    expect(container.querySelector(".animated-gradient-text")).not.toBeNull();
+  });
+  it("shows the raw title for an unknown tool", () => {
+    render(
+      <ToolCallCard
+        title="mystery_tool"
+        status="completed"
+        rawInput={{ a: 1 }}
+      />,
+    );
+    expect(screen.getByText("mystery_tool")).toBeTruthy();
+  });
+  it("renders a file chip for read (basename + language icon)", () => {
+    render(
+      <ToolCallCard
+        title="read"
+        status="completed"
+        rawInput={{ path: "/a/b/c.ts" }}
+      />,
+    );
+    expect(screen.getByText("c.ts")).toBeTruthy();
+    expect(
+      screen.getByText("c.ts").closest("span[title]")?.getAttribute("title"),
+    ).toBe("/a/b/c.ts");
+  });
+  it("renders edit change stats", () => {
+    const { container } = render(
+      <ToolCallCard
+        title="edit"
+        status="completed"
+        rawInput={{
+          path: "/a/b/c.ts",
+          edits: [{ oldText: "a\nb", newText: "x\ny\nz" }],
+        }}
+      />,
+    );
+    // `DiffCount` renders `+` and the number in separate nested elements (the
+    // `FlipMetricValue` span), so `getByText("+3")` can never match — use
+    // `textContent`.
+    expect(container.textContent).toContain("+3");
+    expect(container.textContent).toContain("-2");
+  });
+  it("renders the $ prompt + command in the expanded shell body", () => {
+    render(
+      <ToolCallCard
+        title="bash"
+        status="completed"
+        rawInput={{ command: "node --check app.js" }}
+        rawOutput={{ content: [{ type: "text", text: "ok" }] }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("$")).toBeTruthy();
+    expect(screen.getByText("ok")).toBeTruthy();
+    // The command text appears TWICE (header span + body `<pre>`), so
+    // `getByText` would throw "multiple elements" — use `getAllByText` and
+    // assert the second match is the `<pre>`.
+    const pres = screen.getAllByText("node --check app.js");
+    expect(pres.length).toBeGreaterThanOrEqual(2);
+    expect(pres[1].tagName).toBe("PRE");
+  });
+  it("renders the Failed word on failure (stable header assertions)", () => {
+    render(
+      <ToolCallCard
+        title="bash"
+        status="failed"
+        rawInput={{ command: "ls" }}
+        rawOutput={{
+          content: [{ type: "text", text: "" }],
+          details: { error: "command not found" },
+        }}
+      />,
+    );
+    // The word is a plain header span — always rendered, no tooltip
+    // interaction needed.
+    const failed = screen.getByText("Failed");
+    expect(failed).toBeTruthy();
+    expect(failed.className).toContain("cursor-help");
+    expect(failed.className).toContain("text-destructive");
+  });
+  it("opens the failure tooltip with the error text + copy button on pointer interaction", () => {
+    render(
+      <ToolCallCard
+        title="bash"
+        status="failed"
+        rawInput={{ command: "ls" }}
+        rawOutput={{
+          content: [{ type: "text", text: "" }],
+          details: { error: "command not found" },
+        }}
+      />,
+    );
+    // Radix `TooltipTrigger` listens to pointer/focus events —
+    // `fireEvent.mouseEnter` / `fireEvent.pointerMove` do NOT open it in
+    // this Radix version; `fireEvent.focus` does. `TooltipProvider` sets
+    // `delayDuration = 0`, so the portal mounts synchronously (no fake
+    // timers needed).
+    fireEvent.focus(screen.getByText("Failed"));
+    // The content renders into a portal outside the card container — assert
+    // on `document.body`.
+    expect(document.body.textContent).toContain("command not found");
+    expect(screen.getByRole("button", { name: "Copy error" })).toBeTruthy();
   });
   it("renders the output text when expanded", () => {
     render(
@@ -132,7 +244,7 @@ describe("ToolCallCard (rendering)", () => {
   it("renders (no output) when there is no rawOutput", () => {
     render(<ToolCallCard title="bash" status="completed" />);
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("(no output)")).toBeTruthy();
+    expect(screen.getByText("No output.")).toBeTruthy();
   });
   it("renders (no output) for a result with only an empty text item", () => {
     render(
@@ -147,7 +259,7 @@ describe("ToolCallCard (rendering)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("(no output)")).toBeTruthy();
+    expect(screen.getByText("No output.")).toBeTruthy();
   });
   it("shows the failure reason from details for a failed call with empty text", () => {
     render(
