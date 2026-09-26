@@ -34,7 +34,9 @@
 #[cfg(target_os = "linux")]
 mod bridge_integration {
     use std::collections::HashMap;
+    use std::future::Future;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
@@ -43,7 +45,9 @@ mod bridge_integration {
     use tokio::sync::{watch, Mutex};
 
     use archimedes_desktop_lib::agent::bridge::{self, BridgeHandle};
-    use archimedes_desktop_lib::agent::{EventSink, PendingBridge};
+    use archimedes_desktop_lib::agent::{
+        CachedPassword, EventSink, PendingBridge, PendingSudo, SudoRun, SudoRunner, TodoStore,
+    };
 
     /// The Python stub. It writes its result to the file given as arg 3.
     ///
@@ -194,6 +198,30 @@ main()
         path
     }
 
+    /// A no-op `SudoRunner` (the listener in this test is never asked to
+    /// run `sudo` — the frames it sees are `ask` / push; the seam just
+    /// has to be named for the `start_listener` signature).
+    struct NoopRunner;
+
+    impl SudoRunner for NoopRunner {
+        fn run(
+            &self,
+            _argv: Vec<String>,
+            _password: String,
+            _timeout: Duration,
+        ) -> Pin<Box<dyn Future<Output = SudoRun> + Send + 'static>> {
+            Box::pin(async {
+                SudoRun {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: "not run".to_string(),
+                    timed_out: false,
+                    error: Some("noop runner".to_string()),
+                }
+            })
+        }
+    }
+
     /// Start the real listener (anchor = the test process's own pid) and
     /// return the handle + the (unused) close sender.
     async fn start(
@@ -204,6 +232,13 @@ main()
         timeout: Duration,
     ) -> (BridgeHandle, watch::Sender<bool>) {
         let (close_tx, _close_rx) = watch::channel(false);
+        // The Phase 2 (Task 1) `start_listener` parameters: a fresh todo
+        // store, an empty `pending_sudo` map, an empty `sudo_password`
+        // cache, and a fake runner (no real `sudo` in `cargo test`).
+        let todo_store = Arc::new(TodoStore::new());
+        let pending_sudo: PendingSudo = Arc::new(Mutex::new(HashMap::new()));
+        let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let handle = bridge::start_listener(
             session_id.to_string(),
             path,
@@ -214,6 +249,10 @@ main()
             timeout,
             None,
             None,
+            todo_store,
+            pending_sudo,
+            sudo_password,
+            Arc::new(NoopRunner),
         )
         .await
         .expect("start_listener should bind");

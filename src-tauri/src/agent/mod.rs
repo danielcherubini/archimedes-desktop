@@ -9,9 +9,13 @@ mod permission;
 pub mod rpc;
 mod session;
 pub mod subagent;
+pub mod todo;
+pub mod tools;
 pub mod worker_runtime;
 
-pub use bridge::{bridge_key, PendingBridge};
+pub use bridge::{
+    bridge_key, CachedPassword, PendingBridge, PendingSudo, RealSudoRunner, SudoRun, SudoRunner,
+};
 pub use errors::RpcError;
 pub use fs_backend::{FsBackend, FsError};
 pub use gate::{gate_env, gate_spawn_args, install_gate_extension};
@@ -22,4 +26,6 @@ pub use session::{
     SessionInfo, SessionManager, StopReason, SubagentSpawn, MAX_IMAGE_BYTES,
 };
 pub use subagent::{SubagentMetrics, SubagentOutcome, SubagentSessionManager};
+pub use todo::{TodoItem, TodoStatus, TodoStore};
+pub use tools::{install_tools_extension, tools_spawn_args};
 pub use worker_runtime::WorkerRuntime;

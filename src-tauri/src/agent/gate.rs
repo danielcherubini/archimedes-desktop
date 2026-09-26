@@ -11,10 +11,14 @@
 //! the env var (its first line), so it is inert outside desktop-spawned
 //! sessions — the desktop is the only thing that sets the var.
 //!
-//! Gated tools (Phase 1): the mutating/privileged ones — `bash`, `edit`,
-//! `write`, `sudo_exec`. Read-only tools (`read`/`find`/`grep`/`ls`) and
-//! the suite's own `ask`/`subagent`/`manage_todo_list` are ungated (their
-//! own UI, or harmless).
+//! Gated tools (Phase 1): the mutating/privileged built-ins — `bash`,
+//! `edit`, `write`. `sudo_exec` is NOT gated here: in a desktop spawn the
+//! `tools.ts` override replaces the suite's `sudo_exec`, and the desktop's
+//! `sudo_exec` handler is the single confirm (a gate confirm + a desktop
+//! confirm = double). Read-only tools (`read`/`find`/`grep`/`ls`) and the
+//! suite's own `ask`/`subagent`/`manage_todo_list` are ungated (their own
+//! UI, or harmless — `ask` / `manage_todo_list` are overridden by `tools.ts`
+//! into desktop delegates, whose handlers own the UI).
 
 /// The embedded extension source (`src-tauri/assets/gate.ts`).
 pub const GATE_SOURCE: &str = include_str!("../../assets/gate.ts");

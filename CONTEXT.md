@@ -24,6 +24,10 @@ _Avoid_: Conversation, chat, thread, run
 A desktop-spawned pi RPC session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
 _Avoid_: Worker, delegated task, child session, background session
 
+**Suite tool**:
+One of the pi-archimedes suite's interactive tools — `ask` / `sudo_exec` / `manage_todo_list`. In Phase 2 these EXECUTE IN THE DESKTOP (the Client), not the agent: the desktop injects a `tools.ts` override (ADR 0009) that re-registers them with the same name + schema but `execute()` = a bridge round-trip, so the agent's copies are thin delegates and the desktop owns the confirmation / execution / todo store. `subagent` is already desktop-executed (not overridden); pi's BUILT-IN tools (`bash` / `edit` / `write` / `read` / `find` / `grep`) still run in the agent.
+_Avoid_: Agent tool, delegated tool, built-in tool
+
 **Agent registry**:
 The Client's list of known agents — each entry is a spawn command (program + args) plus metadata (name, capabilities, defaults). v1 ships with pi only.
 _Avoid_: Agent list, agent config, agent profile

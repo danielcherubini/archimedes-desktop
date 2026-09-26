@@ -44,10 +44,14 @@ serde_json = "1"
 # Enables `tauri::test` (mock runtime) for the headless IPC test.
 tauri = { version = "2", features = ["test"] }
 
-# Platform-gated bridge deps: `libc` (SO_PEERCRED / ucred) is only needed on
-# Linux, the `windows` crate (named-pipe client pid + Toolhelp) only on
+# Platform-gated bridge deps: `libc` is needed on ALL unix platforms — Linux
+# for the bridge's `SO_PEERCRED`/`ucred` peer verification (those specific
+# uses stay `#[cfg(target_os = "linux")]`-gated) and macOS because
+# `run_sudo_real`'s `#[cfg(unix)]` `setpgid`/`kill` (process-group kill) code
+# compiles there too (the bridge is inert on macOS, but the code must still
+# COMPILE). The `windows` crate (named-pipe client pid + Toolhelp) is only on
 # Windows — a top-level dep would pull each into the other platform's build.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

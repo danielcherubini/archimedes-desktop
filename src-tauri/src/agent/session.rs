@@ -38,10 +38,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use crate::agent::bridge::{self, PendingBridge};
+use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
 use crate::agent::errors::RpcError;
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
+use crate::agent::todo::TodoStore;
 use crate::config::{AgentEntry, ConfigError, Registry};
 use crate::storage::Db;
 
@@ -401,6 +402,27 @@ pub struct SessionDriver {
     pub(crate) sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
     pub(crate) pending_permissions: PendingPermissions,
     pub(crate) pending_bridge: PendingBridge,
+    /// The shared todo store (Phase 2, Task 1 — the `todo_update`
+    /// handler's store; the main and subagent managers each get their
+    /// OWN store, mirroring how `pending_bridge` is split across the
+    /// two managers).
+    pub(crate) todo_store: Arc<TodoStore>,
+    /// The pending `sudo_exec` sub-prompt oneshots (Phase 2, Task 1 —
+    /// one entry per sub-prompt, keyed `"{sid}/{id}:confirm"` /
+    /// `"{sid}/{id}:password"`).
+    pub(crate) pending_sudo: PendingSudo,
+    /// The per-session sudo credential cache (Phase 2, Task 1 — the
+    /// suite's `credentialCache`: in-memory only, keyed by session id,
+    /// cleared in the driver-task teardown alongside the `pending_bridge`
+    /// prefix drain — mirroring the suite's cache cleared at every
+    /// session boundary). It MUST live in shared per-session state (the
+    /// `ConnCtx` is per-connection, rebuilt per frame — it cannot hold
+    /// the cache).
+    pub(crate) sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>>,
+    /// The `sudo -S` execution seam (Phase 2, Task 1 — the real runner
+    /// in production; tests inject a fake via the `start_listener`
+    /// parameter).
+    pub(crate) runner: Arc<dyn SudoRunner>,
     /// How long the establishment phase (agent spawn + `get_state`
     /// establisher) may run before it is cancelled. Default: 30 s.
     pub(crate) establish_timeout: Duration,
@@ -435,6 +457,10 @@ impl SessionDriver {
             generation_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_bridge: Arc::new(Mutex::new(HashMap::new())),
+            todo_store: Arc::new(TodoStore::new()),
+            pending_sudo: Arc::new(Mutex::new(HashMap::new())),
+            sudo_password: Arc::new(Mutex::new(HashMap::new())),
+            runner: Arc::new(bridge::RealSudoRunner),
             establish_timeout: Duration::from_secs(30),
             db: None,
             text_capture: None,
@@ -529,6 +555,15 @@ impl SessionDriver {
                     parent_agent_id: agent_id.to_string(),
                 });
                 let cost_capture = self.cost_capture.clone();
+                // The Phase 2 method-aware handler state (`todo_update` /
+                // `sudo_exec` — the desktop answers them itself): the
+                // shared todo store, the sudo sub-prompt oneshots, the
+                // per-session sudo credential cache, and the `sudo -S`
+                // execution seam.
+                let todo_store = self.todo_store.clone();
+                let pending_sudo = self.pending_sudo.clone();
+                let sudo_password = self.sudo_password.clone();
+                let runner = self.runner.clone();
                 Some(
                     bridge::start_listener(
                         client_session_id,
@@ -540,6 +575,10 @@ impl SessionDriver {
                         bridge::DEFAULT_BRIDGE_TIMEOUT,
                         subagent_spawn,
                         cost_capture,
+                        todo_store,
+                        pending_sudo,
+                        sudo_password,
+                        runner,
                     )
                     .await
                     .map_err(|e| RpcError::Io(format!("bridge listener: {e}")))?,
@@ -566,6 +605,13 @@ impl SessionDriver {
         let sessions_arc = self.sessions.clone();
         let pending_permissions_arc = self.pending_permissions.clone();
         let pending_bridge_arc = self.pending_bridge.clone();
+        // The Phase 2 shared state for the driver-task teardown (the
+        // `sudo_password` cache + the `todo_store` entry are removed by the
+        // BARE session id; the `pending_sudo` oneshots are drained with the
+        // `pending_bridge` prefix drain below — their keys are compound).
+        let pending_sudo_arc = self.pending_sudo.clone();
+        let sudo_password_arc = self.sudo_password.clone();
+        let todo_store_arc = self.todo_store.clone();
         let establish_timeout = self.establish_timeout;
         let db = self.db.clone();
         // The capture hooks (subagents only; `None` for main). Clones for
@@ -830,6 +876,27 @@ impl SessionDriver {
                 .lock()
                 .await
                 .retain(|key, _| !key.starts_with(&bridge_prefix));
+            // Phase 2: drain this session's pending `sudo_exec` sub-prompts
+            // too (dropping the senders cancels the in-flight confirm /
+            // password waiters). The `pending_sudo` entries are COMPOUND-keyed
+            // (`"{sid}/{id}:confirm"`), so the trailing-slash prefix is correct
+            // there.
+            pending_sudo_arc
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&bridge_prefix));
+            // Clear the cached sudo password (the suite's `credentialCache`
+            // is cleared at every session boundary — a stale credential must
+            // not survive the session, and a resume under the same id must
+            // re-prompt, not silently reuse it). The cache is keyed by the
+            // BARE session id (NOT compound — `cache.get(sid)`), so it is
+            // removed by the bare key: a `"{sid}/"` prefix would never match
+            // `"{sid}"` and the plaintext credential would leak.
+            sudo_password_arc.lock().await.remove(&info.session_id);
+            // Same boundary for the todo store (a resumed session must not
+            // read the previous incarnation's todos; the map must not grow
+            // one entry per session forever).
+            todo_store_arc.remove(&info.session_id);
             sink.emit(
                 "session-closed",
                 json!({
@@ -1023,6 +1090,10 @@ pub struct SessionManager {
     /// failed — the spawn then skips the gate args/env, and the session
     /// runs ungated rather than broken).
     gate_path: Option<PathBuf>,
+    /// The installed tools-override extension's path (`None` when the
+    /// install failed — the spawn then skips the tools args, and the
+    /// session runs on the suite's original tools rather than broken).
+    tools_path: Option<PathBuf>,
 }
 
 impl SessionManager {
@@ -1044,11 +1115,24 @@ impl SessionManager {
                 None
             }
         };
+        // Install the desktop-provided tools override (idempotent — both
+        // managers install the same file). A failure is NON-fatal: the
+        // session runs on the suite's original tools rather than broken.
+        let tools_path = match crate::agent::tools::install_tools_extension(&config_dir) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!(
+                    "tools extension install failed: {e} (sessions run on the suite's tools)"
+                );
+                None
+            }
+        };
         Ok(Self {
             driver: SessionDriver::new(),
             registry,
             config_dir,
             gate_path,
+            tools_path,
         })
     }
 
@@ -1146,8 +1230,11 @@ impl SessionManager {
         };
 
         // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`
-        // (the extension is inert without the env var).
+        // (the extension is inert without the env var). The tools override
+        // (Phase 2): a SECOND `-e <tools.ts>` (inert without the bridge env,
+        // which the bridge setup above already set when available).
         let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &entry.args);
+        let args = crate::agent::tools::tools_spawn_args(self.tools_path.as_deref(), &args);
         let mut agent_env = agent_env;
         if self.gate_path.is_some() {
             crate::agent::gate::gate_env(&mut agent_env);
@@ -1285,7 +1372,9 @@ impl SessionManager {
         args.push(session_file.to_string());
 
         // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`.
+        // The tools override (Phase 2): a second `-e <tools.ts>`.
         let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &args);
+        let args = crate::agent::tools::tools_spawn_args(self.tools_path.as_deref(), &args);
         let mut agent_env = agent_env;
         if self.gate_path.is_some() {
             crate::agent::gate::gate_env(&mut agent_env);
@@ -1622,7 +1711,22 @@ impl SessionManager {
                 let _ = sender.send(result);
                 Ok(true)
             }
-            None => Ok(false),
+            None => {
+                // Phase 2: the `pending_bridge` lookup missed — check the
+                // `pending_sudo` sub-prompt oneshots (the `sudo_exec`
+                // `:confirm` / `:password` keys, `"{sid}/{id}:confirm"` /
+                // `"{sid}/{id}:password"`). The legacy `confirm` /
+                // `password` flow still resolves via `pending_bridge` (the
+                // lookup above is NOT removed).
+                let sudo_sender = self.driver.pending_sudo.lock().await.remove(&key);
+                match sudo_sender {
+                    Some(sender) => {
+                        let _ = sender.send(result);
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            }
         }
     }
 
@@ -3287,6 +3391,73 @@ mod session_tests {
         );
 
         let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (teardown) A session close clears the session's Phase 2 shared
+    /// state: the cached sudo password (keyed by the BARE session id —
+    /// the suite's `credentialCache` is cleared at every session boundary,
+    /// so a resumed session under the same id must re-prompt, not silently
+    /// reuse the pre-close credential) and the `TodoStore` entry (a
+    /// resumed session must not read the previous incarnation's todos).
+    #[tokio::test]
+    async fn session_close_clears_the_cached_sudo_password_and_the_todos() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.set_establish_timeout(Duration::from_secs(15));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+        let sid = info.session_id.clone();
+
+        // Simulate mid-session state: a cached credential + todos for this
+        // session (the `sudo_password` cache is keyed by the BARE session
+        // id — `cache.get(sid)` — and the todo store likewise).
+        manager.driver.sudo_password.lock().await.insert(
+            sid.clone(),
+            CachedPassword {
+                password: "pw".to_string(),
+                expires_at: std::time::Instant::now() + Duration::from_secs(600),
+            },
+        );
+        manager.driver.todo_store.set(
+            &sid,
+            vec![crate::agent::todo::TodoItem {
+                content: "a".to_string(),
+                status: crate::agent::todo::TodoStatus::Pending,
+                description: None,
+            }],
+        );
+
+        let _ = manager.close_session(&sid).await;
+
+        // Wait for the driver's `session-closed` event (it is emitted AFTER
+        // the teardown — the assertions below are only meaningful once the
+        // teardown has run).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut closed = false;
+        while std::time::Instant::now() < deadline && !closed {
+            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                if msg.unwrap()["event"] == "session-closed" {
+                    closed = true;
+                }
+            }
+        }
+        assert!(closed, "the session-closed event fired");
+        assert!(
+            !manager.driver.sudo_password.lock().await.contains_key(&sid),
+            "the cached sudo password is cleared at the session boundary"
+        );
+        assert!(
+            manager.driver.todo_store.get(&sid).is_empty(),
+            "the todo list is cleared at the session boundary"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

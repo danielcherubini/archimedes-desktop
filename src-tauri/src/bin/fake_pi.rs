@@ -114,6 +114,20 @@ fn main() {
     let mut current_model_id = "fake-model".to_string();
     let mut current_level = "off".to_string();
 
+    // The FAKE_PI_TOOLS mode (Phase 2, Task 3): the TEST sets the bridge
+    // env (`PI_ARCHIMEDES_BRIDGE=1` + `_SOCKET`/`_SESSION`/`_SERVER_PID`) when
+    // it spawns us; we connect to the socket and simulate the `tools.ts`
+    // override's `execute()` round-trips by sending the `todo_update` /
+    // `sudo_exec` / `ask` frames the override would send (the wire
+    // simulation). Each received bridge response is PRINTED to stdout (one
+    // JSON line) — that is the fake→test assertion channel. We do NOT
+    // `require()` the real `tools.ts` (the self-gate is verified separately,
+    // `tools_selfgate.test.mjs`); we exit 0 after the responses (no RPC loop).
+    if is_set("FAKE_PI_TOOLS") {
+        handle_tools(&mut out);
+        return;
+    }
+
     // HANG mode: never respond to ANY command (notably `get_state`) — for
     // the rewritten `establishment_times_out_when_the_agent_hangs` test.
     // Consume stdin until EOF so the process stays alive while the (real)
@@ -708,6 +722,156 @@ fn emit_two_msgs(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
 fn write_line(out: &mut std::io::BufWriter<std::io::StdoutLock>, line: &str) {
     out.write_all(line.as_bytes()).expect("write");
     out.write_all(b"\n").expect("write");
+}
+
+// ---------------------------------------------------------------------------
+// The FAKE_PI_TOOLS mode (Phase 2, Task 3): the wire simulation of the
+// `tools.ts` override's `execute()` round-trips.
+// ---------------------------------------------------------------------------
+
+/// The `manage_todo_list` override's `todo_update` frame. `op` is `"write"`
+/// (carrying a `todoList`) or `"read"` (the desktop serves it from the store).
+fn todo_frame(id: &str, op: &str) -> serde_json::Value {
+    if op == "read" {
+        return serde_json::json!({
+            "v": 1,
+            "type": "request",
+            "id": id,
+            "method": "todo_update",
+            "source": "main",
+            "params": { "operation": "read" }
+        });
+    }
+    // write: a 3-item list with one `in_progress` + one `pending` + one
+    // `completed` so the desktop's stats are non-trivial (and the `<3 items`
+    // warning path is NOT taken).
+    serde_json::json!({
+        "v": 1,
+        "type": "request",
+        "id": id,
+        "method": "todo_update",
+        "source": "main",
+        "params": {
+            "operation": "write",
+            "todoList": [
+                { "content": "Fix the auth middleware", "status": "in_progress", "description": "src/auth.rs" },
+                { "content": "Write the tests", "status": "pending" },
+                { "content": "Ship it", "status": "completed" }
+            ]
+        }
+    })
+}
+
+/// The `sudo_exec` override's frame (a trivial command + a reason).
+fn sudo_frame(id: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "type": "request",
+        "id": id,
+        "method": "sudo_exec",
+        "source": "main",
+        "params": { "command": command, "reason": "test" }
+    })
+}
+
+/// The `ask` override's frame (the suite's `AskParamsSchema` shape — one
+/// question, two options).
+fn ask_frame(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "type": "request",
+        "id": id,
+        "method": "ask",
+        "source": "main",
+        "params": {
+            "questions": [
+                { "id": "q1", "question": "Pick one", "options": [ { "label": "A" }, { "label": "B" } ] }
+            ]
+        }
+    })
+}
+
+/// Connect the bridge socket (the desktop's listener), send ONE frame, and
+/// read the response line. The connection is held open while waiting for the
+/// response (the desktop's `drain_until_eof` sees no EOF → no cancel), so a
+/// `sudo_exec` / `ask` frame blocks here until the TEST resolves the oneshot
+/// (the desktop then writes the response). Returns `None` when the socket is
+/// unavailable (non-Unix) or the read fails.
+fn send_and_read(socket: &str, frame: &serde_json::Value) -> Option<String> {
+    let mut stream = connect_bridge_socket(socket).ok()?;
+    let data = frame.to_string() + "\n";
+    if std::io::Write::write_all(&mut stream, data.as_bytes()).is_err() {
+        return None;
+    }
+    if std::io::Write::flush(&mut stream).is_err() {
+        return None;
+    }
+    let mut line = String::new();
+    let mut reader = std::io::BufReader::new(&mut stream);
+    match reader.read_line(&mut line) {
+        Ok(0) => None, // closed before a response
+        Ok(_) => Some(line),
+        Err(_) => None,
+    }
+}
+
+/// The `FAKE_PI_TOOLS` mode: send the override's frames (the wire
+/// simulation) and print each received response to stdout (one JSON line) for
+/// the test to assert on. The frame ids are FIXED (`todo-1`/`todo-2`/
+/// `sudo-1`/`sudo-2`/`ask-1`) so the test can pre-empt the `sudo_exec`
+/// sub-prompt oneshots (`{id}:confirm` / `{id}:password`) + the `ask`
+/// oneshot. Each request `id` is printed (a `SENT <id>` marker) BEFORE sending
+/// (the ordering channel); the response is printed verbatim AFTER reading.
+/// Exits 0 after the responses (no RPC loop).
+fn handle_tools(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
+    let socket = match std::env::var("PI_ARCHIMEDES_BRIDGE_SOCKET") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("fake_pi: FAKE_PI_TOOLS: PI_ARCHIMEDES_BRIDGE_SOCKET not set");
+            std::process::exit(1);
+        }
+    };
+
+    // A marker (a `SENT <id>` line) + a response line, each flushed so the
+    // test (which reads our stdout line-by-line) sees them promptly — a
+    // `BufWriter` that only flushed at exit would deadlock the flow (the test
+    // waits for a line that only appears when we exit, but we can't exit
+    // until the test resolves the oneshots).
+    fn emit(out: &mut std::io::BufWriter<std::io::StdoutLock>, line: &str) {
+        out.write_all(line.as_bytes()).expect("write");
+        out.write_all(b"\n").expect("write");
+        out.flush().expect("flush");
+    }
+
+    // 1. `manage_todo_list` write → the desktop updates the store + emits a
+    //    `todos_update` push + responds with the stored todos.
+    emit(out, "SENT todo-1");
+    if let Some(r) = send_and_read(&socket, &todo_frame("todo-1", "write")) {
+        emit(out, r.trim());
+    }
+    // 2. `manage_todo_list` read → the stored todos come back.
+    emit(out, "SENT todo-2");
+    if let Some(r) = send_and_read(&socket, &todo_frame("todo-2", "read")) {
+        emit(out, r.trim());
+    }
+    // 3. `sudo_exec` (the TEST resolves `:confirm` = true + `:password`) → the
+    //    desktop runs the command via the (fake) runner (`exitCode: 0`).
+    emit(out, "SENT sudo-1");
+    if let Some(r) = send_and_read(&socket, &sudo_frame("sudo-1", "echo ok")) {
+        emit(out, r.trim());
+    }
+    // 4. `sudo_exec` (the TEST resolves `:confirm` = false) → "not confirmed",
+    //    no runner call.
+    emit(out, "SENT sudo-2");
+    if let Some(r) = send_and_read(&socket, &sudo_frame("sudo-2", "echo nope")) {
+        emit(out, r.trim());
+    }
+    // 5. `ask` (the TEST resolves it with an `AskResponsePayload`) → the
+    //    desktop responds with the raw payload (the override shapes it).
+    emit(out, "SENT ask-1");
+    if let Some(r) = send_and_read(&socket, &ask_frame("ask-1")) {
+        emit(out, r.trim());
+    }
 }
 
 /// A full success `response` line echoing the command's `id` (REQUIRED for
