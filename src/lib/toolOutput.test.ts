@@ -5,6 +5,7 @@ import {
   fileSummaries,
   editChangeStat,
   failureText,
+  readLineRange,
 } from "./toolOutput";
 import {
   SquareTerminalIcon,
@@ -114,6 +115,20 @@ describe("editChangeStat", () => {
   });
   it("returns undefined for input without edits", () => {
     expect(editChangeStat("edit", {})).toBeUndefined();
+  });
+});
+
+describe("readLineRange", () => {
+  it("returns the inclusive range when both offset and limit are numbers", () => {
+    expect(readLineRange({ offset: 5, limit: 50 })).toBe("L5–54");
+    expect(readLineRange({ offset: 1, limit: 10 })).toBe("L1–10");
+  });
+  it("returns undefined when either is missing or not a number", () => {
+    expect(readLineRange({})).toBeUndefined();
+    expect(readLineRange({ offset: 5 })).toBeUndefined();
+    expect(readLineRange({ limit: 5 })).toBeUndefined();
+    expect(readLineRange({ offset: "5", limit: 50 })).toBeUndefined();
+    expect(readLineRange("x")).toBeUndefined();
   });
 });
 

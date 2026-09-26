@@ -243,6 +243,21 @@ export function editChangeStat(
 }
 
 /**
+ * The line range of a `read` with `offset` + `limit` (1-based, inclusive
+ * end — same arithmetic as `summarizeToolCall`'s read case):
+ * `L{offset}–{offset + limit - 1}`. `undefined` when either is missing or
+ * not a number.
+ */
+export function readLineRange(rawInput: unknown): string | undefined {
+  if (typeof rawInput !== "object" || rawInput === null) return undefined;
+  const input = rawInput as Record<string, unknown>;
+  const offset = typeof input.offset === "number" ? input.offset : undefined;
+  const limit = typeof input.limit === "number" ? input.limit : undefined;
+  if (offset === undefined || limit === undefined) return undefined;
+  return `L${offset}–${offset + limit - 1}`;
+}
+
+/**
  * The failure reason for a failed tool call (the failure tooltip):
  * `details.error` wins, then the first non-empty `content` text item,
  * then a bare-string result as-is. `undefined` when nothing usable.

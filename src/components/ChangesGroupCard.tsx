@@ -1,5 +1,5 @@
-import { useLayoutEffect, useRef, useState } from "react";
-import { ChevronRightIcon, PencilIcon } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronRightIcon, PencilIcon, XCircleIcon } from "lucide-react";
 import type { ToolCallMessage } from "../lib/toolGroups";
 import {
   editChangeStat,
@@ -11,7 +11,6 @@ import DiffCount from "./DiffCount";
 import ToolCallCard from "./ToolCallCard";
 
 const CHIP_GAP_PX = 8;
-const TRAILING_PX = 24;
 
 function dedupeFiles(files: ToolFileSummary[]): ToolFileSummary[] {
   const seen = new Set<string>();
@@ -56,7 +55,17 @@ export default function ChangesGroupCard({
 }: {
   messages: ToolCallMessage[];
 }) {
-  const [open, setOpen] = useState(false);
+  // A group that forms with an already-finished member starts OPEN
+  // (mirrors the standalone card's auto-open — the user sees the result
+  // without clicking). A group that forms while ALL members are pending
+  // starts collapsed, then auto-opens ONCE when the last pending member
+  // finishes (the `anyPending` true → false edge, same one-shot pattern
+  // as `ToolCallCard`'s auto-open; the group is always file tools, so no
+  // title check is needed). A user close sticks — the refs guard the
+  // auto-open, never a manual toggle.
+  const [open, setOpen] = useState(
+    () => messages.some((m) => m.status !== "pending"),
+  );
   const files = dedupeFiles(
     messages.flatMap((m) => fileSummaries(m.title, m.rawInput)),
   );
@@ -64,6 +73,17 @@ export default function ChangesGroupCard({
     messages.map((m) => editChangeStat(m.title, m.rawInput)),
   );
   const anyPending = messages.some((m) => m.status === "pending");
+  const anyFailed = messages.some((m) => m.status === "failed");
+  const prevAnyPendingRef = useRef(anyPending);
+  const hasAutoOpenedRef = useRef(false);
+  useEffect(() => {
+    const was = prevAnyPendingRef.current;
+    prevAnyPendingRef.current = anyPending;
+    if (was && !anyPending && !hasAutoOpenedRef.current) {
+      hasAutoOpenedRef.current = true;
+      setOpen(true);
+    }
+  }, [anyPending]);
   const latest = anyPending
     ? messages.reduce((a, b) => (b.at >= a.at ? b : a))
     : undefined;
@@ -76,6 +96,10 @@ export default function ChangesGroupCard({
   const listRef = useRef<HTMLSpanElement>(null);
   const chipRefs = useRef<Array<HTMLSpanElement | null>>([]);
   const overflowRef = useRef<HTMLSpanElement>(null);
+  // The trailing content (stats + chevron) is MEASURED, not a fixed
+  // constant — it can total ~80px, so a fixed reservation would clip
+  // the last chip with no `+N` indicator.
+  const trailingRef = useRef<HTMLSpanElement>(null);
   const [visibleCount, setVisibleCount] = useState(files.length);
   useLayoutEffect(() => {
     const update = () => {
@@ -84,7 +108,11 @@ export default function ChangesGroupCard({
       const boundary = list.closest("[data-changes-group-row]") ?? list;
       const rect = list.getBoundingClientRect();
       const boundaryRight = boundary.getBoundingClientRect().right;
-      const available = Math.max(0, boundaryRight - rect.left - TRAILING_PX);
+      const trailingWidth = trailingRef.current?.offsetWidth ?? 0;
+      const available = Math.max(
+        0,
+        boundaryRight - rect.left - trailingWidth,
+      );
       const chipWidths = files.map(
         (_, i) => chipRefs.current[i]?.offsetWidth ?? 0,
       );
@@ -140,6 +168,12 @@ export default function ChangesGroupCard({
         <span className="shrink-0 whitespace-nowrap font-medium text-foreground-subtlest">
           Changes
         </span>
+        {anyFailed && (
+          <XCircleIcon
+            className="size-4 shrink-0 text-destructive"
+            aria-label="Some changes failed"
+          />
+        )}
         {files.length > 1 && (
           <span className="shrink-0 text-foreground-subtlest">
             {filesCountLabel(files.length)}
@@ -187,18 +221,20 @@ export default function ChangesGroupCard({
           </span>
         )}
         {files.length === 1 && !anyPending && <FileChip path={files[0].path} />}
-        {totalStat && <DiffCount stat={totalStat} />}
-        {anyPending && latestFile && (
-          <span className="inline-flex min-w-0 items-center gap-2">
-            <FileChip path={latestFile.path} />
-          </span>
-        )}
-        <ChevronRightIcon
-          aria-hidden
-          className={`size-4 shrink-0 text-foreground-subtlest opacity-0 transition-transform transition-opacity duration-200 ease-out group-hover/tool-summary:opacity-100 ${
-            open ? "rotate-90 opacity-100" : "rotate-0"
-          }`}
-        />
+        <span ref={trailingRef} className="flex shrink-0 items-center gap-2">
+          {totalStat && <DiffCount stat={totalStat} />}
+          {anyPending && latestFile && (
+            <span className="inline-flex min-w-0 items-center gap-2">
+              <FileChip path={latestFile.path} />
+            </span>
+          )}
+          <ChevronRightIcon
+            aria-hidden
+            className={`size-4 shrink-0 text-foreground-subtlest opacity-0 transition-transform transition-opacity duration-200 ease-out group-hover/tool-summary:opacity-100 ${
+              open ? "rotate-90 opacity-100" : "rotate-0"
+            }`}
+          />
+        </span>
       </button>
       {open && (
         <div className="ml-2 mt-1 space-y-2 border-l border-border pl-3.5">

@@ -150,6 +150,21 @@ describe("ToolCallCard (rendering)", () => {
     expect(container.textContent).toContain("+3");
     expect(container.textContent).toContain("-2");
   });
+  it("renders the read line range next to the file chip", () => {
+    render(
+      <ToolCallCard
+        title="read"
+        status="completed"
+        rawInput={{ path: "/a/b/c.ts", offset: 5, limit: 50 }}
+      />,
+    );
+    // The chip replaces the summary (which carried the range) — the range
+    // must render next to the chip in the header.
+    expect(screen.getByText("L5–54")).toBeTruthy();
+    // The expanded body's chip row carries it too.
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("L5–54").length).toBe(2);
+  });
   it("renders the $ prompt + command in the expanded shell body", () => {
     render(
       <ToolCallCard

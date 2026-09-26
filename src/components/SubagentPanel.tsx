@@ -82,8 +82,18 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           session id), the `state` push chip (finally rendered), the
           subagent status, a pending-permission badge, and a dismiss. */}
       <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
         className="flex cursor-pointer items-center gap-1.5"
         onClick={() => setOpen((o) => !o)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            // `preventDefault` for space — avoid the page scroll.
+            event.preventDefault();
+            setOpen((o) => !o);
+          }
+        }}
       >
         <p className="min-w-0 flex-1 truncate text-ui-base font-medium">
           {entry.agentName}

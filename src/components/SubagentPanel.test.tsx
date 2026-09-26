@@ -261,6 +261,26 @@ describe("SubagentPanel", () => {
     expect(screen.getByText("reviewer")).toBeTruthy();
   });
 
+  it("toggles a collapsed section via keyboard (Enter / space on the header)", () => {
+    useSubagents.getState().addSession({ ...entry, status: "completed" });
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Already finished → starts collapsed.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    // The header row is a `role="button"` whose accessible name is its text
+    // content (agent name + status word); the dismiss `X` is a separate
+    // button with its own aria-label, so the exact name targets the header.
+    const header = screen.getByRole("button", { name: "reviewer completed" });
+    fireEvent.keyDown(header, { key: "Enter" });
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    // Space toggles too (with `preventDefault` — no page scroll).
+    fireEvent.keyDown(header, { key: " " });
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+  });
+
   it("styles the status chip per status (running → warning, failed → destructive)", () => {
     useSubagents.getState().addSession(entry);
     useSubagents.getState().addSession({

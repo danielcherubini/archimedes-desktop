@@ -6,6 +6,7 @@ import {
   failureText,
   fileSummaries,
   normalizeToolOutput,
+  readLineRange,
   summarizeToolCall,
   toolIcon,
   toolVerb,
@@ -73,6 +74,7 @@ export default function ToolCallCard({
   const Icon = toolIcon(title);
   const files = fileSummaries(title, rawInput);
   const stat = editChangeStat(title, rawInput);
+  const range = readLineRange(rawInput);
   const summary = summarizeToolCall(title, rawInput);
   const isShell = SHELL_TOOLS.has(title);
   const command =
@@ -125,7 +127,14 @@ export default function ToolCallCard({
           {verb ?? title}
         </span>
         {files.length > 0 ? (
-          <FileChip path={files[0].path} />
+          <>
+            <FileChip path={files[0].path} />
+            {range && (
+              <span className="shrink-0 text-ui-sm text-foreground-subtlest">
+                {range}
+              </span>
+            )}
+          </>
         ) : isShell && typeof command === "string" && command !== "" ? (
           <span className="min-w-0 truncate font-sans text-foreground-subtle">
             {command}
@@ -199,6 +208,11 @@ export default function ToolCallCard({
                   {files.length > 0 && (
                     <div className="flex items-center gap-2">
                       <FileChip path={files[0].path} />
+                      {range && (
+                        <span className="shrink-0 text-ui-sm text-foreground-subtlest">
+                          {range}
+                        </span>
+                      )}
                       {stat && <DiffCount stat={stat} />}
                     </div>
                   )}
