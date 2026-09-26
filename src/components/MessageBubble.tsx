@@ -202,6 +202,8 @@ export default memo(
               title={message.title}
               status={message.status}
               diff={message.diff}
+              rawInput={message.rawInput}
+              rawOutput={message.rawOutput}
             />
           </div>
         );
