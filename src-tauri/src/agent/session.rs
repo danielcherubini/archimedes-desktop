@@ -2006,9 +2006,11 @@ fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             "toolCallId": tool_call_id,
             "status": "in_progress",
         })],
-        // `rawOutput` is persisted-only (the frontend's `AcpSessionUpdate`
-        // has no `rawOutput` field — it lands in the persisted payload via
-        // `merge_json` and is harmless).
+        // `rawOutput` is the tool's result (the RPC `AgentToolResult`): a live
+        // partial while the tool runs, final on `tool_execution_end`. It is
+        // consumed by the frontend (the `tool-call` `Message` carries it) AND
+        // persisted into the tool-call row via `merge_json` (so a resume
+        // restores the summary + output).
         RpcEvent::tool_execution_update {
             tool_call_id,
             partial_result,
