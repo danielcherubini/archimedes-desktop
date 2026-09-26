@@ -4,8 +4,10 @@ import { useSubagents, type SubagentEntry } from "../store/subagents";
 import { useBridge, type BridgeRequestData } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
+import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 import MessageBubble from "./MessageBubble";
+import ChangesGroupCard from "./ChangesGroupCard";
 import ToolCallCard from "./ToolCallCard";
 import DiffBlock from "./DiffBlock";
 import PermissionPrompt from "./PermissionPrompt";
@@ -51,6 +53,10 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
   const requestList = requests ?? EMPTY;
   const promptList = prompts ?? EMPTY;
   const messageList = messages ?? EMPTY;
+  // The stream is grouped ONCE per render (not inside the map): a maximal
+  // run of consecutive `write`/`edit` tool calls folds into a single
+  // `Changes` card; everything else renders as before.
+  const units = groupConsecutiveFileWrites(messageList);
   const dismiss = useSubagents((s) => s.dismiss);
   const askRequests = requestList.filter((r) => r.method === "ask");
 
@@ -96,12 +102,16 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           default), `DiffBlock` for `diff`, `Reasoning` for thinking. */}
       {messageList.length > 0 && (
         <div className="mt-1 max-h-48 space-y-1 overflow-y-auto rounded-md bg-surface p-2">
-          {messageList.map((m, i) => {
+          {units.map((unit, i) => {
+            if (unit.kind === "changes-group") {
+              return <ChangesGroupCard key={i} messages={unit.messages} />;
+            }
+            const m = unit.message;
             if (m.kind === "agent-text") {
               return <MessageBubble key={i} message={m} />;
             }
             if (m.kind === "agent-thought") {
-              const isStreaming = entry.status === "running" && i === messageList.length - 1;
+              const isStreaming = entry.status === "running" && i === units.length - 1;
               return (
                 <Reasoning
                   key={i}
