@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useSubagents, type SubagentEntry } from "../store/subagents";
 import { useBridge, type BridgeRequestData } from "../store/bridge";
@@ -53,6 +54,20 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
   const requestList = requests ?? EMPTY;
   const promptList = prompts ?? EMPTY;
   const messageList = messages ?? EMPTY;
+  // Auto-collapse when the subagent session finishes (ZCode's
+  // `autoCollapseOnComplete`): edge-triggered (running → terminal),
+  // one-shot, doesn't affect later manual toggles. A section that is
+  // ALREADY finished on first render starts collapsed (the header +
+  // metrics line remain; the user expands on click).
+  const [open, setOpen] = useState(() => entry.status === "running");
+  const prevStatusRef = useRef(entry.status);
+  useEffect(() => {
+    const was = prevStatusRef.current;
+    prevStatusRef.current = entry.status;
+    if (was === "running" && entry.status !== "running") {
+      setOpen(false);
+    }
+  }, [entry.status]);
   // The stream is grouped ONCE per render (not inside the map): a maximal
   // run of consecutive `write`/`edit` tool calls folds into a single
   // `Changes` card; everything else renders as before.
@@ -66,7 +81,10 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           cards render in its stream with `source: "main"` from its own
           session id), the `state` push chip (finally rendered), the
           subagent status, a pending-permission badge, and a dismiss. */}
-      <div className="flex items-center gap-1.5">
+      <div
+        className="flex cursor-pointer items-center gap-1.5"
+        onClick={() => setOpen((o) => !o)}
+      >
         <p className="min-w-0 flex-1 truncate text-ui-base font-medium">
           {entry.agentName}
         </p>
@@ -89,7 +107,10 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
         )}
         <button
           type="button"
-          onClick={() => dismiss(entry.sessionId)}
+          onClick={(event) => {
+            event.stopPropagation();
+            dismiss(entry.sessionId);
+          }}
           aria-label={`Dismiss ${entry.agentName}`}
           className="flex size-6 items-center justify-center text-foreground-subtlest hover:text-foreground"
         >
@@ -100,7 +121,7 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           font/spacing — NOT a new message renderer). `MessageBubble` for
           `agent-text`, `ToolCallCard` for `tool-call` (collapsed by
           default), `DiffBlock` for `diff`, `Reasoning` for thinking. */}
-      {messageList.length > 0 && (
+      {open && messageList.length > 0 && (
         <div className="mt-1 max-h-48 space-y-1 overflow-y-auto rounded-md bg-surface p-2">
           {units.map((unit, i) => {
             if (unit.kind === "changes-group") {

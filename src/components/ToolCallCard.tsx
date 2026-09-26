@@ -50,6 +50,25 @@ export default function ToolCallCard({
   rawOutput?: unknown;
 }) {
   const [open, setOpen] = useState(false);
+  // Auto-open a single file edit once when it finishes (ZCode's
+  // one-shot `autoOpen`): the user sees the result without clicking;
+  // they can close it, and it never re-opens on later updates.
+  const prevStatusRef = useRef(status);
+  const hasAutoOpenedRef = useRef(false);
+  useEffect(() => {
+    const was = prevStatusRef.current;
+    prevStatusRef.current = status;
+    const isFileTool = title === "write" || title === "edit";
+    if (
+      isFileTool &&
+      was === "pending" &&
+      status !== "pending" &&
+      !hasAutoOpenedRef.current
+    ) {
+      hasAutoOpenedRef.current = true;
+      setOpen(true);
+    }
+  }, [status, title]);
   const verb = toolVerb(title, status);
   const Icon = toolIcon(title);
   const files = fileSummaries(title, rawInput);

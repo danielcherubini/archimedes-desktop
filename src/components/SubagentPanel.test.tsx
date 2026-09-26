@@ -193,7 +193,72 @@ describe("SubagentPanel", () => {
     useSubagents.getState().addSession({ ...entry, status: "completed" });
     useSessions.getState().applySessionUpdate("sub1", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "done" }, messageId: "m1" });
     render(<SubagentPanel />);
+    // A completed section STARTS COLLAPSED (the auto-collapse behavior) —
+    // expand the header row (the agent-name's `cursor-pointer` ancestor)
+    // before asserting the stream content.
+    const header = screen.getByText("reviewer").closest("div.cursor-pointer");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
     expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
+  it("auto-collapses a subagent section when the session finishes", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Running → the stream is visible.
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    // The session finishes (edge-triggered auto-collapse).
+    act(() => {
+      useSubagents.getState().markClosed("sub1", "completed", undefined, {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        durationMs: 100,
+      });
+    });
+    // The stream content is GONE; the header (agent name) is still visible.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    expect(screen.getByText("reviewer")).toBeTruthy();
+  });
+
+  it("lets the user re-open a collapsed section", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    act(() => {
+      useSubagents.getState().markClosed("sub1", "completed", undefined, {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        durationMs: 100,
+      });
+    });
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    // Click the header row (the agent-name's `cursor-pointer` ancestor).
+    const header = screen.getByText("reviewer").closest("div.cursor-pointer");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+  });
+
+  it("starts collapsed for a session that is already finished", () => {
+    useSubagents.getState().addSession({ ...entry, status: "completed" });
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Already finished on first render → the stream is NOT visible.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    expect(screen.getByText("reviewer")).toBeTruthy();
   });
 
   it("styles the status chip per status (running → warning, failed → destructive)", () => {

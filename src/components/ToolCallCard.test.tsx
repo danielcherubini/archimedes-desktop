@@ -290,4 +290,57 @@ describe("ToolCallCard (rendering)", () => {
     expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
   });
+  it("auto-opens a single file edit once when it finishes", () => {
+    const input = {
+      path: "/a/b/c.ts",
+      edits: [{ oldText: "a", newText: "b" }],
+    };
+    const { container, rerender } = render(
+      <ToolCallCard title="edit" status="pending" rawInput={input} />,
+    );
+    // Not visible yet while pending.
+    expect(screen.queryByText("No output.")).toBeNull();
+    expect(container.querySelector(".bg-panel")).toBeNull();
+    // Finishes → the card opens itself (one-shot auto-open).
+    rerender(
+      <ToolCallCard
+        title="edit"
+        status="completed"
+        rawInput={input}
+        rawOutput={{ content: [{ type: "text", text: "done" }] }}
+      />,
+    );
+    expect(container.querySelector(".bg-panel")).not.toBeNull();
+    expect(screen.getByText("done")).toBeTruthy();
+    // The user closes it → a later status change never re-opens it.
+    fireEvent.click(screen.getByRole("button"));
+    rerender(
+      <ToolCallCard
+        title="edit"
+        status="completed"
+        rawInput={input}
+        rawOutput={{ content: [{ type: "text", text: "done" }] }}
+      />,
+    );
+    expect(container.querySelector(".bg-panel")).toBeNull();
+  });
+  it("does not auto-open non-file tools", () => {
+    const { container, rerender } = render(
+      <ToolCallCard
+        title="bash"
+        status="pending"
+        rawInput={{ command: "ls" }}
+      />,
+    );
+    rerender(
+      <ToolCallCard
+        title="bash"
+        status="completed"
+        rawInput={{ command: "ls" }}
+        rawOutput={{ content: [{ type: "text", text: "ok" }] }}
+      />,
+    );
+    // Manual expand only.
+    expect(container.querySelector(".bg-panel")).toBeNull();
+  });
 });
