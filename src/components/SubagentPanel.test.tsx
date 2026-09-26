@@ -182,6 +182,37 @@ describe("SubagentPanel", () => {
     expect(screen.queryByText("reviewer")).toBeNull();
   });
 
+  it("dismisses an entry via keyboard (Enter on the focused dismiss button)", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    const dismissButton = screen.getByRole("button", { name: "Dismiss reviewer" });
+    // The keydown bubbles to the header's `onKeyDown`, which must NOT
+    // `preventDefault` it — in a real browser that cancels the button's
+    // native Enter activation, so keyboard users could never dismiss.
+    // jsdom does not perform the keydown default action, so simulate the
+    // browser: the button activates natively IFF the default was not
+    // prevented.
+    let defaultPrevented = false;
+    const onKey = (e: KeyboardEvent) => {
+      defaultPrevented = e.defaultPrevented;
+    };
+    document.addEventListener("keydown", onKey);
+    fireEvent.keyDown(dismissButton, { key: "Enter" });
+    document.removeEventListener("keydown", onKey);
+    if (!defaultPrevented) {
+      fireEvent.click(dismissButton); // the browser's native activation
+    }
+    // Dismissed — the entry is gone from the store / the section unmounted
+    // (NOT merely toggled by the header's handler, which would leave the
+    // entry in the store).
+    expect(useSubagents.getState().entries["sub1"]).toBeUndefined();
+    expect(screen.queryByText("reviewer")).toBeNull();
+  });
+
   it("renders thinking block (streaming)", () => {
     useSubagents.getState().addSession(entry);
     useSessions.getState().applySessionUpdate("sub1", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "pondering" }, messageId: "m1" });
@@ -193,7 +224,92 @@ describe("SubagentPanel", () => {
     useSubagents.getState().addSession({ ...entry, status: "completed" });
     useSessions.getState().applySessionUpdate("sub1", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "done" }, messageId: "m1" });
     render(<SubagentPanel />);
+    // A completed section STARTS COLLAPSED (the auto-collapse behavior) —
+    // expand the header row (the agent-name's `cursor-pointer` ancestor)
+    // before asserting the stream content.
+    const header = screen.getByText("reviewer").closest("div.cursor-pointer");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
     expect(screen.getByText("Thought")).toBeTruthy();
+  });
+
+  it("auto-collapses a subagent section when the session finishes", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Running → the stream is visible.
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    // The session finishes (edge-triggered auto-collapse).
+    act(() => {
+      useSubagents.getState().markClosed("sub1", "completed", undefined, {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        durationMs: 100,
+      });
+    });
+    // The stream content is GONE; the header (agent name) is still visible.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    expect(screen.getByText("reviewer")).toBeTruthy();
+  });
+
+  it("lets the user re-open a collapsed section", () => {
+    useSubagents.getState().addSession(entry);
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    act(() => {
+      useSubagents.getState().markClosed("sub1", "completed", undefined, {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        durationMs: 100,
+      });
+    });
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    // Click the header row (the agent-name's `cursor-pointer` ancestor).
+    const header = screen.getByText("reviewer").closest("div.cursor-pointer");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+  });
+
+  it("starts collapsed for a session that is already finished", () => {
+    useSubagents.getState().addSession({ ...entry, status: "completed" });
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Already finished on first render → the stream is NOT visible.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    expect(screen.getByText("reviewer")).toBeTruthy();
+  });
+
+  it("toggles a collapsed section via keyboard (Enter / space on the header)", () => {
+    useSubagents.getState().addSession({ ...entry, status: "completed" });
+    useSessions.getState().applySessionUpdate("sub1", {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello from the subagent" },
+    });
+    render(<SubagentPanel />);
+    // Already finished → starts collapsed.
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
+    // The header row is a `role="button"` whose accessible name is its text
+    // content (agent name + status word); the dismiss `X` is a separate
+    // button with its own aria-label, so the exact name targets the header.
+    const header = screen.getByRole("button", { name: "reviewer completed" });
+    fireEvent.keyDown(header, { key: "Enter" });
+    expect(screen.getByText("hello from the subagent")).toBeTruthy();
+    // Space toggles too (with `preventDefault` — no page scroll).
+    fireEvent.keyDown(header, { key: " " });
+    expect(screen.queryByText("hello from the subagent")).toBeNull();
   });
 
   it("styles the status chip per status (running → warning, failed → destructive)", () => {

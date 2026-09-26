@@ -1,3 +1,22 @@
+import { basenameOfPath } from "./paths";
+import type { ToolCallUiStatus } from "../store/sessions";
+import type { LucideIcon } from "lucide-react";
+import {
+  SquareTerminalIcon,
+  FileTextIcon,
+  FilePenIcon,
+  PencilIcon,
+  SearchIcon,
+  ListIcon,
+  GlobeIcon,
+  DownloadIcon,
+  MessageCircleQuestionIcon,
+  ListTodoIcon,
+  BotIcon,
+  PlugIcon,
+  WrenchIcon,
+} from "lucide-react";
+
 /** Truncate to `max` chars, appending an ellipsis when cut. */
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
@@ -122,4 +141,147 @@ export function normalizeToolOutput(
   }
   const whole = JSON.stringify(rawOutput);
   return whole === "{}" || whole === "null" ? undefined : whole;
+}
+
+const VERBS: Record<string, { completed: string; running: string }> = {
+  bash: { completed: "Ran", running: "Running" },
+  powershell: { completed: "Ran", running: "Running" },
+  sudo_exec: { completed: "Ran", running: "Running" },
+  read: { completed: "Read", running: "Reading" },
+  write: { completed: "Wrote", running: "Writing" },
+  edit: { completed: "Edited", running: "Editing" },
+  grep: { completed: "Searched", running: "Searching" },
+  find: { completed: "Searched", running: "Searching" },
+  web_search: { completed: "Searched", running: "Searching" },
+  ls: { completed: "Listed", running: "Listing" },
+  fetch_content: { completed: "Fetched", running: "Fetching" },
+  ask: { completed: "Asked", running: "Asking" },
+  manage_todo_list: { completed: "Todos", running: "Updating todos" },
+  subagent: { completed: "Delegated", running: "Delegating" },
+  mcp: { completed: "MCP", running: "MCP" },
+};
+
+/**
+ * The header verb for a tool call. Past tense when finished (the verb
+ * itself is the "done" signal — no check icon), present tense while
+ * `pending` (the caller adds the `animated-gradient-text` shimmer).
+ * A `failed` call takes the past tense too — the red `Failed` word is
+ * the failure signal, so do not "fix" this. `undefined` for unknown
+ * tools (the caller falls back to the raw title).
+ */
+export function toolVerb(title: string, status: ToolCallUiStatus): string | undefined {
+  const v = VERBS[title];
+  if (!v) return undefined;
+  return status === "pending" ? v.running : v.completed;
+}
+
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  bash: SquareTerminalIcon,
+  powershell: SquareTerminalIcon,
+  sudo_exec: SquareTerminalIcon,
+  read: FileTextIcon,
+  write: FilePenIcon,
+  edit: PencilIcon,
+  grep: SearchIcon,
+  find: SearchIcon,
+  web_search: GlobeIcon,
+  ls: ListIcon,
+  fetch_content: DownloadIcon,
+  ask: MessageCircleQuestionIcon,
+  manage_todo_list: ListTodoIcon,
+  subagent: BotIcon,
+  mcp: PlugIcon,
+};
+
+/** The header icon for a tool call (always static — no spinner). */
+export function toolIcon(title: string): LucideIcon {
+  return TOOL_ICONS[title] ?? WrenchIcon;
+}
+
+export interface ToolFileSummary {
+  path: string;
+  fileName: string;
+}
+
+/**
+ * The file a tool call touches (the header chip). `read` / `write` /
+ * `edit` carry `path`; every other tool → `[]`. `fileName` is the
+ * basename (the full path is the chip's `title` tooltip).
+ */
+export function fileSummaries(title: string, rawInput: unknown): ToolFileSummary[] {
+  if (title !== "read" && title !== "write" && title !== "edit") return [];
+  if (typeof rawInput !== "object" || rawInput === null) return [];
+  const path = (rawInput as Record<string, unknown>).path;
+  if (typeof path !== "string" || path === "") return [];
+  const fileName = basenameOfPath(path);
+  return [{ path, fileName: fileName !== "" ? fileName : path }];
+}
+
+/**
+ * Line-count change stat — `edit` ONLY (ZCode's `getChangeStat`
+ * semantics): sum over `edits[]` of `lineCount(newText)` /
+ * `lineCount(oldText)`. `undefined` for other tools, missing/empty
+ * `edits`, or when both totals are 0.
+ */
+export function editChangeStat(
+  title: string,
+  rawInput: unknown,
+): { added: number; removed: number } | undefined {
+  if (title !== "edit") return undefined;
+  if (typeof rawInput !== "object" || rawInput === null) return undefined;
+  const edits = (rawInput as Record<string, unknown>).edits;
+  if (!Array.isArray(edits)) return undefined;
+  const countLines = (s: string): number => (s === "" ? 0 : s.split("\n").length);
+  let added = 0;
+  let removed = 0;
+  for (const e of edits as Array<Record<string, unknown>>) {
+    if (typeof e.newText === "string") added += countLines(e.newText);
+    if (typeof e.oldText === "string") removed += countLines(e.oldText);
+  }
+  if (added === 0 && removed === 0) return undefined;
+  return { added, removed };
+}
+
+/**
+ * The line range of a `read` with `offset` + `limit` (1-based, inclusive
+ * end — same arithmetic as `summarizeToolCall`'s read case):
+ * `L{offset}–{offset + limit - 1}`. `undefined` when either is missing or
+ * not a number.
+ */
+export function readLineRange(rawInput: unknown): string | undefined {
+  if (typeof rawInput !== "object" || rawInput === null) return undefined;
+  const input = rawInput as Record<string, unknown>;
+  const offset = typeof input.offset === "number" ? input.offset : undefined;
+  const limit = typeof input.limit === "number" ? input.limit : undefined;
+  if (offset === undefined || limit === undefined) return undefined;
+  return `L${offset}–${offset + limit - 1}`;
+}
+
+/**
+ * The failure reason for a failed tool call (the failure tooltip):
+ * `details.error` wins, then the first non-empty `content` text item,
+ * then a bare-string result as-is. `undefined` when nothing usable.
+ */
+export function failureText(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput === "string")
+    return rawOutput.trim() === "" ? undefined : rawOutput;
+  if (typeof rawOutput !== "object" || rawOutput === null) return undefined;
+  const result = rawOutput as Record<string, unknown>;
+  const details = result.details;
+  if (typeof details === "object" && details !== null) {
+    const err = (details as Record<string, unknown>).error;
+    if (typeof err === "string" && err.trim() !== "") return err;
+  }
+  if (Array.isArray(result.content)) {
+    for (const item of result.content as Array<Record<string, unknown>>) {
+      if (
+        item &&
+        item.type === "text" &&
+        typeof item.text === "string" &&
+        item.text.trim() !== ""
+      )
+        return item.text;
+    }
+  }
+  return undefined;
 }

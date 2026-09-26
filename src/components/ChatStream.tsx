@@ -15,6 +15,7 @@ import {
   setSessionConfigOption,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
+import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
   agentSupportsImages,
@@ -51,6 +52,7 @@ import {
 } from "./ui/select";
 import SessionConfigSelect from "./SessionConfigSelect";
 import MessageBubble from "./MessageBubble";
+import ChangesGroupCard from "./ChangesGroupCard";
 import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
 import FileSummaryCard from "./FileSummaryCard";
@@ -689,6 +691,11 @@ export default function ChatStream() {
     setAttachments(next);
   };
 
+  // The transcript is grouped ONCE per render (not inside the map): a
+  // maximal run of consecutive `write`/`edit` tool calls folds into a
+  // single `Changes` card; everything else renders as before.
+  const units = groupConsecutiveFileWrites(messages);
+
   return (
     <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
       {isHistoryOnly && (
@@ -803,7 +810,16 @@ export default function ChatStream() {
               </p>
             </div>
           )}
-        {messages.map((message, i) => {
+        {units.map((unit, i) => {
+          if (unit.kind === "changes-group") {
+            return (
+              <ChangesGroupCard
+                key={`${activeSessionId}:${i}`}
+                messages={unit.messages}
+              />
+            );
+          }
+          const message = unit.message;
           // The key is session-scoped: switching sessions must not reuse the
           // previous session's component at the same index (a `Reasoning`
           // would otherwise carry over expanded state, duration, and timers).
@@ -832,7 +848,7 @@ export default function ChatStream() {
               isStreaming={
                 message.kind === "agent-thought" &&
                 inTurn &&
-                i === messages.length - 1
+                i === units.length - 1
               }
             />
           );

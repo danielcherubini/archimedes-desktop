@@ -1,11 +1,14 @@
 import { X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useSubagents, type SubagentEntry } from "../store/subagents";
 import { useBridge, type BridgeRequestData } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
+import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 import MessageBubble from "./MessageBubble";
+import ChangesGroupCard from "./ChangesGroupCard";
 import ToolCallCard from "./ToolCallCard";
 import DiffBlock from "./DiffBlock";
 import PermissionPrompt from "./PermissionPrompt";
@@ -51,6 +54,24 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
   const requestList = requests ?? EMPTY;
   const promptList = prompts ?? EMPTY;
   const messageList = messages ?? EMPTY;
+  // Auto-collapse when the subagent session finishes (ZCode's
+  // `autoCollapseOnComplete`): edge-triggered (running → terminal),
+  // one-shot, doesn't affect later manual toggles. A section that is
+  // ALREADY finished on first render starts collapsed (the header +
+  // metrics line remain; the user expands on click).
+  const [open, setOpen] = useState(() => entry.status === "running");
+  const prevStatusRef = useRef(entry.status);
+  useEffect(() => {
+    const was = prevStatusRef.current;
+    prevStatusRef.current = entry.status;
+    if (was === "running" && entry.status !== "running") {
+      setOpen(false);
+    }
+  }, [entry.status]);
+  // The stream is grouped ONCE per render (not inside the map): a maximal
+  // run of consecutive `write`/`edit` tool calls folds into a single
+  // `Changes` card; everything else renders as before.
+  const units = groupConsecutiveFileWrites(messageList);
   const dismiss = useSubagents((s) => s.dismiss);
   const askRequests = requestList.filter((r) => r.method === "ask");
 
@@ -60,7 +81,25 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           cards render in its stream with `source: "main"` from its own
           session id), the `state` push chip (finally rendered), the
           subagent status, a pending-permission badge, and a dismiss. */}
-      <div className="flex items-center gap-1.5">
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        className="flex cursor-pointer items-center gap-1.5"
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(event) => {
+          // Only act when the HEADER ITSELF is focused — a keydown on a
+          // nested button (the dismiss `X`) bubbles here, and
+          // `preventDefault` would cancel the button's native activation,
+          // so keyboard users could never dismiss.
+          if (event.target !== event.currentTarget) return;
+          if (event.key === "Enter" || event.key === " ") {
+            // `preventDefault` for space — avoid the page scroll.
+            event.preventDefault();
+            setOpen((o) => !o);
+          }
+        }}
+      >
         <p className="min-w-0 flex-1 truncate text-ui-base font-medium">
           {entry.agentName}
         </p>
@@ -83,7 +122,10 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
         )}
         <button
           type="button"
-          onClick={() => dismiss(entry.sessionId)}
+          onClick={(event) => {
+            event.stopPropagation();
+            dismiss(entry.sessionId);
+          }}
           aria-label={`Dismiss ${entry.agentName}`}
           className="flex size-6 items-center justify-center text-foreground-subtlest hover:text-foreground"
         >
@@ -94,14 +136,18 @@ function SubagentSection({ entry }: { entry: SubagentEntry }) {
           font/spacing — NOT a new message renderer). `MessageBubble` for
           `agent-text`, `ToolCallCard` for `tool-call` (collapsed by
           default), `DiffBlock` for `diff`, `Reasoning` for thinking. */}
-      {messageList.length > 0 && (
+      {open && messageList.length > 0 && (
         <div className="mt-1 max-h-48 space-y-1 overflow-y-auto rounded-md bg-surface p-2">
-          {messageList.map((m, i) => {
+          {units.map((unit, i) => {
+            if (unit.kind === "changes-group") {
+              return <ChangesGroupCard key={i} messages={unit.messages} />;
+            }
+            const m = unit.message;
             if (m.kind === "agent-text") {
               return <MessageBubble key={i} message={m} />;
             }
             if (m.kind === "agent-thought") {
-              const isStreaming = entry.status === "running" && i === messageList.length - 1;
+              const isStreaming = entry.status === "running" && i === units.length - 1;
               return (
                 <Reasoning
                   key={i}
