@@ -36,6 +36,10 @@ _Avoid_: Agent list, agent config, agent profile
 The Client's UI response to a tool-call permission gate from an agent (the bundled gate extension's `tool_call` hook → `ctx.ui.confirm` → the RPC `extension_ui_request` subprotocol, ADR 0009) — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
 
+**Trusted Space**:
+A Space flagged as trusted — its Sessions (including Subagent sessions) skip the **Permission prompt** for the gated tools (`bash`/`edit`/`write`), which the Client auto-approves. `sudo_exec` (its own confirm + password modal) and `ask` (a `select` request, not a confirm) are unaffected. Trust is stored per-Space, defaults to off, and is enforced desktop-side — the gate extension is unchanged (ADR 0010).
+_Avoid_: Auto-approve mode, trust mode, yolo mode
+
 **Bridge**:
 The mechanism by which the archimedes suite (running inside an Agent process managed by the Client) routes its interactive UI primitives (ask picker, confirmations, masked password input) and ambient state (todos, cost, subagent streams, agent state) to the Client over a local channel. Gated by process spawn: the Client sets the bridge env vars on the Agent it spawns; the suite is inert when they are absent. See the pi-archimedes glossary for the suite-side view.
 _Avoid_: Side channel, socket bridge, client mode, host mode
