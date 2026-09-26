@@ -345,6 +345,78 @@ describe("applySessionUpdate — tool calls", () => {
     });
   });
 
+  it("keeps rawOutput on the tool-call message", () => {
+    const messages = applySessionUpdate(
+      [],
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc1",
+        title: "bash",
+        rawOutput: { content: [{ type: "text", text: "hello" }] },
+      },
+      1,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawOutput).toEqual({ content: [{ type: "text", text: "hello" }] });
+  });
+
+  it("keeps the rawOutput from a tool_call_update", () => {
+    let messages = applySessionUpdate(
+      [],
+      { sessionUpdate: "tool_call", toolCallId: "tc1", title: "bash" },
+      1,
+    );
+    messages = applySessionUpdate(
+      messages,
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc1",
+        rawOutput: { content: [{ type: "text", text: "world" }] },
+      },
+      2,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawOutput).toEqual({ content: [{ type: "text", text: "world" }] });
+  });
+
+  it("preserves an earlier rawOutput when a later update carries none", () => {
+    let messages = applySessionUpdate(
+      [],
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tc1",
+        title: "bash",
+        rawOutput: { content: [{ type: "text", text: "hello" }] },
+      },
+      1,
+    );
+    messages = applySessionUpdate(
+      messages,
+      { sessionUpdate: "tool_call_update", toolCallId: "tc1", status: "completed" },
+      2,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawOutput).toEqual({ content: [{ type: "text", text: "hello" }] });
+  });
+
+  it("stores rawOutput when a tool_call_update arrives for a tool call we never saw", () => {
+    const messages = applySessionUpdate(
+      [],
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc1",
+        rawOutput: { content: [{ type: "text", text: "late" }] },
+      },
+      1,
+    );
+    const toolCall = messages.find((m) => m.kind === "tool-call");
+    if (toolCall?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(toolCall.rawOutput).toEqual({ content: [{ type: "text", text: "late" }] });
+  });
+
   it("extracts a diff from a tool_call's content into a diff message", () => {
     const messages = applySessionUpdate(
       [],
@@ -820,6 +892,23 @@ describe("rowToMessages (history replay from the database)", () => {
       operation: "write",
       todoList: [{ content: "a", status: "pending" }],
     });
+  });
+
+  it("maps a tool-call row's rawOutput onto the message", () => {
+    const [msg] = rowToMessages(
+      row({
+        kind: "tool-call",
+        messageKey: "tc1",
+        payloadJson: JSON.stringify({
+          toolCallId: "tc1",
+          title: "bash",
+          status: "completed",
+          rawOutput: { content: [{ type: "text", text: "done" }] },
+        }),
+      }),
+    );
+    if (msg?.kind !== "tool-call") throw new Error("no tool-call message");
+    expect(msg.rawOutput).toEqual({ content: [{ type: "text", text: "done" }] });
   });
 
   it("ignores rows with unparseable payloads or unknown kinds", () => {

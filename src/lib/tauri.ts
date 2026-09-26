@@ -138,6 +138,9 @@ export type ToolCallContent =
  * A `session/update` notification body. The five update types the desktop
  * handles are modelled; anything else (unknown/future types) falls through
  * to the reducer's `default` branch and is ignored (forward-compat).
+ *
+ * `rawOutput` is the tool's result (the RPC `AgentToolResult`), live-partial
+ * while the tool runs, final on `tool_execution_end`.
  */
 export type AcpSessionUpdate =
   | {
@@ -156,6 +159,7 @@ export type AcpSessionUpdate =
       title?: string;
       status?: AcpToolCallStatus;
       rawInput?: unknown;
+      rawOutput?: unknown;
       content?: ToolCallContent[];
     }
   | {
@@ -164,6 +168,7 @@ export type AcpSessionUpdate =
       title?: string;
       status?: AcpToolCallStatus;
       rawInput?: unknown;
+      rawOutput?: unknown;
       content?: ToolCallContent[];
     }
   | { sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] };

@@ -43,6 +43,8 @@ export type Message =
       diff?: DiffRef;
       /** The ACP `rawInput` (the tool's raw input) — kept for the todo board's `rawInput` fallback (the latest `manage_todo_list` input). */
       rawInput?: unknown;
+      /** The ACP rawOutput (the tool's result — the RPC AgentToolResult, live-partial while running). */
+      rawOutput?: unknown;
       at: number;
     }
   | { kind: "diff"; path: string; patch: string; at: number };
@@ -142,6 +144,7 @@ export function applySessionUpdate(
         status: mapStatus(update.status),
         diff: diffs[0],
         rawInput: update.rawInput,
+        rawOutput: update.rawOutput,
         at,
       };
       return [...messages, msg, ...diffMessages(diffs, at)];
@@ -161,6 +164,7 @@ export function applySessionUpdate(
           status: mapStatus(update.status),
           diff: diffs[0],
           rawInput: update.rawInput,
+          rawOutput: update.rawOutput,
           at,
         };
         return [...messages, msg, ...diffMessages(diffs, at)];
@@ -173,6 +177,7 @@ export function applySessionUpdate(
         status: update.status ? mapStatus(update.status) : prev.status,
         diff: diffs[0] ?? prev.diff,
         rawInput: update.rawInput ?? prev.rawInput,
+        rawOutput: update.rawOutput ?? prev.rawOutput,
       };
       const next = [...messages];
       next[index] = updated;
@@ -330,6 +335,7 @@ export function rowToMessages(row: MessageRow): Message[] {
         status: mapStatus(payload.status as AcpToolCallStatus | undefined),
         diff: diffs[0],
         rawInput: payload.rawInput,
+        rawOutput: payload.rawOutput,
         at: row.createdAt,
       };
       return [
