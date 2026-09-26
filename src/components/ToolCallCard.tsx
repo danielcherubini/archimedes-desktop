@@ -30,7 +30,7 @@ export default function ToolCallCard({
   // Defer output normalization until the card is expanded: the body is the
   // only consumer, and joining/serializing large results on every streaming
   // render while collapsed is wasted work.
-  const output = open && !diff ? normalizeToolOutput(rawOutput) : undefined;
+  const output = open && !diff ? normalizeToolOutput(rawOutput, status === "failed") : undefined;
   return (
     <div className="w-full">
       <button

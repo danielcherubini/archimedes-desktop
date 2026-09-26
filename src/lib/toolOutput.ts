@@ -80,11 +80,18 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
 /**
  * Normalize a tool result to display text. Accepts pi's `AgentToolResult`
  * shape (`{ content: (TextContent | ImageContent)[], details? }` — text
- * items joined, images counted, `details` as a fallback only when no text
- * items exist at all), a bare string (as-is), or any other object
- * (compact JSON). `undefined` when there is nothing to show.
+ * items joined, images counted, `details` as a fallback), a bare string
+ * (as-is), or any other object (compact JSON). `undefined` when there is
+ * nothing to show.
+ *
+ * `failed` marks a failed tool call: its failure reason lives in
+ * `details`, so an empty text item does NOT mean "no output" for failed
+ * calls — the `details` fallback still applies.
  */
-export function normalizeToolOutput(rawOutput: unknown): string | undefined {
+export function normalizeToolOutput(
+  rawOutput: unknown,
+  failed = false,
+): string | undefined {
   if (typeof rawOutput === "string") return rawOutput === "" ? undefined : rawOutput;
   if (typeof rawOutput !== "object" || rawOutput === null) return undefined;
   const result = rawOutput as Record<string, unknown>;
@@ -101,11 +108,13 @@ export function normalizeToolOutput(rawOutput: unknown): string | undefined {
     let text = parts.join("\n");
     if (images > 0)
       text = (text ? text + "\n" : "") + `(+${images} image${images > 1 ? "s" : ""})`;
+    if (text !== "") return text;
     // A text item that is present but empty (e.g. a successful command with
     // no stdout) means the tool produced no output — show "(no output)"
-    // rather than falling back to metadata. Only fall back to `details`
-    // when no text items exist at all.
-    if (hasText || images > 0) return text === "" ? undefined : text;
+    // instead of metadata. Exception: a FAILED call puts its failure
+    // reason in `details`, so fall back to it. Same for results with no
+    // text items at all.
+    if (hasText && !failed) return undefined;
   }
   if (result.details !== undefined) {
     const d = JSON.stringify(result.details);

@@ -72,6 +72,19 @@ describe("normalizeToolOutput", () => {
       }),
     ).toBeUndefined();
   });
+  it("falls back to details for a FAILED call with empty text", () => {
+    // A failed/timed-out sudo_exec has an empty text item and puts the
+    // failure reason in details — the expanded card must show it.
+    expect(
+      normalizeToolOutput(
+        {
+          content: [{ type: "text", text: "" }],
+          details: { command: "true", error: "timed out after 120s" },
+        },
+        true,
+      ),
+    ).toBe('{"command":"true","error":"timed out after 120s"}');
+  });
 });
 
 describe("ToolCallCard (rendering)", () => {
@@ -135,6 +148,21 @@ describe("ToolCallCard (rendering)", () => {
     );
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("(no output)")).toBeTruthy();
+  });
+  it("shows the failure reason from details for a failed call with empty text", () => {
+    render(
+      <ToolCallCard
+        title="sudo_exec"
+        status="failed"
+        rawInput={{ command: "true" }}
+        rawOutput={{
+          content: [{ type: "text", text: "" }],
+          details: { command: "true", error: "timed out after 120s" },
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(/timed out after 120s/)).toBeTruthy();
   });
   it("defers output normalization until the card is expanded", () => {
     const spy = vi.spyOn(toolOutput, "normalizeToolOutput");
