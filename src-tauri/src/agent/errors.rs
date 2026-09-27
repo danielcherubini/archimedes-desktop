@@ -59,4 +59,8 @@ pub enum RpcError {
     /// oversized image).
     #[error("invalid prompt payload: {reason}")]
     InvalidPrompt { reason: String },
+
+    /// The turn did not settle within the settle timeout (a hung turn).
+    #[error("settle timeout: {detail}")]
+    SettleTimeout { detail: String },
 }

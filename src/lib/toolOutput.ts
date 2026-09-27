@@ -97,6 +97,198 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
 }
 
 /**
+ * A human duration for a millisecond span (`<60s` → `Ns`, `<60m` → `Nm`,
+ * else `Nh`) — the live tool duration in the subagent activity line.
+ */
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
+}
+
+/**
+ * One subagent's ACTIVITY line (the pi-archimedes `buildActivityLine`
+ * treatment, condensed): the failure reason, or `Done` / `Failed`, or
+ * the current tool + args + live duration, or the LAST line of the
+ * subagent's streamed output (the "what is it working on" line), or
+ * `Starting...`. `undefined` when there is nothing to show.
+ */
+function subagentActivityLine(e: Record<string, unknown>): string | undefined {
+  if (typeof e.error === "string" && e.error !== "") return truncate(e.error, 80);
+  const status = typeof e.status === "string" ? e.status : undefined;
+  if (status === "completed") return "Done";
+  if (status === "failed") return "Failed";
+  if (status === "running") {
+    const tool = typeof e.currentTool === "string" ? e.currentTool : undefined;
+    if (tool) {
+      const args = typeof e.currentToolArgs === "string" ? e.currentToolArgs : "";
+      const startedAt =
+        typeof e.currentToolStartedAt === "number" ? e.currentToolStartedAt : undefined;
+      const duration =
+        startedAt !== undefined ? ` · ${formatDuration(Date.now() - startedAt)}` : "";
+      return (args !== "" ? `${tool}: ${truncate(args, 60)}` : tool) + duration;
+    }
+    // The last non-empty line of the subagent's streamed output (the
+    // "what is it working on" line the user asked for).
+    const recent = Array.isArray(e.recentOutput)
+      ? (e.recentOutput as unknown[]).filter(
+          (l): l is string => typeof l === "string" && l.trim() !== "",
+        )
+      : [];
+    if (recent.length > 0) return truncate(recent[recent.length - 1] as string, 80);
+    if (typeof e.output === "string" && e.output.trim() !== "") {
+      const lines = (e.output as string)
+        .split("\n")
+        .filter((l) => l.trim() !== "");
+      if (lines.length > 0) return truncate(lines[lines.length - 1], 80);
+    }
+    return "Starting...";
+  }
+  // The final `results` shape (with `exitCode` + `finalOutput`, no `status`):
+  // the last line of the subagent's final output (the "what it worked on"
+  // line the user asked for), or `Done` / `Failed` when there is none.
+  const exitCode = typeof e.exitCode === "number" ? e.exitCode : undefined;
+  if (exitCode !== undefined) {
+    const final = typeof e.finalOutput === "string" ? e.finalOutput : "";
+    const lines = final.split("\n").filter((l) => l.trim() !== "");
+    if (lines.length > 0) return truncate(lines[lines.length - 1], 80);
+    return exitCode === 0 ? "Done" : "Failed";
+  }
+  return undefined;
+}
+
+/**
+ * The subagent tool's `details` (the progress envelope — NOT display text)
+ * as a human-readable summary: one block per subagent — `<agent>: <task>`
+ * + the activity line. Prefers the live `progress` (while any subagent is
+ * still running) and falls back to the final `results`. `undefined` when
+ * there is nothing to show.
+ */
+function summarizeSubagentDetails(details: unknown): string | undefined {
+  if (typeof details !== "object" || details === null) return undefined;
+  const d = details as Record<string, unknown>;
+  const asEntries = (
+    key: "progress" | "results",
+  ): Array<Record<string, unknown>> => {
+    const arr = d[key];
+    if (!Array.isArray(arr)) return [];
+    return (arr as unknown[]).filter(
+      (x): x is Record<string, unknown> =>
+        typeof x === "object" && x !== null,
+    );
+  };
+  // Prefer the live progress while any subagent is still running; once
+  // all are terminal, the final `results` carry the authoritative state
+  // (the `progress` may be stale / misaligned after settle).
+  const progress = asEntries("progress");
+  const anyRunning = progress.some(
+    (p) => p.status === "running",
+  );
+  const entries = anyRunning ? progress : (asEntries("results").length > 0 ? asEntries("results") : progress);
+  if (entries.length === 0) return undefined;
+  const blocks = entries.map((e) => {
+    const agent = typeof e.agent === "string" ? e.agent : "subagent";
+    const task = typeof e.task === "string" ? e.task : "";
+    const header = task !== "" ? `${agent}: ${task}` : agent;
+    const line = subagentActivityLine(e);
+    return line !== undefined ? `${header}\n  ${line}` : header;
+  });
+  return blocks.join("\n\n");
+}
+
+/**
+ * The subagent tool's `details` summary for ONE subagent (the `Subagents`
+ * panel's transcript fallback): filters the `progress` / `results` entries
+ * to the one matching `sessionId` (via `childSessionId` on `results`, or
+ * the `task` on `progress` — the live entries carry no session id) and
+ * renders it (the `summarizeSubagentDetails` treatment). `undefined` when
+ * no entry matches (the caller falls back to the subagent's own stream).
+ */
+export function summarizeSubagentFor(
+  details: unknown,
+  sessionId: string,
+  task: string,
+): string | undefined {
+  if (typeof details !== "object" || details === null) return undefined;
+  const d = details as Record<string, unknown>;
+  const pick = (
+    key: "progress" | "results",
+  ): Array<Record<string, unknown>> => {
+    const arr = d[key];
+    if (!Array.isArray(arr)) return [];
+    return (arr as unknown[])
+      .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+      .filter((x) => {
+        // `results` carry the subagent's pi id; `progress` (live) do not —
+        // match those on the `task` (the dispatch's task, unique per
+        // subagent in practice).
+        const childId = x.childSessionId;
+        if (typeof childId === "string") return childId === sessionId;
+        return typeof x.task === "string" && x.task === task;
+      });
+  };
+  const filtered = { ...d, progress: pick("progress"), results: pick("results") };
+  return summarizeSubagentDetails(filtered);
+}
+
+/**
+ * The subagent tool's `details` ONE-LINE activity for a SINGLE subagent
+ * (the nested `SubagentDelegatingCard`'s live preview — e.g. `read:
+ * docs/foo.md · 12s`): filters the `progress` / `results` entries to the
+ * one matching `sessionId` / `task` (the `summarizeSubagentFor` match),
+ * applies the `summarizeSubagentDetails` preference ON THE FILTERED
+ * arrays (prefer the live `progress` while any filtered `progress` entry
+ * is still running — the SAME predicate, which checks only the
+ * `progress` entries), and returns the `subagentActivityLine` of the
+ * FIRST entry of the chosen array (the ONE-LINE activity, not the
+ * multi-line `summarizeSubagentFor` block). `undefined` when no entry
+ * matches (the caller renders no activity line) or when `details` is
+ * not an object. Filtering FIRST matters for the mixed multi-subagent
+ * case (one `subagent` tool call's `details` can carry multiple
+ * subagents: with sub A finished while sub B runs, prefer-then-filter
+ * would pick `progress` (B running) for A's row — a stale preview;
+ * filter-first picks A's finished entry from `results`).
+ */
+export function subagentActivityFor(
+  details: unknown,
+  sessionId: string,
+  task: string,
+): string | undefined {
+  if (typeof details !== "object" || details === null) return undefined;
+  const d = details as Record<string, unknown>;
+  const pick = (
+    key: "progress" | "results",
+  ): Array<Record<string, unknown>> => {
+    const arr = d[key];
+    if (!Array.isArray(arr)) return [];
+    return (arr as unknown[])
+      .filter((x): x is Record<string, unknown> => typeof x === "object" && x !== null)
+      .filter((x) => {
+        // `results` carry the subagent's pi id; `progress` (live) do not —
+        // match those on the `task` (the dispatch's task, unique per
+        // subagent in practice).
+        const childId = x.childSessionId;
+        if (typeof childId === "string") return childId === sessionId;
+        return typeof x.task === "string" && x.task === task;
+      });
+  };
+  // The `summarizeSubagentDetails` preference, applied to the FILTERED
+  // arrays: prefer the live `progress` while any filtered `progress`
+  // entry is still running (the same predicate — `progress` entries
+  // only), else the final `results` if non-empty, else `progress`.
+  const filteredProgress = pick("progress");
+  const filteredResults = pick("results");
+  const anyRunning = filteredProgress.some((p) => p.status === "running");
+  const entries = anyRunning
+    ? filteredProgress
+    : (filteredResults.length > 0 ? filteredResults : filteredProgress);
+  if (entries.length === 0) return undefined;
+  return subagentActivityLine(entries[0]);
+}
+
+/**
  * Normalize a tool result to display text. Accepts pi's `AgentToolResult`
  * shape (`{ content: (TextContent | ImageContent)[], details? }` — text
  * items joined, images counted, `details` as a fallback), a bare string
@@ -106,10 +298,16 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
  * `failed` marks a failed tool call: its failure reason lives in
  * `details`, so an empty text item does NOT mean "no output" for failed
  * calls — the `details` fallback still applies.
+ *
+ * `title` (the tool name) selects tool-specific `details` rendering: the
+ * `subagent` `details` is a progress envelope (not display text) and is
+ * rendered as a human-readable summary (agent + task + activity line)
+ * instead of a raw JSON dump.
  */
 export function normalizeToolOutput(
   rawOutput: unknown,
   failed = false,
+  title?: string,
 ): string | undefined {
   if (typeof rawOutput === "string") return rawOutput === "" ? undefined : rawOutput;
   if (typeof rawOutput !== "object" || rawOutput === null) return undefined;
@@ -136,6 +334,13 @@ export function normalizeToolOutput(
     if (hasText && !failed) return undefined;
   }
   if (result.details !== undefined) {
+    // The `subagent` `details` is a progress envelope (not display text) —
+    // render the human-readable summary; a `null` / empty summary falls
+    // through to the JSON dump below (nothing to show yet).
+    if (title === "subagent") {
+      const summary = summarizeSubagentDetails(result.details);
+      if (summary !== undefined) return summary;
+    }
     const d = JSON.stringify(result.details);
     return d === "null" || d === "{}" ? undefined : d;
   }

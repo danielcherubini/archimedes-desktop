@@ -426,6 +426,11 @@ pub struct SessionDriver {
     /// How long the establishment phase (agent spawn + `get_state`
     /// establisher) may run before it is cancelled. Default: 30 s.
     pub(crate) establish_timeout: Duration,
+    /// How long to wait for a turn to settle before reporting a failure. A
+    /// hung turn (a prompt that never settles) is torn down + reported
+    /// failed after this, so a subagent can't linger forever (the
+    /// zombie-subagent fix). Defaults to 30 minutes.
+    pub(crate) settle_timeout: Duration,
     /// Transcript persistence (main only; `None` for subagents —
     /// ephemeral, not stored). Gates `persist_update` only; the trust
     /// lookup is `trust_db` (below — main AND subagent).
@@ -472,6 +477,7 @@ impl SessionDriver {
             sudo_password: Arc::new(Mutex::new(HashMap::new())),
             runner: Arc::new(bridge::RealSudoRunner),
             establish_timeout: Duration::from_secs(30),
+            settle_timeout: Duration::from_secs(30 * 60),
             db: None,
             trust_db: None,
             text_capture: None,
@@ -973,12 +979,14 @@ impl SessionDriver {
     }
     /// Await the session's next turn settle (the driver's `agent_settled` watch).
     ///
-    /// UNBOUNDED (like the ACP subagent prompt await): the wait ends on the
-    /// turn's `agent_settled` OR on a teardown (the driver task ending DROPS
-    /// the watch sender, which resolves `changed()`). `Ok(reason)` when a
-    /// settle was recorded (the `cancel_requested` flag already mapped it to
-    /// `Cancelled`); `Err` when the session vanished or the agent died without
-    /// settling.
+    /// BOUNDED by `settle_timeout` (a hung turn can't linger forever — the
+    /// zombie-subagent fix): the wait ends on the turn's `agent_settled`
+    /// (resolves `Ok(reason)` — the `cancel_requested` flag already mapped a
+    /// cancel to `Cancelled`), on a teardown (the driver task ending DROPS
+    /// the watch sender, which resolves `changed()` as `Err` →
+    /// `Err(ProcessExited)` — the agent died mid-turn, or the session was
+    /// torn down), or on the settle timeout (a hung turn →
+    /// `Err(SettleTimeout)` — the caller's cancel tears the session down).
     pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, RpcError> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
@@ -989,16 +997,29 @@ impl SessionDriver {
                     id: session_id.to_string(),
                 })?
         };
-        // `borrow_and_update` marks the current value as seen: `changed()` then
-        // fires only on a LATER change (or a sender drop).
-        let (seq, _) = *rx.borrow_and_update();
-        if seq == 0 {
-            let _ = rx.changed().await;
+        // A bounded wait: a hung turn (no settle within `settle_timeout`)
+        // resolves `Err(SettleTimeout)`; a teardown (sender dropped)
+        // resolves `Err(ProcessExited)`; a settle resolves `Ok(reason)`.
+        match tokio::time::timeout(self.settle_timeout, rx.changed()).await {
+            Ok(Ok(_)) => {} // a settle was recorded (fall through)
+            Ok(Err(_)) => {
+                // The sender was dropped without a settle (the agent died
+                // mid-turn, or the session was torn down).
+                return Err(RpcError::ProcessExited(None));
+            }
+            Err(_elapsed) => {
+                // The settle timed out (a hung turn — the caller's cancel
+                // tears the session down; see the dispatch).
+                return Err(RpcError::SettleTimeout {
+                    detail: format!(
+                        "the turn did not settle within {}s",
+                        self.settle_timeout.as_secs()
+                    ),
+                });
+            }
         }
         let (seq, reason) = *rx.borrow();
         if seq == 0 {
-            // The sender was dropped without a settle (the agent died
-            // mid-turn, or the session was torn down).
             Err(RpcError::ProcessExited(None))
         } else {
             Ok(reason)

@@ -40,6 +40,15 @@ export interface SubagentEntry {
   agentName: string;
   task: string;
   status: "running" | "completed" | "failed";
+  /**
+   * Wall-clock arrival (`Date.now()` at `addSession`). The directory's
+   * relative time for RUNNING entries (elapsed since arrival). A
+   * re-delivered frame keeps the ORIGINAL value (a re-sent frame must not
+   * reset the clock).
+   */
+  startedAt: number;
+  /** Wall-clock close (`Date.now()` at `markClosed`) — the directory's relative time for ENDED entries (when it ended — distinct from `metrics.durationMs`, the DURATION). */
+  endedAt?: number;
   error?: string;
   /**
    * Snapshot from the `subagent-closed` payload. The metrics line MUST read
@@ -55,8 +64,8 @@ export interface SubagentEntry {
 interface SubagentState {
   /** Keyed by the subagent session id (insertion order = arrival order). */
   entries: Record<string, SubagentEntry>;
-  /** "subagent-session-started" */
-  addSession: (e: SubagentEntry) => void;
+  /** "subagent-session-started" (the store stamps `startedAt`; a re-delivery keeps the original). */
+  addSession: (e: Omit<SubagentEntry, "startedAt" | "endedAt">) => void;
   /** "subagent-closed" */
   markClosed: (
     sessionId: string,
@@ -79,7 +88,16 @@ export const useSubagents = create<SubagentState>((set) => ({
       // a `markClosed` that may never come) — accepted as-is: it requires
       // double-delivered events, which the listener registration guards
       // against (App.tsx's StrictMode double-registration guard).
-      const entries = { ...state.entries, [e.sessionId]: e };
+      const existing = state.entries[e.sessionId];
+      const entries = {
+        ...state.entries,
+        [e.sessionId]: {
+          ...e,
+          // A re-sent frame must not reset the directory's elapsed-time
+          // clock: keep the ORIGINAL arrival.
+          startedAt: existing?.startedAt ?? Date.now(),
+        },
+      };
       return { entries: evictOldestClosed(entries) };
     }),
 
@@ -89,7 +107,15 @@ export const useSubagents = create<SubagentState>((set) => ({
       if (!existing) return state; // unknown / dismissed id: no-op
       const entries = {
         ...state.entries,
-        [sessionId]: { ...existing, status, error, metrics },
+        [sessionId]: {
+          ...existing,
+          status,
+          error,
+          metrics,
+          // The directory's relative time for ENDED entries (when it
+          // ended — distinct from `metrics.durationMs`, the DURATION).
+          endedAt: Date.now(),
+        },
       };
       return { entries: evictOldestClosed(entries) };
     }),

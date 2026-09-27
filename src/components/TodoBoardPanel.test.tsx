@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, renderHook, screen } from "@testing-library/react";
-import TodoBoardPanel, { useMainTodoItems } from "./TodoBoardPanel";
+import { act, render, renderHook, screen } from "@testing-library/react";
+import TodoBoardPanel, { useMainTodoItems, useMainOpenTodoCount } from "./TodoBoardPanel";
 import { useBridge } from "../store/bridge";
 import { useSessions } from "../store/sessions";
 
@@ -20,7 +20,7 @@ beforeEach(() => {
 });
 
 describe("TodoBoardPanel", () => {
-  it("renders the progress header N/M with a progress indicator for a main column", () => {
+  it("renders the section header (the Todos label + N/M) with a progress indicator for a main column", () => {
     // 1 done / 3 total.
     useBridge.getState().applyTodoUpdate("main1", {
       source: "main",
@@ -31,6 +31,10 @@ describe("TodoBoardPanel", () => {
       ],
     });
     const { container } = render(<TodoBoardPanel sessionId="main1" />);
+    // The section label (the `SidePane` hosts the board as a section — the
+    // ZCode `Goal`/`Progress` treatment: the header carries the label +
+    // the count, the body the progress bar + checklist).
+    expect(screen.getByText("Todos")).toBeTruthy();
     expect(screen.getByText("1/3")).toBeTruthy();
     const indicator = container.querySelector<HTMLElement>(
       '[data-slot="progress-indicator"]',
@@ -67,15 +71,72 @@ describe("TodoBoardPanel", () => {
     expect(pending.className).toContain("text-foreground-subtlest");
   });
 
-  it("renders the empty state when there are no todos", () => {
+  it("renders NOTHING when there are no todos (the board is visible only while open todos exist)", () => {
     const { container } = render(<TodoBoardPanel sessionId="main1" />);
-    const empty = screen.getByText("No todos yet");
-    expect(empty.className).toContain("text-ui-sm");
-    expect(empty.className).toContain("text-foreground-subtlest");
-    // The progress header is NOT rendered for an empty board (M = 0).
+    // No "No todos yet" placeholder — an empty board is hidden entirely.
+    expect(screen.queryByText("No todos yet")).toBeNull();
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("renders NOTHING when ALL main todos are completed (the board hides once the list is done)", () => {
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [
+        { content: "done one", status: "completed" },
+        { content: "done two", status: "completed" },
+      ],
+    });
+    const { container } = render(<TodoBoardPanel sessionId="main1" />);
+    // No progress header, no checklist rows — a fully-completed board is
+    // hidden (it carries no attention cue; the badge is gone too, via the
+    // same open-count derivation).
     expect(
       container.querySelector('[data-slot="progress-indicator"]'),
     ).toBeNull();
+    expect(screen.queryByText("done one")).toBeNull();
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("hides a subagent todo column when ALL of its todos are completed (open columns still render)", () => {
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "subagent:done-agent",
+      todos: [
+        { content: "sub done one", status: "completed" },
+        { content: "sub done two", status: "completed" },
+      ],
+    });
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "subagent:busy-agent",
+      todos: [
+        { content: "sub open one", status: "in_progress" },
+        { content: "sub open two", status: "completed" },
+      ],
+    });
+    const { container } = render(<TodoBoardPanel sessionId="main1" />);
+    // The all-completed column is hidden (no header, no rows)...
+    expect(screen.queryByText("subagent:done-agent")).toBeNull();
+    expect(screen.queryByText("sub done one")).toBeNull();
+    // ...while the column with an open item still renders.
+    expect(screen.getByText("subagent:busy-agent")).toBeTruthy();
+    expect(screen.getByText("sub open one")).toBeTruthy();
+    expect(container.firstChild).not.toBeNull();
+  });
+
+  it("shows the subagent column(s) when the main list is fully completed but a subagent column is still open", () => {
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [{ content: "main done", status: "completed" }],
+    });
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "subagent:busy-agent",
+      todos: [{ content: "sub open", status: "pending" }],
+    });
+    render(<TodoBoardPanel sessionId="main1" />);
+    // The main section (progress header + checklist) is hidden (all done)...
+    expect(screen.queryByText("main done")).toBeNull();
+    // ...but the open subagent column keeps the board visible.
+    expect(screen.getByText("subagent:busy-agent")).toBeTruthy();
+    expect(screen.getByText("sub open")).toBeTruthy();
   });
 
   it("renders subagent todo columns as indented sub-rows", () => {
@@ -101,6 +162,33 @@ describe("TodoBoardPanel", () => {
     const row = screen.getByText("sub task one").parentElement;
     expect(row?.className).toContain("text-ui-sm");
     expect(screen.getByText("sub task two")).toBeTruthy();
+  });
+
+  it("useMainOpenTodoCount returns the OPEN (non-completed) main todo count (zero when fully completed)", () => {
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [
+        { content: "a", status: "pending" },
+        { content: "b", status: "completed" },
+        { content: "c", status: "in_progress" },
+        { content: "d", status: "completed" },
+      ],
+    });
+    const { result, rerender } = renderHook(() => useMainOpenTodoCount("main1"));
+    expect(result.current).toBe(2);
+    // A fully-completed list counts as ZERO (the badge and the panel's
+    // visibility share this derivation — they can never disagree).
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [
+          { content: "a", status: "completed" },
+          { content: "b", status: "completed" },
+        ],
+      });
+    });
+    rerender();
+    expect(result.current).toBe(0);
   });
 
   it("useMainTodoItems returns the rawInput fallback when the bridge column is absent", () => {

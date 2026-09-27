@@ -62,6 +62,23 @@ describe("addSession", () => {
     expect(useSubagents.getState().entries["sub1"].agentName).toBe("reviewer");
     expect(useSubagents.getState().entries["sub2"].agentName).toBe("explorer");
   });
+
+  it("stamps `startedAt` on arrival (the directory's relative-time source)", () => {
+    const before = Date.now();
+    useSubagents.getState().addSession(A1);
+    const after = Date.now();
+    const startedAt = useSubagents.getState().entries["sub1"].startedAt;
+    expect(startedAt).toBeGreaterThanOrEqual(before);
+    expect(startedAt).toBeLessThanOrEqual(after);
+  });
+
+  it("keeps the ORIGINAL `startedAt` on re-delivery (a re-sent frame must not reset the clock)", () => {
+    const add = useSubagents.getState().addSession;
+    add(A1);
+    const original = useSubagents.getState().entries["sub1"].startedAt;
+    add({ ...A1, task: "review v2" });
+    expect(useSubagents.getState().entries["sub1"].startedAt).toBe(original);
+  });
 });
 
 describe("markClosed", () => {
@@ -91,6 +108,15 @@ describe("markClosed", () => {
     useSubagents.getState().markClosed("unknown", "completed");
     expect(useSubagents.getState().entries["unknown"]).toBeUndefined();
     expect(Object.keys(useSubagents.getState().entries)).toEqual([]);
+  });
+
+  it("stamps `endedAt` when the session closes", () => {
+    useSubagents.getState().addSession(A1);
+    const before = Date.now();
+    useSubagents.getState().markClosed("sub1", "completed");
+    const entry = useSubagents.getState().entries["sub1"];
+    expect(entry.endedAt).toBeGreaterThanOrEqual(before);
+    expect(entry.endedAt).toBeGreaterThanOrEqual(entry.startedAt);
   });
 
   it("keeps the entry's identity fields (only status/error/metrics change)", () => {

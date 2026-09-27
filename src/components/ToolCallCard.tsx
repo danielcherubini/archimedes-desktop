@@ -1,25 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronRightIcon, CopyIcon } from "lucide-react";
 import type { DiffRef, ToolCallUiStatus } from "../store/sessions";
 import {
   editChangeStat,
-  failureText,
   fileSummaries,
   normalizeToolOutput,
   readLineRange,
-  summarizeToolCall,
-  toolIcon,
-  toolVerb,
 } from "../lib/toolOutput";
 import FileChip from "./FileChip";
 import DiffCount from "./DiffCount";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "./ui/tooltip";
 import DiffBlock from "./DiffBlock";
+import { ToolCallCardHeader } from "./ToolCallCardHeader";
 
 const SHELL_TOOLS = new Set(["bash", "powershell", "sudo_exec"]);
 
@@ -70,12 +60,9 @@ export default function ToolCallCard({
       setOpen(true);
     }
   }, [status, title]);
-  const verb = toolVerb(title, status);
-  const Icon = toolIcon(title);
   const files = fileSummaries(title, rawInput);
   const stat = editChangeStat(title, rawInput);
   const range = readLineRange(rawInput);
-  const summary = summarizeToolCall(title, rawInput);
   const isShell = SHELL_TOOLS.has(title);
   const command =
     isShell && typeof rawInput === "object" && rawInput !== null
@@ -86,109 +73,24 @@ export default function ToolCallCard({
   // streaming render while collapsed is wasted work.
   const output =
     open && !diff
-      ? normalizeToolOutput(rawOutput, status === "failed")
+      ? normalizeToolOutput(rawOutput, status === "failed", title)
       : undefined;
-  const failure = status === "failed" ? failureText(rawOutput) : undefined;
-
-  // The failure tooltip's copy button (ZCode's pattern: copy → check
-  // for 1.5s; a no-op when there is no failure text).
-  const [copied, setCopied] = useState(false);
-  const resetRef = useRef<number | null>(null);
-  const handleCopy = () => {
-    if (!failure) return;
-    void navigator.clipboard?.writeText(failure)?.then(() => {
-      setCopied(true);
-      if (resetRef.current !== null) window.clearTimeout(resetRef.current);
-      resetRef.current = window.setTimeout(() => setCopied(false), 1500);
-    });
-  };
-  useEffect(
-    () => () => {
-      if (resetRef.current !== null) window.clearTimeout(resetRef.current);
-    },
-    [],
-  );
 
   return (
     <div className="w-full">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="group/tool-summary flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left hover:bg-surface-hover"
-      >
-        <Icon className="size-4 shrink-0 text-foreground-subtle" />
-        <span
-          className={`shrink-0 whitespace-nowrap font-medium ${
-            status === "pending"
-              ? "animated-gradient-text"
-              : "text-foreground-subtlest"
-          }`}
-        >
-          {verb ?? title}
-        </span>
-        {files.length > 0 ? (
-          <>
-            <FileChip path={files[0].path} />
-            {range && (
-              <span className="shrink-0 text-ui-sm text-foreground-subtlest">
-                {range}
-              </span>
-            )}
-          </>
-        ) : isShell && typeof command === "string" && command !== "" ? (
-          <span className="min-w-0 truncate font-sans text-foreground-subtle">
-            {command}
-          </span>
-        ) : summary ? (
-          <span className="min-w-0 truncate text-ui-sm text-foreground-subtlest">
-            {summary}
-          </span>
-        ) : null}
-        {stat && <DiffCount stat={stat} />}
-        {status === "failed" && (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="shrink-0 cursor-help whitespace-nowrap text-destructive underline decoration-dotted underline-offset-2">
-                  Failed
-                </span>
-              </TooltipTrigger>
-              {failure && (
-                <TooltipContent side="top" align="start" className="max-w-96">
-                  <div className="flex max-w-96 items-center gap-2">
-                    <span className="line-clamp-3 min-w-0 flex-1 whitespace-pre-wrap break-words">
-                      {failure}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        handleCopy();
-                      }}
-                      aria-label={copied ? "Error copied" : "Copy error"}
-                      title={copied ? "Error copied" : "Copy error"}
-                      className="shrink-0 text-foreground-subtle hover:text-foreground"
-                    >
-                      {copied ? (
-                        <CheckIcon className="size-3" />
-                      ) : (
-                        <CopyIcon className="size-3" />
-                      )}
-                    </button>
-                  </div>
-                </TooltipContent>
-              )}
-            </Tooltip>
-          </TooltipProvider>
-        )}
-        <ChevronRightIcon
-          aria-hidden
-          className={`size-4 shrink-0 text-foreground-subtlest opacity-0 transition-transform transition-opacity duration-200 ease-out group-hover/tool-summary:opacity-100 ${
-            open ? "rotate-90 opacity-100" : "rotate-0"
-          }`}
-        />
-      </button>
+      <ToolCallCardHeader
+        title={title}
+        status={status}
+        rawInput={rawInput}
+        rawOutput={rawOutput}
+        open={open}
+        onToggle={() => setOpen((o) => !o)}
+        files={files}
+        stat={stat}
+        range={range}
+        isShell={isShell}
+        command={command}
+      />
       {open && (
         <div className="mt-1 rounded-xl border border-border bg-panel px-4 py-3">
           {diff ? (

@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
 import type { Message } from "../store/sessions";
 import ToolCallCard from "./ToolCallCard";
+import SubagentDelegatingCard from "./SubagentDelegatingCard";
 import DiffBlock from "./DiffBlock";
 import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 
@@ -151,7 +152,20 @@ function AgentMarkdown({ text }: { text: string }) {
 // (a full ReactMarkdown re-parse per agent-text bubble), which made the app
 // render real slow. Only the changed bubble re-renders now.
 export default memo(
-  function MessageBubble({ message, isStreaming = false }: { message: Message; isStreaming?: boolean }) {
+  function MessageBubble({
+    message,
+    isStreaming = false,
+    sessionId,
+  }: {
+    message: Message;
+    isStreaming?: boolean;
+    /**
+     * The ACP session id (optional — the `SubagentTranscript`'s
+     * `MessageBubble` does not pass it; a subagent session never has a
+     * `subagent` tool call, so the `subagent` branch is never taken there).
+     */
+    sessionId?: string;
+  }) {
     switch (message.kind) {
       case "user":
         // The design reference: a plain row — no bubble, no avatar.
@@ -198,13 +212,23 @@ export default memo(
       case "tool-call":
         return (
           <div className="w-full">
-            <ToolCallCard
-              title={message.title}
-              status={message.status}
-              diff={message.diff}
-              rawInput={message.rawInput}
-              rawOutput={message.rawOutput}
-            />
+            {message.title === "subagent" ? (
+              <SubagentDelegatingCard
+                title={message.title}
+                status={message.status}
+                rawInput={message.rawInput}
+                rawOutput={message.rawOutput}
+                sessionId={sessionId ?? ""}
+              />
+            ) : (
+              <ToolCallCard
+                title={message.title}
+                status={message.status}
+                diff={message.diff}
+                rawInput={message.rawInput}
+                rawOutput={message.rawOutput}
+              />
+            )}
           </div>
         );
 

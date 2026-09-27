@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
-import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import ReactMarkdown from "react-markdown";
 import MessageBubble from "./MessageBubble";
 import { Message } from "../store/sessions";
+import { useSubagents } from "../store/subagents";
 
 // Spy on the markdown renderer: the streaming-perf test below counts how
 // often it runs when a bubble re-renders with an UNCHANGED message
@@ -105,5 +106,73 @@ describe("MessageBubble", () => {
     expect(first).toBe(1);
     rerender(<MessageBubble message={message} />);
     expect(markdownSpy.mock.calls.length).toBe(first);
+  });
+
+  // --- `subagent` tool call: render the `SubagentDelegatingCard` (not the
+  // plain `ToolCallCard`); every other tool is unchanged. ---
+
+  beforeEach(() => {
+    for (const id of Object.keys(useSubagents.getState().entries)) {
+      useSubagents.getState().dismiss(id);
+    }
+  });
+
+  it("renders a subagent tool call as SubagentDelegatingCard (not the plain ToolCallCard)", () => {
+    const message: Message = {
+      kind: "tool-call",
+      id: "t1",
+      title: "subagent",
+      status: "pending",
+      at: 1,
+    };
+    render(<MessageBubble message={message} sessionId="main1" />);
+    // The `SubagentDelegatingCard` is OPEN by default (no seeded entries →
+    // the empty-state marker, unique to it, is visible).
+    expect(screen.getByText("No subagents yet.")).toBeTruthy();
+    // The plain `ToolCallCard` is collapsed by default and shows "No
+    // output." when expanded — toggling here must NOT surface a plain-card
+    // body (the nested card's empty state just hides).
+    act(() => {
+      fireEvent.click(screen.getByRole("button"));
+    });
+    expect(screen.queryByText("No subagents yet.")).toBeNull();
+    expect(screen.queryByText("No output.")).toBeNull();
+  });
+
+  it("renders a non-subagent tool call as the plain ToolCallCard (unchanged)", () => {
+    const message: Message = {
+      kind: "tool-call",
+      id: "t1",
+      title: "bash",
+      status: "completed",
+      rawInput: { command: "ls -la" },
+      at: 1,
+    };
+    render(<MessageBubble message={message} />);
+    expect(screen.getByText("Ran")).toBeTruthy();
+    expect(screen.getByText("ls -la")).toBeTruthy();
+    // No `SubagentDelegatingCard` for a plain tool.
+    expect(screen.queryByText("No subagents yet.")).toBeNull();
+  });
+
+  it("renders the session's subagent rows nested under the subagent tool call", () => {
+    useSubagents.getState().addSession({
+      sessionId: "sub1",
+      parentSessionId: "main1",
+      agentName: "reviewer",
+      task: "review the diff",
+      status: "running",
+    });
+    const message: Message = {
+      kind: "tool-call",
+      id: "t1",
+      title: "subagent",
+      status: "pending",
+      at: 1,
+    };
+    render(<MessageBubble message={message} sessionId="main1" />);
+    expect(screen.getByText("reviewer")).toBeTruthy();
+    expect(screen.getByText("review the diff")).toBeTruthy();
+    expect(screen.queryByText("No subagents yet.")).toBeNull();
   });
 });

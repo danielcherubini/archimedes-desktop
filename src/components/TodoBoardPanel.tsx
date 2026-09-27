@@ -62,6 +62,18 @@ export function useMainTodoItems(sessionId: string | null): TodoItem[] {
   return column?.main ?? rawTodos ?? [];
 }
 
+/**
+ * The main column's OPEN (non-`completed`) todo count — the SHARED
+ * derivation for the `SidePane`'s auto open/close (the pane's visibility
+ * and the board's can never disagree — a fully-completed list counts as
+ * ZERO: no board, and it does not keep the pane open either).
+ */
+export function useMainOpenTodoCount(sessionId: string | null): number {
+  return useMainTodoItems(sessionId).filter(
+    (t) => t.status !== "completed",
+  ).length;
+}
+
 /** The three-state indicator: done = check circle, in-progress = `◉`, pending = `○`. */
 function TodoIndicator({ status }: { status: TodoItem["status"] }) {
   if (status === "completed") {
@@ -102,20 +114,31 @@ function TodoItems({ items }: { items: TodoItem[] }) {
 }
 
 /**
- * The session's todo board (hosted by the `SidePane`'s Todos tab):
+ * The session's todo board (the `SidePane`'s TODOS SECTION — the ZCode
+ * `Goal`/`Progress` treatment: the header carries the label + the count,
+ * the body the progress bar + checklist):
  *
- * - Progress header (`N/M` + `progress` bar, primary fill) when M > 0.
- * - `h-8` checklist rows with the three-state indicators (done = a
- *   `size-4` check circle `text-success` + label `text-foreground-subtle`;
+ * - **Visible ONLY while open todos exist** (the user's rule): the board
+ *   renders `null` when there is nothing open — no todos at all, or a
+ *   fully-completed list (the old "No todos yet" placeholder is gone).
+ *   The `SidePane`'s auto open/close shares the SAME `useMainOpenTodoCount`
+ *   derivation, so the pane's visibility and the board can never
+ *   disagree.
+ * - Header: the `Todos` label + `N/M` + the `progress` bar (primary fill).
+ *   checklist rows with the three-state indicators (done = a `size-4`
+ *   check circle `text-success` + label `text-foreground-subtle`;
  *   in-progress = `◉` `text-warning`; pending = `○`
- *   `text-foreground-subtlest`).
+ *   `text-foreground-subtlest`) — the main section renders only when an
+ *   OPEN main todo exists (a fully-completed main list is hidden even
+ *   while a subagent column is still open).
  * - Subagent todo columns (`subagents[source]`, fed by the same bridge
  *   events — a unique `source` per child, cleared on child exit) as
  *   indented sub-rows (`pl-6`, `text-ui-sm`), one block per source with a
- *   `text-ui-xs text-foreground-subtlest` header.
+ *   `text-ui-xs text-foreground-subtlest` header — a column renders only
+ *   while it has an OPEN item (an all-completed column is hidden).
  * - `rawInput` fallback for non-bridge agents (via `useMainTodoItems`).
- * - Empty: "No todos yet" (the `SidePane` frame owns collapse now — the
- *   panel no longer auto-collapses).
+ * - The `SidePane` frame owns the auto open/close (the board no longer
+ *   auto-collapses on its own — the frame's auto open/close does it).
  */
 export default function TodoBoardPanel({
   sessionId,
@@ -126,29 +149,38 @@ export default function TodoBoardPanel({
   const subagents = useBridge((state) =>
     sessionId ? state.todos[sessionId]?.subagents : undefined,
   ) ?? {};
-  const subagentEntries = Object.entries(subagents).filter(
-    ([, items]) => items.length > 0,
+  // The visibility filter (the SAME open-item rule the badge's count uses
+  // for the main column): a column renders only while it has an OPEN
+  // item — a fully-completed column/list is hidden.
+  const mainOpen = mainItems.filter((t) => t.status !== "completed").length;
+  const subagentEntries = Object.entries(subagents).filter(([, items]) =>
+    items.some((t) => t.status !== "completed"),
   );
 
-  if (mainItems.length === 0 && subagentEntries.length === 0) {
-    return (
-      <p className="text-center text-ui-sm text-foreground-subtlest">No todos yet</p>
-    );
+  // Nothing open (no todos at all, or every todo completed) → hidden.
+  if (mainOpen === 0 && subagentEntries.length === 0) {
+    return null;
   }
 
   const completed = mainItems.filter((t) => t.status === "completed").length;
 
   return (
     <div className="flex flex-col gap-3">
-      {mainItems.length > 0 && (
+      {mainOpen > 0 && (
         <div>
-          <p className="text-ui-base font-medium">
-            {completed}/{mainItems.length}
-          </p>
+          {/* The section header (the ZCode `Goal` row treatment): the
+              label + the open count (N/M — the completed count is part
+              of the fraction; the OPEN count carries the cue). */}
+          <div className="flex items-center gap-2">
+            <p className="text-ui-base font-medium">Todos</p>
+            <span className="text-ui-xs text-foreground-subtlest">
+              {completed}/{mainItems.length}
+            </span>
+          </div>
           <Progress value={(completed / mainItems.length) * 100} />
         </div>
       )}
-      {mainItems.length > 0 && <TodoItems items={mainItems} />}
+      {mainOpen > 0 && <TodoItems items={mainItems} />}
       {subagentEntries.map(([source, items]) => (
         <div key={source} className="pl-6">
           <p className="text-ui-xs text-foreground-subtlest">{source}</p>

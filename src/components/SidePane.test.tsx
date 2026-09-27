@@ -47,48 +47,16 @@ beforeEach(() => {
   useSessions.setState({ messages: {}, activeSessionId: null });
 });
 
-/** The subagents `TabsContent` (located via its content text). */
-function subagentsContent(): Element {
-  return screen
-    .getByText("No subagent sessions")
-    .closest('[data-slot="tabs-content"]')!;
-}
-
-/** The Radix `data-state` of the subagents content ("active"/"inactive"). */
-function subagentsContentState(): string {
-  return subagentsContent().getAttribute("data-state") ?? "";
-}
-
-describe("SidePane", () => {
-  it("renders the two tab triggers", () => {
-    render(<SidePane />);
-    expect(screen.getByRole("tab", { name: /Todos/ })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: /Subagents/ })).toBeTruthy();
+describe("SidePane (the status panel)", () => {
+  it("renders NO sections when there are no todos", () => {
+    const { container } = render(<SidePane />);
+    // The section is data-gated (the ZCode `canRender*` treatment): an
+    // empty pane is an empty frame — no "No todos yet" placeholders.
+    expect(screen.queryByText("Todos")).toBeNull();
+    expect(container.textContent).toBe("");
   });
 
-  it("clicking Subagents swaps the content to the subagent panel", () => {
-    render(<SidePane />);
-    // The `todos` tab is active by default: the subagent content is
-    // inactive (force-mounted — it stays in the document, visually hidden).
-    expect(subagentsContentState()).toBe("inactive");
-    // Radix's `TabsTrigger` activates on `mousedown` (not `click`).
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Subagents/ }));
-    expect(subagentsContentState()).toBe("active");
-  });
-
-  it("persists the selected tab to localStorage", () => {
-    render(<SidePane />);
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Subagents/ }));
-    expect(localStorage.getItem("side-pane-tab")).toBe("subagents");
-  });
-
-  it("restores the selected tab from localStorage on mount", () => {
-    localStorage.setItem("side-pane-tab", "subagents");
-    render(<SidePane />);
-    expect(subagentsContentState()).toBe("active");
-  });
-
-  it("shows a count badge on the inactive Todos trigger when the session has todos", () => {
+  it("renders the Todos section (label + N/M + progress) when there are open todos", () => {
     useSessions.setState({ activeSessionId: "main1" });
     useBridge.getState().applyTodoUpdate("main1", {
       source: "main",
@@ -97,60 +65,136 @@ describe("SidePane", () => {
         { content: "b", status: "completed" },
       ],
     });
-    render(<SidePane />);
-    // The badge shows only on the INACTIVE trigger.
-    expect(screen.queryByText("2")).toBeNull();
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Subagents/ }));
-    expect(screen.getByText("2")).toBeTruthy();
+    const { container } = render(<SidePane />);
+    // The section label + the open-count derivation (1 of 2 open).
+    expect(screen.getByText("Todos")).toBeTruthy();
+    expect(screen.getByText("1/2")).toBeTruthy();
+    const indicator = container.querySelector('[data-slot="progress-indicator"]');
+    expect(indicator).not.toBeNull();
   });
 
-  it("shows a 'Waiting' pill on the Subagents trigger while a subagent has a pending request (replacing the count badge)", () => {
-    useSubagents.getState().addSession(entry);
-    useBridge.getState().addRequest("sub1", {
-      requestId: "r1",
-      method: "ask",
-      source: "subagent:reviewer",
-      params: { question: "which library?" },
+  it("hides the Todos section when all todos are completed", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [
+        { content: "a", status: "completed" },
+        { content: "b", status: "completed" },
+      ],
     });
     render(<SidePane />);
-    const trigger = screen.getByRole("tab", { name: /Subagents/ });
-    // The SAME green "Waiting" treatment as the sidebar session row's badge.
-    expect(trigger.textContent).toContain("Waiting");
-    const pill = trigger.querySelector(".bg-success\\/14")!;
-    expect(pill.className).toContain("text-success");
-    // The entry-count badge is NOT shown while a request is pending.
-    expect(screen.queryByText("1")).toBeNull();
+    expect(screen.queryByText("Todos")).toBeNull();
+    expect(screen.queryByText("1/2")).toBeNull();
   });
 
-  it("shows the 'Waiting' pill on a pending permission prompt too (and drops it once settled)", () => {
-    useSubagents.getState().addSession(entry);
+  // -- Auto open/close (the "popup" rule: the pane is driven by TODOS
+  // -- ONLY — a subagent session never opens it; edge-triggered, manual
+  // -- choice wins) --
+
+  it("auto-expands the frame when open todos appear (0 → visible)", () => {
+    useSessions.setState({ activeSessionId: "main1" });
     act(() => {
-      usePermissions.getState().addPrompt("sub1", "p1", {
-        sessionId: "sub1",
-        toolCall: { title: "Run rm -rf" },
-        options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+      setSidePaneCollapsed(true);
+    });
+    const { container } = render(<SidePane />);
+    const frame = container.firstChild as HTMLElement;
+    expect(frame.style.width).toBe("0px");
+    // Open todos appear (the 0 → visible edge): the frame EXPANDS.
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [{ content: "a", status: "pending" }],
       });
     });
-    const { rerender } = render(<SidePane />);
-    expect(screen.getByRole("tab", { name: /Subagents/ }).textContent).toContain(
-      "Waiting",
-    );
-    act(() => {
-      usePermissions.getState().removePrompt("sub1", "p1");
-    });
-    rerender(<SidePane />);
-    // Settled: the entry-count badge is back.
-    expect(screen.getByRole("tab", { name: /Subagents/ }).textContent).toContain(
-      "1",
-    );
+    expect(frame.style.width).toBe("320px");
   });
 
-  it("keeps the entry-count badge when there are entries but NO pending requests", () => {
-    useSubagents.getState().addSession(entry);
-    render(<SidePane />);
-    const trigger = screen.getByRole("tab", { name: /Subagents/ });
-    expect(trigger.textContent).not.toContain("Waiting");
-    expect(trigger.textContent).toContain("1");
+  it("does NOT auto-expand on mount when todos already exist (no 0 → visible edge on the first render)", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [{ content: "a", status: "pending" }],
+    });
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    const { container } = render(<SidePane />);
+    // The pane was collapsed while the todos were already open: the first
+    // render is NOT an edge — the user's collapsed choice is respected.
+    expect((container.firstChild as HTMLElement).style.width).toBe("0px");
+  });
+
+  it("auto-collapses the frame when all todos complete (visible → 0)", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    const { container } = render(<SidePane />);
+    const frame = container.firstChild as HTMLElement;
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [
+          { content: "a", status: "pending" },
+          { content: "b", status: "pending" },
+        ],
+      });
+    });
+    expect(frame.style.width).toBe("320px"); // auto-expanded
+    // All todos complete (the visible → 0 edge): the frame COLLAPSES (the
+    // Todos section is hidden — the pane is hidden with it).
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [
+          { content: "a", status: "completed" },
+          { content: "b", status: "completed" },
+        ],
+      });
+    });
+    expect(frame.style.width).toBe("0px");
+  });
+
+  it("does NOT auto-expand the frame when a subagent session starts (the pane is driven by todos only)", () => {
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    const { container } = render(<SidePane />);
+    const frame = container.firstChild as HTMLElement;
+    expect(frame.style.width).toBe("0px");
+    // A subagent starts: NO 0 → visible edge (the pane is todos-only —
+    // a subagent no longer opens it): the frame STAYS COLLAPSED.
+    act(() => {
+      useSubagents.getState().addSession(entry);
+    });
+    expect(frame.style.width).toBe("0px");
+  });
+
+  it("respects a MANUAL collapse while work is in flight (a change without the edge does not re-expand)", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    const { container } = render(<SidePane />);
+    const frame = container.firstChild as HTMLElement;
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [{ content: "a", status: "pending" }],
+      });
+    });
+    expect(frame.style.width).toBe("320px"); // auto-expanded
+    // The user manually collapses (the header toggle) while work is open.
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    expect(frame.style.width).toBe("0px");
+    // Another todo arrives (1 → 2 — still visible, NO edge): the manual
+    // collapse is respected (no re-expand).
+    act(() => {
+      useBridge.getState().applyTodoUpdate("main1", {
+        source: "main",
+        todos: [
+          { content: "a", status: "pending" },
+          { content: "b", status: "pending" },
+        ],
+      });
+    });
+    expect(frame.style.width).toBe("0px");
   });
 
   it("flushes the drag width to localStorage on mouseup only (not on every mousemove)", () => {

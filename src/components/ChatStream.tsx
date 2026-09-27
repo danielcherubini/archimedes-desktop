@@ -850,6 +850,7 @@ export default function ChatStream() {
                 inTurn &&
                 i === units.length - 1
               }
+              sessionId={activeSessionId}
             />
           );
         })}

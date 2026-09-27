@@ -6,6 +6,9 @@ import {
   editChangeStat,
   failureText,
   readLineRange,
+  normalizeToolOutput,
+  summarizeSubagentFor,
+  subagentActivityFor,
 } from "./toolOutput";
 import {
   SquareTerminalIcon,
@@ -162,5 +165,243 @@ describe("failureText", () => {
   });
   it("returns undefined for undefined", () => {
     expect(failureText(undefined)).toBeUndefined();
+  });
+});
+
+describe("normalizeToolOutput (the subagent progress envelope)", () => {
+  const runningDetails = {
+    mode: "single",
+    results: [],
+    progress: [
+      {
+        agent: "explore",
+        status: "running",
+        task: "Read the markdown documentation",
+        currentTool: "read",
+        currentToolArgs: "docs/decisions/0001-foo.md",
+        currentToolStartedAt: Date.now() - 5000,
+      },
+    ],
+  };
+  it("renders a human-readable summary for the subagent details (not raw JSON)", () => {
+    const out = normalizeToolOutput(
+      { content: [], details: runningDetails },
+      false,
+      "subagent",
+    );
+    expect(out).toContain("explore");
+    expect(out).toContain("Read the markdown documentation");
+    expect(out).toContain("read");
+    // Not a raw JSON dump (no `{"mode"` envelope marker).
+    expect(out).not.toContain('{"mode"');
+  });
+  it("renders the LAST line of the subagent's streamed output when no current tool", () => {
+    const out = normalizeToolOutput(
+      {
+        content: [],
+        details: {
+          mode: "single",
+          progress: [
+            {
+              agent: "explore",
+              status: "running",
+              task: "Read the docs",
+              recentOutput: ["line one", "line two"],
+            },
+          ],
+        },
+      },
+      false,
+      "subagent",
+    );
+    expect(out).toContain("line two");
+    expect(out).not.toContain("line one");
+  });
+  it("returns the content text when present (not the details summary)", () => {
+    const out = normalizeToolOutput(
+      {
+        content: [{ type: "text", text: "final output" }],
+        details: runningDetails,
+      },
+      false,
+      "subagent",
+    );
+    expect(out).toBe("final output");
+  });
+  it("still JSON-dumps a non-subagent details", () => {
+    const out = normalizeToolOutput(
+      { content: [], details: { foo: "bar" } },
+      false,
+      "some_other_tool",
+    );
+    expect(out).toBe('{"foo":"bar"}');
+  });
+});
+
+describe("summarizeSubagentFor (one subagent's summary)", () => {
+  it("filters to the matching subagent by childSessionId (results)", () => {
+    const out = summarizeSubagentFor(
+      {
+        mode: "single",
+        results: [
+          {
+            agent: "a",
+            task: "task-a",
+            childSessionId: "sub-a",
+            exitCode: 0,
+            finalOutput: "done-a",
+          },
+          {
+            agent: "b",
+            task: "task-b",
+            childSessionId: "sub-b",
+            exitCode: 0,
+            finalOutput: "done-b",
+          },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    expect(out).toContain("task-a");
+    expect(out).not.toContain("task-b");
+  });
+  it("filters to the matching subagent by task (progress)", () => {
+    const out = summarizeSubagentFor(
+      {
+        mode: "parallel",
+        progress: [
+          { agent: "a", task: "task-a", status: "running" },
+          { agent: "b", task: "task-b", status: "running" },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    expect(out).toContain("task-a");
+    expect(out).not.toContain("task-b");
+  });
+  it("returns undefined when no entry matches", () => {
+    const out = summarizeSubagentFor(
+      {
+        mode: "single",
+        results: [
+          { agent: "a", task: "task-a", childSessionId: "sub-a" },
+        ],
+      },
+      "sub-unknown",
+      "task-unknown",
+    );
+    expect(out).toBeUndefined();
+  });
+});
+
+describe("subagentActivityFor (the one-line activity)", () => {
+  it("returns the one-line activity of a progress entry matching by task", () => {
+    const out = subagentActivityFor(
+      {
+        progress: [
+          {
+            agent: "a",
+            task: "task-a",
+            status: "running",
+            currentTool: "read",
+            currentToolArgs: "docs/foo.md",
+            currentToolStartedAt: Date.now() - 12000,
+          },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    // `currentTool` + `currentToolArgs` + the live duration.
+    expect(out).toBe("read: docs/foo.md · 12s");
+  });
+  it("returns the one-line activity of a results entry matching by childSessionId", () => {
+    const out = subagentActivityFor(
+      {
+        results: [
+          {
+            agent: "a",
+            task: "task-a",
+            childSessionId: "sub-a",
+            exitCode: 0,
+            finalOutput: "line1\nline2",
+          },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    // The LAST line of the final output (the `subagentActivityLine` treatment).
+    expect(out).toBe("line2");
+  });
+  it("returns `Done` for a results entry with no final output", () => {
+    const out = subagentActivityFor(
+      {
+        results: [
+          {
+            agent: "a",
+            task: "task-a",
+            childSessionId: "sub-a",
+            exitCode: 0,
+          },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    expect(out).toBe("Done");
+  });
+  it("returns undefined when no entry matches the sessionId / task", () => {
+    const out = subagentActivityFor(
+      {
+        progress: [
+          { agent: "a", task: "task-a", status: "running" },
+        ],
+        results: [
+          { agent: "a", task: "task-a", childSessionId: "sub-a" },
+        ],
+      },
+      "sub-unknown",
+      "task-unknown",
+    );
+    expect(out).toBeUndefined();
+  });
+  it("returns undefined when details is undefined / null / a non-object", () => {
+    expect(subagentActivityFor(undefined, "sub-a", "task-a")).toBeUndefined();
+    expect(subagentActivityFor(null, "sub-a", "task-a")).toBeUndefined();
+    expect(subagentActivityFor("details", "sub-a", "task-a")).toBeUndefined();
+  });
+  it("filters FIRST (a finished subagent keeps its results entry while a sibling runs)", () => {
+    // A's finished entry lives in `results`; B is still running in
+    // `progress`. Prefer-then-filter would pick `progress` (B running) for
+    // A's row — a stale preview. Filter-first picks A's `results` entry.
+    const out = subagentActivityFor(
+      {
+        progress: [
+          { agent: "a", task: "task-a", status: "completed" },
+          {
+            agent: "b",
+            task: "task-b",
+            status: "running",
+            currentTool: "read",
+            currentToolArgs: "docs/b.md",
+          },
+        ],
+        results: [
+          {
+            agent: "a",
+            task: "task-a",
+            childSessionId: "sub-a",
+            exitCode: 0,
+            finalOutput: "done-a",
+          },
+        ],
+      },
+      "sub-a",
+      "task-a",
+    );
+    expect(out).toBe("done-a");
   });
 });

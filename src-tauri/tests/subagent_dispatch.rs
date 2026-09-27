@@ -792,3 +792,72 @@ async fn dispatch_subagent_cost_push_is_accumulated_into_metrics() {
     let _ = manager.close_session(&main_sid).await;
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+/// (DIAGNOSTIC) The subagent's OWN `session-update` stream flows: the
+/// subagent's driver task (on the worker runtime) normalizes the subagent
+/// pi process's events and emits them as `session-update` frames keyed by
+/// the subagent's pi id — the frontend's `SubagentTranscript` reads them
+/// from `useSessions.messages[sessionId]`. Assert the subagent's stream
+/// contains the echo text (the subagent's `agent_message_chunk` events
+/// reached the sink, not just the `subagent-closed` summary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_streams_the_subagents_own_session_updates() {
+    let config_dir = temp_config_dir();
+    let events: Arc<StdMutex<Vec<(String, Value)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let (manager, main_sid, _sub) = setup_dispatch_test(
+        &config_dir,
+        &[
+            ("FAKE_PI_DISPATCH", "1"),
+            ("FAKE_PI_DISPATCH_TASK", "do the task"),
+        ],
+        &events,
+    )
+    .await;
+
+    // The main prompt fires the dispatch frame and blocks until the
+    // subagent settles.
+    let reason = tokio::time::timeout(
+        Duration::from_secs(30),
+        manager.send_prompt(&main_sid, "go".to_string()),
+    )
+    .await
+    .expect("the main prompt (the dispatch E2E) must not stall")
+    .expect("main send_prompt should succeed");
+    assert_eq!(
+        reason,
+        StopReason::EndTurn,
+        "the main prompt resolves end_turn"
+    );
+
+    // The subagent's session id (from `subagent-session-started`).
+    let sub_sid = {
+        let evs = events.lock().unwrap();
+        let started = evs
+            .iter()
+            .find(|(name, p)| {
+                name.as_str() == "subagent-session-started"
+                    && p["parentSessionId"].as_str() == Some(main_sid.as_str())
+            })
+            .expect("a subagent-session-started should fire")
+            .1
+            .clone();
+        started["sessionId"].as_str().unwrap().to_string()
+    };
+
+    // The subagent's OWN `session-update` stream contains the echo text
+    // (the subagent's `agent_message_chunk` events reached the sink —
+    // NOT just the `subagent-closed` summary).
+    assert!(
+        wait_for_event(&events, Duration::from_secs(5), |evs| stream_texts(
+            evs, &sub_sid
+        )
+        .iter()
+        .any(|t| t == "do the task"))
+        .await,
+        "the subagent's own session-update stream should carry its turn text"
+    );
+
+    // Cleanup.
+    let _ = manager.close_session(&main_sid).await;
+    let _ = std::fs::remove_dir_all(&config_dir);
+}

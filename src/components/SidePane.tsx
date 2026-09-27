@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs";
 import { useSessions } from "../store/sessions";
-import { useSubagents } from "../store/subagents";
-import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
-import { getSidePaneCollapsed, subscribeSidePane } from "../lib/sidePaneState";
-import TodoBoardPanel, { useMainTodoItems } from "./TodoBoardPanel";
-import SubagentPanel from "./SubagentPanel";
+import { getSidePaneCollapsed, setSidePaneCollapsed, subscribeSidePane } from "../lib/sidePaneState";
+import TodoBoardPanel, { useMainOpenTodoCount } from "./TodoBoardPanel";
+import { SubagentModals } from "./SubagentModals";
 
 const WIDTH_KEY = "side-pane-width";
-const TAB_KEY = "side-pane-tab";
 const MIN_WIDTH = 240;
 const MAX_WIDTH = 480;
 const DEFAULT_WIDTH = 320;
@@ -26,25 +22,35 @@ function initialWidth(): number {
   return clampWidth(n);
 }
 
-function initialTab(): "todos" | "subagents" {
-  return localStorage.getItem(TAB_KEY) === "subagents" ? "subagents" : "todos";
-}
-
 /**
  * The right-hand side pane: a 320px-default resizable + collapsible frame
- * hosting the `TodoBoardPanel` (Todos tab) and the `SubagentPanel`
- * (Subagents tab) — moved up from the `ChatStream` to the `App` level so
- * they render for every session state.
+ * hosting a STATUS PANEL (the ZCode `ConversationStatusPanel` treatment —
+ * NOT a tabbed sidebar): a single data-gated section in one content
+ * area, rendering only while it has something to show:
  *
+ * - **Todos section** (`TodoBoardPanel`): the `Todos` label + `N/M` +
+ *   progress header, the checklist, the subagent todo columns — hidden
+ *   while there are no OPEN todos (no todos at all, or a
+ *   fully-completed list; the `useMainOpenTodoCount` derivation).
+ *
+ * - **Auto open/close (the "popup" rule): the frame EXPANDS when open
+ *   todos go 0 → >0 and COLLAPSES when there are no open todos. The
+ *   pane is driven by TODOS ONLY — a subagent session never opens it
+ *   (the subagents live under the "Delegating" card + the dedicated
+ *   modal; their sudo modals stay mounted at the frame root regardless).
+ *   The logic is EDGE-TRIGGERED (a `prevVisible` ref): a MANUAL
+ *   collapse/expand while `visible` is unchanged is respected — a count
+ *   change without the edge never flips the flag.
  * - **Collapse mechanism: the frame's `width: 0` + `overflow: hidden` —
- *   NOT `display: none`, NOT a transform, NOT unmount.** The content stays
- *   mounted and `fixed` overlays escape `overflow` clipping, so a collapsed
- *   pane never hides a pending `SudoConfirmModal`/`SudoPasswordModal` (the
- *   panel's doc comment requires this invariant). The collapsed flag is
- *   shared with the header toggle (Task 6) via `sidePaneState`: the module
- *   seeds the flag from `localStorage` at import (it is the single
- *   persistence owner) — `SidePane` only READS it via
- *   `useSyncExternalStore` (it has no collapse control of its own).
+ *   NOT `display: none`, NOT a transform, NOT unmount.** The content
+ *   stays mounted and `fixed` overlays escape `overflow` clipping, so a
+ *   collapsed pane never hides a pending `SudoConfirmModal`/
+ *   `SudoPasswordModal` (rendered by `SubagentModals` at the frame root).
+ *   The collapsed flag is shared with the header toggle (Task 6) via
+ *   `sidePaneState`: the module seeds the flag from `localStorage` at
+ *   import (it is the single persistence owner) — `SidePane` READS it
+ *   via `useSyncExternalStore` and WRITES it only from the auto
+ *   open/close edge (the toggle writes it itself).
  * - **Resize:** a 4px drag handle on the frame's left edge (a `w-1`
  *   `cursor-col-resize` div, transparent hit area — a 2px
  *   `bg-foreground-subtlest/50` line shows on hover/while dragging). The
@@ -54,26 +60,14 @@ function initialTab(): "todos" | "subagents" {
  *   ~60/s sync writes). The handle captures the pointer on `pointerdown`
  *   (released on `pointerup`/`pointercancel`) so a release outside the
  *   webview still ends the drag; a `blur` listener is the fallback.
- * - **Tabs:** manual selection, `localStorage` (`"side-pane-tab"`),
- *   default Todos, no auto-switching. Inactive triggers show a count
- *   badge: Todos = the `useMainTodoItems` derivation (the SAME extraction
- *   the panel's checklist consumes — the badge and the rendered list can
- *   never disagree); Subagents = the subagent entry count — REPLACED by
- *   a green "Waiting" pill (the SAME treatment as the sidebar session
- *   row's `waiting` badge in `SpacesList`) while ANY subagent session has
- *   a pending interactive request (via `usePendingSubagentRequests` —
- *   the SAME derivation the `ChatStream` header toggle dot uses, so the
- *   two cues can never disagree). The pill is the cue for the
- *   INACTIVE-TAB case (the entry count does not change when a request
- *   arrives); the `ChatStream` header toggle dot is the cue for the
- *   COLLAPSED-PANE case (the pill is clipped by the frame's `width: 0`
- *   + `overflow: hidden` when collapsed — it cannot carry the cue
- *   then).
+ * - **`SubagentModals`:** the bridge sudo modals for the subagent
+ *   entries, rendered at the frame ROOT (a `fixed` overlay, NOT inside
+ *   the scrollable content — see the component doc in
+ *   `SubagentModals`).
  */
 export default function SidePane() {
   const [width, setWidthState] = useState(initialWidth);
-  const [tab, setTab] = useState<"todos" | "subagents">(initialTab);
-  // The shared collapsed flag (Task 6's header toggle consumes the same
+  // The shared collapsed flag (the header toggle consumes the same
   // module — the module seeds it from localStorage at import).
   const collapsed = useSyncExternalStore(
     subscribeSidePane,
@@ -89,12 +83,6 @@ export default function SidePane() {
     widthRef.current = clamped;
     setWidthState(clamped);
   }, []);
-
-  const selectTab = (value: string) => {
-    const next = value === "subagents" ? "subagents" : "todos";
-    setTab(next);
-    localStorage.setItem(TAB_KEY, next);
-  };
 
   // The drag (track `mousemove` on `window` while dragging; the handle
   // captures the pointer so a release outside the webview still delivers
@@ -163,20 +151,25 @@ export default function SidePane() {
     };
   }, [dragging, setWidth]);
 
-  // The tab count badges: the resolved main-column todo count for the
-  // active session (the SAME derivation `TodoBoardPanel` uses) and the
-  // subagent entry count.
+  // The data: the resolved main-column OPEN todo count for the active
+  // session (the SAME derivation the Todos section's visibility uses).
   const activeSessionId = useSessions((s) => s.activeSessionId);
-  const mainTodoCount = useMainTodoItems(activeSessionId).length;
-  // Stable-reference selectors (no fresh values built INSIDE the selector —
-  // Zustand re-renders forever otherwise); the pending count comes from
-  // `usePendingSubagentRequests` (the SAME derivation the `ChatStream`
-  // header toggle dot uses — the pill is the cue for the inactive-tab
-  // case, the toggle dot for the collapsed-pane case).
-  const subagentEntries = useSubagents((s) => s.entries);
-  const pendingSubagentRequests = usePendingSubagentRequests();
-  const subagentCount = Object.keys(subagentEntries).length;
-  const subagentWaiting = pendingSubagentRequests > 0;
+  const mainTodoCount = useMainOpenTodoCount(activeSessionId);
+
+  // The auto open/close (the "popup" rule — see the component doc): the
+  // frame follows `visible` EDGE-TRIGGERED (the `prevVisible` ref — a
+  // manual collapse/expand while `visible` is unchanged is respected: a
+  // count change without the edge never flips the flag). The pane is
+  // driven by TODOS ONLY (a subagent session never opens it — the
+  // subagents live under the "Delegating" card + the dedicated modal).
+  const visible = mainTodoCount > 0;
+  const prevVisibleRef = useRef(visible);
+  useEffect(() => {
+    const was = prevVisibleRef.current;
+    prevVisibleRef.current = visible;
+    if (was === visible) return;
+    setSidePaneCollapsed(!visible);
+  }, [visible]);
 
   return (
     // Collapse = `width: 0` + `overflow: hidden` (the content stays mounted;
@@ -198,69 +191,19 @@ export default function SidePane() {
           }`}
         />
       </div>
-      {/* The `Tabs` root wraps the WHOLE pane (Radix requires the
-          `TabsContent`s to be descendants of the root): the tab bar +
-          the content. */}
-      <Tabs value={tab} onValueChange={selectTab} className="flex h-full flex-col">
-        <div className="flex h-9 items-center gap-0.5 px-2">
-          <TabsList variant="line" className="h-full">
-            <TabsTrigger
-              value="todos"
-              className="rounded-md px-2 text-ui-sm data-active:bg-selected"
-            >
-              Todos
-              {tab !== "todos" && mainTodoCount > 0 && (
-                <span className="ml-1 rounded-full bg-surface px-1.5 text-ui-xs">
-                  {mainTodoCount}
-                </span>
-              )}
-            </TabsTrigger>
-            <TabsTrigger
-              value="subagents"
-              className="rounded-md px-2 text-ui-sm data-active:bg-selected"
-            >
-              Subagents
-              {tab !== "subagents" &&
-                (subagentWaiting ? (
-                  // The green "Waiting" pill (the SAME treatment as the
-                  // sidebar session row's `waiting` badge in `SpacesList`) —
-                  // REPLACES the entry-count badge while a request is
-                  // pending (the count does not change when a request
-                  // arrives, so it carries no attention cue).
-                  <span className="ml-1 rounded-full bg-success/14 px-2 text-ui-sm font-medium text-success">
-                    Waiting
-                  </span>
-                ) : subagentCount > 0 ? (
-                  <span className="ml-1 rounded-full bg-surface px-1.5 text-ui-xs">
-                    {subagentCount}
-                  </span>
-                ) : null)}
-            </TabsTrigger>
-          </TabsList>
+      {/* The STATUS PANEL (the ZCode `ConversationStatusPanel` treatment):
+          the data-gated sections stacked in one content area (no tabs). */}
+      <div className="flex-1 overflow-y-auto p-3">
+        <div className="flex flex-col gap-4">
+          {/* The Todos section (data-gated by `TodoBoardPanel` — renders
+              `null` while there are no open todos). */}
+          <TodoBoardPanel sessionId={activeSessionId} />
         </div>
-        <div className="flex-1 overflow-y-auto p-3">
-          {/* `forceMount`: the content stays MOUNTED for every tab (the
-              panel is the ONLY render site for subagent-session requests
-              — an unrendered request would hang until the bridge timeout);
-              the `data-[state=inactive]:hidden` class provides the visual
-              tab swap (the primitive's own `hidden` attribute is suppressed
-              by `forceMount`). */}
-          <TabsContent
-            value="todos"
-            forceMount
-            className="m-0 data-[state=inactive]:hidden"
-          >
-            <TodoBoardPanel sessionId={activeSessionId} />
-          </TabsContent>
-          <TabsContent
-            value="subagents"
-            forceMount
-            className="m-0 data-[state=inactive]:hidden"
-          >
-            <SubagentPanel />
-          </TabsContent>
-        </div>
-      </Tabs>
+      </div>
+      {/* The bridge sudo modals for the entries (at the frame ROOT —
+          `fixed` overlays, NOT inside the scrollable content: a collapsed
+          pane never hides a pending modal). */}
+      <SubagentModals />
     </div>
   );
 }

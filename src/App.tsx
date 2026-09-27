@@ -21,6 +21,7 @@ import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 import SidePane from "./components/SidePane";
+import SubagentDetailHost from "./components/SubagentDetailHost";
 
 function App() {
   // Register the Tauri event listeners once; dispatch into the stores.
@@ -188,6 +189,12 @@ function App() {
       <SpacesList />
       <ChatStream />
       <SidePane />
+      {/* The dedicated subagent transcript view (Task 5): the single
+          ALWAYS-MOUNTED host — the visible modal for the selected
+          subagent + a hidden `SubagentTranscript` for every other one
+          (a `fixed` overlay, so its position in the flex row does not
+          affect layout). */}
+      <SubagentDetailHost />
     </div>
   );
 }
