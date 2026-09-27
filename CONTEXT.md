@@ -9,16 +9,28 @@ The Archimedes Desktop application itself — the RPC *client* role: it spawns a
 _Avoid_: App, frontend, IDE
 
 **Agent**:
-An external coding agent process (pi, …) that speaks pi's RPC mode (`--mode rpc`), spawned by the Client as a subprocess and communicated with over stdio JSONL (one JSON object per line, both directions).
-_Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated pi RPC session — see its entry below.)
+The conversation *partner* — the thing that produces the assistant's responses. Embodied either as a spawned external process (pi, which speaks pi's RPC mode `--mode rpc` over stdio JSONL, one JSON object per line, both directions) or in the desktop's in-process harness (a **Native session** — no external process). _Generalized 2026-10-06: a native session has no subprocess; the partner is embodied in the desktop's own runtime._
+_Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated session — see its entry below.)
+
+**Agent harness**:
+The machinery that runs an agent conversation end-to-end — the model loop (model call → tool dispatch → retry/compaction) + the tool registry + session persistence + provider integration. A harness is a *runtime*, not a model: pi is one harness (an external Node process, its `agent-core`); the desktop's native runtime is another (in-process Rust). The harness owns the conversation's *control flow*; the model only produces tokens, the tools only act on the world.
+_Avoid_: Agent (that's the conversation *partner*; a harness *runs* it), loop, brain, runtime (too generic)
 
 **Space**:
 A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: one active conversation per Space — its most recent live **Session** (multiple live Sessions may coexist app-wide: the one-live policy was lifted 2026-09-22, ADR 0002 superseded); stored conversations of a Space survive.
 _Avoid_: Project, workspace, folder, directory, environment
 
 **Session**:
-One live conversation between the Client and one agent process, backed by exactly one spawned subprocess. The unit of process lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session.
+One live conversation, backed by exactly one **Agent harness** — either a spawned external process (an **External session**) or the desktop's in-process runtime (a **Native session**). The unit of lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session. _Generalized 2026-10-06: a native session has no subprocess; embodiment is a harness, not a process._
 _Avoid_: Conversation, chat, thread, run
+
+**Native session**:
+A **Session** whose **Agent harness** is the desktop's in-process Rust runtime — no spawned agent process, no bridge, no pi. Driven by the desktop's own AgentLoop (a tokio task) that calls the model directly (an OpenAI-compatible provider), executes tools in-process (Rust executors), and persists to SQLite.
+_Avoid_: In-process session, local session, built-in session
+
+**External session**:
+A **Session** whose **Agent harness** is a spawned external agent process (today: pi, `pi --mode rpc`). The desktop is the RPC client; tools execute in the child (pre-tool-move) or are delegated to the desktop (tool-move+).
+_Avoid_: pi session, child session, remote session
 
 **Subagent session**:
 A desktop-spawned pi RPC session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
