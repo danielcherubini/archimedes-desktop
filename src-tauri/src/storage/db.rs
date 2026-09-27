@@ -70,6 +70,8 @@ pub struct SpaceRow {
     pub created_at: i64,
     /// Unix milliseconds.
     pub last_opened_at: i64,
+    /// Trusted Space flag (untrusted by default; fail-closed reads).
+    pub trusted: bool,
 }
 
 /// The app's SQLite database.
@@ -92,6 +94,22 @@ impl Db {
         // Enforce the ON DELETE CASCADE on messages.
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(SCHEMA)?;
+        // One-time migration for pre-existing databases: add `trusted`
+        // (fresh databases already have it from SCHEMA). Gated on a schema
+        // pre-check — the ALTER runs only when the column is absent, so a
+        // re-open never issues it and no error string is matched (the
+        // backfill below, by contrast, is idempotent via DO NOTHING).
+        let has_trusted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = 'trusted'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_trusted == 0 {
+            conn.execute(
+                "ALTER TABLE spaces ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // One-time backfill for pre-existing databases: give a space row to every
         // distinct stored session cwd (canonicalized). A vanished folder is skipped
         // silently — its sessions stay stored, just without a space.
@@ -99,6 +117,14 @@ impl Db {
         // every open (that would collapse the sidebar's recent-first ordering to a
         // tie on every restart — recency is refreshed by `upsert_space`, which runs
         // on real starts/resumes, i.e. Task 3's `record_session` hook).
+        //
+        // Key regime: rows are keyed by CANONICAL path — every upsert source
+        // canonicalizes (`upsert_space` is fed `info.cwd`, canonicalized at
+        // `start_session`/`resume_session`; the backfill above canonicalizes too),
+        // so this migration intentionally does NOT re-key pre-existing non-canonical
+        // rows. A hypothetical legacy non-canonical row is fail-closed: the
+        // canonical lookup never matches it, so it can only cause MORE prompts,
+        // never fewer.
         let cwds: Vec<String> = {
             let mut stmt = conn.prepare("SELECT DISTINCT cwd FROM sessions")?;
             let rows = stmt
@@ -266,24 +292,43 @@ impl Db {
 
     /// Insert or touch the bookkeeping row for a folder.
     ///
+    /// Keyed by the canonical path (the single key form, ADR 0010) — the
+    /// input is canonicalized here, falling back to the raw string when the
+    /// folder no longer exists (a best-effort write; reads stay fail-closed).
     /// `created_at` is preserved on conflict; `last_opened_at` is always
     /// refreshed (an actual start/resume is a real "open"). No folder
     /// validation happens here — whether the folder exists is the caller's
     /// problem (the canonicalizing gate is in `start_session`/`space_for_path`).
     pub fn upsert_space(&self, path: &str) -> Result<(), DbError> {
+        let key = space_key(path).unwrap_or_else(|| path.to_string());
         self.conn.lock().expect("db mutex poisoned").execute(
             "INSERT INTO spaces (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
                  ON CONFLICT(path) DO UPDATE SET last_opened_at = excluded.last_opened_at",
-            params![path, now_ms()],
+            params![key, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Set (or clear) a space's trust flag, keyed by the canonical path
+    /// (raw fallback on canonicalize failure, as in `upsert_space`).
+    ///
+    /// Returns `true` when a row matched, `false` when nothing matched (a
+    /// missing row is a no-op, not an error — but a diagnosable one, not a
+    /// silent one).
+    pub fn set_space_trusted(&self, path: &str, trusted: bool) -> Result<bool, DbError> {
+        let key = space_key(path).unwrap_or_else(|| path.to_string());
+        let n = self.conn.lock().expect("db mutex poisoned").execute(
+            "UPDATE spaces SET trusted = ?2 WHERE path = ?1",
+            params![key, trusted],
+        )?;
+        Ok(n > 0)
     }
 
     /// All spaces, most recently opened first.
     pub fn list_spaces(&self) -> Result<Vec<SpaceRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT path, created_at, last_opened_at
+            "SELECT path, created_at, last_opened_at, trusted
              FROM spaces
              ORDER BY last_opened_at DESC, path ASC",
         )?;
@@ -293,6 +338,7 @@ impl Db {
                     path: row.get(0)?,
                     created_at: row.get(1)?,
                     last_opened_at: row.get(2)?,
+                    trusted: row.get::<_, i64>(3)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -311,6 +357,24 @@ impl Db {
         Ok(found)
     }
 
+    /// The trust flag for the space at `cwd`, keyed by the canonical path
+    /// (the single key form, ADR 0010). Fail-closed: a canonicalize failure
+    /// or a missing row is `Ok(false)` — untrusted.
+    pub fn space_trusted(&self, cwd: &std::path::Path) -> Result<bool, DbError> {
+        // Fail-closed on canonicalize failure (unlike the write path's raw
+        // fallback): a folder that can't be canonicalized is untrusted.
+        let Some(key) = space_key(cwd) else {
+            return Ok(false);
+        };
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = guard.prepare("SELECT trusted FROM spaces WHERE path = ?1")?;
+        let found = stmt
+            .query_map(params![key], |row| row.get::<_, i64>(0))?
+            .next()
+            .transpose()?;
+        Ok(found.map(|t| t != 0).unwrap_or(false))
+    }
+
     /// Delete the bookkeeping row only (conversations/messages are NOT touched).
     pub fn delete_space(&self, path: &str) -> Result<(), DbError> {
         self.conn
@@ -327,6 +391,16 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The single key form of a `spaces` row (ADR 0010): the canonical path.
+/// `None` when the path can't be canonicalized (the folder is missing, or
+/// the filesystem changed) — the write path falls back to the raw string
+/// (best-effort), the read path fails closed.
+fn space_key(path: impl AsRef<std::path::Path>) -> Option<String> {
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|c| c.display().to_string())
 }
 
 const SCHEMA: &str = r#"
@@ -351,6 +425,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE TABLE IF NOT EXISTS spaces (
     path TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
-    last_opened_at INTEGER NOT NULL
+    last_opened_at INTEGER NOT NULL,
+    trusted INTEGER NOT NULL DEFAULT 0
 );
 "#;

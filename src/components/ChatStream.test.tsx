@@ -83,7 +83,7 @@ function seedLiveSession(): void {
     sessions: [
       { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
     ],
-    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [],
     messages: { s1: [] },
     inTurn: {},
@@ -104,7 +104,7 @@ function seedStoredSession(
   useSessions.setState({
     activeSessionId: "s1",
     sessions: [],
-    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [
       { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities },
     ],
@@ -131,7 +131,7 @@ function seedLiveSessionWithImages(): void {
         capabilities: { promptCapabilities: { image: true } },
       },
     ],
-    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+    spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [],
     messages: { s1: [] },
     inTurn: {},
@@ -805,7 +805,7 @@ describe("ChatStream", () => {
         { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
         { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
       ],
-      spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1 }],
+      spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
       historySessions: [],
       messages: {
         s1: [

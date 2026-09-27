@@ -426,8 +426,17 @@ pub struct SessionDriver {
     /// How long the establishment phase (agent spawn + `get_state`
     /// establisher) may run before it is cancelled. Default: 30 s.
     pub(crate) establish_timeout: Duration,
-    /// Persistence (main only; `None` for subagents — ephemeral, not stored).
+    /// Transcript persistence (main only; `None` for subagents —
+    /// ephemeral, not stored). Gates `persist_update` only; the trust
+    /// lookup is `trust_db` (below — main AND subagent).
     pub(crate) db: Option<Arc<Db>>,
+    /// The trust lookup source (ADR 0010): the `space_trusted` lookup the
+    /// permission gate uses to auto-confirm a TRUSTED Space's `confirm`.
+    /// Independent of `db` — `db` gates TRANSCRIPT PERSISTENCE (main only;
+    /// `None` for subagents, which are ephemeral), while `trust_db` is the
+    /// trust lookup for BOTH main and subagent Sessions (`None` = fail-
+    /// closed: the gate prompts, today's flow).
+    pub(crate) trust_db: Option<Arc<Db>>,
     /// In-memory per-`messageId` agent-text accumulator for the FINAL
     /// OUTPUT (subagents only; `None` for main — main persists to the DB).
     pub(crate) text_capture: Option<Arc<StdMutex<HashMap<String, String>>>>,
@@ -450,7 +459,8 @@ pub struct SessionDriver {
 
 impl SessionDriver {
     /// Create a driver (a fresh sessions map, empty pending maps, a 30 s
-    /// establish timeout, no persistence / captures / subagent handle).
+    /// establish timeout, no persistence / trust db / captures / subagent
+    /// handle).
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -463,6 +473,7 @@ impl SessionDriver {
             runner: Arc::new(bridge::RealSudoRunner),
             establish_timeout: Duration::from_secs(30),
             db: None,
+            trust_db: None,
             text_capture: None,
             last_message_id: None,
             cost_capture: None,
@@ -614,6 +625,10 @@ impl SessionDriver {
         let todo_store_arc = self.todo_store.clone();
         let establish_timeout = self.establish_timeout;
         let db = self.db.clone();
+        // The trust lookup source (ADR 0010 — the permission gate's
+        // `space_trusted` lookup; independent of `db`, which gates transcript
+        // persistence only).
+        let trust_db = self.trust_db.clone();
         // The capture hooks (subagents only; `None` for main). Clones for
         // the driver task's event handler.
         let text_capture = self.text_capture.clone();
@@ -814,8 +829,15 @@ impl SessionDriver {
                         };
                         // The permission gate (the bundled gate extension's
                         // `ctx.ui.confirm` / `ctx.ui.select` dialogs).
+                        // `trust_db` + `cwd` let a TRUSTED Space's `confirm`
+                        // short-circuit (ADR 0010) — one call site serves both
+                        // main and subagent Sessions: the main manager's
+                        // `attach_db` sets `trust_db` (the same db), and the
+                        // subagent manager threads it through `new` (its `db`
+                        // stays `None` — ephemeral, no transcript persistence).
                         permission::handle_extension_ui_request(
                             &info.session_id, req, &handle, &sink, &pending_permissions_arc,
+                            trust_db.as_ref(), &info.cwd,
                         )
                         .await;
                     }
@@ -1072,6 +1094,7 @@ async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
 /// Manages all live ACP sessions (the MAIN sessions).
 ///
 /// Owns a [`SessionDriver`] (db: attached via [`Self::attach_db`],
+/// `trust_db`: the same db, attached via [`Self::attach_db`],
 /// captures: `None`, subagent: injected via [`Self::set_subagent_manager`])
 /// plus the agent registry + config dir. DB recording and
 /// `record_session` stay here; the shared driver
@@ -1136,9 +1159,13 @@ impl SessionManager {
         })
     }
 
-    /// Attach the persistence database. Persistence is a no-op without it.
+    /// Attach the persistence database. Sets BOTH `db` (transcript
+    /// persistence) and `trust_db` (the ADR 0010 trust lookup) to the same
+    /// db — main-session behavior is unchanged (same db, same lookup).
+    /// Persistence is a no-op without it.
     pub fn attach_db(&mut self, db: Arc<Db>) {
-        self.driver.db = Some(db);
+        self.driver.db = Some(db.clone());
+        self.driver.trust_db = Some(db);
     }
 
     /// Override the establishment timeout (default 30 s; tests shrink it
@@ -3295,7 +3322,9 @@ mod session_tests {
 
     /// (permission) `FAKE_PI_GATE=1`: the `prompt` turn fires the gate
     /// dialog (`extension_ui_request` `confirm` → a `permission-request`
-    /// event with the `[Allow, Block]` options) → `respond_permission`
+    /// event with the `[Allow, Block, Don't ask again for this Space]`
+    /// options — no `db` is attached, so the Space is untrusted and the
+    /// third option is offered) → `respond_permission`
     /// (`Selected("allow")` → `confirmed: true`) → the turn still resolves
     /// `EndTurn` (the fake only settles after the response).
     #[tokio::test]
@@ -3334,7 +3363,7 @@ mod session_tests {
                 // The `permission-request` event (the synthesized shape —
                 // the `request` sub-object mirrors the frontend's
                 // `PermissionRequest` type; `confirm` frames offer
-                // `[Allow, Block]`).
+                // `[Allow, Block, Don't ask again for this Space]`).
                 let mut request_id = None;
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 while std::time::Instant::now() < deadline && request_id.is_none() {
@@ -3352,8 +3381,8 @@ mod session_tests {
                                 .collect();
                             assert_eq!(
                                 options,
-                                vec!["allow", "reject"],
-                                "confirm frames offer [Allow, Block]"
+                                vec!["allow", "reject", "trust-space"],
+                                "confirm frames offer [Allow, Block, Don't ask again for this Space]"
                             );
                             assert_eq!(request["sessionId"], sid);
                             // The tool name is in the title (the frontend's

@@ -2478,7 +2478,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone())
+        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone(), None)
             .expect("subagent manager should build");
         let spawn = crate::agent::session::SubagentSpawn {
             manager: Arc::new(manager),
@@ -2547,7 +2547,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone())
+        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone(), None)
             .expect("subagent manager should build");
         let spawn = crate::agent::session::SubagentSpawn {
             manager: Arc::new(manager),

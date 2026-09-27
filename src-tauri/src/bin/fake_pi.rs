@@ -67,6 +67,11 @@ const USAGE: &str = r#"{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"cost"
 /// bundled gate extension produces).
 const GATE_REQUEST: &str = r#"{"type":"extension_ui_request","id":"gate-1","method":"confirm","title":"Allow bash?","message":"ls -la"}"#;
 
+/// The `FAKE_PI_SELECT` dialog (the `ask` tool's `ctx.ui.select` flow —
+/// a `select` request the agent awaits; the turn settles on the client's
+/// response, like the gate).
+const SELECT_REQUEST: &str = r#"{"type":"extension_ui_request","id":"select-1","method":"select","title":"Pick one","options":["A","B"]}"#;
+
 /// The `FAKE_PI_UNKNOWN` event (an event type this `PiRpc` version doesn't
 /// know — must be received as `RpcEvent::Unknown`, never an error).
 const UNKNOWN_EVENT: &str = r#"{"type":"brand_new_event","foo":1}"#;
@@ -160,7 +165,7 @@ fn main() {
         // The client's answer to a dialog (no response of its own — the
         // agent-side correlation is by the request's `id`).
         if t == "extension_ui_response" {
-            if is_set("FAKE_PI_GATE") {
+            if is_set("FAKE_PI_GATE") || is_set("FAKE_PI_SELECT") {
                 emit_turn(&mut out);
             }
             continue;
@@ -185,6 +190,11 @@ fn main() {
                     // sequence follows the client's answer (below) — NOT
                     // here (the agent is blocked awaiting the dialog).
                     write_line(&mut out, GATE_REQUEST);
+                } else if is_set("FAKE_PI_SELECT") {
+                    // The `ask` tool's dialog (a `select` request — the
+                    // turn sequence follows the client's answer, like the
+                    // gate).
+                    write_line(&mut out, SELECT_REQUEST);
                 } else if is_set("FAKE_PI_DISPATCH")
                     || is_set("FAKE_PI_DISPATCH_TWO")
                     || is_set("FAKE_PI_DISPATCH_CANCEL")

@@ -5,6 +5,7 @@ import {
   deleteSpace as deleteSpaceCommand,
   loadHistory,
   resumeSession as resumeSessionCommand,
+  setSpaceTrusted as setSpaceTrustedCommand,
   type AcpSessionUpdate,
   type AcpToolCallStatus,
   type CloseReasonStr,
@@ -435,6 +436,8 @@ export interface SpaceView {
   liveSessionId: string | null;
   /** Stored sessions of this space, in `historySessions` order (newest-first as delivered by `list_sessions` — do NOT re-sort). */
   storedSessionIds: string[];
+  /** Whether the space is trusted (permission prompts for gated tools are auto-approved). */
+  trusted: boolean;
   /** Close reason of the space's newest session (live one preferred, else the head of the stored subsequence), if any. */
   lastReason: CloseReasonStr | undefined;
 }
@@ -462,6 +465,7 @@ export function spaceViewFor(
     title: basenameOfPath(space.path),
     liveSessionId,
     storedSessionIds,
+    trusted: space.trusted,
     lastReason:
       newestId === undefined ? undefined : closeReasons[newestId],
   };
@@ -515,6 +519,13 @@ interface SessionsState {
    * decision). `activeSessionId` is left alone.
    */
   removeSpace: (path: string) => Promise<void>;
+  /**
+   * Flip a space's `trusted` flag: optimistic local update first (the spaces
+   * store has NO live refresh — the flag must flip immediately, not wait for
+   * a round-trip), then the `set_space_trusted` command; on rejection the
+   * flag rolls back to the previous value.
+   */
+  setSpaceTrusted: (path: string, trusted: boolean) => void;
   /** Populate the history list from `list_sessions` (boot). */
   setHistorySessions: (rows: SessionInfo[]) => void;
   /**
@@ -538,6 +549,22 @@ interface SessionsState {
   handleSessionClosed: (sessionId: string, reason: CloseReasonStr) => void;
   turnCompleted: (sessionId: string, stopReason: StopReason) => void;
 }
+
+// Per-path queue of in-flight `set_space_trusted` commands: a toggle is
+// chained after the previous one for the same path, so the DB commits in
+// click order (two overlapping invokes could otherwise land in either
+// order and the DB could end on the OPPOSITE value from the optimistic
+// UI). The stored promise never rejects (its errors are handled below),
+// so a failed toggle cannot break the chain for later ones.
+const inFlightToggles = new Map<string, Promise<void>>();
+// The last value known to be committed per path: a failed command rolls
+// the flag back to THIS (not the value at click time — which may itself
+// be an optimistic value from a still-pending toggle, and rolling two
+// failures back to their per-click `previous` could settle on the wrong
+// side). Seeded from the DB rows in `setSpaces` / `addSpace` (and
+// pruned in `removeSpace`), so every known path has a committed
+// baseline; the UI-value fallback below is a last resort only.
+const committedTrusted = new Map<string, boolean>();
 
 export const useSessions = create<SessionsState>((set, get) => ({
   sessions: [],
@@ -584,13 +611,22 @@ export const useSessions = create<SessionsState>((set, get) => ({
         ? autoSelectActive(rows, state.sessions, state.historySessions)
         : state.activeSessionId;
     set({ spaces: rows, activeSessionId: selectedId });
+    // Seed the committed-trusted baseline from the DB rows: every path
+    // now has a known-committed value, so a rollback target is never
+    // inferred from a possibly-optimistic UI value.
+    for (const s of rows) committedTrusted.set(s.path, s.trusted);
     // `autoSelectActive` lands on a stored session (live ones never survive
     // a restart): load its transcript so boot lands on content, not an
     // empty chat. (No-op for live / already-loaded sessions.)
     if (selectedId) get().openSession(selectedId);
   },
 
-  addSpace: (path) =>
+  addSpace: (path) => {
+    // A fresh space is committed as `trusted: false` in the DB: seed the
+    // baseline so the first toggle's rollback targets the DB value, not
+    // a possibly-optimistic UI value. (A re-added space keeps its
+    // existing baseline — `setSpaces` re-seeds it from the DB.)
+    if (!committedTrusted.has(path)) committedTrusted.set(path, false);
     set((state) => {
       const existing = state.spaces.find((s) => s.path === path);
       const now = Date.now();
@@ -598,13 +634,66 @@ export const useSessions = create<SessionsState>((set, get) => ({
         ? state.spaces.map((s) =>
             s.path === path ? { ...s, lastOpenedAt: now } : s,
           )
-        : [...state.spaces, { path, createdAt: now, lastOpenedAt: now }];
+        : [...state.spaces, { path, createdAt: now, lastOpenedAt: now, trusted: false }];
       return { spaces };
-    }),
+    });
+  },
 
   removeSpace: async (path) => {
     await deleteSpaceCommand(path);
+    // Prune the per-path state: a re-added space must not inherit a
+    // stale rollback target (or a stale in-flight queue entry) from a
+    // removed one.
+    inFlightToggles.delete(path);
+    committedTrusted.delete(path);
     set((state) => ({ spaces: state.spaces.filter((s) => s.path !== path) }));
+  },
+
+  setSpaceTrusted: (path, trusted) => {
+    // Optimistic: flip the flag now, roll back if the command fails (the
+    // spaces store has no live refresh — the flag must not wait for a
+    // round-trip). The rollback target is the last COMMITTED value, not
+    // the UI value at click time (see `committedTrusted` above).
+    const previous =
+      committedTrusted.get(path) ??
+      get().spaces.find((s) => s.path === path)?.trusted ??
+      false;
+    set((state) => ({
+      spaces: state.spaces.map((s) =>
+        s.path === path ? { ...s, trusted } : s,
+      ),
+    }));
+    // Chain this command after the previous one for the path (the
+    // per-path queue above) so the DB commits in click order. The stored
+    // `done` promise never rejects (its errors are handled below), so a
+    // failed toggle cannot break the chain for later ones.
+    const run = () =>
+      inFlightToggles
+        .get(path)
+        ?.then(() => setSpaceTrustedCommand(path, trusted))
+        ?? setSpaceTrustedCommand(path, trusted);
+    const done = run().then(
+      () => {
+        // Gate on the path still being present in the store: a success
+        // that lands AFTER a `removeSpace` (its prune) must not
+        // re-insert a baseline entry — a re-added space would then keep
+        // the stale value over its fresh `trusted: false` DB row. (The
+        // rejection handler below only maps `state.spaces` — a no-op for
+        // a removed path — and never writes `committedTrusted`.)
+        if (get().spaces.some((s) => s.path === path)) {
+          committedTrusted.set(path, trusted);
+        }
+      },
+      (err) => {
+        console.error(`Failed to set trusted for ${path}:`, err);
+        set((state) => ({
+          spaces: state.spaces.map((s) =>
+            s.path === path ? { ...s, trusted: previous } : s,
+          ),
+        }));
+      },
+    );
+    inFlightToggles.set(path, done);
   },
 
   setHistorySessions: (rows) =>

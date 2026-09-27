@@ -7,6 +7,8 @@ import {
   MessageCirclePlusIcon,
   PauseIcon,
   PlusIcon,
+  ShieldCheckIcon,
+  ShieldIcon,
 } from "lucide-react";
 import { closeSession } from "../lib/tauri";
 import {
@@ -190,6 +192,7 @@ function SpaceGroup({
 }) {
   const [open, setOpen] = useState(true);
   const newSession = useStartNewConversation(view);
+  const setSpaceTrusted = useSessions((s) => s.setSpaceTrusted);
   const name = view.title !== "" ? view.title : view.path;
   return (
     <div className="px-2.5 py-1">
@@ -205,6 +208,23 @@ function SpaceGroup({
           className="rounded-md size-6 hover:bg-surface-hover"
         >
           <PlusIcon className="size-4" />
+        </button>
+        <button
+          type="button"
+          aria-label={view.trusted ? `Stop trusting ${name}` : `Trust ${name}`}
+          title={
+            view.trusted
+              ? "Stop trusting this Space"
+              : "Trust this Space — skip permission prompts for bash/edit/write"
+          }
+          onClick={() => setSpaceTrusted(view.path, !view.trusted)}
+          className="rounded-md size-6 hover:bg-surface-hover"
+        >
+          {view.trusted ? (
+            <ShieldCheckIcon className="size-4 text-success" />
+          ) : (
+            <ShieldIcon className="size-4 text-foreground-subtlest" />
+          )}
         </button>
         <button
           type="button"

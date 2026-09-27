@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { closeSession, startSession } from "../lib/tauri";
+import { closeSession, deleteSpace, setSpaceTrusted, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
@@ -22,11 +22,15 @@ vi.mock("../lib/tauri", async () => {
     respondBridgeRequest: vi.fn(),
     loadHistory: vi.fn().mockResolvedValue([]),
     closeSession: vi.fn().mockRejectedValue(new Error("boom")),
+    setSpaceTrusted: vi.fn().mockResolvedValue(undefined),
+    deleteSpace: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 const mockedStartSession = vi.mocked(startSession);
 const mockedCloseSession = vi.mocked(closeSession);
+const mockedSetSpaceTrusted = vi.mocked(setSpaceTrusted);
+const mockedDeleteSpace = vi.mocked(deleteSpace);
 
 /**
  * Fixture: two spaces. `alpha` holds a live session `s1` (in-turn, with a
@@ -40,8 +44,8 @@ function seed(): void {
   // triggers boot auto-selection + `openSession` → `loadHistory` IPC).
   useSessions.setState({
     spaces: [
-      { path: "/tmp/alpha", createdAt: now, lastOpenedAt: now },
-      { path: "/tmp/beta", createdAt: now, lastOpenedAt: now },
+      { path: "/tmp/alpha", createdAt: now, lastOpenedAt: now, trusted: false },
+      { path: "/tmp/beta", createdAt: now, lastOpenedAt: now, trusted: true },
     ],
     sessions: [
       { sessionId: "s1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {} },
@@ -145,6 +149,245 @@ describe("SpacesList", () => {
     await waitFor(() =>
       expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/beta"),
     );
+  });
+
+  it("renders a muted Shield for an untrusted space and a success-colored ShieldCheck for a trusted space", () => {
+    render(<SpacesList />);
+    // `alpha` (untrusted): the muted `Shield` (no check variant).
+    const untrusted = screen.getByRole("button", { name: "Trust alpha" });
+    expect(untrusted.querySelector(".lucide-shield")).not.toBeNull();
+    // `getAttribute("class")` (not `className` — an SVG element's
+    // `className` is an `SVGAnimatedString` in jsdom, not a string).
+    expect(untrusted.querySelector(".lucide-shield")!.getAttribute("class")).toContain(
+      "text-foreground-subtlest",
+    );
+    expect(untrusted.querySelector(".lucide-shield-check")).toBeNull();
+    // `beta` (trusted): the success-colored `ShieldCheck`.
+    const trusted = screen.getByRole("button", { name: "Stop trusting beta" });
+    expect(trusted.querySelector(".lucide-shield-check")).not.toBeNull();
+    expect(trusted.querySelector(".lucide-shield-check")!.getAttribute("class")).toContain(
+      "text-success",
+    );
+  });
+
+  it("flips the space's trusted flag optimistically and calls the set_space_trusted wrapper", () => {
+    render(<SpacesList />);
+    fireEvent.click(screen.getByRole("button", { name: "Trust alpha" }));
+    // Optimistic: the store flipped BEFORE the (async) command resolves —
+    // the spaces store has no live refresh, so the flag must not wait for
+    // a round-trip.
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/alpha")!.trusted,
+    ).toBe(true);
+    expect(mockedSetSpaceTrusted).toHaveBeenCalledWith("/tmp/alpha", true);
+  });
+
+  it("rolls the trusted flag back to the previous value when the command rejects", async () => {
+    mockedSetSpaceTrusted.mockRejectedValueOnce(new Error("boom"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<SpacesList />);
+    fireEvent.click(screen.getByRole("button", { name: "Stop trusting beta" }));
+    // Optimistic flip first (beta trusted → untrusted)...
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
+    ).toBe(false);
+    // ...then rolled back once the command rejects.
+    await waitFor(() =>
+      expect(
+        useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
+      ).toBe(true),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to set trusted for /tmp/beta:",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("serializes rapid trust toggles for a space (the second command runs only after the first settles)", async () => {
+    // The first command stays pending on a deferred promise: without a
+    // per-path queue, the second click's command would be issued
+    // immediately (two overlapping Tauri invokes could commit in either
+    // order and the DB could end on the OPPOSITE value from the
+    // optimistic UI).
+    let resolveFirst!: () => void;
+    const first = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+    mockedSetSpaceTrusted.mockImplementationOnce(() => first);
+    mockedSetSpaceTrusted.mockImplementationOnce(() => Promise.resolve());
+    render(<SpacesList />);
+    // Toggle trust on...
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Trust alpha" }));
+    });
+    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(1);
+    // ...then immediately off (the optimistic flip re-labeled the button).
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Stop trusting alpha" }),
+      );
+    });
+    // The second command is NOT issued until the first settles.
+    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveFirst();
+    });
+    await waitFor(() =>
+      expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(2),
+    );
+    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(1, "/tmp/alpha", true);
+    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(2, "/tmp/alpha", false);
+    // The final UI state ends on the last click's value.
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/alpha")!.trusted,
+    ).toBe(false);
+  });
+
+  it("settles on the DB-committed value when BOTH of two rapid toggles reject (not the first click's optimistic value)", async () => {
+    // Seed through `setSpaces` (the production load path) so the store's
+    // committed-trusted baseline is seeded from the DB rows like in
+    // production. `delta` is a fresh path (no baseline entry from an
+    // earlier test) committed as `trusted: false`.
+    const now = Date.now();
+    useSessions.getState().setSpaces([
+      { path: "/tmp/delta", createdAt: now, lastOpenedAt: now, trusted: false },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Both commands reject, on deferred promises so the two rollbacks
+    // land in click order: the first click's rollback first, the
+    // second's LAST — the last rollback is what the UI settles on.
+    let rejectFirst!: (err: Error) => void;
+    let rejectSecond!: (err: Error) => void;
+    mockedSetSpaceTrusted.mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectFirst = reject;
+        }),
+    );
+    mockedSetSpaceTrusted.mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectSecond = reject;
+        }),
+    );
+    render(<SpacesList />);
+    // Click 1 (false → true): the optimistic flip lands before the
+    // command settles.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Trust delta" }));
+    });
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(true);
+    // Click 2 (true → false) while click 1's command is still pending:
+    // the per-path queue defers the second command.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Stop trusting delta" }));
+    });
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(false);
+    // Reject click 1's command: its rollback lands first, and the queue
+    // then issues click 2's (still pending) command.
+    await act(async () => {
+      rejectFirst(new Error("boom"));
+    });
+    // Reject click 2's command LAST: its rollback settles the UI.
+    await act(async () => {
+      rejectSecond(new Error("boom"));
+    });
+    // The UI settles on the DB-committed value (false) — NOT the first
+    // click's optimistic value (true): inferring the second rollback
+    // target from the live UI value (the first click's optimistic flip,
+    // which is NOT the committed value while a toggle is in flight) would
+    // settle on the wrong side.
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(false);
+    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(2);
+    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(1, "/tmp/delta", true);
+    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(2, "/tmp/delta", false);
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to set trusted for /tmp/delta:",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("does NOT leave a stale committed-trusted baseline after a remove (a late in-flight toggle success must not re-insert the pruned entry)", async () => {
+    // Seed through `setSpaces` (the production load path) so the store's
+    // committed-trusted baseline is seeded from the DB rows: `epsilon`
+    // is committed as `trusted: false`.
+    const now = Date.now();
+    useSessions.getState().setSpaces([
+      { path: "/tmp/epsilon", createdAt: now, lastOpenedAt: now, trusted: false },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    // A toggle in flight on a deferred command...
+    let resolveToggle!: () => void;
+    mockedSetSpaceTrusted.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveToggle = resolve;
+        }),
+    );
+    await act(async () => {
+      useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
+    });
+    // ...and a removal while it is in flight (deferred delete): the
+    // store prunes the path's baseline + queue once the delete settles.
+    let resolveDelete!: () => void;
+    mockedDeleteSpace.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+    const removing = useSessions.getState().removeSpace("/tmp/epsilon");
+    await act(async () => {
+      resolveDelete();
+    });
+    await act(async () => {
+      await removing;
+    });
+    // The in-flight toggle's command succeeds AFTER the prune: its
+    // success handler must NOT re-insert a baseline entry for the
+    // removed path (it would survive the `addSpace` guard and poison a
+    // fresh re-add).
+    await act(async () => {
+      resolveToggle();
+    });
+    // Re-add the path: a fresh DB row is committed as `trusted: false`,
+    // so the (pruned) baseline must re-seed to false.
+    await act(async () => {
+      useSessions.getState().addSpace("/tmp/epsilon");
+    });
+    // A failed toggle must roll back to the FRESH baseline (false), not
+    // a stale in-flight value (true).
+    let rejectToggle!: (err: Error) => void;
+    mockedSetSpaceTrusted.mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectToggle = reject;
+        }),
+    );
+    await act(async () => {
+      useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
+    });
+    await act(async () => {
+      rejectToggle(new Error("boom"));
+    });
+    expect(
+      useSessions
+        .getState()
+        .spaces.find((s) => s.path === "/tmp/epsilon")!.trusted,
+    ).toBe(false);
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to set trusted for /tmp/epsilon:",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
   });
 
   it("renders a live session row with its title, a spinner while in-turn, and its relative time", () => {

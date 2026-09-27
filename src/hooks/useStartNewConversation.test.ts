@@ -37,7 +37,7 @@ const mockedListAgents = vi.mocked(listAgents);
  * session (agentId `a-stored`).
  */
 const spaces: SpaceRow[] = [
-  { path: "/tmp/alpha", createdAt: 1, lastOpenedAt: 1 },
+  { path: "/tmp/alpha", createdAt: 1, lastOpenedAt: 1, trusted: false },
 ];
 const sessions: SessionInfo[] = [
   { sessionId: "s-live", agentId: "a-live", cwd: "/tmp/alpha", capabilities: {} },

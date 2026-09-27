@@ -78,7 +78,8 @@ fn build_app(
             archimedes_desktop_lib::commands::spaces::list_agents,
             archimedes_desktop_lib::commands::spaces::list_spaces,
             archimedes_desktop_lib::commands::spaces::delete_space,
-            archimedes_desktop_lib::commands::spaces::space_for_path
+            archimedes_desktop_lib::commands::spaces::space_for_path,
+            archimedes_desktop_lib::commands::spaces::set_space_trusted
         ])
         .build(tauri::generate_context!())
         .expect("app should build");
@@ -365,6 +366,36 @@ fn spaces_and_agents_commands_round_trip() {
         serde_json::json!({ "path": newproj.to_string_lossy() }),
     );
     assert_eq!(check["isSpace"], true);
+
+    // set_space_trusted: round-trips through list_spaces (the camelCase
+    // `trusted` field the sidebar shield reads).
+    let set = invoke(
+        &webview,
+        "set_space_trusted",
+        serde_json::json!({ "path": canonical, "trusted": true }),
+    );
+    assert!(set.is_null() || set.is_object());
+    let spaces = invoke(&webview, "list_spaces", serde_json::json!({}));
+    assert_eq!(spaces.as_array().unwrap()[0]["trusted"], true);
+
+    // Clear the flag again: round-trips back to false.
+    invoke(
+        &webview,
+        "set_space_trusted",
+        serde_json::json!({ "path": canonical, "trusted": false }),
+    );
+    let spaces = invoke(&webview, "list_spaces", serde_json::json!({}));
+    assert_eq!(spaces.as_array().unwrap()[0]["trusted"], false);
+
+    // A missing path is a SUCCESS no-op (not an error): a deleted or
+    // never-seen row simply has nothing to flip.
+    let gone = config_dir.join(format!("gone-{}", uuid::Uuid::new_v4()));
+    let noop = invoke(
+        &webview,
+        "set_space_trusted",
+        serde_json::json!({ "path": gone.to_string_lossy(), "trusted": true }),
+    );
+    assert!(noop.is_null() || noop.is_object());
 
     // delete_space: drops the bookkeeping row only.
     invoke(

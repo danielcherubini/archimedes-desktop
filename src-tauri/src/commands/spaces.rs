@@ -74,3 +74,22 @@ pub async fn list_spaces(
 pub async fn delete_space(state: State<'_, Arc<Db>>, path: String) -> Result<(), String> {
     state.delete_space(&path).map_err(|e| e.to_string())
 }
+
+/// Set (or clear) a space's trust flag (Trusted Space, ADR 0010).
+/// No-op if the row is missing — still a SUCCESS (the shield's optimistic
+/// update just has nothing to persist; the no-op is logged, not silent).
+#[tauri::command]
+pub async fn set_space_trusted(
+    state: State<'_, Arc<Db>>,
+    path: String,
+    trusted: bool,
+) -> Result<(), String> {
+    match state.set_space_trusted(&path, trusted) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            eprintln!("set_space_trusted: no space row for {path} (no-op)");
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}

@@ -41,7 +41,9 @@ pub fn setup_dirs<R: tauri::Runtime>(
     // manager; only the main manager's `SessionDriver.subagent` field points
     // at it.
     let subagent_manager = Arc::new(
-        SubagentSessionManager::new(config_dir)
+        // The trust db is threaded (ADR 0010 — subagent Sessions inherit
+        // Space trust; the subagent's driver `db` stays `None` — ephemeral).
+        SubagentSessionManager::new(config_dir, Some(db.clone()))
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     );
     manager.set_subagent_manager(subagent_manager.clone());
@@ -93,6 +95,7 @@ pub fn run() {
             commands::spaces::list_spaces,
             commands::spaces::delete_space,
             commands::spaces::space_for_path,
+            commands::spaces::set_space_trusted,
             commands::clipboard::read_clipboard_image
         ])
         .setup(|app| {

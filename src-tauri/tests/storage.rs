@@ -5,6 +5,7 @@
 //! the accumulated text), session listing, history fetch, and cascade
 //! delete (deleting a session removes its messages).
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use archimedes_desktop_lib::agent::SessionInfo;
@@ -282,6 +283,200 @@ fn open_backfills_space_rows_from_existing_sessions() {
     assert_eq!(
         before, after,
         "the backfill must not refresh last_opened_at or created_at"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn spaces_trusted_column_fresh_and_migrated() {
+    // (a) Fresh database: the column exists from SCHEMA. The dir is created
+    // FIRST so `space_trusted`'s canonicalize succeeds and the assertion
+    // actually exercises the fresh-DB default (a missing dir makes
+    // canonicalize fail → fail-closed `Ok(false)` regardless of the default).
+    let dir =
+        std::env::temp_dir().join(format!("archimedes-trusted-fresh-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("fresh dir");
+    let p = std::fs::canonicalize(&dir)
+        .expect("canonical fresh dir")
+        .display()
+        .to_string();
+    let fresh = temp_db_path();
+    let db = Db::open(&fresh).expect("db should open");
+    db.upsert_space(&p).expect("upsert_space");
+    assert!(
+        !db.space_trusted(Path::new(&p)).expect("space_trusted"),
+        "a just-upserted space is untrusted by default"
+    );
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert_eq!(spaces.len(), 1);
+    assert!(!spaces[0].trusted, "fresh row defaults to untrusted");
+    let _ = std::fs::remove_file(&fresh);
+
+    // (b) Pre-migration database: a `spaces` table with the OLD 3-column
+    // schema, then `Db::open` must `ALTER TABLE` it into shape.
+    let base = std::env::temp_dir().join(format!("archimedes-spaces-mig-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("base dir");
+    let cwd = base.join("proj");
+    std::fs::create_dir_all(&cwd).expect("proj dir");
+    let p = std::fs::canonicalize(&cwd)
+        .expect("canonical proj")
+        .display()
+        .to_string();
+    let db_path = base.join("archimedes.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("raw open");
+        conn.execute_batch(
+            "CREATE TABLE spaces (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL
+            );",
+        )
+        .expect("old-schema table");
+        conn.execute(
+            "INSERT INTO spaces (path, created_at, last_opened_at) VALUES (?1, 1, 1);",
+            rusqlite::params![p],
+        )
+        .expect("old-schema row");
+    }
+    let db2 = Db::open(&db_path).expect("Db::open should migrate the old table");
+    let spaces = db2.list_spaces().expect("list_spaces");
+    assert_eq!(
+        spaces.len(),
+        1,
+        "the pre-existing row survives the migration"
+    );
+    assert!(
+        !spaces[0].trusted,
+        "the migrated row reads trusted = false (default 0)"
+    );
+    assert!(
+        !db2.space_trusted(Path::new(&p)).expect("space_trusted"),
+        "the migrated row is untrusted by default"
+    );
+
+    // (c) A third open: the migration is idempotent (the pre-check sees the
+    // `trusted` column and skips the ALTER entirely) and the data is untouched.
+    let db3 = Db::open(&db_path).expect("db should reopen (idempotent migration)");
+    let spaces3 = db3.list_spaces().expect("list_spaces");
+    assert_eq!(spaces3.len(), 1);
+    assert!(!spaces3[0].trusted);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn set_space_trusted_updates_and_flag_reads() {
+    let path = temp_db_path();
+    let db = Db::open(&path).expect("db should open");
+    let dir = std::env::temp_dir().join(format!("archimedes-trusted-t-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let p = std::fs::canonicalize(&dir)
+        .expect("canonical dir")
+        .display()
+        .to_string();
+
+    db.upsert_space(&p).expect("upsert_space");
+    assert!(
+        db.set_space_trusted(&p, true)
+            .expect("set_space_trusted true"),
+        "set reports true when a row matched"
+    );
+    assert!(
+        db.space_trusted(Path::new(&p)).expect("space_trusted"),
+        "the flag reads back true after set"
+    );
+    let spaces = db.list_spaces().expect("list_spaces");
+    assert!(spaces[0].trusted, "list_spaces reflects the flag");
+
+    assert!(
+        db.set_space_trusted(&p, false)
+            .expect("set_space_trusted false"),
+        "clearing also matches the row"
+    );
+    assert!(!db.space_trusted(Path::new(&p)).expect("space_trusted"));
+    assert!(!db.list_spaces().expect("list_spaces")[0].trusted);
+
+    // No-op for a missing row: no error, but the bool says nothing matched
+    // (a silent 0-row UPDATE is diagnosable, not invisible).
+    assert!(
+        !db.set_space_trusted("/no/such/row", true)
+            .expect("set on a missing row is a no-op"),
+        "a missing row updates nothing (false, not an error)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn space_trusted_fail_closed() {
+    let path = temp_db_path();
+    let db = Db::open(&path).expect("db should open");
+    // No row for the path: fail-closed, not an error.
+    assert!(
+        !db.space_trusted(Path::new("/tmp/never-upserted-anywhere"))
+            .expect("space_trusted must not error on a missing row"),
+        "a missing row is untrusted (fail-closed)"
+    );
+    // Canonicalize failure: fail-closed, not an error.
+    let gone = temp_db_path().with_extension("does-not-exist");
+    assert!(
+        !db.space_trusted(&gone)
+            .expect("space_trusted must not error on a canonicalize failure"),
+        "a canonicalize failure is untrusted (fail-closed)"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The `spaces` table has ONE key form (ADR 0010: the canonical path), shared
+/// by `upsert_space`, `set_space_trusted` and `space_trusted` — a write and a
+/// read through a non-canonical form (here: a symlink) must agree on the row.
+#[cfg(unix)]
+#[test]
+fn space_methods_agree_on_the_canonical_key() {
+    let base = std::env::temp_dir().join(format!("archimedes-canonical-{}", uuid::Uuid::new_v4()));
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).expect("real dir");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let db_path = base.join("archimedes.db");
+    let db = Db::open(&db_path).expect("db should open");
+
+    // A write via the symlink path keys the row by the CANONICAL path —
+    // never by the raw (non-canonical) string.
+    db.upsert_space(&link.display().to_string())
+        .expect("upsert via symlink");
+    let canonical = std::fs::canonicalize(&real).expect("canonical");
+    let cp = canonical.display().to_string();
+    assert!(
+        db.find_space(&cp).expect("find canonical").is_some(),
+        "the row is keyed by the canonical path"
+    );
+    assert!(
+        db.find_space(&link.display().to_string())
+            .expect("find symlink")
+            .is_none(),
+        "no row under the raw (non-canonical) key"
+    );
+
+    // A trust write via the symlink path hits the canonical row, and a read
+    // via EITHER form sees the flag (they share the one key form).
+    assert!(
+        db.set_space_trusted(&link.display().to_string(), true)
+            .expect("set via symlink"),
+        "set matches the canonical row"
+    );
+    assert!(db.space_trusted(&link).expect("read via symlink"));
+    assert!(db.space_trusted(&canonical).expect("read via canonical"));
+
+    // A write for a path with no row: Ok(false) (diagnosable), not an error.
+    let gone = base.join("never-existed");
+    assert!(
+        !db.set_space_trusted(&gone.display().to_string(), true)
+            .expect("set on a missing row is not an error"),
+        "a missing row updates nothing"
     );
 
     let _ = std::fs::remove_dir_all(&base);

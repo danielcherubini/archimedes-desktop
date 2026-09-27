@@ -67,6 +67,8 @@ export interface SpaceRow {
   path: string;
   createdAt: number;
   lastOpenedAt: number;
+  /** Whether the space is trusted (permission prompts for gated tools are auto-approved). */
+  trusted: boolean;
 }
 
 /** The folder-check result (camelCase over IPC). */
@@ -429,6 +431,11 @@ export async function listSpaces(): Promise<SpaceRow[]> {
 /** "Forget this space": delete the bookkeeping row (conversations stay stored). */
 export async function deleteSpace(path: string): Promise<void> {
   return invoke("delete_space", { path });
+}
+
+/** Flip a space's trusted flag (no-op for a missing row). */
+export async function setSpaceTrusted(path: string, trusted: boolean): Promise<void> {
+  return invoke("set_space_trusted", { path, trusted });
 }
 
 /** Canonicalize a folder and say whether a space row already exists for it. */

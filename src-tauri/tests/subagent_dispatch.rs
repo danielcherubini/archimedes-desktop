@@ -237,7 +237,7 @@ async fn setup_dispatch_test(
     let cwd = config_dir.to_path_buf();
 
     let subagent_manager = Arc::new(
-        SubagentSessionManager::new(config_dir.to_path_buf())
+        SubagentSessionManager::new(config_dir.to_path_buf(), None)
             .expect("subagent manager should build"),
     );
     let mut manager =

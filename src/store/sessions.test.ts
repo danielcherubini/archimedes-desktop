@@ -57,6 +57,7 @@ const row = (path: string, lastOpenedAt: number): SpaceRow => ({
   path,
   createdAt: lastOpenedAt - 86_400_000,
   lastOpenedAt,
+  trusted: false,
 });
 
 /**
@@ -508,6 +509,7 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       title: "alpha",
       liveSessionId: "live-alpha",
       storedSessionIds: ["stored-alpha"],
+      trusted: false,
       // The newest session's reason: the live one's (`live-alpha` →
       // `user`), NOT the stored session's (`stored-alpha` → `error`) —
       // proves the lookup does not fall through to the stored one.
@@ -522,6 +524,7 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       title: "bravo",
       liveSessionId: null,
       storedSessionIds: ["idX", "idY"],
+      trusted: false,
       // No live session: the head of the stored subsequence's reason.
       lastReason: "agent-exited",
     });
@@ -534,6 +537,7 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       title: "charlie",
       liveSessionId: null,
       storedSessionIds: [],
+      trusted: false,
       lastReason: undefined,
     });
   });

@@ -91,6 +91,50 @@ describe("PermissionPrompt", () => {
     );
   });
 
+  it("renders one button per option for the 3-option trusted-space payload (guard)", async () => {
+    // The Rust side (Task 2) appends a third `trust-space` option to the
+    // permission payload. The component is generic — one button per option,
+    // first = primary, the rest = outline — so the third option must appear
+    // with ZERO component changes. This guard pins that assumption.
+    usePermissions.getState().addPrompt("s1", "r2", {
+      toolCall: { toolCallId: "tc2", title: "run a tool" },
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow" },
+        { optionId: "reject", name: "Block", kind: "reject" },
+        {
+          optionId: "trust-space",
+          name: "Don't ask again for this Space",
+          kind: "allow",
+        },
+      ],
+    });
+    const { container } = render(
+      <PermissionPrompt sessionId="s1" requestId="r2" />,
+    );
+    // All three option buttons render with the payload's names, plus Cancel.
+    expect(screen.getByRole("button", { name: "Allow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Block" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Don't ask again for this Space" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    // First option is primary, the rest (incl. trust-space) are outline.
+    const buttons = container.querySelectorAll("button");
+    expect(buttons).toHaveLength(4);
+    expect(buttons[0].className).toContain("bg-primary");
+    expect(buttons[1].className).toContain("border-border");
+    expect(buttons[2].className).toContain("border-border");
+    // Clicking the third option answers with its option id.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Don't ask again for this Space" }),
+    );
+    await waitFor(() =>
+      expect(mockedRespond).toHaveBeenCalledWith("s1", "r2", {
+        selected: { option_id: "trust-space" },
+      }),
+    );
+  });
+
   it("cancels via the Cancel button", async () => {
     usePermissions.getState().addPrompt("s1", "r1", request);
     render(<PermissionPrompt sessionId="s1" requestId="r1" />);

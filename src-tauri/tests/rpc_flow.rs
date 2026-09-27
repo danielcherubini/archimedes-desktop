@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use archimedes_desktop_lib::agent::{EventSink, RpcError, SessionInfo, SessionManager, StopReason};
+use archimedes_desktop_lib::agent::{
+    EventSink, PermissionOutcome, RpcError, SessionInfo, SessionManager, StopReason,
+};
 use archimedes_desktop_lib::storage::Db;
 
 /// The session-id PREFIX `fake_pi` reports for a fresh session (the id
@@ -438,4 +440,307 @@ async fn two_live_sessions_coexist() {
 
     let _ = manager.close_session(&s2.session_id).await;
     let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// A fresh, distinct tempdir for a session's `cwd` (returned with its
+/// canonicalized display string — the `spaces` join key is canonicalized).
+fn temp_cwd() -> (PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("rpc-flow-cwd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let canonical = dir.canonicalize().unwrap();
+    (dir, canonical.display().to_string())
+}
+
+/// Poll the channel until a `permission-request` event arrives (or the
+/// timeout) — ASYNC on purpose: a blocking `recv_timeout` on a runtime
+/// worker starves the driver task this test needs to run CONCURRENTLY
+/// (the `join!` gate test's lesson — the driver is a spawned task on the
+/// same runtime; a blocked worker cannot make progress for it).
+async fn wait_for_permission_request(
+    rx: &std::sync::mpsc::Receiver<(String, Value)>,
+    timeout: Duration,
+) -> Option<(String, Value)> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(e) = rx.try_recv() {
+            if e.0 == "permission-request" {
+                return Some(e);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// (6) Trusted Space (ADR 0010): an UNTRUSTED Space's gate `confirm`
+/// prompts with the third option (`trust-space`); picking it answers
+/// `confirmed: true` (the turn settles) AND sets the trust flag
+/// (the row existed, so the best-effort write succeeds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untrusted_space_prompts_with_third_option_and_trust_space_outcome_trusts() {
+    let config_dir = temp_config_dir();
+    let cwd = config_dir.clone();
+    let cwd_str = cwd.canonicalize().unwrap().display().to_string();
+    write_agents_json_pi(&config_dir, &[("FAKE_PI_GATE", "1")], None);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+    // The space row exists (an UNTRUSTED row — `set_space_trusted` is an
+    // UPDATE, so the `trust-space` outcome's write needs it).
+    db.upsert_space(&cwd_str)
+        .expect("upsert_space should succeed");
+
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("start_session should succeed");
+
+    // The prompt + the gate answer, CONCURRENTLY (`join!` — the fake
+    // settles only after the client's response; the `permission-request`
+    // event arrives mid-turn, and the pending entry is registered BEFORE
+    // the event is emitted, so `respond_permission` finds it by the time
+    // the event is seen).
+    let sid = info.session_id.clone();
+    let (reason, answer) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            manager.send_prompt(&sid, "hi".to_string()),
+        ),
+        async {
+            // The `permission-request` event (ASYNC polling — a blocking
+            // `recv_timeout` on this worker would starve the driver task
+            // that emits it; see `wait_for_permission_request`).
+            let (event, payload) = wait_for_permission_request(&rx, Duration::from_secs(10))
+                .await
+                .expect("an untrusted Space's gate must prompt");
+            assert_eq!(event, "permission-request");
+            let request = &payload["request"];
+            assert_eq!(request["sessionId"], sid);
+            let options: Vec<String> = request["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["optionId"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                options.iter().any(|o| o == "trust-space"),
+                "the untrusted prompt offers the trust-space option, got {options:?}"
+            );
+            let request_id = payload["requestId"].as_str().unwrap().to_string();
+            // The user picks `trust-space` → `confirmed: true` AND the
+            // flag is set.
+            let hit = manager
+                .respond_permission(
+                    &sid,
+                    &request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "trust-space".to_string(),
+                    },
+                )
+                .await
+                .expect("respond_permission should succeed");
+            assert!(hit, "the pending entry must be resolved");
+            Ok::<(), ()>(())
+        },
+    );
+    assert!(answer.is_ok());
+    let reason = reason
+        .expect("the turn must settle after the trust-space answer")
+        .expect("send_prompt should succeed");
+    assert_eq!(
+        reason,
+        StopReason::EndTurn,
+        "the turn settles after the confirmed gate"
+    );
+
+    // The flag is set (the row existed, so the best-effort write after the
+    // answer succeeded).
+    assert!(
+        db.space_trusted(&cwd).expect("space_trusted should work"),
+        "the trust-space outcome sets the trust flag"
+    );
+
+    let _ = manager.close_session(&info.session_id).await;
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// (7) Trusted Space (ADR 0010): a TRUSTED Space's gate `confirm` is
+/// answered `confirmed: true` WITHOUT a `permission-request` event (no
+/// prompt, no oneshot) — the turn settles on its own (the fake settles
+/// on the client's response, which the handler sends immediately).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_space_skips_the_permission_prompt() {
+    let config_dir = temp_config_dir();
+    let (cwd, cwd_str) = temp_cwd();
+    write_agents_json_pi(&config_dir, &[("FAKE_PI_GATE", "1")], None);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+    // The space row exists and is TRUSTED (BEFORE the session starts).
+    db.upsert_space(&cwd_str)
+        .expect("upsert_space should succeed");
+    db.set_space_trusted(&cwd_str, true)
+        .expect("set_space_trusted should succeed");
+    assert!(
+        db.space_trusted(&cwd).expect("space_trusted should work"),
+        "precondition: the space is trusted"
+    );
+
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("start_session should succeed");
+
+    // The gate is auto-confirmed (no prompt) — the fake settles the turn
+    // on the client's `confirmed: true`, so the prompt resolves on its
+    // own (NO `respond_permission` call).
+    let reason = tokio::time::timeout(
+        Duration::from_secs(15),
+        manager.send_prompt(&info.session_id, "hi".to_string()),
+    )
+    .await
+    .expect("the turn must settle without a user answer")
+    .expect("send_prompt should succeed");
+    assert_eq!(
+        reason,
+        StopReason::EndTurn,
+        "the turn settles after the auto-confirmed gate"
+    );
+
+    // NO `permission-request` event was emitted (drain the turn's
+    // `session-update` frames — the gate was answered without a prompt;
+    // ASYNC polling — see `wait_for_permission_request`).
+    let mut prompted = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Ok((event, _)) = rx.try_recv() {
+            if event == "permission-request" {
+                prompted = true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!prompted, "a trusted Space's gate must not prompt");
+
+    let _ = manager.close_session(&info.session_id).await;
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// (8) Trusted Space (ADR 0010, guard): a TRUSTED Space's `select`
+/// request (the `ask` tool's dialog) is NEVER auto-answered — the trust
+/// short-circuit exists only in the `confirm` arm, so the
+/// `permission-request` event STILL arrives and the turn settles only on
+/// the user's answer (a `value` response). The prompt's options are the
+/// request's option labels and do NOT carry the `trust-space` third
+/// option (only `confirm` prompts get it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_space_never_auto_answers_select_requests() {
+    let config_dir = temp_config_dir();
+    let (cwd, cwd_str) = temp_cwd();
+    write_agents_json_pi(&config_dir, &[("FAKE_PI_SELECT", "1")], None);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+    let mut manager = SessionManager::new(config_dir.clone()).unwrap();
+    let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
+    manager.attach_db(db.clone());
+    // The space row exists and is TRUSTED (BEFORE the session starts —
+    // the same precondition the auto-answer test sets, which is exactly
+    // the state a regression would abuse to suppress this prompt).
+    db.upsert_space(&cwd_str)
+        .expect("upsert_space should succeed");
+    db.set_space_trusted(&cwd_str, true)
+        .expect("set_space_trusted should succeed");
+    assert!(
+        db.space_trusted(&cwd).expect("space_trusted should work"),
+        "precondition: the space is trusted"
+    );
+
+    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        manager.start_session("fake", cwd.clone(), &sink).await
+    })
+    .await
+    .expect("start_session should succeed");
+
+    // The select prompt + the answer, CONCURRENTLY (`join!` — the fake
+    // settles only after the client's response; see (6)).
+    let sid = info.session_id.clone();
+    let (reason, answer) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            manager.send_prompt(&sid, "hi".to_string()),
+        ),
+        async {
+            // The `permission-request` event MUST arrive even though the
+            // Space is trusted (a `select` request is never auto-answered
+            // — ASYNC polling — see `wait_for_permission_request`).
+            let (event, payload) = wait_for_permission_request(&rx, Duration::from_secs(10))
+                .await
+                .expect("a select request must prompt, trusted or not");
+            assert_eq!(event, "permission-request");
+            let request = &payload["request"];
+            assert_eq!(request["sessionId"], sid);
+            let options: Vec<String> = request["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["optionId"].as_str().unwrap().to_string())
+                .collect();
+            // The options are the request's option labels ("A" / "B") —
+            // NOT the confirm prompt's allow/reject/trust-space set.
+            assert_eq!(options, vec!["A".to_string(), "B".to_string()]);
+            assert!(
+                !options.iter().any(|o| o == "trust-space"),
+                "a select prompt must not offer the trust-space option, got {options:?}"
+            );
+            let request_id = payload["requestId"].as_str().unwrap().to_string();
+            // The user picks an option → a `value` response settles the
+            // turn (the `Select` arm maps `Selected` to `Value`).
+            let hit = manager
+                .respond_permission(
+                    &sid,
+                    &request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "A".to_string(),
+                    },
+                )
+                .await
+                .expect("respond_permission should succeed");
+            assert!(hit, "the pending entry must be resolved");
+            Ok::<(), ()>(())
+        },
+    );
+    assert!(answer.is_ok());
+    let reason = reason
+        .expect("the turn must settle after the select answer")
+        .expect("send_prompt should succeed");
+    assert_eq!(
+        reason,
+        StopReason::EndTurn,
+        "the turn settles after the select answer"
+    );
+
+    // The trust flag is untouched (answering a question is not a trust
+    // decision — it was trusted before and stays trusted).
+    assert!(
+        db.space_trusted(&cwd).expect("space_trusted should work"),
+        "a select answer must not alter the trust flag"
+    );
+
+    let _ = manager.close_session(&info.session_id).await;
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&cwd);
 }
