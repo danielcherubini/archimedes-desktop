@@ -1,7 +1,7 @@
 ---
 status: live
-last-verified: 2026-09-22
-verified-by: cargo test (63 passed, incl. subagent_dispatch + subagent_concurrency) + pnpm test (102 passed) in archimedes-desktop
+last-verified: 2026-09-27
+verified-by: cargo test (143 passed, incl. subagent_dispatch + subagent_concurrency) + pnpm test (505 passed) in archimedes-desktop
 ---
 
 # Subagent sessions
@@ -14,6 +14,44 @@ machinery (per-spawn peer-verified bridge listener, per-dispatch
 `PI_ACP_PI_COMMAND` launch wrapper — ADR 0005). The request resolves with the
 final output + metrics. Subagent sessions are ephemeral (not stored,
 `--no-session`) and excluded from the one-live policy by definition (ADR 0002).
+
+## Bounded settle (the zombie fix, 2026-09-27)
+
+A subagent's turn settle wait is BOUNDED (a 30-min `settle_timeout` on the
+`SessionDriver`; `RpcError::SettleTimeout`): a hung turn is torn down (the
+external close kills the `pi` process) and reported `failed` instead of
+lingering as a zombie. The dispatch's cancel probe is read BEFORE the
+unconditional teardown cancel, so a user cancel still reports
+`error "cancelled"` while a settle timeout / agent death reports its own
+error (a `SettleTimeout` / agent death has no flipped flag yet). Teardown on
+completion is preserved (a completed subagent's `pi` process is still
+reaped — `dispatch_spawns_rpc_child_and_captures`).
+
+## Presentation (2026-09-27)
+
+Subagents live under the "Delegating" tool card in the main chat view
+(`SubagentDelegatingCard` — one row per subagent: status icon + agent name +
+task + a live one-line activity preview; open by default); clicking a row
+opens a dedicated right-side transcript modal. The sidebar Subagents panel
+is removed (`SidePane` is todos-only + the subagent sudo modals at the frame
+root; its auto open/close is driven by todos only — a subagent no longer
+opens the pane). Grouping is session-level: every `SubagentDelegatingCard`
+in a session lists all of that session's subagent rows (the
+`subagent-session-started` payload carries no `toolCallId`), while the
+activity preview resolves only from each card's own `rawOutput.details`.
+
+**The "always mounted" invariant (load-bearing):** a subagent's interactive
+requests (`ask` / permission / sudo `confirm` / `password`) MUST be rendered
+by a mounted React component, or they hang until the bridge timeout (330 s).
+`SubagentDetailHost` (always mounted at the `App` root) renders every
+subagent's `SubagentTranscript` exactly once — the selected one in the
+visible modal, the rest hidden (the `hidden` attribute keeps the component
+mounted) — so an unrendered request can never hang. Closing the modal (X / Esc)
+only clears the selection; the entry stays in `useSubagents`. The modal's
+`onKeyDown` Esc handler is a React handler on the sheet (NOT a window-level
+capture handler) so it stops the native event before `ChatStream`'s
+window-level Escape-cancel fires, and a nested consumer's own
+`stopPropagation` (e.g. `AskQuestionCard`'s Esc-dismiss) still wins.
 
 ## Constraints
 
