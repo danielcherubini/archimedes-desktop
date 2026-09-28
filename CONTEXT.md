@@ -67,3 +67,7 @@ _Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZC
 **Attachment**:
 An image staged in the composer (via clipboard paste or drag-and-drop) that is sent with the next prompt. Previewed as a removable thumbnail in a strip above the composer's textarea; persisted inline in the user message's payload.
 _Avoid_: File, image, media, clip, paperclip
+
+**Skill**:
+A directory containing a `SKILL.md` — YAML frontmatter (`name`, `description`) + a markdown body (instructions, optionally referencing bundled files) — discovered from the standard locations (the user home `~/.agents/skills` + `~/.pi/agent/skills`; the Space/project's `.agents/skills` + `.pi/skills` walked up to the repository root). The **Agent harness** advertises each skill's metadata (name, description, location) in the system prompt and loads the full instructions on demand (progressive disclosure). In the Client, a skill is explicitly invoked with a `$name` composer mention; the Client expands the mention into the skill's full content on send, before the message is recorded (ADR 0013).
+_Avoid_: Plugin, command, prompt template
