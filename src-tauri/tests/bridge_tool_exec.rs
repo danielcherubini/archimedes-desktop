@@ -38,8 +38,8 @@ mod bridge_tool_exec {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::sync::{watch, Mutex};
 
-    use archimedes_desktop_lib::agent::bridge::{self, BridgeHandle, SudoRun, SudoRunner};
-    use archimedes_desktop_lib::agent::{EventSink, TodoStore};
+    use archimedes_lib::agent::bridge::{self, BridgeHandle, SudoRun, SudoRunner};
+    use archimedes_lib::agent::{EventSink, TodoStore};
 
     /// A mock `EventSink` (the test double for `TauriSink` — `tool_exec`
     /// emits no events, so the emissions are not captured).

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    archimedes_desktop_lib::run()
+    archimedes_lib::run()
 }

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use archimedes_desktop_lib::agent::{FsBackend, FsError};
+use archimedes_lib::agent::{FsBackend, FsError};
 
 /// Create a fresh temp directory to act as the sandbox root.
 fn temp_root() -> PathBuf {

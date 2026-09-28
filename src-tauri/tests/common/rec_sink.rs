@@ -1,7 +1,7 @@
 //! A collecting `EventSink` (moved from `harness_subagent_dispatch.rs` —
 //! shared with `harness_dispatch_native`).
 
-use archimedes_desktop_lib::agent::EventSink;
+use archimedes_lib::agent::EventSink;
 use serde_json::Value;
 use tokio::sync::mpsc;
 

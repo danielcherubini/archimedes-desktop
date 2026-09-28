@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use archimedes_desktop_lib::agent::{
+use archimedes_lib::agent::{
     EventSink, PermissionOutcome, RpcError, SessionInfo, SessionManager, StopReason,
 };
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::storage::Db;
 
 /// The session-id PREFIX `fake_pi` reports for a fresh session (the id
 /// itself is UNIQUE per process — see `bin/fake_pi.rs`).
@@ -161,7 +161,7 @@ async fn full_session_flow_streams_and_cleans_up() {
     let cwd = config_dir.clone();
 
     // 1. Start the session (the `get_state` establish).
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -249,7 +249,7 @@ async fn establishment_times_out_when_the_agent_hangs() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        archimedes_desktop_lib::test_support::run_with_retry(|| async {
+        archimedes_lib::test_support::run_with_retry(|| async {
             manager.start_session("fake", cwd.clone(), &sink).await
         }),
     )
@@ -326,7 +326,7 @@ async fn agent_death_produces_session_closed() {
     let manager = SessionManager::new(config_dir.clone()).unwrap();
     let cwd = config_dir.clone();
 
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -383,7 +383,7 @@ async fn two_live_sessions_coexist() {
     let manager = SessionManager::new(config_dir.clone()).unwrap();
     let cwd = config_dir.clone();
 
-    let s1 = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let s1 = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -397,7 +397,7 @@ async fn two_live_sessions_coexist() {
     // A second session (the same agent, a fresh spawn) — a DISTINCT pi
     // session id (the fake's per-process id; the driver keys the sessions
     // map by the pi `session_id`, so two live sessions are two entries).
-    let s2 = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let s2 = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -494,7 +494,7 @@ async fn untrusted_space_prompts_with_third_option_and_trust_space_outcome_trust
     db.upsert_space(&cwd_str)
         .expect("upsert_space should succeed");
 
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -596,7 +596,7 @@ async fn trusted_space_skips_the_permission_prompt() {
         "precondition: the space is trusted"
     );
 
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await
@@ -669,7 +669,7 @@ async fn trusted_space_never_auto_answers_select_requests() {
         "precondition: the space is trusted"
     );
 
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("fake", cwd.clone(), &sink).await
     })
     .await

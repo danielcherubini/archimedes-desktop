@@ -18,15 +18,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use archimedes_desktop_lib::agent::bridge::PendingBridge;
-use archimedes_desktop_lib::agent::harness::{
+use archimedes_lib::agent::bridge::PendingBridge;
+use archimedes_lib::agent::harness::{
     FinishReason, Model, ModelCatalog, ModelRequest, Prompt, Provider, ProviderError,
     ProviderEvent, RetryPolicy, SessionStore, SudoDeps, ToolCall,
 };
-use archimedes_desktop_lib::agent::rpc::RpcEvent;
-use archimedes_desktop_lib::agent::subagent::{NativeDeps, SubagentSessionManager};
-use archimedes_desktop_lib::agent::{EventSink, PendingPermissions, ProviderFactory, TodoStore};
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::rpc::RpcEvent;
+use archimedes_lib::agent::subagent::{NativeDeps, SubagentSessionManager};
+use archimedes_lib::agent::{EventSink, PendingPermissions, ProviderFactory, TodoStore};
+use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde_json::{json, Value};
@@ -123,9 +123,9 @@ fn make_manager(
 /// `SubagentSessionManager` — the `subagent` tool spawns a real sub-session).
 async fn build_harness(
     provider: MockProvider,
-    subagent_manager: Option<Arc<archimedes_desktop_lib::agent::SubagentSessionManager>>,
+    subagent_manager: Option<Arc<archimedes_lib::agent::SubagentSessionManager>>,
 ) -> (
-    mpsc::Sender<archimedes_desktop_lib::agent::harness::Prompt>,
+    mpsc::Sender<archimedes_lib::agent::harness::Prompt>,
     mpsc::Receiver<RpcEvent>,
     mpsc::UnboundedReceiver<(String, Value)>,
     SessionStore,
@@ -133,7 +133,7 @@ async fn build_harness(
     let dir = std::env::temp_dir().join(format!("harness-subagent-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = Arc::new(Db::open(&dir.join("db.sqlite")).unwrap());
-    db.record_session(&archimedes_desktop_lib::agent::SessionInfo {
+    db.record_session(&archimedes_lib::agent::SessionInfo {
         session_id: "ns1".to_string(),
         agent_id: "native".to_string(),
         cwd: PathBuf::from("/tmp"),
@@ -153,7 +153,7 @@ async fn build_harness(
         Arc::new(StdMutex::new(CancellationToken::new()));
     let (settle_tx, _settle_rx) = watch::channel(0u64);
     let model = parent_model();
-    let loop_ = archimedes_desktop_lib::agent::harness::AgentLoop::new(
+    let loop_ = archimedes_lib::agent::harness::AgentLoop::new(
         "ns1".to_string(),
         dir,
         model,

@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use archimedes_desktop_lib::agent::harness::ModelCatalog;
+use archimedes_lib::agent::harness::ModelCatalog;
 
 /// Write one file into `dir` (creating it).
 fn write_file(dir: &Path, name: &str, contents: &str) {

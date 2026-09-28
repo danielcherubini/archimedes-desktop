@@ -22,15 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use archimedes_desktop_lib::agent::harness::{
+use archimedes_lib::agent::harness::{
     AgentLoop, ChatRole, FinishReason, Model, ModelCatalog, ModelRequest, Prompt, Provider,
     ProviderError, ProviderEvent, RetryPolicy, SessionStore, SudoDeps, ToolCall,
 };
-use archimedes_desktop_lib::agent::subagent::{
+use archimedes_lib::agent::subagent::{
     LaunchConfig, NativeDeps, SubagentOutcome, SubagentSessionManager,
 };
-use archimedes_desktop_lib::agent::{EventSink, ProviderFactory, RpcEvent, SessionInfo, TodoStore};
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::{EventSink, ProviderFactory, RpcEvent, SessionInfo, TodoStore};
+use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
@@ -692,7 +692,7 @@ async fn dispatch_native_system_prompt_seeds_the_child_transcript() {
         first.messages.first().map(|m| &m.content)
     );
     match &first.messages.first().unwrap().content {
-        archimedes_desktop_lib::agent::harness::MessageContent::Text(t) => {
+        archimedes_lib::agent::harness::MessageContent::Text(t) => {
             assert_eq!(t, "You are terse.")
         }
         other => panic!("the seeded prompt is text — got {other:?}"),
@@ -904,7 +904,7 @@ async fn dispatch_native_tools_override_controls_execution_and_advertised_specs(
 /// sink EXACTLY ONCE (the decorator never re-emits).
 #[test]
 fn capturing_sink_accumulates_the_last_message_and_forwards_every_frame_once() {
-    use archimedes_desktop_lib::agent::subagent::CapturingSink;
+    use archimedes_lib::agent::subagent::CapturingSink;
 
     let (real_tx, mut real_rx) = mpsc::unbounded_channel();
     let real: Arc<dyn EventSink> = Arc::new(RecSink { tx: real_tx });
@@ -959,7 +959,7 @@ fn capturing_sink_accumulates_the_last_message_and_forwards_every_frame_once() {
 /// but the frame is still forwarded).
 #[test]
 fn capturing_sink_skips_empty_deltas_but_forwards_the_frame() {
-    use archimedes_desktop_lib::agent::subagent::CapturingSink;
+    use archimedes_lib::agent::subagent::CapturingSink;
 
     let (real_tx, mut real_rx) = mpsc::unbounded_channel();
     let real: Arc<dyn EventSink> = Arc::new(RecSink { tx: real_tx });
@@ -989,7 +989,7 @@ fn capturing_sink_skips_empty_deltas_but_forwards_the_frame() {
 /// to the real sink EXACTLY ONCE (the user sees the one-liner).
 #[test]
 fn capturing_sink_skips_system_chunks_but_forwards_them() {
-    use archimedes_desktop_lib::agent::subagent::CapturingSink;
+    use archimedes_lib::agent::subagent::CapturingSink;
 
     let (real_tx, mut real_rx) = mpsc::unbounded_channel();
     let real: Arc<dyn EventSink> = Arc::new(RecSink { tx: real_tx });
@@ -1041,10 +1041,10 @@ fn capturing_sink_skips_system_chunks_but_forwards_them() {
 /// `messages: self.messages.clone()`).
 #[test]
 fn agent_loop_getters_and_prepend_system() {
-    use archimedes_desktop_lib::agent::harness::AgentLoop;
-    use archimedes_desktop_lib::agent::harness::{ModelCatalog, RetryPolicy, SessionStore};
-    use archimedes_desktop_lib::agent::{EventSink, TodoStore};
-    use archimedes_desktop_lib::storage::Db;
+    use archimedes_lib::agent::harness::AgentLoop;
+    use archimedes_lib::agent::harness::{ModelCatalog, RetryPolicy, SessionStore};
+    use archimedes_lib::agent::{EventSink, TodoStore};
+    use archimedes_lib::storage::Db;
     use tokio::sync::{mpsc, watch, Mutex};
     use tokio_util::sync::CancellationToken;
 
@@ -1052,7 +1052,7 @@ fn agent_loop_getters_and_prepend_system() {
         std::env::temp_dir().join(format!("native-dispatch-getters-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
-    db.record_session(&archimedes_desktop_lib::agent::SessionInfo {
+    db.record_session(&archimedes_lib::agent::SessionInfo {
         session_id: "s1".to_string(),
         agent_id: "native".to_string(),
         cwd: std::path::PathBuf::from("/tmp"),

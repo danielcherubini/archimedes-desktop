@@ -50,8 +50,8 @@ mod desktop_tools {
     use serde_json::{json, Value};
     use tokio::sync::{watch, Mutex};
 
-    use archimedes_desktop_lib::agent::bridge::{self, BridgeHandle};
-    use archimedes_desktop_lib::agent::{
+    use archimedes_lib::agent::bridge::{self, BridgeHandle};
+    use archimedes_lib::agent::{
         CachedPassword, EventSink, PendingBridge, PendingSudo, SudoRun, SudoRunner, TodoStore,
     };
 
@@ -129,7 +129,7 @@ mod desktop_tools {
     /// A unique temp path (the socket).
     fn unique_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "archimedes-desktop-tools-{tag}-{}.tmp",
+            "archimedes-tools-{tag}-{}.tmp",
             uuid::Uuid::new_v4()
         ))
     }

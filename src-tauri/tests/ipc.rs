@@ -14,8 +14,8 @@ use tauri::test::{get_ipc_response, mock_builder, MockRuntime, INVOKE_KEY};
 use tauri::webview::InvokeRequest;
 use tauri::{Manager, WebviewWindow, WebviewWindowBuilder};
 
-use archimedes_desktop_lib::agent::EventSink;
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::EventSink;
+use archimedes_lib::storage::Db;
 
 /// The session-id PREFIX `fake_pi` reports for a fresh session (the id
 /// itself is UNIQUE per process — see `bin/fake_pi.rs`).
@@ -64,22 +64,22 @@ fn build_app(
 ) -> tauri::App<MockRuntime> {
     let app = mock_builder()
         .invoke_handler(tauri::generate_handler![
-            archimedes_desktop_lib::commands::app_info,
-            archimedes_desktop_lib::commands::sessions::start_session,
-            archimedes_desktop_lib::commands::sessions::send_prompt,
-            archimedes_desktop_lib::commands::sessions::close_session,
-            archimedes_desktop_lib::commands::sessions::respond_permission,
-            archimedes_desktop_lib::commands::sessions::resume_session,
-            archimedes_desktop_lib::commands::history::list_sessions,
-            archimedes_desktop_lib::commands::history::load_history,
-            archimedes_desktop_lib::commands::history::delete_session,
-            archimedes_desktop_lib::commands::settings::get_settings,
-            archimedes_desktop_lib::commands::settings::save_settings,
-            archimedes_desktop_lib::commands::spaces::list_agents,
-            archimedes_desktop_lib::commands::spaces::list_spaces,
-            archimedes_desktop_lib::commands::spaces::delete_space,
-            archimedes_desktop_lib::commands::spaces::space_for_path,
-            archimedes_desktop_lib::commands::spaces::set_space_trusted
+            archimedes_lib::commands::app_info,
+            archimedes_lib::commands::sessions::start_session,
+            archimedes_lib::commands::sessions::send_prompt,
+            archimedes_lib::commands::sessions::close_session,
+            archimedes_lib::commands::sessions::respond_permission,
+            archimedes_lib::commands::sessions::resume_session,
+            archimedes_lib::commands::history::list_sessions,
+            archimedes_lib::commands::history::load_history,
+            archimedes_lib::commands::history::delete_session,
+            archimedes_lib::commands::settings::get_settings,
+            archimedes_lib::commands::settings::save_settings,
+            archimedes_lib::commands::spaces::list_agents,
+            archimedes_lib::commands::spaces::list_spaces,
+            archimedes_lib::commands::spaces::delete_space,
+            archimedes_lib::commands::spaces::space_for_path,
+            archimedes_lib::commands::spaces::set_space_trusted
         ])
         .build(tauri::generate_context!())
         .expect("app should build");
@@ -89,8 +89,7 @@ fn build_app(
     // phase, where the setup hook would run, so the test calls it directly
     // on the built app). This registers the SessionManager, the Db, and
     // the EventSink exactly as the real app does.
-    archimedes_desktop_lib::setup_dirs(&app, config_dir, app_data_dir)
-        .expect("setup_dirs should succeed");
+    archimedes_lib::setup_dirs(&app, config_dir, app_data_dir).expect("setup_dirs should succeed");
 
     // Regression check for the TypeId lesson: the commands resolve the
     // sink as `State<Arc<dyn EventSink>>`, and Tauri's state registry is

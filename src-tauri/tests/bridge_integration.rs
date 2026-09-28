@@ -44,8 +44,8 @@ mod bridge_integration {
     use serde_json::{json, Value};
     use tokio::sync::{watch, Mutex};
 
-    use archimedes_desktop_lib::agent::bridge::{self, BridgeHandle};
-    use archimedes_desktop_lib::agent::{
+    use archimedes_lib::agent::bridge::{self, BridgeHandle};
+    use archimedes_lib::agent::{
         CachedPassword, EventSink, PendingBridge, PendingSudo, SudoRun, SudoRunner, TodoStore,
     };
 

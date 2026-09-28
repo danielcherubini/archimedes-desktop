@@ -4,9 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
 
-use archimedes_desktop_lib::agent::harness::{
-    ModelRequest, Provider, ProviderError, ProviderEvent,
-};
+use archimedes_lib::agent::harness::{ModelRequest, Provider, ProviderError, ProviderEvent};
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;

@@ -14,11 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use archimedes_desktop_lib::agent::subagent::{
-    LaunchConfig, SubagentOutcome, SubagentSessionManager,
-};
-use archimedes_desktop_lib::agent::{EventSink, PermissionOutcome};
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::subagent::{LaunchConfig, SubagentOutcome, SubagentSessionManager};
+use archimedes_lib::agent::{EventSink, PermissionOutcome};
+use archimedes_lib::storage::Db;
 use serde_json::Value;
 
 /// The full path to the compiled `fake_pi` binary.

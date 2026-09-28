@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use archimedes_desktop_lib::config::{AgentEntry, AgentKind, Registry};
+use archimedes_lib::config::{AgentEntry, AgentKind, Registry};
 use serde_json::json;
 
 fn temp_dir() -> PathBuf {

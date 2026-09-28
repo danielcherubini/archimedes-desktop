@@ -1,5 +1,5 @@
 {
-  "name": "archimedes-desktop",
+  "name": "archimedes",
   "packageManager": "pnpm@11.7.0",
   "private": true,
   "version": "0.1.0",

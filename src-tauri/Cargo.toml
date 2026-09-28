@@ -1,5 +1,5 @@
 [package]
-name = "archimedes-desktop"
+name = "archimedes"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -8,7 +8,7 @@ edition = "2021"
 # Two binaries exist (the app + the dev-only `fake_pi` fixture — a
 # stand-in for the real `pi --mode rpc` agent in integration tests); tell
 # cargo which one `cargo run` (and thus `tauri dev`) should launch.
-default-run = "archimedes-desktop"
+default-run = "archimedes"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,7 +16,7 @@ default-run = "archimedes-desktop"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "archimedes_desktop_lib"
+name = "archimedes_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

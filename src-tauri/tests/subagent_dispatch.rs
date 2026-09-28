@@ -23,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use archimedes_desktop_lib::agent::{
-    EventSink, SessionManager, StopReason, SubagentSessionManager,
-};
+use archimedes_lib::agent::{EventSink, SessionManager, StopReason, SubagentSessionManager};
 use serde_json::Value;
 
 /// The full path to the compiled `fake_pi` binary.
@@ -245,7 +243,7 @@ async fn setup_dispatch_test(
     manager.set_subagent_manager(subagent_manager.clone());
     let manager = Arc::new(manager);
 
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         let manager = Arc::clone(&manager);
         manager.start_session("fake", cwd.clone(), &sink).await
     })

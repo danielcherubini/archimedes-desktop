@@ -8,8 +8,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use archimedes_desktop_lib::agent::SessionInfo;
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::SessionInfo;
+use archimedes_lib::storage::Db;
 
 fn temp_db_path() -> PathBuf {
     std::env::temp_dir().join(format!("archimedes-storage-test-{}", uuid::Uuid::new_v4()))

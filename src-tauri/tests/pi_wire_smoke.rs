@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use archimedes_desktop_lib::agent::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, RpcEvent};
+use archimedes_lib::agent::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, RpcEvent};
 use serde_json::Value;
 
 /// Locate the `pi` binary on PATH (`None` = skip the test).
@@ -199,7 +199,7 @@ async fn real_pi_gate_and_resume_smoke() {
 
     // The bundled gate extension (the desktop's own `gate.ts` — the
     // self-gated `tool_call` → `ctx.ui.confirm` round-trip).
-    let gate_path = match archimedes_desktop_lib::agent::install_gate_extension(&dir) {
+    let gate_path = match archimedes_lib::agent::install_gate_extension(&dir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("skipping real_pi_gate_and_resume_smoke: gate install failed: {e}");
@@ -211,7 +211,7 @@ async fn real_pi_gate_and_resume_smoke() {
     // Spawn 1: `--session <file>` (a NEW session at that path — pi
     // creates it) + the gate extension (`-e`) + the gate env.
     let mut env = empty_env();
-    archimedes_desktop_lib::agent::gate_env(&mut env);
+    archimedes_lib::agent::gate_env(&mut env);
     let args = [
         "--mode".to_string(),
         "rpc".to_string(),

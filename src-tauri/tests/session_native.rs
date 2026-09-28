@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use archimedes_desktop_lib::agent::harness::{
+use archimedes_lib::agent::harness::{
     ChatMessage, ChatRole, CompactionConfig, FinishReason, MessageContent, Model, ModelCatalog,
     Provider, ProviderError, ProviderEvent,
 };
-use archimedes_desktop_lib::agent::{EventSink, SessionManager, StopReason};
-use archimedes_desktop_lib::config::{AgentKind, Registry};
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::{EventSink, SessionManager, StopReason};
+use archimedes_lib::config::{AgentKind, Registry};
+use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
@@ -68,7 +68,7 @@ impl MockProvider {
 impl Provider for MockProvider {
     async fn complete(
         &self,
-        req: &archimedes_desktop_lib::agent::harness::ModelRequest,
+        req: &archimedes_lib::agent::harness::ModelRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
         // Record the request's messages (role + text) — the resume assertion.
         let recorded_msgs: Vec<(String, String)> = req

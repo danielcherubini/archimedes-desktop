@@ -2,7 +2,7 @@
 //! (native-agent-harness Task 4): `complete()` against a mock HTTP server
 //! (wiremock) serving canned SSE streams / canned status codes.
 
-use archimedes_desktop_lib::agent::harness::{
+use archimedes_lib::agent::harness::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest,
     OpenAiCompatibleProvider, Provider, ProviderError, ProviderEvent,
 };

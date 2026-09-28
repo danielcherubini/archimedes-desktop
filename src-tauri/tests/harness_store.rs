@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use archimedes_desktop_lib::agent::harness::{
+use archimedes_lib::agent::harness::{
     ChatMessage, ChatRole, MessageContent, SessionStore, ToolCall,
 };
-use archimedes_desktop_lib::agent::SessionInfo;
-use archimedes_desktop_lib::storage::Db;
+use archimedes_lib::agent::SessionInfo;
+use archimedes_lib::storage::Db;
 use serde_json::json;
 
 /// A temp `Db` (a fresh file per test — `Db` is a single

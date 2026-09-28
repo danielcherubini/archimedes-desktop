@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use archimedes_desktop_lib::agent::{EventSink, SessionManager, StopReason, WorkerRuntime};
+use archimedes_lib::agent::{EventSink, SessionManager, StopReason, WorkerRuntime};
 
 /// The full path to the compiled `fake_pi` binary.
 const FAKE_PI: &str = env!("CARGO_BIN_EXE_fake_pi");
@@ -175,7 +175,7 @@ async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
     // 1. The MAIN-runtime session (the test's own runtime plays the "app
     //    runtime" role — the test does not require the Tauri app runtime).
     let manager = SessionManager::new(config_dir.clone()).unwrap();
-    let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+    let info = archimedes_lib::test_support::run_with_retry(|| async {
         manager.start_session("main", cwd.clone(), &sink).await
     })
     .await
@@ -201,7 +201,7 @@ async fn two_sessions_on_two_runtimes_answer_concurrent_prompts() {
             let manager = Arc::new(
                 SessionManager::new(worker_config_dir).expect("worker SessionManager should build"),
             );
-            let info = archimedes_desktop_lib::test_support::run_with_retry(|| async {
+            let info = archimedes_lib::test_support::run_with_retry(|| async {
                 manager
                     .start_session("worker", cwd.clone(), &worker_sink)
                     .await
@@ -326,7 +326,7 @@ async fn app_exit_shutdown_and_join_reaps_worker_agent() {
         let s = Arc::clone(&sink);
         worker
             .spawn_task(async move {
-                archimedes_desktop_lib::test_support::run_with_retry(|| async {
+                archimedes_lib::test_support::run_with_retry(|| async {
                     m.start_session("worker", cwd.clone(), &s).await
                 })
                 .await
