@@ -479,6 +479,26 @@ export function listenBridgeRequest(
   );
 }
 
+/**
+ * A `bridge-request-close` event payload (the Rust `SudoPromptCleanup` drop
+ * guard emits it when a `sudo_exec` sub-prompt is DROPPED — a turn cancel
+ * skips the flow's exit-path cleanup, so the modal must be closed here). The
+ * `requestId` is the sub-prompt's derived id (`"{id}:confirm"` /
+ * `"{id}:password"`).
+ */
+export interface BridgeRequestClosePayload {
+  sessionId: string;
+  requestId: string;
+}
+
+export function listenBridgeRequestClose(
+  callback: (payload: BridgeRequestClosePayload) => void,
+): Promise<UnlistenFn> {
+  return listen<BridgeRequestClosePayload>("bridge-request-close", (event) =>
+    callback(event.payload),
+  );
+}
+
 export function listenBridgeEvent(
   callback: (payload: BridgeEventPayload) => void,
 ): Promise<UnlistenFn> {

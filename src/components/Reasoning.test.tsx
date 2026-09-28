@@ -214,7 +214,10 @@ describe("resolveReasoningStreamingSummary", () => {
       return performance.now() - t0;
     };
     // A `replace`+`split` over the whole text makes the 1MB input orders of
-    // magnitude slower than the 1KB one; a backwards line scan is ~equal.
-    expect(timeIt(big) / Math.max(0.001, timeIt(small))).toBeLessThan(5);
+    // magnitude slower than the 1KB one (~1000x); a backwards line scan is
+    // ~equal (same last line, ~1-10x under load). The threshold is deliberately
+    // lenient (50) so wall-clock noise under load can't flake it, while a
+    // whole-text regression (~1000x) still fails it with a 20x margin.
+    expect(timeIt(big) / Math.max(0.001, timeIt(small))).toBeLessThan(50);
   });
 });

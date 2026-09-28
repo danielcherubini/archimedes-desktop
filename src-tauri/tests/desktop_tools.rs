@@ -10,9 +10,9 @@
 //! child of the test — a descendant, so the peer-verification passes) with
 //! the bridge env set by the TEST (`PI_ARCHIMEDES_BRIDGE=1` + `_SOCKET` /
 //! `_SESSION` / `_SERVER_PID`). The fake connects to the socket and sends the
-//! `todo_update` / `sudo_exec` / `ask` frames the override would send, printing
-//! each received response to stdout (one JSON line — the fake→test assertion
-//! channel).
+//! `todo_update` / `sudo_exec` / `ask` / `tool_exec` frames the override would
+//! send, printing each received response to stdout (one JSON line — the
+//! fake→test assertion channel).
 //!
 //! **Correlation ids (CRITICAL for the `sudo_exec` sub-prompts):** the fake
 //! uses FIXED frame ids (`todo-1`/`todo-2`/`sudo-1`/`sudo-2`/`ask-1`). The
@@ -24,12 +24,16 @@
 //! oneshots via `respond` BEFORE any response exists. Without fixed/known ids
 //! the test could not pre-empt the oneshots.
 //!
-//! The built-in-tools-untouched invariant is asserted in the `tools.rs` unit
-//! tests (the authoritative check — `tools_spawn_args` appends only `-e <path>`
-//! and never `--no-builtin-tools`/`--tools`), NOT here: the e2e spawns
-//! `fake_pi` itself, so "the absence of any `--no-builtin-tools`/`--tools` arg
-//! in the spawn" asserts nothing about the desktop's spawn composition, and
-//! `fake_pi` exposes no `get_state` tool list.
+//! The `--no-builtin-tools` spawn-composition invariant is asserted in the
+//! `tools.rs` `spawn_args` unit tests (the authoritative check — the composed
+//! gate + tools + `--no-builtin-tools` args append `--no-builtin-tools` ONLY
+//! when the tools override will actually register the built-ins: a Linux
+//! bridge spawn), NOT here: the e2e spawns `fake_pi` itself, so "the absence
+//! of any `--no-builtin-tools`/`--tools` arg in the spawn" asserts nothing
+//! about the desktop's spawn composition, and `fake_pi` exposes no
+//! `get_state` tool list. (This e2e IS the Phase 1 round-trip check: the
+//! fake's `tool_exec` frame is executed by the desktop's REAL `tool_exec`
+//! handler — override → bridge → desktop executor → back.)
 //!
 //! Linux-only: the bridge listener is fail-closed (not started) on
 //! macOS/Windows.
@@ -147,10 +151,16 @@ mod desktop_tools {
         let (close_tx, _close_rx) = watch::channel(false);
         let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        // The native-agent-harness (Task 2) `start_listener` parameter: a
+        // fresh session `cwd` (the `tool_exec` sandbox root — the fake's
+        // `tool_exec` frame below executes `bash` in this dir).
+        let cwd = unique_path("cwd");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
         bridge::start_listener(
             session_id.to_string(),
             path,
             std::process::id(),
+            &cwd,
             sink,
             pending,
             &close_tx,
@@ -478,6 +488,36 @@ mod desktop_tools {
             "the desktop responds with the raw AskResponsePayload (verbatim)"
         );
         assert!(v.get("error").is_none(), "the ask response has no error");
+
+        // ── tool_exec `bash` (Phase 1 — the built-in override's
+        // round-trip): the fake sends the frame the `bash` override's
+        // `execute()` would (`{ tool: "bash", params: { command } }`); the
+        // desktop's REAL `tool_exec` handler executes the delegated
+        // built-in itself (`tools/exec.rs` `exec_bash` — sandboxed to the
+        // session `cwd`) and responds with a ToolResult. THIS is the full
+        // Phase 1 round-trip: override → bridge → desktop executor → back.
+        let resp = wait_for_stdout(&out_lines, "\"id\":\"tool-1\"", Duration::from_secs(15))
+            .await
+            .expect("the tool_exec response");
+        let v: Value = serde_json::from_str(&resp).expect("the response is JSON");
+        assert_eq!(v.get("type").and_then(Value::as_str), Some("response"));
+        let text = v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("delegated"),
+            "the desktop executed the delegated bash (output: {text:?})"
+        );
+        assert_eq!(
+            v["result"]["details"]["exitCode"].as_i64(),
+            Some(0),
+            "the desktop's executor reports exitCode 0"
+        );
+        assert_eq!(
+            v["result"].get("isError").and_then(Value::as_bool),
+            Some(false),
+            "a successful delegated run has isError: false"
+        );
 
         // The fake exits 0 after the responses (a descendant is accepted and
         // all the frames are answered).

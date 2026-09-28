@@ -41,11 +41,13 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, watch, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::session::{CostAccumulator, EventSink, SubagentSpawn};
 use crate::agent::subagent::LaunchConfig;
 use crate::agent::subagent::{SubagentMetrics, SubagentOutcome};
 use crate::agent::todo::{TodoItem, TodoStatus, TodoStore};
+use crate::agent::tools::exec::{execute_tool, ContentBlock, ToolCtx, ToolResult};
 
 /// The manager's map of pending bridge-request senders.
 ///
@@ -98,6 +100,13 @@ pub const SUDO_TTL: Duration = Duration::from_millis(900_000);
 /// the caller's `timeoutMs` (absent = this), NOT by the 330 s sub-prompt
 /// cap.
 pub const SUDO_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+
+/// The `tool_exec` per-method timeout (native-agent-harness Task 2): fast
+/// tools are capped at 30 s; `bash` is capped by its `timeout_ms` param
+/// (absent = this 5-min default — the RUN is bounded by the caller's
+/// `timeout_ms`, mirroring the `sudo_exec` run cap).
+pub const TOOL_EXEC_FAST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const TOOL_EXEC_BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The `SudoRunner`'s outcome: `timed_out: true` + `exit_code` (the timeout
 /// sentinel, 124) = a timeout; `error: Some(…)` = a spawn failure (NOT an
@@ -171,6 +180,12 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Kill the child (SIGKILL) if the run future is DROPPED mid-flight
+    // (finding 3 — a `tokio::select!` dropping the future would otherwise
+    // leave the elevated command running detached; `kill_on_drop` alone
+    // kills the DIRECT child — the `SudoGroupGuard` below kills the whole
+    // group, so a root command that forked further does not survive).
+    cmd.kill_on_drop(true);
     // The child owns its process group (the suite's `detached: true`):
     // `setpgid(0, 0)` in the child (a single async-signal-safe libc call
     // — the only `unsafe` here) makes it the leader of a fresh group —
@@ -197,6 +212,16 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
             }
         }
     };
+    // Kill the WHOLE process group if the run is dropped mid-flight (finding
+    // 3 — `kill_on_drop` alone kills only the direct child; a root command
+    // that forked further survives a bare kill of the child alone). The guard
+    // is DISARMED on every return path (a normal completion leaves the group
+    // alone — a backgrounded grandchild the user wanted to keep running
+    // survives; the timeout / kill paths already reaped the group, so a
+    // second `kill(-pgid)` is a redundant double-kill / a pid-reuse hazard):
+    // it fires ONLY on an abrupt drop (the future dropped mid-flight, before
+    // the child was reaped).
+    let mut group_guard = SudoGroupGuard { pid: child.id() };
     // The password travels via stdin ONLY (`sudo -S` reads it from there —
     // it never appears in argv or env). A fatal EPIPE (the child finished
     // without reading it — e.g. a NOPASSWD sudo) is NOT an auth failure:
@@ -217,6 +242,10 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
             Ok(r) => r,
             Err(_) => {
                 kill_process_group_and_reap(&mut child).await;
+                // The group was just killed + reaped — disarm the guard (a
+                // second `kill(-pgid)` on a reaped pgid is a redundant
+                // double-kill / a pid-reuse hazard).
+                group_guard.disarm();
                 return SudoRun {
                     exit_code: -1,
                     stdout: String::new(),
@@ -270,6 +299,12 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                 }
+                // The child is reaped (a `wait` failure, or the read failure
+                // with a successful `wait` — the child's own exit settled the
+                // run) — disarm the guard (a `kill(-pgid)` on a reaped pid is
+                // a pid-reuse hazard; the group is left alone on a transport
+                // failure, matching the "no group kill on a normal exit" rule).
+                group_guard.disarm();
                 return SudoRun {
                     exit_code: -1,
                     stdout,
@@ -279,6 +314,11 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
                 };
             }
             let status = w.expect("wait succeeded (checked above)");
+            // A NORMAL completion (no read / wait error): the child exited and
+            // was reaped inside `read` — disarm the guard so the group is left
+            // alone (a backgrounded grandchild the user wanted to keep running
+            // survives; a bare group kill here is a pid-reuse hazard too).
+            group_guard.disarm();
             SudoRun {
                 exit_code: status.code().unwrap_or(-1),
                 stdout,
@@ -291,6 +331,10 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
             // Timeout: kill the WHOLE process group + reap (the shared
             // helper — consistent with the write-timeout kill above).
             kill_process_group_and_reap(&mut child).await;
+            // The group was just killed + reaped — disarm the guard (a second
+            // `kill(-pgid)` on a reaped pgid is a redundant double-kill / a
+            // pid-reuse hazard).
+            group_guard.disarm();
             SudoRun {
                 // The suite's timeout sentinel (124).
                 exit_code: 124,
@@ -317,6 +361,124 @@ async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+/// A drop guard that KILLS the WHOLE process group of a `run_sudo_real`
+/// child (finding 3 — a dropped mid-run future must not leave the elevated
+/// command running detached). The child owns its process group (the
+/// `setpgid(0, 0)` in `pre_exec`), so a negative pid targets the group;
+/// ESRCH = the group is already gone (no-op — a normal completion). It
+/// complements `kill_on_drop(true)` (which kills the DIRECT child but not
+/// its grandchildren): a root command that forked further survives a bare
+/// kill of the child alone, but not a kill of the group.
+///
+/// The guard fires ONLY on an abrupt drop (the future dropped mid-flight,
+/// before the child was reaped): `run_sudo_real` disarms it on every
+/// return path (a normal completion leaves the group alone — a backgrounded
+/// grandchild the user wanted to keep running survives; the timeout / kill
+/// paths already reaped the group via `kill_process_group_and_reap`, so a
+/// second `kill(-pgid)` is a redundant double-kill / a pid-reuse hazard).
+struct SudoGroupGuard {
+    pid: Option<u32>,
+}
+
+impl SudoGroupGuard {
+    /// Disarm the guard (the child was reaped — a `kill(-pgid)` would be a
+    /// pid-reuse hazard, or a redundant double-kill on a group already
+    /// reaped by `kill_process_group_and_reap`). Called on a normal
+    /// completion (the group is left alone) and on the timeout / kill paths.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for SudoGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            {
+                let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// A drop guard that cleans up a `sudo_run_flow`'s `pending_sudo` entry
+/// (finding 3 — a DROPPED flow: the `dispatch_tool` `select!`'s turn-cancel
+/// arm drops the `sudo_run_flow` future, skipping its exit-path cleanup, so
+/// the `:confirm` / `:password` oneshot entry leaked + the `bridge-request`
+/// modal stayed open with no pending response). On `Drop` it (a) emits a
+/// `bridge-request-close` event (the UI closes the modal) and (b) removes the
+/// tracked key(s) (best-effort — a dropped runtime skips the removal). The
+/// keys are tracked as they are inserted; a normal exit UNTRACKS them (the
+/// entry is removed + the key is untracked — the guard's removal is then a
+/// no-op, so it is idempotent), so `bridge-request-close` is emitted ONLY for
+/// a genuinely dropped flow (the entry NOT removed — a completed flow, after
+/// the user answered both sub-prompts, does NOT emit a stale close).
+struct SudoPromptCleanup {
+    pending_sudo: PendingSudo,
+    sink: Arc<dyn EventSink>,
+    session_id: String,
+    keys: Vec<String>,
+}
+
+impl SudoPromptCleanup {
+    fn new(pending_sudo: &PendingSudo, sink: &Arc<dyn EventSink>, session_id: &str) -> Self {
+        Self {
+            pending_sudo: pending_sudo.clone(),
+            sink: sink.clone(),
+            session_id: session_id.to_string(),
+            keys: Vec::new(),
+        }
+    }
+    /// Track a `pending_sudo` key (called as the entry is inserted).
+    fn track(&mut self, key: &str) {
+        self.keys.push(key.to_string());
+    }
+    /// Untrack a `pending_sudo` key (called when the entry is removed on a
+    /// normal exit — the `bridge-request-close` is then NOT emitted for it, so
+    /// a completed flow does not emit a stale close for an already-answered
+    /// sub-prompt; only a genuinely dropped flow (the entry NOT removed) emits
+    /// the close).
+    fn untrack(&mut self, key: &str) {
+        self.keys.retain(|k| k.as_str() != key);
+    }
+}
+
+impl Drop for SudoPromptCleanup {
+    fn drop(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        // (a) Close the modal(s) (a `bridge-request` was emitted for each
+        // sub-prompt; a drop must close it — pre-fix the modal stayed open
+        // with no pending response, and a late answer got `Ok(true)` with
+        // the send silently failing). The `requestId` is the key's suffix
+        // after `"{session_id}/"` (`bridge_key` is `"{session_id}/{id}"`).
+        let prefix = format!("{}/", self.session_id);
+        for key in &self.keys {
+            if let Some(request_id) = key.strip_prefix(&prefix) {
+                self.sink.emit(
+                    "bridge-request-close",
+                    json!({
+                        "sessionId": self.session_id,
+                        "requestId": request_id,
+                    }),
+                );
+            }
+        }
+        // (b) Remove the entries (best-effort — a dropped runtime skips it).
+        let pending_sudo = self.pending_sudo.clone();
+        let keys = std::mem::take(&mut self.keys);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut map = pending_sudo.lock().await;
+                for key in keys {
+                    map.remove(&key);
+                }
+            });
+        }
+    }
 }
 
 /// Read a stream to EOF into `buf` (chunked — bounded; the buffer is
@@ -565,7 +727,10 @@ pub fn available() -> bool {
 /// `todo_store` / `pending_sudo` / `sudo_password` / `runner` (Phase 2,
 /// Task 1) service the method-aware `todo_update` / `sudo_exec` handlers:
 /// the shared todo store, the sudo sub-prompt oneshots, the per-session
-/// sudo credential cache, and the `sudo -S` execution seam.
+/// sudo credential cache, and the `sudo -S` execution seam. `cwd`
+/// (native-agent-harness Task 2) is the session's `cwd` — the sandbox root
+/// the method-aware `tool_exec` handler runs the delegated built-in tools
+/// in.
 ///
 /// **Platform policy:** on **macOS** (and other platforms) the listener is
 /// NOT started — a no-op handle is returned (fail-closed, ADR 0003).
@@ -574,6 +739,7 @@ pub async fn start_listener(
     placeholder_session_id: String,
     socket_path: &Path,
     anchor_pid: u32,
+    cwd: &Path,
     sink: Arc<dyn EventSink>,
     pending_bridge: PendingBridge,
     close_tx: &watch::Sender<bool>,
@@ -591,6 +757,7 @@ pub async fn start_listener(
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let session_id = Arc::new(Mutex::new(placeholder_session_id));
         let last_seq = Arc::new(AtomicU64::new(0));
+        let cwd = Arc::new(cwd.to_path_buf());
         // Owned (and `'static`) so the spawned accept loop + per-connection
         // waiters can hold it; `watch::Sender::clone` shares the same channel.
         let close_tx: Arc<watch::Sender<bool>> = Arc::new(close_tx.clone());
@@ -660,6 +827,7 @@ pub async fn start_listener(
                                             last_seq: last_seq.clone(),
                                             close_tx: close_tx.clone(),
                                             timeout,
+                                            cwd: cwd.clone(),
                                             subagent: subagent.clone(),
                                             cost_capture: cost_capture.clone(),
                                             todo_store: todo_store.clone(),
@@ -699,6 +867,7 @@ pub async fn start_listener(
         let _ = (
             socket_path,
             anchor_pid,
+            cwd,
             sink,
             pending_bridge,
             close_tx,
@@ -733,6 +902,7 @@ pub async fn start_listener(
         let _ = (
             socket_path,
             anchor_pid,
+            cwd,
             sink,
             pending_bridge,
             close_tx,
@@ -858,6 +1028,9 @@ struct ConnCtx {
     last_seq: Arc<AtomicU64>,
     close_tx: Arc<watch::Sender<bool>>,
     timeout: Duration,
+    /// The session's `cwd` (the `tool_exec` sandbox root — the `ToolCtx`
+    /// for the desktop's own tool execution; native-agent-harness Task 2).
+    cwd: Arc<PathBuf>,
     /// The subagent dispatch handle (main only — `Some`); `None` for tests /
     /// non-bridge setups (a `dispatch_subagent` frame on such a listener gets
     /// the unknown-method `error` response).
@@ -931,6 +1104,8 @@ where
         last_seq,
         close_tx,
         timeout,
+        // The session's `cwd` (the `tool_exec` sandbox root).
+        cwd,
         // The subagent dispatch handle (main only — `Some`); the
         // `dispatch_subagent` method is method-aware (NO timeout).
         subagent,
@@ -1018,6 +1193,17 @@ where
                     &close_tx,
                 )
                 .await;
+                return;
+            }
+
+            // `tool_exec` is method-aware too (native-agent-harness Task 2):
+            // NO `pending_bridge` entry (the desktop executes the delegated
+            // built-in tool itself — not the user), NO `bridge-request`
+            // event, NO 330 s timeout arm (the run is bounded by the
+            // per-method timeout instead; cancellation is the agent's EOF /
+            // the session close).
+            if method == "tool_exec" {
+                handle_tool_exec(&mut stream, &id, frame.get("params"), &cwd, &close_tx).await;
                 return;
             }
 
@@ -1169,7 +1355,11 @@ enum DispatchWait {
 /// dispatch an empty-prompt subagent session). `tools: []` is treated as
 /// `None` (an empty allowlist is malformed, not an allowlist — it would
 /// produce `--tools ''`).
-fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> {
+/// Parse + validate the `dispatch_subagent` params: `task` (required,
+/// non-empty) + the optional `launch` config (`model` / `systemPrompt` /
+/// `tools` — `tools: []` is treated as `None`). `pub(crate)` so the native
+/// `AgentLoop`'s `ToolRegistry` (Task 6) reuses the SAME validation.
+pub(crate) fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> {
     let task = params
         .get("task")
         .and_then(Value::as_str)
@@ -1356,9 +1546,190 @@ async fn handle_dispatch_subagent<S>(
 /// never update). The result shapes/text mirror the suite's
 /// `packages/todo/src/tool.ts` VERBATIM.
 ///
-/// A cancelled session aborts the handler (the work is fast — a close-flag
-/// check before the store write / push emit, and the response write races
-/// the close flag: a write to a closed stream fails silently).
+/// The FRAME-FREE CORE (native-agent-harness Task 6, reviewer-corrected
+/// Major #15): apply the suite's `manage_todo_list` params to the shared
+/// [`TodoStore`], and — on a `write` — emit the `todos_update` push the
+/// EXISTING `useBridge.applyTodoUpdate` / `TodoBoardPanel` consume (the
+/// `BridgeEventPayload` shape — `sessionId` is MANDATORY), returning the
+/// result (the text + details mirror the suite's `tool.ts` VERBATIM). Both
+/// the `todo_update` frame handler AND the native `AgentLoop`'s
+/// `ToolRegistry` call it (the native `AgentLoop` passes its `cancel`
+/// token; the frame handler passes a token bridged from the close flag).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn todo_apply(
+    store: &TodoStore,
+    sid: &str,
+    source: &str,
+    params: &Value,
+    sink: &Arc<dyn EventSink>,
+    cancel: &CancellationToken,
+) -> ToolResult {
+    let operation = params
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // A cancelled session aborts the core (BEFORE the store write / the
+    // push emit — a cancelled session's agent is gone).
+    if cancel.is_cancelled() {
+        return ToolResult {
+            content: vec![],
+            details: None,
+            is_error: true,
+        };
+    }
+
+    if operation == "read" {
+        let todos = store.get(sid);
+        // The suite's read text (`tool.ts:75-84`): `JSON.stringify(todos,
+        // null, 2)` when non-empty, else the "No todos" text.
+        let text = if todos.is_empty() {
+            "No todos. Use write operation to create a todo list.".to_string()
+        } else {
+            serde_json::to_string_pretty(&todos).unwrap_or_default()
+        };
+        return ToolResult {
+            content: vec![ContentBlock::Text { text }],
+            details: Some(json!({ "operation": "read", "todos": todos })),
+            is_error: false,
+        };
+    }
+    // write (the default for a missing/unknown operation — the suite's
+    // schema requires `operation` in {"write","read"}, so anything
+    // else is a malformed write).
+    match params.get("todoList").and_then(Value::as_array) {
+        None => {
+            // The suite's text + flag (`tool.ts:89-94`): `todos` is
+            // the CURRENT list, `error` is the marker.
+            let current = store.get(sid);
+            ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "Error: todoList is required for write operation.".to_string(),
+                }],
+                details: Some(
+                    json!({ "operation": "write", "todos": current, "error": "todoList required" }),
+                ),
+                is_error: true,
+            }
+        }
+        Some(arr) => {
+            // The suite's `state.validate` (`state-manager.ts:36-59`): the
+            // TypeBox schema lets an empty/whitespace `content` through, so
+            // the validation is the guard here. (The `status` is checked
+            // against the wire casing; a non-string `description` is an
+            // error — the schema would have rejected it, but a
+            // hand-rolled frame must not blow up the handler.)
+            let valid_statuses = ["pending", "in_progress", "completed"];
+            let mut errors: Vec<String> = Vec::new();
+            let mut items: Vec<TodoItem> = Vec::new();
+            for (i, item) in arr.iter().enumerate() {
+                let prefix = format!("Item {}", i + 1);
+                if item.is_null() {
+                    errors.push(format!("{prefix}: undefined item"));
+                    continue;
+                }
+                let content = item.get("content").and_then(Value::as_str);
+                let status = item.get("status").and_then(Value::as_str);
+                if content.is_none_or(|c| c.trim().is_empty()) {
+                    errors.push(format!("{prefix}: missing or invalid 'content'"));
+                }
+                if !status.is_some_and(|s| valid_statuses.contains(&s)) {
+                    errors.push(format!(
+                        "{prefix}: 'status' must be one of: pending, in_progress, completed"
+                    ));
+                }
+                if item.get("description").is_some()
+                    && item.get("description").and_then(Value::as_str).is_none()
+                {
+                    errors.push(format!("{prefix}: 'description' must be a string"));
+                }
+                if let (Some(content), Some(status)) = (content, status) {
+                    items.push(TodoItem {
+                        content: content.to_string(),
+                        status: match status {
+                            "pending" => TodoStatus::Pending,
+                            "in_progress" => TodoStatus::InProgress,
+                            _ => TodoStatus::Completed,
+                        },
+                        description: item
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                }
+            }
+            if !errors.is_empty() {
+                // The suite's validation text (`tool.ts:84-93`): the errors
+                // prefixed `  - ` and joined with newlines; `details.error`
+                // is the errors joined with `; `.
+                let text = format!(
+                    "Validation failed:\n{}",
+                    errors
+                        .iter()
+                        .map(|e| format!("  - {e}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                let current = store.get(sid);
+                ToolResult {
+                    content: vec![ContentBlock::Text { text }],
+                    details: Some(
+                        json!({ "operation": "write", "todos": current, "error": errors.join("; ") }),
+                    ),
+                    is_error: true,
+                }
+            } else {
+                let stored = store.set(sid, items.clone());
+                // Emit the `todos_update` push via the EXISTING
+                // `bridge-event` sink path (the `BridgeEventPayload` shape
+                // — the EXISTING `useBridge.applyTodoUpdate` +
+                // `TodoBoardPanel` consume it; do NOT invent a new
+                // `todo-update` event).
+                sink.emit(
+                    "bridge-event",
+                    json!({
+                        "sessionId": sid,
+                        "seq": 0,
+                        "event": "todos_update",
+                        "payload": { "source": source, "todos": stored }
+                    }),
+                );
+                // The suite's write text (`tool.ts:138`): the stats from
+                // the stored items, + a warning appended when the list has
+                // <3 items.
+                let completed = stored
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::Completed)
+                    .count();
+                let total = stored.len();
+                let mut message = format!(
+                    "Todos have been modified all. {completed}/{total} completed. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable."
+                );
+                if stored.len() < 3 {
+                    message.push_str(
+                        "\n\nWarning: Small todo list (<3 items). This task might not need a todo list.",
+                    );
+                }
+                ToolResult {
+                    content: vec![ContentBlock::Text { text: message }],
+                    details: Some(json!({ "operation": "write", "todos": stored })),
+                    is_error: false,
+                }
+            }
+        }
+    }
+}
+
+/// The `todo_update` request branch (method-aware — the desktop answers
+/// it itself; see the `handle_connection` request arm): the frame wrapper
+/// around the frame-free [`todo_apply`] core (Task 6) — a cancelled
+/// session aborts the handler (BEFORE the store write / the push emit),
+/// and the response write races the close flag (a write to a closed
+/// stream fails silently). `drain_until_eof` is NOT a separate arm: it and
+/// the write would both need `&mut stream` in the same `select!` (a
+/// double mutable borrow) — the close flag is the driver's cancel path
+/// and the write itself is bounded (it cannot block on a dead stream:
+/// `write_all` on a closed stream errors immediately).
 #[allow(clippy::too_many_arguments)]
 async fn handle_todo_update<S>(
     stream: &mut S,
@@ -1373,170 +1744,27 @@ async fn handle_todo_update<S>(
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let params = params.cloned().unwrap_or(Value::Null);
-    let operation = params
-        .get("operation")
-        .and_then(Value::as_str)
-        .unwrap_or("");
 
     // A cancelled session aborts the handler (BEFORE the store write / the
-    // push emit — a cancelled session's agent is gone).
+    // push emit — a cancelled session's agent is gone). The core's own
+    // `cancel.is_cancelled()` check sees the SAME snapshot (the token is
+    // built from the flag state at call time — the todo work is fast, so a
+    // flag that flips MID-CALL is caught by the response write race below,
+    // exactly as before).
     let mut close_rx = close_tx.subscribe();
     if *close_rx.borrow() {
         return;
     }
-
-    let response = if operation == "read" {
-        let todos = todo_store.get(sid);
-        // The suite's read text (`tool.ts:75-84`): `JSON.stringify(todos,
-        // null, 2)` when non-empty, else the "No todos" text.
-        let text = if todos.is_empty() {
-            "No todos. Use write operation to create a todo list.".to_string()
-        } else {
-            serde_json::to_string_pretty(&todos).unwrap_or_default()
-        };
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": text }],
-                "details": { "operation": "read", "todos": todos }
-            }
-        })
-    } else {
-        // write (the default for a missing/unknown operation — the suite's
-        // schema requires `operation` in {"write","read"}, so anything
-        // else is a malformed write).
-        match params.get("todoList").and_then(Value::as_array) {
-            None => {
-                // The suite's text + flag (`tool.ts:89-94`): `todos` is
-                // the CURRENT list, `error` is the marker.
-                let current = todo_store.get(sid);
-                json!({
-                    "v": 1, "type": "response", "id": id,
-                    "result": {
-                        "content": [{ "type": "text", "text": "Error: todoList is required for write operation." }],
-                        "details": { "operation": "write", "todos": current, "error": "todoList required" },
-                        "isError": true
-                    }
-                })
-            }
-            Some(arr) => {
-                // The suite's `state.validate` (`state-manager.ts:36-59`): the
-                // TypeBox schema lets an empty/whitespace `content` through, so
-                // the validation is the guard here. (The `status` is checked
-                // against the wire casing; a non-string `description` is an
-                // error — the schema would have rejected it, but a
-                // hand-rolled frame must not blow up the handler.)
-                let valid_statuses = ["pending", "in_progress", "completed"];
-                let mut errors: Vec<String> = Vec::new();
-                let mut items: Vec<TodoItem> = Vec::new();
-                for (i, item) in arr.iter().enumerate() {
-                    let prefix = format!("Item {}", i + 1);
-                    if item.is_null() {
-                        errors.push(format!("{prefix}: undefined item"));
-                        continue;
-                    }
-                    let content = item.get("content").and_then(Value::as_str);
-                    let status = item.get("status").and_then(Value::as_str);
-                    if content.is_none_or(|c| c.trim().is_empty()) {
-                        errors.push(format!("{prefix}: missing or invalid 'content'"));
-                    }
-                    if !status.is_some_and(|s| valid_statuses.contains(&s)) {
-                        errors.push(format!(
-                            "{prefix}: 'status' must be one of: pending, in_progress, completed"
-                        ));
-                    }
-                    if item.get("description").is_some()
-                        && item.get("description").and_then(Value::as_str).is_none()
-                    {
-                        errors.push(format!("{prefix}: 'description' must be a string"));
-                    }
-                    if let (Some(content), Some(status)) = (content, status) {
-                        items.push(TodoItem {
-                            content: content.to_string(),
-                            status: match status {
-                                "pending" => TodoStatus::Pending,
-                                "in_progress" => TodoStatus::InProgress,
-                                _ => TodoStatus::Completed,
-                            },
-                            description: item
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        });
-                    }
-                }
-                if !errors.is_empty() {
-                    // The suite's validation text (`tool.ts:84-93`): the errors
-                    // prefixed `  - ` and joined with newlines; `details.error`
-                    // is the errors joined with `; `.
-                    let text = format!(
-                        "Validation failed:\n{}",
-                        errors
-                            .iter()
-                            .map(|e| format!("  - {e}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    let current = todo_store.get(sid);
-                    json!({
-                        "v": 1, "type": "response", "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": text }],
-                            "details": { "operation": "write", "todos": current, "error": errors.join("; ") },
-                            "isError": true
-                        }
-                    })
-                } else {
-                    let stored = todo_store.set(sid, items.clone());
-                    // Emit the `todos_update` push via the EXISTING
-                    // `bridge-event` sink path (the `BridgeEventPayload` shape
-                    // — the EXISTING `useBridge.applyTodoUpdate` +
-                    // `TodoBoardPanel` consume it; do NOT invent a new
-                    // `todo-update` event).
-                    sink.emit(
-                        "bridge-event",
-                        json!({
-                            "sessionId": sid,
-                            "seq": 0,
-                            "event": "todos_update",
-                            "payload": { "source": source, "todos": stored }
-                        }),
-                    );
-                    // The suite's write text (`tool.ts:138`): the stats from
-                    // the stored items, + a warning appended when the list has
-                    // <3 items.
-                    let completed = stored
-                        .iter()
-                        .filter(|t| t.status == TodoStatus::Completed)
-                        .count();
-                    let total = stored.len();
-                    let mut message = format!(
-                    "Todos have been modified all. {completed}/{total} completed. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable."
-                );
-                    if stored.len() < 3 {
-                        message.push_str(
-                        "\n\nWarning: Small todo list (<3 items). This task might not need a todo list.",
-                    );
-                    }
-                    json!({
-                        "v": 1, "type": "response", "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": message }],
-                            "details": { "operation": "write", "todos": stored }
-                        }
-                    })
-                }
-            }
-        }
-    };
+    let cancel = close_flag_token(close_tx);
+    let result = todo_apply(todo_store, sid, source, &params, sink, &cancel).await;
+    let response = json!({
+        "v": 1, "type": "response", "id": id,
+        "result": tool_result_response_value(&result),
+    });
 
     // Write the response, racing the close flag (a cancelled session
     // aborts the write — the agent is gone; a write to a closed stream
-    // fails silently). `drain_until_eof` is NOT a separate arm: it and
-    // the write would both need `&mut stream` in the same `select!` (a
-    // double mutable borrow) — the close flag is the driver's cancel
-    // path and the write itself is bounded (it cannot block on a dead
-    // stream: `write_all` on a closed stream errors immediately).
+    // fails silently).
     let data = response.to_string() + "\n";
     tokio::select! {
         _ = close_rx.changed() => {}
@@ -1545,6 +1773,58 @@ async fn handle_todo_update<S>(
             let _ = stream.flush().await;
         } => {}
     }
+}
+
+/// The `todo_update` / `sudo_exec` response's `result` value (the LEGACY
+/// wire contract, byte-compatible with the pre-refactor handlers — the
+/// existing bridge tests freeze it): `content` + `details` (omitted when
+/// absent) + `isError` — present **ONLY on a failure** (`true`); a
+/// success omits it. (The `tool_exec` method deliberately keeps the full
+/// `ToolResult` serialization — its wire contract carries `isError: false`
+/// on a success.)
+fn tool_result_response_value(result: &ToolResult) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "content".into(),
+        serde_json::to_value(&result.content).unwrap_or(Value::Array(Vec::new())),
+    );
+    if let Some(details) = &result.details {
+        obj.insert("details".into(), details.clone());
+    }
+    if result.is_error {
+        obj.insert("isError".into(), Value::Bool(true));
+    }
+    Value::Object(obj)
+}
+
+/// A `CancellationToken` bridged from the session's close flag: a
+/// `close_tx` whose flag is ALREADY set yields an already-cancelled token;
+/// otherwise a forwarder task cancels the token when the flag flips (the
+/// `sudo_exec` core awaits user-paced oneshots for up to 330 s — a
+/// MID-CALL close must cancel them; the todo core only needs the
+/// snapshot, but the bridge serves both).
+///
+/// KNOWN MINOR (not blocking): one forwarder task is spawned per
+/// `todo_update` / `sudo_exec` call and lives until the session closes —
+/// a long-lived session with many calls accumulates them (each is a
+/// trivial `rx.changed().await` waiter, but the count grows unboundedly
+/// for the session's lifetime). A per-session cached forwarder (keyed
+/// off the close flag's first flip) would bound this, but the current
+/// shape is safe (the tasks exit as soon as the flag flips).
+fn close_flag_token(close_tx: &Arc<watch::Sender<bool>>) -> CancellationToken {
+    let token = CancellationToken::new();
+    let mut rx = close_tx.subscribe();
+    if *rx.borrow() {
+        token.cancel();
+        return token;
+    }
+    let token_task = token.clone();
+    tokio::spawn(async move {
+        if rx.changed().await.is_ok() {
+            token_task.cancel();
+        }
+    });
+    token
 }
 
 /// The `sudo_exec` request branch (method-aware — the desktop orchestrates
@@ -1578,23 +1858,27 @@ async fn handle_todo_update<S>(
 ///   exclusions — a future task can add the `authProbe`).
 /// - **Secret scrubbing** (the suite's `scrubSecret`, applied PER STREAM):
 ///   the password must not appear in the captured output that is persisted
-///   in tool results.
+///   in tool results).
+///
+/// The FRAME-FREE CORE (native-agent-harness Task 6, reviewer-corrected
+/// Major #15) is [`sudo_run_flow`] — the same flow WITHOUT the stream:
+/// it owns the `"{sid}/{id}:confirm"` / `"{sid}/{id}:password"` oneshot
+/// registration in `pending_sudo` + the `bridge-request` events via
+/// `sink`, and calls the `SudoRunner` (the production `RealSudoRunner`;
+/// tests inject a fake). Both the `sudo_exec` frame handler AND the
+/// native `AgentLoop`'s `ToolRegistry` call it.
 #[allow(clippy::too_many_arguments)]
-async fn handle_sudo_exec<S>(
-    stream: &mut S,
-    id: &str,
+pub(crate) async fn sudo_run_flow(
     sid: &str,
+    request_id: &str,
     source: &str,
-    params: Option<&Value>,
+    params: &Value,
     sink: &Arc<dyn EventSink>,
     runner: &Arc<dyn SudoRunner>,
     pending_sudo: &PendingSudo,
     sudo_password: &Arc<Mutex<HashMap<String, CachedPassword>>>,
-    close_tx: &Arc<watch::Sender<bool>>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    let params = params.cloned().unwrap_or(Value::Null);
+    cancel: &CancellationToken,
+) -> ToolResult {
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -1608,22 +1892,26 @@ async fn handle_sudo_exec<S>(
         .trim()
         .to_string();
 
-    let mut close_rx = close_tx.subscribe();
-
     // The suite's empty-command rejection (`tool.ts:404-411`) — BEFORE any
     // sub-prompt (no runner call, no modal).
     if command.is_empty() {
-        let response = json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": "The command is empty — provide the exact command to run with elevated privileges." }],
-                "details": { "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "empty command" },
-                "isError": true
-            }
-        });
-        write_sudo_response(stream, &response, &mut close_rx).await;
-        return;
+        return ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "The command is empty — provide the exact command to run with elevated privileges.".to_string(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "empty command" }),
+            ),
+            is_error: true,
+        };
     }
+
+    // The DROPPED-flow cleanup guard (finding 3): a `tokio::select!` dropping
+    // this future (the `dispatch_tool` turn-cancel arm) skips the exit-path
+    // cleanup below, so the guard removes the `pending_sudo` key(s) + closes
+    // the modal on `Drop` (a normal completion removes the keys first — the
+    // guard's removal is then a no-op, so it is idempotent).
+    let mut cleanup = SudoPromptCleanup::new(pending_sudo, sink, sid);
 
     // ── the confirm sub-prompt (BEFORE any credential is acquired) ──
     // Register the oneshot BEFORE the event is emitted (the UI may answer
@@ -1631,46 +1919,40 @@ async fn handle_sudo_exec<S>(
     // guards, `b3c920a`). The `requestId` is the DERIVED `"{id}:confirm"`
     // (NOT the bare frame `id` — a bare id would miss the
     // `respond_bridge_request` lookup and silently time out at 330 s).
-    let confirm_key = bridge_key(sid, &format!("{id}:confirm"));
+    let confirm_key = bridge_key(sid, &format!("{request_id}:confirm"));
     let (confirm_tx, confirm_rx) = oneshot::channel();
     {
         let mut map = pending_sudo.lock().await;
         map.insert(confirm_key.clone(), confirm_tx);
     }
+    cleanup.track(&confirm_key);
     sink.emit(
         "bridge-request",
         json!({
             "sessionId": sid,
-            "requestId": format!("{id}:confirm"),
+            "requestId": format!("{request_id}:confirm"),
             "method": "confirm",
             "source": source,
             "toolCallId": Value::Null,
             "params": { "command": command, "reason": reason }
         }),
     );
-    let close_already = *close_rx.borrow();
-    let r: Result<Value, ()> = if close_already {
-        Err(())
-    } else {
-        // `Result<Value, ()>`: the cancel arms (timeout / close / EOF) all
-        // map to `Err(())` — a cancel is a `false` confirm.
-        tokio::select! {
-            r = confirm_rx => r.map_err(|_| ()),
-            _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
-            _ = close_rx.changed() => Err(()),
-            // EOF drain: the agent hung up — cancel (the agent holds the
-            // connection open while waiting, so EOF is the immediate-cancel
-            // signal, exactly like the generic path).
-            _ = drain_until_eof(stream) => Err(()),
-        }
+    let r: Result<Value, ()> = tokio::select! {
+        r = confirm_rx => r.map_err(|_| ()),
+        _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
+        _ = cancel.cancelled() => Err(()),
     };
-    // EVERY exit path (answered, timeout, close, EOF — the `close_already`
-    // pre-check path INCLUDED: the entry was inserted BEFORE the pre-check,
-    // so it must be removed there too, mirroring the password block) removes
-    // the entry (no leaked dead-receiver entries — mirrors the
-    // `pending_bridge` remove in the generic path). A cancel resolves to
-    // `false` (a missing/`false` `confirmed` is a cancel).
+    // EVERY exit path (answered, timeout, cancel — the entry was inserted
+    // BEFORE the select, so it must be removed on all of them) removes the
+    // entry (no leaked dead-receiver entries — mirrors the `pending_bridge`
+    // remove in the generic path). A cancel resolves to `false` (a
+    // missing/`false` `confirmed` is a cancel). The key is UNTRACKED too
+    // (the `SudoPromptCleanup` guard's `bridge-request-close` is then a
+    // no-op — a completed flow, after the user answered, must not emit a
+    // stale close; only a genuinely dropped flow — the entry NOT removed —
+    // emits the close).
     pending_sudo.lock().await.remove(&confirm_key);
+    cleanup.untrack(&confirm_key);
     let confirmed = r
         .ok()
         .and_then(|v| v.get("confirmed").and_then(Value::as_bool))
@@ -1678,16 +1960,16 @@ async fn handle_sudo_exec<S>(
     if !confirmed {
         // The suite's result (`tool.ts:429-434`) — on a user cancel, a
         // timeout, OR a session close: no password prompt, no execution.
-        let response = json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": "Command not confirmed — not executed, and no password was requested." }],
-                "details": { "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "command not confirmed" },
-                "isError": true
-            }
-        });
-        write_sudo_response(stream, &response, &mut close_rx).await;
-        return;
+        return ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "Command not confirmed — not executed, and no password was requested."
+                    .to_string(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "command not confirmed" }),
+            ),
+            is_error: true,
+        };
     }
 
     // ── the password (CACHE-HIT FIRST — the suite's `credentialCache.get()`,
@@ -1710,35 +1992,34 @@ async fn handle_sudo_exec<S>(
     let mut prompted = false;
     let mut prompted_value: Option<Value> = None;
     if cached.is_none() {
-        let password_key = bridge_key(sid, &format!("{id}:password"));
+        let password_key = bridge_key(sid, &format!("{request_id}:password"));
         let (pw_tx, pw_rx) = oneshot::channel();
         {
             let mut map = pending_sudo.lock().await;
             map.insert(password_key.clone(), pw_tx);
         }
+        cleanup.track(&password_key);
         sink.emit(
             "bridge-request",
             json!({
                 "sessionId": sid,
-                "requestId": format!("{id}:password"),
+                "requestId": format!("{request_id}:password"),
                 "method": "password",
                 "source": source,
                 "toolCallId": Value::Null,
                 "params": { "command": command, "reason": reason }
             }),
         );
-        let close_already = *close_rx.borrow();
-        let r: Result<Value, ()> = if close_already {
-            Err(())
-        } else {
-            tokio::select! {
-                r = pw_rx => r.map_err(|_| ()),
-                _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
-                _ = close_rx.changed() => Err(()),
-                _ = drain_until_eof(stream) => Err(()),
-            }
+        let r: Result<Value, ()> = tokio::select! {
+            r = pw_rx => r.map_err(|_| ()),
+            _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
+            _ = cancel.cancelled() => Err(()),
         };
         pending_sudo.lock().await.remove(&password_key);
+        // Untrack the key (the `SudoPromptCleanup` guard's `bridge-request-close`
+        // is then a no-op — a completed flow, after the user answered, must
+        // not emit a stale close; only a genuinely dropped flow emits it).
+        cleanup.untrack(&password_key);
         prompted = true;
         prompted_value = r.ok();
     }
@@ -1750,19 +2031,19 @@ async fn handle_sudo_exec<S>(
             .filter(|p| !p.is_empty()) // an EMPTY `""` password is a cancel
     });
     let Some(password) = password else {
-        // Cancelled (an empty password, a timeout, a session close, or an
-        // EOF) — the suite's result (`tool.ts:437-447`): nothing was
+        // Cancelled (an empty password, a timeout, a session close, or a
+        // cancel) — the suite's result (`tool.ts:437-447`): nothing was
         // cached, nothing was run.
-        let response = json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": "Password entry cancelled — not executed, and nothing was cached." }],
-                "details": { "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "password entry cancelled" },
-                "isError": true
-            }
-        });
-        write_sudo_response(stream, &response, &mut close_rx).await;
-        return;
+        return ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "Password entry cancelled — not executed, and nothing was cached."
+                    .to_string(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "password entry cancelled" }),
+            ),
+            is_error: true,
+        };
     };
     if prompted {
         // Cache the password with the suite's TTL (15 min — `config.ts`;
@@ -1798,69 +2079,240 @@ async fn handle_sudo_exec<S>(
     let stdout = scrub_secret(&run.stdout, &password);
     let stderr = scrub_secret(&run.stderr, &password);
 
-    let response = if let Some(error) = &run.error {
+    if let Some(error) = &run.error {
         // Process-level failure (spawn `error`, spawner throw, fatal stdin
         // write) — the suite's `tool.ts:483-490`: a clean tool failure with
         // `exitCode: -1` + `error`, NEVER an auth failure — the cached
         // credential is KEPT (a transport glitch is transient relative to
         // the credential itself).
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": format!("failed to run privileged command: {error}") }],
-                "details": { "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": error },
-                "isError": true
-            }
-        })
+        ToolResult {
+            content: vec![ContentBlock::Text {
+                text: format!("failed to run privileged command: {error}"),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": error }),
+            ),
+            is_error: true,
+        }
     } else if auth_failed {
         // The suite's auth-failure handling (`tool.ts:225-228`): CLEAR the
         // cached password (a mistyped password must not stick for the TTL —
         // the next `sudo_exec` re-prompts) and report the failure.
         sudo_password.lock().await.remove(sid);
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": format!("sudo authentication failed (incorrect password) — exit code {}. The in-memory credential cache was cleared; the user will be re-prompted on the next attempt.", run.exit_code) }],
-                "details": { "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": "authentication failed" },
-                "isError": true
-            }
-        })
+        ToolResult {
+            content: vec![ContentBlock::Text {
+                text: format!("sudo authentication failed (incorrect password) — exit code {}. The in-memory credential cache was cleared; the user will be re-prompted on the next attempt.", run.exit_code),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": "authentication failed" }),
+            ),
+            is_error: true,
+        }
     } else if run.timed_out {
         // The suite's timeout result (`tool.ts:493-504`): the (partial)
         // stdout + the timeout error + `isError`.
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": stdout }],
-                "details": { "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("timed out after {timeout_ms}ms — command was killed") },
-                "isError": true
-            }
-        })
+        ToolResult {
+            content: vec![ContentBlock::Text {
+                text: stdout.clone(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("timed out after {timeout_ms}ms — command was killed") }),
+            ),
+            is_error: true,
+        }
     } else if run.exit_code == 0 {
         // Success: the SCRUBBED stdout VERBATIM (`content[0].text` is what
         // the LLM sees — NOT a summary; `details` is not LLM-visible). NO
         // `isError`, NO `error`.
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": stdout }],
-                "details": { "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr }
-            }
-        })
+        ToolResult {
+            content: vec![ContentBlock::Text {
+                text: stdout.clone(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr }),
+            ),
+            is_error: false,
+        }
     } else {
         // A non-zero exit (no auth markers, no timeout): `isError` + the
         // suite's failure text. (The suite's two-strike ambiguous-failure
         // rule with the `sudo -n -v` `authProbe` is SCOPED OUT — fast path
         // only, documented above.)
-        json!({
-            "v": 1, "type": "response", "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": stdout }],
-                "details": { "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("command failed with exit code {}", run.exit_code) },
-                "isError": true
-            }
-        })
+        ToolResult {
+            content: vec![ContentBlock::Text {
+                text: stdout.clone(),
+            }],
+            details: Some(
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("command failed with exit code {}", run.exit_code) }),
+            ),
+            is_error: true,
+        }
+    }
+}
+
+/// The `sudo_exec` request branch (method-aware — the desktop orchestrates
+/// the confirm → password → run-sudo flow; the user answers the sub-prompts
+/// via the EXISTING `respond_bridge_request`): the frame wrapper around the
+/// frame-free [`sudo_run_flow`] core (Task 6) — a cancelled session aborts
+/// the handler (the token is bridged from the close flag; a MID-CALL close
+/// cancels the user-paced oneshots), and the response write races the close
+/// flag. `drain_until_eof` is a SEPARATE arm (unlike `todo_update`): the
+/// core does NOT own the stream, so an EOF (the agent hung up — it holds
+/// the connection open while waiting, so EOF is the immediate-cancel
+/// signal) drops the core (a dropped oneshot entry is drained by the
+/// driver-task teardown) and skips the write (the connection is dead —
+/// the pre-refactor behavior wrote a cancel response that failed on the
+/// dead stream, a net no-op).
+#[allow(clippy::too_many_arguments)]
+async fn handle_sudo_exec<S>(
+    stream: &mut S,
+    id: &str,
+    sid: &str,
+    source: &str,
+    params: Option<&Value>,
+    sink: &Arc<dyn EventSink>,
+    runner: &Arc<dyn SudoRunner>,
+    pending_sudo: &PendingSudo,
+    sudo_password: &Arc<Mutex<HashMap<String, CachedPassword>>>,
+    close_tx: &Arc<watch::Sender<bool>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let params = params.cloned().unwrap_or(Value::Null);
+
+    // A cancelled session aborts the handler (BEFORE any sub-prompt — the
+    // token is bridged from the close flag: a flag that flips MID-CALL
+    // cancels the user-paced oneshots via the core's `cancel.cancelled()`
+    // arms).
+    let mut close_rx = close_tx.subscribe();
+    if *close_rx.borrow() {
+        return;
+    }
+    let cancel = close_flag_token(close_tx);
+    let result = tokio::select! {
+        r = sudo_run_flow(sid, id, source, &params, sink, runner, pending_sudo, sudo_password, &cancel) => r,
+        // EOF drain: the agent hung up — drop the core + skip the write
+        // (the connection is dead).
+        _ = drain_until_eof(stream) => return,
     };
+    let response = json!({
+        "v": 1, "type": "response", "id": id,
+        "result": tool_result_response_value(&result),
+    });
+    write_sudo_response(stream, &response, &mut close_rx).await;
+}
+
+/// The `tool_exec` request branch (method-aware — the desktop executes the
+/// delegated built-in tool itself and answers the frame; native-agent-harness
+/// Task 2): parse `{ tool, params }` (the inner `params` is the tool's own
+/// params), run [`execute_tool`] (Task 1) with a `ToolCtx` built from the
+/// session's `cwd` (the sandbox root) + a fresh cancellation token, and
+/// write back the `ToolResult`.
+///
+/// **Response shape (byte-compatible with the other handlers):** a
+/// successful dispatch — including a tool that returned `isError: true`
+/// (a clean tool failure the LLM sees) — is a `result` frame with **NO
+/// `error` key** (the agent-side client treats `error !== undefined` as a
+/// failure, so an `error: null` frame would fail every round-trip); a hard
+/// failure (a timeout) is an `error` frame with **NO `result` key**.
+///
+/// **Abort:** a `tokio::select!` over the execution, the agent's EOF
+/// (drain), the session close, and the per-method timeout; every
+/// non-completion arm cancels the token (the `bash` child is killed — the
+/// select dropping the execution future would kill it via `kill_on_drop`
+/// too; the explicit cancel is the documented seam). A dead-but-open peer
+/// with a full buffer must not park the handler (the response write races
+/// the close flag — the `write_sudo_response` posture).
+///
+/// **Timeout:** fast tools are capped at [`TOOL_EXEC_FAST_TIMEOUT`] (30 s);
+/// `bash` is capped by its `timeout_ms` param (absent = the 5-min default,
+/// [`TOOL_EXEC_BASH_DEFAULT_TIMEOUT`] — the run is bounded by the caller's
+/// `timeout_ms`, mirroring the `sudo_exec` run cap).
+async fn handle_tool_exec<S>(
+    stream: &mut S,
+    id: &str,
+    params: Option<&Value>,
+    cwd: &Arc<PathBuf>,
+    close_tx: &Arc<watch::Sender<bool>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let params = params.cloned().unwrap_or(Value::Null);
+    let tool = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // The inner `params` is the tool's own params (a missing one is a
+    // `Null` — the executors validate their own params and return a clean
+    // `isError: true` result).
+    let inner = params.get("params").cloned().unwrap_or(Value::Null);
+
+    // The per-method timeout (see the doc above).
+    let timeout = if tool == "bash" {
+        inner
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(TOOL_EXEC_BASH_DEFAULT_TIMEOUT)
+    } else {
+        TOOL_EXEC_FAST_TIMEOUT
+    };
+
+    let mut close_rx = close_tx.subscribe();
+    let cancel = CancellationToken::new();
+    let ctx = ToolCtx {
+        cwd: cwd.as_path().to_path_buf(),
+        cancel: cancel.clone(),
+    };
+
+    // `Result<_, &str>`: the cancel arms (close / EOF) and the timeout arm
+    // all map to an `error` frame; a tool that returns `isError: true` is
+    // STILL a successful response (the `result` carries the flag — the LLM
+    // sees the clean tool failure). A session that is ALREADY closing
+    // skips the select entirely (the `close_already` pre-check — a
+    // `changed()` on a fresh receiver would never fire when the flag was
+    // set at subscribe time; the write below is skipped by the same check).
+    let close_already = *close_rx.borrow();
+    let outcome: Result<ToolResult, &str> = if close_already {
+        Err("cancelled")
+    } else {
+        tokio::select! {
+            r = execute_tool(&ctx, &tool, &inner) => Ok(r),
+            _ = tokio::time::sleep(timeout) => {
+                cancel.cancel();
+                Err("timeout")
+            }
+            // The session closed AFTER the pre-check passed (the flag
+            // flipped between the check and here): cancel the tool.
+            _ = close_rx.changed() => {
+                cancel.cancel();
+                Err("cancelled")
+            }
+            // EOF drain: the agent hung up — cancel the tool (the agent
+            // holds the connection open while waiting, so EOF is the
+            // immediate-cancel signal, exactly like the other handlers).
+            _ = drain_until_eof(stream) => {
+                cancel.cancel();
+                Err("cancelled")
+            }
+        }
+    };
+    let response = match outcome {
+        Ok(result) => {
+            json!({
+                "v": 1, "type": "response", "id": id,
+                "result": serde_json::to_value(&result).unwrap_or(Value::Null)
+            })
+        }
+        Err(reason) => {
+            json!({ "v": 1, "type": "response", "id": id, "error": reason })
+        }
+    };
+    // The close-raced write (the `write_sudo_response` posture): a
+    // dead-but-open peer with a full buffer must not park the handler —
+    // a write to a closed stream fails silently (the agent is gone).
     write_sudo_response(stream, &response, &mut close_rx).await;
 }
 
@@ -2143,6 +2595,7 @@ mod tests {
                 last_seq,
                 close_tx,
                 timeout,
+                cwd: Arc::new(std::env::temp_dir()),
                 subagent,
                 cost_capture: None,
                 todo_store: Arc::new(TodoStore::new()),
@@ -3859,6 +4312,286 @@ mod tests {
             "the grandchild (pid {grandchild_pid}) is dead — the group kill reached it"
         );
         let _ = std::fs::remove_file(&grandchild_pid_file);
+    }
+
+    /// (finding 3) A `run_sudo_real` future DROPPED mid-flight (the
+    /// `dispatch_tool` `select!`'s turn-cancel arm) must KILL the whole
+    /// process group (pre-fix the `Child` had no `kill_on_drop` + no group
+    /// kill, so a root command that forked further kept running detached).
+    /// `kill_on_drop(true)` kills the direct child; the `SudoGroupGuard`
+    /// kills the group (a grandchild of the group leader must not survive).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sudo_real_a_dropped_future_kills_the_whole_process_group() {
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "/bin/sh must exist"
+        );
+        let grandchild_pid_file = std::env::temp_dir().join(format!(
+            "archimedes-sudo-drop-test-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The script echoes a marker, backgrounds a `sleep` (the GRANDCHILD),
+        // records its pid, then blocks in the foreground — a DROP of the run
+        // future must kill the WHOLE group (a bare kill of the child alone
+        // would leave the grandchild alive).
+        let script = format!(
+            "echo partial; sleep 60 & echo $! > {}; sleep 60",
+            grandchild_pid_file.display()
+        );
+        // SPAWN the run (a `Box::pin` would not poll the future, so the
+        // spawn is what actually starts the command). The run blocks in the
+        // foreground `sleep` until aborted.
+        let run_task = tokio::spawn(run_sudo_real(
+            vec!["/bin/sh".to_string(), "-c".to_string(), script],
+            "pw".to_string(),
+            Duration::from_secs(30),
+        ));
+        // Let the run start (the script runs, the grandchild is spawned).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let grandchild_pid: u32 = std::fs::read_to_string(&grandchild_pid_file)
+            .expect("the script wrote the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // DROP the run future mid-flight (abort the task — pre-fix the child
+        // kept running detached; `kill_on_drop` + the `SudoGroupGuard`
+        // kill it now).
+        run_task.abort();
+        // The GRANDCHILD (the backgrounded `sleep`) is dead too: the drop
+        // killed the WHOLE group. (Poll — the kernel reaps the orphaned,
+        // killed grandchild promptly, but not instantaneously.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut gone = false;
+        while std::time::Instant::now() < deadline && !gone {
+            if unsafe { libc::kill(grandchild_pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                gone = true;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert!(
+            gone,
+            "the dropped run killed the whole process group (the grandchild is dead)"
+        );
+        let _ = std::fs::remove_file(&grandchild_pid_file);
+    }
+
+    /// (finding 3) A `run_sudo_real` command that BACKGROUNDS a grandchild
+    /// and COMPLETES NORMALLY (exit 0) must NOT kill the process group:
+    /// the `SudoGroupGuard` is disarmed on a normal completion, so a
+    /// backgrounded process the user wanted to keep running survives (a
+    /// `nohup`-style background process — `nohup` does not change the
+    /// process group, so a bare group kill on completion would reach it).
+    /// The mirror of `run_sudo_real_timeout_kills_the_whole_process_group`
+    /// (a timeout DOES kill the group; a normal completion does NOT).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sudo_real_a_normal_completion_does_not_kill_the_process_group() {
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "/bin/sh must exist"
+        );
+        // The script backgrounds a `sleep` (the GRANDCHILD), records its
+        // pid, then EXITS (a normal completion — exit 0). The `sleep`'s
+        // stdout / stderr are redirected to `/dev/null` (a backgrounded
+        // process that inherits the piped streams would keep them open
+        // until it exits — the run would time out, not complete): the run
+        // completes when the `sh` process exits, so the `sleep` is still
+        // running (the grandchild must survive a normal completion).
+        let grandchild_pid_file = std::env::temp_dir().join(format!(
+            "archimedes-sudo-normal-test-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "sleep 5 > /dev/null 2>&1 & echo $! > {}; echo done",
+            grandchild_pid_file.display()
+        );
+        let run = run_sudo_real(
+            vec!["/bin/sh".to_string(), "-c".to_string(), script],
+            "pw".to_string(),
+            Duration::from_secs(5),
+        )
+        .await;
+        // A NORMAL completion (exit 0, no timeout, no error).
+        assert_eq!(run.exit_code, 0, "a normal completion exits 0");
+        assert!(!run.timed_out);
+        assert!(run.error.is_none());
+        // The GRANDCHILD (the backgrounded `sleep`) is ALIVE: the normal
+        // completion did NOT kill the group (the `SudoGroupGuard` is
+        // disarmed on a normal completion — a backgrounded process the user
+        // wanted to keep running survives). Give the (wrong) group kill a
+        // moment to land, then check.
+        let grandchild_pid: u32 = std::fs::read_to_string(&grandchild_pid_file)
+            .expect("the script wrote the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let alive = unsafe { libc::kill(grandchild_pid as i32, 0) } == 0;
+        assert!(
+            alive,
+            "the grandchild (pid {grandchild_pid}) is ALIVE — a normal completion must not kill the group"
+        );
+        // Clean up: kill the backgrounded grandchild (the test's process).
+        let _ = unsafe { libc::kill(grandchild_pid as i32, libc::SIGKILL) };
+        let _ = std::fs::remove_file(&grandchild_pid_file);
+    }
+
+    /// (finding 3) A `sudo_run_flow` future DROPPED while blocked on its
+    /// confirm sub-prompt (the `dispatch_tool` `select!`'s turn-cancel arm)
+    /// must clean up: the `pending_sudo` `:confirm` entry is removed (no
+    /// leaked dead-oneshot entry) AND a `bridge-request-close` event is
+    /// emitted (the UI closes the modal — pre-fix the modal stayed open
+    /// with no pending response, and a late answer got `Ok(true)` with the
+    /// send silently failing). The `SudoPromptCleanup` drop guard does it.
+    #[tokio::test]
+    async fn a_dropped_sudo_flow_cleans_up_its_pending_entry_and_closes_the_modal() {
+        let capturing = Arc::new(CapturingSink::default());
+        let pending_sudo: PendingSudo = Arc::new(Mutex::new(HashMap::new()));
+        let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let runner: Arc<dyn SudoRunner> = Arc::new(FakeRunner::default());
+        let cancel = CancellationToken::new(); // the SESSION teardown token (NOT cancelled)
+        let params = json!({ "command": "echo hi", "reason": "test" });
+        // SPAWN the flow (it inserts the `:confirm` entry + emits
+        // `bridge-request`, then blocks on the confirm sub-prompt — never
+        // answered in the test). A `Box::pin` would not poll the future, so
+        // the spawn is what actually runs it. The `Arc`s are CLONED for the
+        // closure (the originals are kept for the assertions below).
+        let sink: Arc<dyn EventSink> = capturing.clone();
+        let runner_task = runner.clone();
+        let pending_sudo_task = pending_sudo.clone();
+        let sudo_password_task = sudo_password.clone();
+        let cancel_task = cancel.clone();
+        let flow_task = tokio::spawn(async move {
+            sudo_run_flow(
+                "s1",
+                "r1",
+                "native",
+                &params,
+                &sink,
+                &runner_task,
+                &pending_sudo_task,
+                &sudo_password_task,
+                &cancel_task,
+            )
+            .await
+        });
+        // Let the flow insert the entry (it then blocks on the confirm).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let map = pending_sudo.lock().await;
+            assert!(
+                map.contains_key("s1/r1:confirm"),
+                "the :confirm entry is present while the flow is blocked"
+            );
+        }
+        // DROP the flow mid-confirm (abort the task — the `select!`'s
+        // turn-cancel arm; the `SudoPromptCleanup` guard's `Drop` runs).
+        flow_task.abort();
+        // The modal-closing event is emitted SYNCHRONOUSLY by the guard's
+        // `Drop` (assert after a short poll — the abort is a request).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let close_events = capturing.events_named("bridge-request-close");
+        assert!(
+            close_events.iter().any(|p| p["requestId"] == "r1:confirm"),
+            "the bridge-request-close event was emitted (the modal closes)"
+        );
+        // The entry is removed (the guard's spawned cleanup task) — wait for
+        // it to run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let map = pending_sudo.lock().await;
+            assert!(
+                !map.contains_key("s1/r1:confirm"),
+                "the :confirm entry is removed after the drop (no leaked dead-oneshot)"
+            );
+        }
+    }
+
+    /// (finding 3) A COMPLETED (answered) `sudo_run_flow` must NOT emit a
+    /// `bridge-request-close` (the `SudoPromptCleanup` guard's
+    /// `bridge-request-close` is only for a genuinely DROPPED flow — the user
+    /// already answered both sub-prompts, so a stale close would promise
+    /// "close this open modal" for a modal that is already closed). The mirror
+    /// of `a_dropped_sudo_flow_cleans_up_its_pending_entry_and_closes_the_modal`
+    /// (a dropped flow DOES emit the close; a completed flow does NOT).
+    #[tokio::test]
+    async fn a_completed_sudo_flow_does_not_emit_a_stale_request_close() {
+        // A runner that succeeds (the flow completes — the user answers both
+        // sub-prompts, the command runs, and the flow returns a success result).
+        let runner = Arc::new(FakeRunner::with_result(SudoRun {
+            exit_code: 0,
+            stdout: "ok\n".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            error: None,
+        }));
+        let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
+        let task = run_sudo(
+            "id1",
+            json!({ "command": "echo hi", "reason": "test" }),
+            runner.clone(),
+            pending_sudo.clone(),
+            password.clone(),
+            close_tx,
+            sink.clone(),
+        )
+        .await;
+        // The user answers BOTH sub-prompts (the flow completes — NOT dropped).
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:confirm").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "confirm",
+                json!({ "confirmed": true })
+            )
+            .await
+        );
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:password").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "password",
+                json!({ "password": "hunter2" })
+            )
+            .await
+        );
+        // The flow COMPLETES (a success result — the command ran).
+        let response = task.await.unwrap();
+        let result = &response["result"];
+        assert!(
+            result.get("isError").is_none(),
+            "the flow completed (a success result), got {result:?}"
+        );
+        // The flow completed — the `SudoPromptCleanup` guard's `Drop` must NOT
+        // emit a `bridge-request-close` (the user already answered both
+        // sub-prompts; a stale close would promise "close this open modal" for
+        // a modal that is already closed).
+        let close_events = sink.events_named("bridge-request-close");
+        assert!(
+            close_events.is_empty(),
+            "a COMPLETED sudo flow must NOT emit a bridge-request-close (the user already answered both sub-prompts), got {close_events:?}"
+        );
+        // The `pending_sudo` map is empty (the entries were removed on the
+        // normal exit — no leaked dead-oneshot entries).
+        assert!(
+            pending_sudo.lock().await.is_empty(),
+            "the pending_sudo map is empty after the completion (no leaked dead-oneshot)"
+        );
     }
 
     #[cfg(unix)]

@@ -115,6 +115,162 @@ fn records_sessions_and_messages_with_upsert_semantics() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// (finding 10) `native_messages` must NOT be orphaned on session delete:
+/// deleting a session removes its native transcript (the `ON DELETE
+/// CASCADE` foreign key — the `messages` cascade implies `PRAGMA
+/// foreign_keys` is on), while an unrelated session's rows survive.
+#[test]
+fn delete_session_cascades_native_messages() {
+    let path = temp_db_path();
+    let db = Db::open(&path).expect("db should open");
+
+    let session = sample_session(); // sess-1
+    db.record_session(&session).expect("record_session sess-1");
+    let other = SessionInfo {
+        session_id: "sess-2".to_string(),
+        ..session.clone()
+    };
+    db.record_session(&other).expect("record_session sess-2");
+
+    // Transcript rows for BOTH sessions.
+    db.insert_native_message("sess-1", 0, "user", r#"{"role":"user"}"#)
+        .expect("insert native row 1");
+    db.insert_native_message("sess-1", 1, "assistant", r#"{"role":"assistant"}"#)
+        .expect("insert native row 2");
+    db.insert_native_message("sess-2", 0, "user", r#"{"role":"user"}"#)
+        .expect("insert native row 3");
+
+    db.delete_session("sess-1")
+        .expect("delete_session should succeed");
+    assert!(
+        db.load_native_messages("sess-1")
+            .expect("load_native_messages sess-1")
+            .is_empty(),
+        "the deleted session's native_messages rows are gone (cascade)"
+    );
+    assert_eq!(
+        db.load_native_messages("sess-2")
+            .expect("load_native_messages sess-2")
+            .len(),
+        1,
+        "an unrelated session's native_messages rows survive"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// (finding 10) Pre-existing databases: a `native_messages` table that
+/// predates the foreign key (no `REFERENCES`) must be migrated by
+/// `Db::open` — the table is recreated WITH the `ON DELETE CASCADE` FK,
+/// the pre-existing rows survive, and a session delete cascades.
+#[test]
+fn native_messages_fk_migrated_on_preexisting_databases() {
+    let base = std::env::temp_dir().join(format!("archimedes-native-mig-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("base dir");
+    let path = base.join("archimedes.db");
+    // A pre-migration database: the OLD `native_messages` (no FK) with a
+    // row, plus a session row for it.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw open");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL
+            );
+            CREATE TABLE native_messages (
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );",
+        )
+        .expect("old-schema tables");
+        conn.execute(
+            "INSERT INTO sessions (id, agent_id, cwd, created_at, capabilities_json)
+             VALUES ('sess-1', 'native', '/tmp', 1, '{}');",
+            [],
+        )
+        .expect("session row");
+        conn.execute(
+            "INSERT INTO native_messages (session_id, seq, role, content_json, created_at)
+             VALUES ('sess-1', 0, 'user', '{}', 1);",
+            [],
+        )
+        .expect("native row");
+    }
+    let db = Db::open(&path).expect("Db::open should migrate the native_messages table");
+    assert_eq!(
+        db.load_native_messages("sess-1")
+            .expect("load_native_messages")
+            .len(),
+        1,
+        "the pre-existing row survives the migration"
+    );
+    // The migrated table cascades.
+    db.delete_session("sess-1").expect("delete_session");
+    assert!(
+        db.load_native_messages("sess-1")
+            .expect("load_native_messages after delete")
+            .is_empty(),
+        "the migrated table cascades on session delete"
+    );
+
+    // A re-open: the migration is idempotent (the pre-check sees the FK
+    // and skips the recreation) and the data is untouched.
+    let db2 = Db::open(&path).expect("db should reopen (idempotent migration)");
+    assert!(db2
+        .load_native_messages("sess-1")
+        .expect("load_native_messages reopen")
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The `replace_native_messages` rewrite (the `run_compaction` seam):
+/// the old rows are replaced by the new ones ATOMICALLY — a single
+/// transaction (clear + reinsert), so a crash mid-rewrite never leaves
+/// an empty / partial transcript.
+#[test]
+fn replace_native_messages_replaces_the_transcript() {
+    let path = temp_db_path();
+    let db = Db::open(&path).expect("db should open");
+    db.record_session(&sample_session())
+        .expect("record_session");
+    // Three rows, then a 2-row replacement.
+    db.insert_native_message("sess-1", 0, "user", r#"{"a":1}"#)
+        .expect("insert 0");
+    db.insert_native_message("sess-1", 1, "assistant", r#"{"a":2}"#)
+        .expect("insert 1");
+    db.insert_native_message("sess-1", 2, "tool", r#"{"a":3}"#)
+        .expect("insert 2");
+    db.replace_native_messages(
+        "sess-1",
+        &[
+            (0, "system".to_string(), r#"{"a":"summary"}"#.to_string()),
+            (1, "user".to_string(), r#"{"a":100}"#.to_string()),
+        ],
+    )
+    .expect("replace_native_messages");
+    let rows = db
+        .load_native_messages("sess-1")
+        .expect("load_native_messages");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the old 3-row transcript is replaced by the new 2"
+    );
+    assert_eq!(rows[0], r#"{"a":"summary"}"#);
+    assert_eq!(rows[1], r#"{"a":100}"#);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn reopens_an_existing_database() {
     let path = temp_db_path();

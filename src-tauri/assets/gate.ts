@@ -4,7 +4,7 @@
 // reason as an error result).
 export default (pi: any) => {
   if (process.env.PI_ARCHIMEDES_GATE !== "1") return;
-  // sudo_exec is NOT gated here: in a desktop spawn the tools.ts override replaces the suite's sudo_exec, and the desktop's sudo_exec handler is the single confirm (a gate confirm + a desktop confirm = double). bash/edit/write stay gated (built-in, NOT overridden in Phase 2).
+  // sudo_exec is NOT gated here: in a desktop spawn the tools.ts override replaces the suite's sudo_exec, and the desktop's sudo_exec handler is the single confirm (a gate confirm + a desktop confirm = double). bash/edit/write stay gated: on a Linux desktop spawn they are OVERRIDDEN by tools.ts into desktop delegates (Phase 1) — the gate prompt fires BEFORE the tool_exec round-trip (the gate = permission, the override = execution, orthogonal); on Windows/macOS the override is inert and they are the built-ins (still gated).
   const GATED = new Set(["bash", "edit", "write"]);
   const TIMEOUT_MS = 300_000; // matches the desktop's 300 s permission waiter
   pi.on("tool_call", async (event: any, ctx: any) => {

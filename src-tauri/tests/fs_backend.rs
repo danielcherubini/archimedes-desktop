@@ -103,6 +103,67 @@ fn path_escape_via_symlink_is_rejected() {
 }
 
 #[test]
+fn validate_resolves_valid_path() {
+    let root = temp_root();
+    let backend = FsBackend { root: root.clone() };
+
+    let file = root.join("v.txt");
+    std::fs::write(&file, "x").unwrap();
+    let resolved = backend
+        .validate(&file)
+        .expect("a path inside the root validates");
+    assert_eq!(resolved, file.canonicalize().unwrap());
+
+    // A not-yet-existing file under the root still validates (write target).
+    let new_file = root.join("nested/dir/new.txt");
+    backend
+        .validate(&new_file)
+        .expect("a new file under the root validates");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn validate_rejects_escaping_path() {
+    let root = temp_root();
+    let backend = FsBackend { root: root.clone() };
+
+    let err = backend
+        .validate(&root.join("../etc/passwd"))
+        .expect_err("an escaping path must be rejected");
+    assert!(
+        matches!(err, FsError::PathEscape { .. }),
+        "an escaping path should be PathEscape, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_bytes_round_trip_and_rejects_escape() {
+    let root = temp_root();
+    let backend = FsBackend { root: root.clone() };
+
+    let bytes: &[u8] = &[1, 2, 3, 4, 0, 255];
+    let file = root.join("b.bin");
+    std::fs::write(&file, bytes).unwrap();
+    assert_eq!(
+        backend.read_bytes(&file).expect("read_bytes inside root"),
+        bytes
+    );
+
+    let err = backend
+        .read_bytes(&root.join("../etc/passwd"))
+        .expect_err("read_bytes must reject an escaping path");
+    assert!(
+        matches!(err, FsError::PathEscape { .. }),
+        "an escaping path should be PathEscape, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn absolute_path_outside_root_is_rejected() {
     let root = temp_root();
     let backend = FsBackend { root: root.clone() };

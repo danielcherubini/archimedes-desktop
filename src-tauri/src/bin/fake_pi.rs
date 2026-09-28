@@ -801,6 +801,22 @@ fn ask_frame(id: &str) -> serde_json::Value {
     })
 }
 
+/// The `tool_exec` override's frame (Phase 1 — a built-in re-registration's
+/// `execute()` round-trip: the desktop executes the delegated built-in via
+/// `tools/exec.rs` and answers the frame with a ToolResult). `tool` is the
+/// built-in's name; `params` is the tool's own params (here a `bash`
+/// `command`).
+fn tool_exec_frame(id: &str, tool: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "type": "request",
+        "id": id,
+        "method": "tool_exec",
+        "source": "main",
+        "params": { "tool": tool, "params": { "command": command } }
+    })
+}
+
 /// Connect the bridge socket (the desktop's listener), send ONE frame, and
 /// read the response line. The connection is held open while waiting for the
 /// response (the desktop's `drain_until_eof` sees no EOF → no cancel), so a
@@ -828,11 +844,11 @@ fn send_and_read(socket: &str, frame: &serde_json::Value) -> Option<String> {
 /// The `FAKE_PI_TOOLS` mode: send the override's frames (the wire
 /// simulation) and print each received response to stdout (one JSON line) for
 /// the test to assert on. The frame ids are FIXED (`todo-1`/`todo-2`/
-/// `sudo-1`/`sudo-2`/`ask-1`) so the test can pre-empt the `sudo_exec`
-/// sub-prompt oneshots (`{id}:confirm` / `{id}:password`) + the `ask`
-/// oneshot. Each request `id` is printed (a `SENT <id>` marker) BEFORE sending
-/// (the ordering channel); the response is printed verbatim AFTER reading.
-/// Exits 0 after the responses (no RPC loop).
+/// `sudo-1`/`sudo-2`/`ask-1`/`tool-1`) so the test can pre-empt the
+/// `sudo_exec` sub-prompt oneshots (`{id}:confirm` / `{id}:password`) + the
+/// `ask` oneshot. Each request `id` is printed (a `SENT <id>` marker) BEFORE
+/// sending (the ordering channel); the response is printed verbatim AFTER
+/// reading. Exits 0 after the responses (no RPC loop).
 fn handle_tools(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
     let socket = match std::env::var("PI_ARCHIMEDES_BRIDGE_SOCKET") {
         Ok(s) => s,
@@ -880,6 +896,17 @@ fn handle_tools(out: &mut std::io::BufWriter<std::io::StdoutLock>) {
     //    desktop responds with the raw payload (the override shapes it).
     emit(out, "SENT ask-1");
     if let Some(r) = send_and_read(&socket, &ask_frame("ask-1")) {
+        emit(out, r.trim());
+    }
+    // 6. `tool_exec` `bash` (Phase 1 — the built-in override's round-trip):
+    //    the desktop executes the delegated built-in ITSELF (`tools/exec.rs`
+    //    `exec_bash`, sandboxed to the session `cwd`) and responds with a
+    //    ToolResult (`content[0].text` carries the command output).
+    emit(out, "SENT tool-1");
+    if let Some(r) = send_and_read(
+        &socket,
+        &tool_exec_frame("tool-1", "bash", "echo delegated"),
+    ) {
         emit(out, r.trim());
     }
 }

@@ -239,10 +239,16 @@ main()
         let pending_sudo: PendingSudo = Arc::new(Mutex::new(HashMap::new()));
         let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        // The native-agent-harness (Task 2) `start_listener` parameter: a
+        // fresh session `cwd` (the `tool_exec` sandbox root — the frames
+        // in this test are `ask` / push, so the dir stays empty).
+        let cwd = unique_path("cwd");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
         let handle = bridge::start_listener(
             session_id.to_string(),
             path,
             std::process::id(),
+            &cwd,
             sink,
             pending,
             &close_tx,

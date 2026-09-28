@@ -93,6 +93,35 @@ impl Db {
         let conn = Connection::open(path)?;
         // Enforce the ON DELETE CASCADE on messages.
         conn.pragma_update(None, "foreign_keys", true)?;
+        // (finding 5) A legacy crash state: a crash under the pre-fix
+        // autocommit code between `DROP TABLE native_messages` and the
+        // `RENAME` leaves `native_messages` GONE with the rows living in
+        // `native_messages_migrated`. Recover it BEFORE the SCHEMA (which
+        // would otherwise `CREATE TABLE IF NOT EXISTS native_messages` — an
+        // empty table — and the FK migration's batch would `DROP TABLE IF
+        // EXISTS native_messages_migrated`, losing the rows). The migrated
+        // table was created WITH the FK, so the rename alone restores the FK
+        // (the FK migration below is then a no-op). Pre-fix the re-run hit
+        // `INSERT … SELECT … FROM native_messages` → "no such table" →
+        // rollback → `Db::open` errored forever, bricking startup.
+        let native_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'native_messages'",
+            [],
+            |row| row.get(0),
+        )?;
+        let migrated_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'native_messages_migrated'",
+            [],
+            |row| row.get(0),
+        )?;
+        if native_exists == 0 && migrated_exists > 0 {
+            conn.execute(
+                "ALTER TABLE native_messages_migrated RENAME TO native_messages",
+                [],
+            )?;
+        }
         conn.execute_batch(SCHEMA)?;
         // One-time migration for pre-existing databases: add `trusted`
         // (fresh databases already have it from SCHEMA). Gated on a schema
@@ -109,6 +138,50 @@ impl Db {
                 "ALTER TABLE spaces ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        // One-time migration for pre-existing databases: give
+        // `native_messages` its `ON DELETE CASCADE` foreign key (a
+        // pre-existing table cannot GAIN an FK in place — recreate it,
+        // preserving the rows). Gated on a pragma pre-check, like the
+        // `trusted` migration above. (Orphan rows — a transcript for a
+        // session that is no longer stored — are dropped: they could
+        // never cascade, and the FK would reject them.)
+        let native_fk: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('native_messages') \
+             WHERE \"table\" = 'sessions'",
+            [],
+            |row| row.get(0),
+        )?;
+        if native_fk == 0 {
+            // ONE transaction (SQLite DDL is transactional — atomic: a
+            // crash mid-batch cannot leave a half-migrated schema
+            // behind; pre-fix each statement autocommitted, and a crash
+            // left `native_messages_migrated` behind (and/or
+            // `native_messages` dropped), so the next open re-ran the
+            // batch, hit `CREATE TABLE … already exists`, and `Db::open`
+            // errored forever — bricking startup). The `DROP TABLE IF
+            // EXISTS` first makes the re-run crash-idempotent too (a
+            // stale `native_messages_migrated` from a pre-transactional
+            // crash is dropped before the `CREATE`).
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS native_messages_migrated;
+                CREATE TABLE native_messages_migrated (
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(session_id, seq)
+                );
+                INSERT INTO native_messages_migrated (session_id, seq, role, content_json, created_at)
+                    SELECT nm.session_id, nm.seq, nm.role, nm.content_json, nm.created_at
+                    FROM native_messages nm
+                    WHERE EXISTS (SELECT 1 FROM sessions s WHERE s.id = nm.session_id);
+                DROP TABLE native_messages;
+                ALTER TABLE native_messages_migrated RENAME TO native_messages;",
+            )?;
+            tx.commit()?;
         }
         // One-time backfill for pre-existing databases: give a space row to every
         // distinct stored session cwd (canonicalized). A vanished folder is skipped
@@ -273,6 +346,10 @@ impl Db {
     /// restored replay is treated as the authoritative history, so a
     /// replay that reuses (or changes) a `messageId` replaces the stored
     /// transcript instead of corrupting or duplicating it.
+    ///
+    /// `native_messages` is NOT touched (the native `AgentLoop`'s
+    /// transcript has its OWN clear — `SessionStore::clear_messages` —
+    /// and the native resume path must NOT clear before `load_messages`).
     pub fn clear_messages_for(&self, session_id: &str) -> Result<(), DbError> {
         self.conn.lock().expect("db mutex poisoned").execute(
             "DELETE FROM messages WHERE session_id = ?1",
@@ -281,12 +358,102 @@ impl Db {
         Ok(())
     }
 
-    /// Delete a session; its messages are removed by `ON DELETE CASCADE`.
+    /// Insert or refresh one native transcript message (the native
+    /// `AgentLoop`'s provider transcript — native-agent-harness Task 6).
+    ///
+    /// `INSERT ... ON CONFLICT(session_id, seq) DO UPDATE` — the same
+    /// `(session_id, seq)` always collapses to one row (idempotent). The
+    /// `role` column is a DENORMALIZED index for cheap queries; the
+    /// content is the serialized full `ChatMessage` (`content_json` —
+    /// role + content + `tool_calls` + `tool_call_id` round-trip).
+    pub fn insert_native_message(
+        &self,
+        session_id: &str,
+        seq: i64,
+        role: &str,
+        content_json: &str,
+    ) -> Result<(), DbError> {
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "INSERT INTO native_messages (session_id, seq, role, content_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, seq) DO UPDATE SET
+               content_json = excluded.content_json,
+               created_at = excluded.created_at",
+            params![session_id, seq, role, content_json, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// A session's native transcript in `seq` order (the provider
+    /// transcript — the `content_json` rows; the `role` column is a
+    /// denormalized index and is NOT read here). A malformed row is a
+    /// `Json` error (a corrupt transcript must not silently load as an
+    /// empty one).
+    pub fn load_native_messages(&self, session_id: &str) -> Result<Vec<String>, DbError> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT content_json FROM native_messages WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete a session's native transcript (`native_messages` ONLY —
+    /// the display `messages` table is NOT touched: the native resume
+    /// path must NOT clear before `load_messages`).
+    pub fn clear_native_messages(&self, session_id: &str) -> Result<(), DbError> {
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "DELETE FROM native_messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a session's native transcript ATOMICALLY: delete all its
+    /// rows, then insert the new ones — in a SINGLE transaction (the
+    /// `run_compaction` rewrite: a crash mid-rewrite must never leave an
+    /// empty / partial transcript). The same `(session_id, seq)` upsert
+    /// semantics as [`insert_native_message`] apply to each row.
+    pub fn replace_native_messages(
+        &self,
+        session_id: &str,
+        rows: &[(i64, String, String)],
+    ) -> Result<(), DbError> {
+        let mut guard = self.conn.lock().expect("db mutex poisoned");
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM native_messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for (seq, role, content_json) in rows {
+            tx.execute(
+                "INSERT INTO native_messages (session_id, seq, role, content_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, seq) DO UPDATE SET
+                   content_json = excluded.content_json,
+                   created_at = excluded.created_at",
+                params![session_id, *seq, *role, *content_json, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete a session; its `messages` AND `native_messages` rows are
+    /// removed (both tables are `ON DELETE CASCADE`; the explicit
+    /// `native_messages` `DELETE` is belt-and-suspenders — it also
+    /// covers a pre-migration database that never gained the FK).
     pub fn delete_session(&self, session_id: &str) -> Result<(), DbError> {
-        self.conn
-            .lock()
-            .expect("db mutex poisoned")
-            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        let mut guard = self.conn.lock().expect("db mutex poisoned");
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM native_messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -422,6 +589,14 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(session_id, kind, message_key)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE TABLE IF NOT EXISTS native_messages (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(session_id, seq)
+);
 CREATE TABLE IF NOT EXISTS spaces (
     path TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
@@ -429,3 +604,162 @@ CREATE TABLE IF NOT EXISTS spaces (
     trusted INTEGER NOT NULL DEFAULT 0
 );
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (the FK migration) A crash MID-BATCH leaves a stale
+    /// `native_messages_migrated` table behind (the original
+    /// `native_messages` still exists, WITHOUT the FK): the next
+    /// `Db::open` must RECOVER (the migration is atomic +
+    /// crash-idempotent — pre-fix the re-run hit `CREATE TABLE …
+    /// already exists` and `Db::open` errored forever, bricking startup).
+    #[test]
+    fn a_crashed_fk_migration_recovers_on_the_next_open() {
+        let dir = std::env::temp_dir().join(format!("db-migration-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // A pre-existing database: `native_messages` WITHOUT the FK (the
+        // pre-migration schema) + a session row + a transcript row.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL
+            );
+            CREATE TABLE native_messages (
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');
+            INSERT INTO native_messages VALUES ('s1', 0, 'user', '{}', 1);",
+        )
+        .unwrap();
+        // The mid-batch CRASH state: a stale `native_messages_migrated`
+        // table left behind.
+        conn.execute_batch(
+            "CREATE TABLE native_messages_migrated (
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            INSERT INTO native_messages_migrated VALUES ('s1', 9, 'assistant', '{}', 2);",
+        )
+        .unwrap();
+        drop(conn);
+        // The next `Db::open` must SUCCEED (the migration is atomic +
+        // crash-idempotent).
+        let db = Db::open(&path).expect("the migration is crash-idempotent/atomic");
+        // ...and the FK is in place now.
+        let fk: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('native_messages') \
+                 WHERE \"table\" = 'sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk, 1, "the FK is in place after recovery");
+        // ...and the pre-existing rows survived the migration (the stale
+        // `native_messages_migrated`'s rows were NOT merged in — only the
+        // original table's rows are the transcript).
+        let n: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM native_messages WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the pre-existing transcript row survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (finding 5) A legacy crash state: a crash under the pre-fix
+    /// autocommit code between `DROP TABLE native_messages` and the
+    /// `RENAME` leaves `native_messages` GONE with the rows living in
+    /// `native_messages_migrated`. `Db::open` must RECOVER (rename the
+    /// migrated table — the rows survive + the FK is restored), not error
+    /// forever (pre-fix the re-run hit `INSERT … SELECT … FROM
+    /// native_messages` → "no such table" → rollback → `Db::open` errored
+    /// forever, bricking startup).
+    #[test]
+    fn a_crashed_fk_migration_with_native_messages_gone_recovers_on_the_next_open() {
+        let dir = std::env::temp_dir().join(format!("db-migration-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // The crash state: `native_messages` is GONE (dropped + autocommitted)
+        // and the rows live in `native_messages_migrated` (created WITH the FK
+        // + the copy, autocommitted).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL
+            );
+            CREATE TABLE native_messages_migrated (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');
+            INSERT INTO native_messages_migrated VALUES ('s1', 0, 'user', '{}', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        // The next `Db::open` must SUCCEED (the migration recovers the crash
+        // state by renaming the migrated table).
+        let db = Db::open(&path).expect("the migration recovers the crash state");
+        // ...and the FK is in place (the migrated table was created with it).
+        let fk: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('native_messages') \
+                 WHERE \"table\" = 'sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk, 1, "the FK is in place after recovery");
+        // ...and the rows SURVIVED the recovery (the migrated table's rows
+        // are the transcript now).
+        let n: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM native_messages WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the transcript row survived the recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

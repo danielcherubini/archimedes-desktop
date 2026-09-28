@@ -15,13 +15,17 @@
 // and asserts:
 //   (a) `win32` / `darwin` + env PRESENT → `registerTool` NOT called (the
 //       platform gate keeps the override inert — the Windows/macOS
-//       no-regression case, even though the env is set).
+//       no-regression case, even though the env is set; the built-in
+//       re-registrations are inert too, so pi's built-ins remain).
 //   (b) `linux` + env ABSENT → `registerTool` NOT called (the env gate — a
 //       bridge-LESS spawn registers nothing; the suite's original tools
 //       remain, no regression on macOS).
 //   (c) `linux` + env PRESENT → `registerTool` IS called (DEFERRED — inside
 //       the `session_start` handler, invoked by calling the captured handler)
-//       for the three tools (`ask` / `sudo_exec` / `manage_todo_list`).
+//       for the three suite tools (`ask` / `sudo_exec` / `manage_todo_list`).
+//   (d) `linux` + env PRESENT → the SEVEN built-ins (`bash` / `read` /
+//       `write` / `edit` / `find` / `grep` / `ls`, Phase 1) are ALSO
+//       registered (all 10 tools — the Phase 1 round-trip).
 
 import { it, expect, afterEach } from "vitest";
 import toolsFactory from "../assets/tools.ts";
@@ -73,6 +77,11 @@ function makeStubPi() {
   return { pi, registered, handlers };
 }
 
+/// The seven built-in tool names the Phase 1 override re-registers as
+/// `tool_exec` round-trips (the same names the desktop's `tools/exec.rs`
+/// executors dispatch on).
+const BUILTIN_NAMES = ["bash", "read", "write", "edit", "find", "grep", "ls"];
+
 afterEach(() => {
   // Restore the platform + the env (so a mutation in one case doesn't leak
   // into the next — the env vars are desktop-specific and absent by default,
@@ -107,6 +116,22 @@ it("(a) is inert on macOS (the platform gate) even with the env set", () => {
   expect(registered).toHaveLength(0);
 });
 
+it("(a) is inert on macOS: NO built-in re-registrations (the Phase 1 no-regression case)", () => {
+  setPlatform("darwin");
+  setBridgeEnv(true);
+  const { pi, registered, handlers } = makeStubPi();
+  toolsFactory(pi);
+  // Even if a `session_start` handler existed, the built-in re-registrations
+  // must be absent off-Linux (the desktop's bridge listener does not exist
+  // there — registering the overrides would strip pi's built-ins via
+  // `--no-builtin-tools` with nothing to replace them).
+  const names = registered.map((t) => t.name);
+  for (const name of BUILTIN_NAMES) {
+    expect(names).not.toContain(name);
+  }
+  expect(handlers.session_start).toBeUndefined();
+});
+
 it("(b) is inert without the bridge env (the env gate) on Linux", () => {
   setPlatform("linux");
   setBridgeEnv(false);
@@ -118,7 +143,7 @@ it("(b) is inert without the bridge env (the env gate) on Linux", () => {
   expect(registered).toHaveLength(0);
 });
 
-it("(c) registers the three tools DEFERRED (in session_start) on Linux with the env set", () => {
+it("(c) registers the three suite tools DEFERRED (in session_start) on Linux with the env set", () => {
   setPlatform("linux");
   setBridgeEnv(true);
   const { pi, registered, handlers } = makeStubPi();
@@ -134,10 +159,41 @@ it("(c) registers the three tools DEFERRED (in session_start) on Linux with the 
   // override wins: CLI `-e` loads first + first-wins merge).
   handlers.session_start();
   const names = registered.map((t) => t.name).sort();
-  expect(names).toEqual(["ask", "manage_todo_list", "sudo_exec"]);
+  expect(names).toContain("ask");
+  expect(names).toContain("manage_todo_list");
+  expect(names).toContain("sudo_exec");
   // The override re-registers with the suite's labels (the same-name override).
   const byName = Object.fromEntries(registered.map((t) => [t.name, t]));
   expect(byName.ask.label).toBe("Ask");
   expect(byName.sudo_exec.label).toBe("sudo");
   expect(byName.manage_todo_list.label).toBe("Todo List");
+});
+
+it("(d) registers the SEVEN built-ins as tool_exec round-trips on Linux with the env set (Phase 1)", () => {
+  setPlatform("linux");
+  setBridgeEnv(true);
+  const { pi, registered, handlers } = makeStubPi();
+  toolsFactory(pi);
+  handlers.session_start();
+  const names = registered.map((t) => t.name).sort();
+  // ALL 10 tools: the three suite delegates + the seven built-in
+  // re-registrations (bash / read / write / edit / find / grep / ls).
+  expect(names).toEqual(
+    [...BUILTIN_NAMES, "ask", "manage_todo_list", "sudo_exec"].sort(),
+  );
+  // The built-in overrides keep the built-in labels (the LLM sees the same
+  // tool) and carry a JSON-schema `parameters` object (the built-in's
+  // parameter shape — the desktop's `tools/exec.rs` executors read it).
+  const byName = Object.fromEntries(registered.map((t) => [t.name, t]));
+  expect(byName.bash.label).toBe("Bash");
+  expect(byName.read.label).toBe("Read");
+  expect(byName.write.label).toBe("Write");
+  expect(byName.edit.label).toBe("Edit");
+  expect(byName.find.label).toBe("Find");
+  expect(byName.grep.label).toBe("Grep");
+  expect(byName.ls.label).toBe("List");
+  for (const name of BUILTIN_NAMES) {
+    expect(typeof byName[name].parameters).toBe("object");
+    expect(typeof byName[name].execute).toBe("function");
+  }
 });

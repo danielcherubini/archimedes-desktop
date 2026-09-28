@@ -40,11 +40,18 @@ use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
 use crate::agent::errors::RpcError;
+use crate::agent::harness::{
+    discover_models, seed_from_pi_config, AgentLoop, ControlCmd, Model, ModelCatalog,
+    OpenAiCompatibleProvider, Prompt, Provider, ProviderDiscovery, RetryPolicy, SessionStore,
+    SudoDeps,
+};
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
-use crate::config::{AgentEntry, ConfigError, Registry};
+use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Sink for outbound events (session updates, session-closed, …).
 ///
@@ -251,8 +258,10 @@ pub struct SessionInfo {
 /// (No `Debug` derive — `PiRpcHandle` does not implement `Debug`.)
 #[allow(dead_code)]
 pub(crate) struct LiveSession {
-    /// Cheap clone of the pi RPC handle, shared with the driver task.
-    pub(crate) handle: PiRpcHandle,
+    /// The session backend (the pi RPC handle for an EXTERNAL session; the
+    /// in-process `AgentLoop` handle for a NATIVE session) — cheap clone,
+    /// shared with the driver task.
+    pub(crate) handle: SessionBackend,
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
     pub(crate) agent_id: String,
@@ -286,6 +295,141 @@ pub(crate) struct LiveSession {
     /// under the same session id) must not clobber the replacement's
     /// entry on teardown — the removal is guarded by this token.
     pub(crate) generation: u64,
+}
+
+/// The session backend (the `SessionDriver` generalization, Task 7): an
+/// EXTERNAL session is a `PiRpc` subprocess (the existing path — unchanged);
+/// a NATIVE session is an in-process `AgentLoop` tokio task (the harness,
+/// Tasks 4–6) driven through the `NativeHandle`.
+#[derive(Clone)]
+pub(crate) enum SessionBackend {
+    /// The pi RPC handle (the external path — `pi --mode rpc`).
+    Pi(PiRpcHandle),
+    /// The in-process `AgentLoop` handle (the native path).
+    Native(NativeHandle),
+}
+
+/// The native session's config state (the `set_config_option` re-synthesizer
+/// source — the loop's own `model` / `thinking_level` live INSIDE the spawned
+/// task, so the handle mirrors the applied config: `start_native_session`
+/// initializes it, `set_config_option` updates it when a change is applied).
+#[derive(Clone)]
+pub(crate) struct NativeConfigState {
+    pub(crate) model: Model,
+    pub(crate) thinking_level: Option<String>,
+}
+
+/// A cheap, `'static`-safe handle to the native `AgentLoop` task (the
+/// NATIVE counterpart of `PiRpcHandle`): `prompt_tx` / `control_tx` clone
+/// the loop's channels and `cancel` is the loop's cancellation token. The
+/// loop's `RpcEvent` `Receiver` is NOT held here (a `tokio` mpsc `Receiver`
+/// is not `Clone`) — `drive_native_session` takes it by move (the driver
+/// task consumes it to watch `agent_settled`; the loop has ALREADY run the
+/// events through the `normalize` + `persist_update` pipeline in its
+/// `emit`).
+#[derive(Clone)]
+pub(crate) struct NativeHandle {
+    prompt_tx: mpsc::Sender<Prompt>,
+    control_tx: mpsc::Sender<ControlCmd>,
+    /// The SESSION teardown token (the loop's `run()` exits on it — a
+    /// `close_session` tears the loop down; the driver tears the session
+    /// down when the loop task ends).
+    cancel: CancellationToken,
+    /// The current TURN's cancel token (SHARED with the loop — the loop
+    /// arms a fresh one per prompt; a `cancel_session` Stop cancels the
+    /// CURRENT turn only — finding 8c).
+    turn_cancel: Arc<StdMutex<CancellationToken>>,
+    /// The session's config state (see `NativeConfigState`).
+    state: Arc<StdMutex<NativeConfigState>>,
+    /// The loop task's `AbortHandle` (set after `tokio::spawn` — a test-only
+    /// seam to kill the loop task DIRECTLY, without cancelling any token, so
+    /// the `settle_tx` sender drops with NO pending settle (a deterministic
+    /// `changed()` `Err` → the teardown resolves `pending_turn` `Cancelled`).
+    loop_task: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
+}
+
+impl NativeHandle {
+    fn new(
+        prompt_tx: mpsc::Sender<Prompt>,
+        control_tx: mpsc::Sender<ControlCmd>,
+        cancel: CancellationToken,
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+        model: Model,
+        thinking_level: Option<String>,
+    ) -> Self {
+        Self {
+            prompt_tx,
+            control_tx,
+            cancel,
+            turn_cancel,
+            state: Arc::new(StdMutex::new(NativeConfigState {
+                model,
+                thinking_level,
+            })),
+            loop_task: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// (test-only) Kill the loop task DIRECTLY (a `JoinHandle::abort` — the
+    /// task dies with NO token cancelled, so it emits NO final settle; the
+    /// `settle_tx` sender drops unseen → `changed()` returns `Err`
+    /// deterministically). Distinct from `close` (which cancels the turn +
+    /// session tokens and may let the loop settle first).
+    #[cfg(test)]
+    fn abort_loop_task(&self) {
+        if let Some(abort) = self.loop_task.lock().unwrap().clone() {
+            abort.abort();
+        }
+    }
+
+    /// Store the loop task's `AbortHandle` (called after `tokio::spawn`).
+    fn set_loop_task(&self, handle: tokio::task::AbortHandle) {
+        *self.loop_task.lock().unwrap() = Some(handle);
+    }
+
+    /// Queue a prompt (best-effort — a full / closed queue is dropped,
+    /// mirroring `AgentLoop::send_prompt`).
+    fn send_prompt(&self, text: &str) -> bool {
+        self.prompt_tx
+            .try_send(Prompt {
+                text: text.to_string(),
+            })
+            .is_ok()
+    }
+
+    /// Stop the in-flight turn (the `cancel_session` Stop — finding 8c:
+    /// the native Stop matches the external `abort`: the loop settles
+    /// the turn `Cancelled` and STAYS ALIVE — a new prompt reuses the
+    /// session; only a `close_session` (`close`) tears the loop down).
+    fn cancel(&self) {
+        self.turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel();
+    }
+
+    /// Tear the loop down (the `close_session` teardown — the prompt
+    /// queue + the in-flight turn stop; the driver teardown cancels too
+    /// — idempotent).
+    fn close(&self) {
+        self.turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel();
+        self.cancel.cancel();
+    }
+
+    /// The current config state (the `set_config_option` re-synthesizer).
+    fn config_state(&self) -> Arc<StdMutex<NativeConfigState>> {
+        self.state.clone()
+    }
+
+    /// The loop's control channel sender (the `set_config_option` native
+    /// branch queues `SetModel` / `SetThinkingLevel` through it — the loop
+    /// applies them via `set_model` / `set_thinking_level` when idle).
+    fn control_tx_clone(&self) -> mpsc::Sender<ControlCmd> {
+        self.control_tx.clone()
+    }
 }
 
 /// The external-close handle: the subagent cancel path (main sessions pass
@@ -586,6 +730,7 @@ impl SessionDriver {
                         client_session_id,
                         &socket_path,
                         std::process::id(),
+                        &cwd,
                         sink.clone(),
                         self.pending_bridge.clone(),
                         listener_close_tx,
@@ -742,9 +887,13 @@ impl SessionDriver {
                         // prompt wait — `wait_for_settle`).
                         if matches!(ev, RpcEvent::agent_settled) {
                             settle_seq += 1;
-                            let reason = {
+                            // (finding 6) The `pending_turn` take + the settle
+                            // watch send happen under ONE `sessions` lock,
+                            // the watch send LAST (the `wait_for_settle`
+                            // race — see the native driver's settle arm).
+                            let _reason = {
                                 let sessions = sessions_arc.lock().await;
-                                if let Some(live) = sessions.get(&info.session_id) {
+                                let reason = if let Some(live) = sessions.get(&info.session_id) {
                                     let cancelled = *live
                                         .cancel_requested
                                         .lock()
@@ -756,10 +905,20 @@ impl SessionDriver {
                                     }
                                 } else {
                                     StopReason::EndTurn
+                                };
+                                if let Some(live) = sessions.get(&info.session_id) {
+                                    if let Some(tx) = live
+                                        .pending_turn
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .take()
+                                    {
+                                        let _ = tx.send(reason);
+                                    }
                                 }
+                                let _ = settle_tx.send((settle_seq, reason));
+                                reason
                             };
-                            let _ = settle_tx.send((settle_seq, reason));
-                            resolve_pending_turn(&sessions_arc, &info.session_id).await;
                         }
                         // A thinking-level change re-synthesizes the config
                         // options (the normalizer has no model list — the
@@ -879,12 +1038,28 @@ impl SessionDriver {
             // Guard by the generation token (captured above): a
             // SUPERSEDED driver (a resume overwrote this entry under the
             // same session id) must not clobber the replacement's entry.
+            // Resolve the pending turn (an in-flight `send_prompt`
+            // awaiting its `agent_settled`) with `Cancelled` BEFORE the
+            // session is removed (finding 3a — the agent died / the
+            // session was torn down mid-turn, so the turn will never
+            // settle; without this the `send_prompt`'s unbounded
+            // `rx.await` hangs forever).
             {
                 let mut sessions = sessions_arc.lock().await;
                 if sessions
                     .get(&info.session_id)
                     .is_some_and(|l| l.generation == live_generation)
                 {
+                    if let Some(live) = sessions.get(&info.session_id) {
+                        if let Some(tx) = live
+                            .pending_turn
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(StopReason::Cancelled);
+                        }
+                    }
                     sessions.remove(&info.session_id);
                 }
             }
@@ -958,7 +1133,9 @@ impl SessionDriver {
         };
 
         let live = LiveSession {
-            handle,
+            // The EXTERNAL backend (the `PiRpc` handle — the task keeps its
+            // own clone; the child lives while ANY clone is alive).
+            handle: SessionBackend::Pi(handle),
             generation: live_generation,
             session_id: info.session_id.clone(),
             cwd,
@@ -980,22 +1157,58 @@ impl SessionDriver {
     /// Await the session's next turn settle (the driver's `agent_settled` watch).
     ///
     /// BOUNDED by `settle_timeout` (a hung turn can't linger forever — the
-    /// zombie-subagent fix): the wait ends on the turn's `agent_settled`
-    /// (resolves `Ok(reason)` — the `cancel_requested` flag already mapped a
-    /// cancel to `Cancelled`), on a teardown (the driver task ending DROPS
-    /// the watch sender, which resolves `changed()` as `Err` →
-    /// `Err(ProcessExited)` — the agent died mid-turn, or the session was
-    /// torn down), or on the settle timeout (a hung turn →
+    /// zombie-subagent fix): the wait ends on a settle AT OR AFTER the turn
+    /// being waited for (resolves `Ok(reason)` — the `cancel_requested` flag
+    /// already mapped a cancel to `Cancelled`), on a teardown (the driver
+    /// task ending DROPS the watch sender, which resolves `changed()` as
+    /// `Err` → `Err(ProcessExited)` — the agent died mid-turn, or the
+    /// session was torn down), or on the settle timeout (a hung turn →
     /// `Err(SettleTimeout)` — the caller's cancel tears the session down).
+    ///
+    /// STALE-SETTLE GUARD: the wait is pinned to the channel's current
+    /// version (`mark_unchanged`) ONLY while a turn is IN FLIGHT (the
+    /// `pending_turn` slot is occupied — `send_prompt` sets it before the
+    /// dispatch and the driver clears it on `agent_settled`). With a turn
+    /// in flight, a recorded settle is a PREVIOUS turn's (stale) — the
+    /// mark makes `changed()` resolve only on a NEW settle. With NO turn
+    /// in flight (the caller's turn already settled — the subagent
+    /// dispatches a raw prompt, which does NOT occupy `pending_turn`, then
+    /// awaits the settle: a fast turn settles before the await), the mark
+    /// is SKIPPED: the clone inherits the stored receiver's initial version,
+    /// so `changed()` resolves immediately with the latest settle (the fast
+    /// turn's — not hung on a new settle that never comes).
     pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, RpcError> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
-            sessions
+            let live = sessions
                 .get(session_id)
-                .map(|l| l.settle_rx.clone())
                 .ok_or_else(|| RpcError::UnknownSession {
                     id: session_id.to_string(),
-                })?
+                })?;
+            // A `send_prompt` turn is in flight (the slot is occupied —
+            // set before the dispatch, cleared on `agent_settled`).
+            let turn_in_flight = live
+                .pending_turn
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some();
+            let mut rx = live.settle_rx.clone();
+            // (finding 6) The `mark_unchanged` runs under the SAME
+            // `sessions` lock as the `pending_turn` snapshot (the race: a
+            // settle that lands between the snapshot and the mark would be
+            // marked seen and never resolve the wait — a 30-min spurious
+            // `SettleTimeout`). It is applied ONLY when a turn is in flight
+            // (a no-turn-in-flight `wait_for_settle` must resolve with the
+            // LATEST settle — the fast-turn contract — not be pinned to the
+            // current version). The driver's settle arm takes the slot +
+            // sends the watch under the same lock (watch send last), so the
+            // two critical sections are ordered: a settle that lands after
+            // the mark is a NEW version (resolves), and one that lands
+            // before empties the slot (no mark → resolve with the latest).
+            if turn_in_flight {
+                rx.mark_unchanged();
+            }
+            rx
         };
         // A bounded wait: a hung turn (no settle within `settle_timeout`)
         // resolves `Err(SettleTimeout)`; a teardown (sender dropped)
@@ -1025,32 +1238,228 @@ impl SessionDriver {
             Ok(reason)
         }
     }
-}
 
-/// Resolve the session's pending turn (a `send_prompt` awaiting its
-/// `agent_settled`): a `cancel_requested` flag maps the settle to
-/// `Cancelled`, else `EndTurn`. A no-op when no turn is in flight.
-async fn resolve_pending_turn(
-    sessions: &Arc<Mutex<HashMap<String, LiveSession>>>,
-    session_id: &str,
-) {
-    if let Some(live) = sessions.lock().await.get(session_id) {
-        if let Some(tx) = live
-            .pending_turn
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let cancelled = *live
-                .cancel_requested
+    /// Shared driver for a NATIVE session (the `AgentLoop` variant of
+    /// [`Self::drive_session`]).
+    ///
+    /// The loop task (spawned by the caller) emits `RpcEvent`s on
+    /// `events_rx` (moved in — a `tokio` mpsc `Receiver` is not `Clone`)
+    /// AND writes the settle watch on every `agent_settled` (finding 3 —
+    /// the RELIABLE settle: a full / slow `events` mpsc can drop the raw
+    /// event, but a watch send is never dropped). The loop has ALREADY
+    /// run the events through the `normalize` + `persist_update` pipeline
+    /// (its `emit`), so the driver does NOT re-normalize: it watches the
+    /// settle (the `pending_turn` + the `settle_tx` watch, populated
+    /// IDENTICALLY to the external path so `wait_for_settle` works
+    /// unchanged) and blocks until close (or the loop task ending — a
+    /// `close_session` / teardown).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn drive_native_session(
+        &self,
+        handle: NativeHandle,
+        events_rx: mpsc::Receiver<RpcEvent>,
+        loop_settle_rx: watch::Receiver<u64>,
+        agent_id: &str,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+        info: SessionInfo,
+    ) -> Result<SessionInfo, RpcError> {
+        let (close_tx, mut close_rx) = watch::channel(false);
+        let kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
+        // The turn-settle watch (the external path's `settle_tx` — the
+        // initial `(0, …)` means "no settle yet").
+        let (settle_tx, settle_rx) = watch::channel((0u64, StopReason::EndTurn));
+        let sessions_arc = self.sessions.clone();
+        let pending_permissions_arc = self.pending_permissions.clone();
+        let pending_bridge_arc = self.pending_bridge.clone();
+        let pending_sudo_arc = self.pending_sudo.clone();
+        let sudo_password_arc = self.sudo_password.clone();
+        let todo_store_arc = self.todo_store.clone();
+        // The session's generation token (the teardown guard: a SUPERSEDED
+        // driver — a resume overwrote this entry under the same session id —
+        // must not clobber the replacement's entry).
+        let live_generation = self
+            .generation_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backend = handle.clone();
+        let mut events_rx = events_rx;
+        // The loop's settle watch receiver (finding 3 — moved into the
+        // driver task; the `LiveSession`'s `settle_rx` above is the
+        // driver's OWN watch, which the driver task UPDATES on settle).
+        let mut loop_settle_rx = loop_settle_rx;
+        // Clones for the driver task (held by the task until AFTER its kind
+        // read below); the originals move into the `LiveSession` value.
+        let info_task = info.clone();
+        let kind_for_task = kind.clone();
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    ev = events_rx.recv() => {
+                        if ev.is_none() {
+                            // The loop task ended (a close / teardown) —
+                            // tear the session down.
+                            break;
+                        }
+                        // The `events` mpsc is a LIVENESS signal only:
+                        // a full / slow channel can DROP an
+                        // `agent_settled` delivery (finding 3), so the
+                        // settle is NOT taken from it — the settle watch
+                        // arm below is the reliable one (a watch send is
+                        // never dropped).
+                    }
+                    // A settled turn (the loop's settle watch — RELIABLE:
+                        // a watch send is never dropped, so a full / slow
+                        // `events` mpsc cannot lose it, finding 3): resolves
+                        // the pending prompt (a `cancel_requested` flag maps
+                        // it to `Cancelled`) AND records the settle on the
+                        // watch (the subagent's prompt wait —
+                        // `wait_for_settle`), IDENTICALLY to the external
+                        // path.
+                    changed = loop_settle_rx.changed() => {
+                        // `changed()` `Err` = the loop's settle sender was
+                        // dropped (the loop task died) — NOT a settle. Skip
+                        // the settle processing: the `events_rx.recv() →
+                        // None` arm breaks the loop, and the teardown resolves
+                        // `pending_turn` with `Cancelled` (a mid-turn death
+                        // must not tell `send_prompt` "turn ended normally"
+                        // — pre-fix the `_ =` pattern treated the `Err` as a
+                        // settle and resolved `pending_turn` `EndTurn` + wrote
+                        // a duplicate `(seq, reason)` to the driver watch).
+                        if changed.is_err() {
+                            break;
+                        }
+                        // The settle count from the loop's watch (the loop's
+                        // `settle_count` atomic — the REAL count: a watch
+                        // coalesces two fast settles into ONE wake, so
+                        // counting wakes would undercount).
+                        let settle_seq = *loop_settle_rx.borrow();
+                        // (finding 6) The `pending_turn` take + the settle
+                        // watch send happen under ONE `sessions` lock, the
+                        // watch send LAST (the `wait_for_settle` race: a
+                        // watch send that lands between the waiter's
+                        // `pending_turn` snapshot and its `mark_unchanged`
+                        // would be marked seen and never resolve the wait;
+                        // taking the slot first, under the same lock, orders
+                        // the two critical sections). The `cancel_requested`
+                        // flag maps the settle to `Cancelled` (else `EndTurn`).
+                        let _reason = {
+                            let sessions = sessions_arc.lock().await;
+                            let reason = if let Some(live) = sessions.get(&info_task.session_id) {
+                                let cancelled = *live
+                                    .cancel_requested
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                if cancelled {
+                                    StopReason::Cancelled
+                                } else {
+                                    StopReason::EndTurn
+                                }
+                            } else {
+                                StopReason::EndTurn
+                            };
+                            if let Some(live) = sessions.get(&info_task.session_id) {
+                                if let Some(tx) = live
+                                    .pending_turn
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .take()
+                                {
+                                    let _ = tx.send(reason);
+                                }
+                            }
+                            let _ = settle_tx.send((settle_seq, reason));
+                            reason
+                        };
+                    }
+                    // The close flag (`close_session`).
+                    _ = close_rx.changed() => break,
+                }
+            }
+
+            // The session is over: tear the loop down (the prompt queue +
+            // the in-flight turn stop) and clean up (the `drive_session`
+            // teardown, minus the bridge listener — a native session has no
+            // bridge: it runs in-process).
+            backend.cancel.cancel();
+            let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
+            let reason = match kind {
+                Some(CloseKind::User) => ClosedReason::User,
+                None => ClosedReason::AgentExited,
+            };
+            // Guard by the generation token (a SUPERSEDED driver must not
+            // clobber the replacement's entry). Resolve the pending turn
+            // (an in-flight `send_prompt` awaiting its `agent_settled`)
+            // with `Cancelled` BEFORE the session is removed (finding 3a —
+            // the session is over, so the turn will never settle; without
+            // this the `send_prompt`'s unbounded `rx.await` hangs forever
+            // — a close / cancel could not unblock the waiter).
+            {
+                let mut sessions = sessions_arc.lock().await;
+                if sessions
+                    .get(&info_task.session_id)
+                    .is_some_and(|l| l.generation == live_generation)
+                {
+                    if let Some(live) = sessions.get(&info_task.session_id) {
+                        if let Some(tx) = live
+                            .pending_turn
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take()
+                        {
+                            let _ = tx.send(StopReason::Cancelled);
+                        }
+                    }
+                    sessions.remove(&info_task.session_id);
+                }
+            }
+            // Keys are `"{session_id}/{request_id}"` — match on the
+            // trailing-slash prefix so closing "s1" does not cancel the
+            // pending prompt of the longer session "s10".
+            let prefix = permission::session_key_prefix(&info_task.session_id);
+            pending_permissions_arc
                 .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let _ = tx.send(if cancelled {
-                StopReason::Cancelled
-            } else {
-                StopReason::EndTurn
-            });
-        }
+                .await
+                .retain(|key, _| !key.starts_with(&prefix));
+            let bridge_prefix = bridge::session_key_prefix(&info_task.session_id);
+            pending_bridge_arc
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&bridge_prefix));
+            pending_sudo_arc
+                .lock()
+                .await
+                .retain(|key, _| !key.starts_with(&bridge_prefix));
+            sudo_password_arc.lock().await.remove(&info_task.session_id);
+            todo_store_arc.remove(&info_task.session_id);
+            sink.emit(
+                "session-closed",
+                json!({
+                    "sessionId": info_task.session_id,
+                    "reason": reason.as_str(),
+                }),
+            );
+        });
+
+        let live = LiveSession {
+            handle: SessionBackend::Native(handle),
+            generation: live_generation,
+            session_id: info.session_id.clone(),
+            cwd,
+            agent_id: agent_id.to_string(),
+            close_tx: close_tx.clone(),
+            close_kind: kind,
+            thought_state: Arc::new(StdMutex::new(ThoughtState::default())),
+            pending_turn: Arc::new(StdMutex::new(None)),
+            cancel_requested: Arc::new(StdMutex::new(false)),
+            settle_rx,
+        };
+        self.sessions
+            .lock()
+            .await
+            .insert(live.session_id.clone(), live);
+
+        Ok(info)
     }
 }
 
@@ -1112,6 +1521,13 @@ async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
     }
 }
 
+/// A factory that builds a `Provider` from a `Model` (the native path's
+/// provider seam — `SessionManager::provider_factory`; the production
+/// default is `OpenAiCompatibleProvider`, a test sets a mock before
+/// `start_session`). `pub` so `subagent.rs`'s `NativeDeps` can carry
+/// one (the native dispatch builds the `Provider` through it).
+pub type ProviderFactory = Arc<dyn Fn(&Model) -> Box<dyn Provider> + Send + Sync>;
+
 /// Manages all live ACP sessions (the MAIN sessions).
 ///
 /// Owns a [`SessionDriver`] (db: attached via [`Self::attach_db`],
@@ -1138,6 +1554,22 @@ pub struct SessionManager {
     /// install failed — the spawn then skips the tools args, and the
     /// session runs on the suite's original tools rather than broken).
     tools_path: Option<PathBuf>,
+    /// The model catalog (Task 5 — seeded from the user's pi config, ADR
+    /// 0012; the native session's model source + the `set_config_option`
+    /// re-synthesizer). Best-effort: a missing pi config degrades to an
+    /// empty catalog (a logged warning), never a crash.
+    catalog: ModelCatalog,
+    /// The provider factory seam (reviewer-corrected Major #21): the native
+    /// path builds the `Provider` through it (the production default is
+    /// `OpenAiCompatibleProvider`; a test sets a mock BEFORE `start_session`),
+    /// so `start_session` never constructs the provider inline.
+    provider_factory: ProviderFactory,
+    /// The per-provider live-discovery cache (the `GET /v1/models` result —
+    /// the OpenAI endpoint "supplies everything"; the `pi-provider-litellm`
+    /// `fetchModels` pattern). At most one fetch per provider (a failed /
+    /// unreachable endpoint is not retried every session); a failure /
+    /// absent model degrades to the static `models-store.json` metadata.
+    discovery_cache: tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>,
 }
 
 impl SessionManager {
@@ -1177,7 +1609,80 @@ impl SessionManager {
             config_dir,
             gate_path,
             tools_path,
+            // The model catalog (Task 5 — seeded from the user's pi
+            // config; best-effort, ADR 0012). Tests override it via
+            // `set_catalog` (a test cannot control the user's real pi
+            // config).
+            catalog: seed_from_pi_config(),
+            // The provider factory seam (reviewer-corrected Major #21 —
+            // the production default; a test sets a mock via
+            // `set_provider_factory` BEFORE `start_session`).
+            provider_factory: Arc::new(|m: &Model| {
+                Box::new(OpenAiCompatibleProvider {
+                    base_url: m.base_url.clone(),
+                    api_key: m.api_key.clone(),
+                }) as Box<dyn Provider>
+            }),
+            discovery_cache: tokio::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Override the model catalog (tests — `new` seeds from the user's pi
+    /// config, which a test cannot control). Set BEFORE `start_session`.
+    pub fn set_catalog(&mut self, catalog: ModelCatalog) {
+        self.catalog = catalog;
+    }
+
+    /// Inject the provider factory (reviewer-corrected Major #21 — the
+    /// native path builds the `Provider` through it; the production default
+    /// is `OpenAiCompatibleProvider`). Set BEFORE `start_session`.
+    pub fn set_provider_factory(
+        &mut self,
+        f: impl Fn(&Model) -> Box<dyn Provider> + Send + Sync + 'static,
+    ) {
+        self.provider_factory = Arc::new(f);
+    }
+
+    /// Best-effort refresh a `Model`'s metadata (context window, thinking
+    /// levels) from the provider's live `GET /v1/models` (the OpenAI
+    /// endpoint "supplies everything" — the `pi-provider-litellm`
+    /// `fetchModels` pattern). Bounded (a `discover_models` timeout) +
+    /// cached per-provider (at most one fetch per provider — a failed /
+    /// unreachable endpoint is NOT retried every session). A failure, or a
+    /// model absent from the response, degrades to the static
+    /// (`models-store.json`) metadata (the `Model` is returned unchanged).
+    async fn refresh_model_metadata(&self, model: &Model) -> Model {
+        if model.base_url.is_empty() {
+            return model.clone();
+        }
+        let mut cache = self.discovery_cache.lock().await;
+        let entry = cache
+            .entry(model.provider.clone())
+            .or_insert_with(ProviderDiscovery::default);
+        if !entry.attempted {
+            entry.attempted = true;
+            // Best-effort: a failure (unreachable endpoint, non-2xx) leaves
+            // `models` empty → the static metadata is kept (no retry).
+            if let Ok(models) = discover_models(&model.base_url, &model.api_key).await {
+                entry.models = models;
+            }
+        }
+        let Some(meta) = entry.models.get(&model.id) else {
+            return model.clone();
+        };
+        // Apply the fresh metadata (only the `Some` fields — an absent
+        // field keeps the static `models-store.json` value).
+        let mut updated = model.clone();
+        if let Some(cw) = meta.context_window {
+            updated.context_window = cw;
+        }
+        if let Some(levels) = meta.thinking_levels.clone() {
+            updated.thinking_levels = levels;
+        }
+        if let Some(st) = meta.supports_thinking {
+            updated.supports_thinking = st;
+        }
+        updated
     }
 
     /// Attach the persistence database. Sets BOTH `db` (transcript
@@ -1200,8 +1705,34 @@ impl SessionManager {
     /// `dispatch_subagent` frames). The subagent manager needs nothing from
     /// the main manager; only this field points at it (intra-crate type
     /// cycles are fine in Rust).
+    ///
+    /// ALSO wires the native-harness deps onto the manager (set-once via
+    /// `set_native_deps` — a `&self` `OnceLock`, so it's callable through
+    /// the `Arc` received here): the `db` is the SIGNAL that native
+    /// wiring is present (skipped when `None` — the manager stays
+    /// external-pi-only); it is NOT passed (the throwaway child `Db` is
+    /// built fresh in `dispatch_native`). `trust_db` IS threaded (the
+    /// SAME db — ADR 0010: a native child in a trusted Space inherits
+    /// the parent's trust, matching the external `dispatch`); it is
+    /// `Some` whenever `db` is (both are set together by `attach_db`).
+    /// In production the native-session path always `attach_db`s, so
+    /// this is set.
     pub fn set_subagent_manager(&mut self, m: Arc<crate::agent::subagent::SubagentSessionManager>) {
-        self.driver.subagent = Some(m);
+        self.driver.subagent = Some(m.clone());
+        if let Some(_db) = &self.driver.db {
+            m.set_native_deps(crate::agent::subagent::NativeDeps {
+                provider_factory: self.provider_factory.clone(),
+                catalog: self.catalog.clone(),
+                todo_store: self.driver.todo_store.clone(),
+                sudo: SudoDeps {
+                    runner: self.driver.runner.clone(),
+                    pending_sudo: self.driver.pending_sudo.clone(),
+                    sudo_password: self.driver.sudo_password.clone(),
+                },
+                settle_timeout: self.driver.settle_timeout,
+                trust_db: self.driver.trust_db.clone(),
+            });
+        }
     }
 
     /// Reset the session's open thinking segment at a prompt boundary. The
@@ -1239,6 +1770,260 @@ impl SessionManager {
         }
     }
 
+    /// The NATIVE session (Task 7): resolve the model (the harness's
+    /// `default_model` → the `ModelCatalog`), build the `Provider` (the
+    /// `provider_factory` seam), the `SessionStore` (the `native_messages`
+    /// table), and the `AgentLoop` — `tokio::spawn` it (IN-PROCESS; no
+    /// subprocess), drive it (the `drive_native_session` driver task —
+    /// `pending_turn` / `settle_tx` / `close_kind` populated IDENTICALLY to
+    /// the external path), and record the session (the `capabilities_json`
+    /// has NO `piSessionFile` — resume is from the `native_messages`
+    /// table, so `loadSession` is `true`).
+    ///
+    /// The `config_options` are SYNTHESIZED from the `ModelCatalog` (the
+    /// existing `synthesize_config_options` shape — the frontend is
+    /// unchanged; a new `get_models` command driving a native-only picker
+    /// would be a UI change, so there is none).
+    async fn start_native_session(
+        &self,
+        entry: &AgentEntry,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+    ) -> Result<SessionInfo, RpcError> {
+        let info = self.build_native_session(entry, cwd, sink, None).await?;
+        self.record_session(&info);
+        Ok(info)
+    }
+
+    /// The NATIVE resume (Task 7, reviewer-corrected Major #18): a native
+    /// session's `capabilities_json` has NO `piSessionFile` (the external
+    /// path would be `NotResumable`), so `kind: native` routes HERE — a
+    /// fresh `AgentLoop` + `SessionStore::load_messages` (resume from the
+    /// `native_messages` table). The model comes from the stored
+    /// `capabilities.model` (a stale / unknown key falls back to the
+    /// harness / catalog default); the thinking level from the stored
+    /// `thinkingLevel` (falling back to the harness default).
+    async fn resume_native_session(
+        &self,
+        entry: &AgentEntry,
+        session_id: &str,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+    ) -> Result<SessionInfo, RpcError> {
+        let db = self.driver.db.clone().ok_or_else(|| {
+            RpcError::Io("a native session requires an attached database".to_string())
+        })?;
+        // The stored row must exist (a native session is recorded at start
+        // — `record_session`; a missing row is unresumable, like the
+        // external path's missing row).
+        let caps_json = db
+            .session(session_id)
+            .ok()
+            .flatten()
+            .map(|row| row.capabilities_json)
+            .ok_or_else(|| RpcError::NotResumable {
+                id: session_id.to_string(),
+            })?;
+        let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
+        let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
+            error: "the native entry has no harness config".to_string(),
+        })?;
+        // The model: the stored `model` (a composed key → the catalog);
+        // an absent / stale key falls back to the harness / catalog
+        // default (never a hard error — the transcript still loads).
+        let model = caps
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(|key| resolve_composed_model(&self.catalog, key))
+            .or_else(|| resolve_native_model(&self.catalog, &harness.default_model).ok());
+        let Some(model) = model else {
+            return Err(RpcError::Command {
+                error: "no models available for the native session".to_string(),
+            });
+        };
+        let thinking_level = caps
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| harness.default_thinking_level.clone());
+
+        let info = self
+            .build_native_session(entry, cwd, sink, Some((session_id, model, thinking_level)))
+            .await?;
+        self.record_session(&info);
+        Ok(info)
+    }
+
+    /// Build + spawn + drive one native session (shared by `start` / `resume`;
+    /// `resume` carries the stored `session_id` + the loaded transcript
+    /// source — `start` mints a fresh UUID and starts with an empty
+    /// transcript).
+    async fn build_native_session(
+        &self,
+        entry: &AgentEntry,
+        cwd: PathBuf,
+        sink: &Arc<dyn EventSink>,
+        resume: Option<(&str, Model, Option<String>)>,
+    ) -> Result<SessionInfo, RpcError> {
+        let db = self.driver.db.clone().ok_or_else(|| {
+            RpcError::Io("a native session requires an attached database".to_string())
+        })?;
+        let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
+            error: "the native entry has no harness config".to_string(),
+        })?;
+        // (finding 13b) The harness `provider` must be
+        // `"openai-compatible"` (v1 is OpenAI-compatible only — ADR
+        // 0012): any other value is REJECTED at session start rather
+        // than silently accepted (pre-fix it got the OpenAI wire
+        // regardless).
+        if harness.provider != "openai-compatible" {
+            return Err(RpcError::Command {
+                error: format!(
+                    "unsupported harness provider `{}` (v1 is OpenAI-compatible only, ADR 0012)",
+                    harness.provider
+                ),
+            });
+        }
+        // The model: the harness's `default_model` (a composed key) → the
+        // catalog; `None` (the built-in) → the catalog's default → the
+        // v1-selectable (`openai_compatible`) set. A resume overrides it
+        // with the stored model (see `resume_native_session`).
+        let is_resume = resume.is_some();
+        let (session_id, model, thinking_level) = match resume {
+            Some((id, model, level)) => (id.to_string(), model.clone(), level),
+            None => (
+                uuid::Uuid::new_v4().to_string(),
+                resolve_native_model(&self.catalog, &harness.default_model)?,
+                harness.default_thinking_level.clone(),
+            ),
+        };
+        // (live `/v1/models` discovery) Best-effort refresh the model's
+        // metadata from the provider's live endpoint (the OpenAI endpoint
+        // "supplies everything" — the `pi-provider-litellm` `fetchModels`
+        // pattern). Bounded + cached per-provider; a failure degrades to
+        // the static (`models-store.json`) metadata.
+        let model = self.refresh_model_metadata(&model).await;
+
+        let store = SessionStore::new(db.clone());
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let (prompt_tx, prompt_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        // The TURN cancel (finding 8c): SHARED with the handle — the loop
+        // arms a fresh token per prompt; a `cancel_session` Stop cancels
+        // the CURRENT turn only (the session stays alive, matching the
+        // external `abort`), a `close_session` (`handle.close`) tears the
+        // loop down (the `cancel` token).
+        let turn_cancel: Arc<StdMutex<CancellationToken>> =
+            Arc::new(StdMutex::new(CancellationToken::new()));
+        // The settle watch (finding 3): the loop writes it on every
+        // `agent_settled` (a watch send is NEVER dropped — a full / slow
+        // `events` mpsc cannot lose the settle); the driver's settle arm
+        // consumes it.
+        let (settle_tx, settle_rx) = watch::channel(0u64);
+        // The `Provider` (the `provider_factory` seam — reviewer-corrected
+        // Major #21: the production default is `OpenAiCompatibleProvider`,
+        // a test sets a mock BEFORE `start_session`).
+        let provider = (self.provider_factory)(&model);
+        let mut loop_ = AgentLoop::new(
+            session_id.clone(),
+            cwd.clone(),
+            model.clone(),
+            provider,
+            self.catalog.clone(),
+            store.clone(),
+            events_tx,
+            cancel.clone(),
+            turn_cancel.clone(),
+            settle_tx,
+            prompt_tx.clone(),
+            prompt_rx,
+            self.driver.pending_permissions.clone(),
+            self.driver.pending_bridge.clone(),
+            self.driver.trust_db.clone(),
+            sink.clone(),
+            self.driver.todo_store.clone(),
+            self.driver.subagent.clone(),
+            SudoDeps {
+                runner: self.driver.runner.clone(),
+                pending_sudo: self.driver.pending_sudo.clone(),
+                sudo_password: self.driver.sudo_password.clone(),
+            },
+            RetryPolicy::new(),
+        );
+        // The harness config's `enabled_tools` (`[]` = all — finding
+        // 13b: a disabled tool is a tool-result error, NOT executed).
+        // The `[]` = all convention maps to `None` (all); a non-empty
+        // set is `Some(v)` (exactly `v`).
+        let parent_enabled_tools = harness.enabled_tools.clone();
+        loop_.set_enabled_tools(if parent_enabled_tools.is_empty() {
+            None
+        } else {
+            Some(parent_enabled_tools)
+        });
+        // The default thinking level (the harness's; a resume overrides it
+        // with the stored `thinkingLevel`).
+        if let Some(level) = &thinking_level {
+            loop_.set_thinking_level(Some(level.clone()));
+        }
+        // A RESUME: `load_messages` restores the stored provider transcript
+        // (the `native_messages` table) BEFORE the first model call (the
+        // `Compactor` is re-estimated on the loaded context).
+        if is_resume {
+            if let Ok(messages) = store.load_messages(&session_id) {
+                loop_.load_transcript(messages);
+            }
+        }
+        let handle = NativeHandle::new(
+            prompt_tx,
+            loop_.control_tx.clone(),
+            cancel,
+            turn_cancel,
+            model.clone(),
+            thinking_level.clone(),
+        );
+        // SPAWN the loop task (in-process — no subprocess; the external
+        // path's `PiRpc::spawn` is NEVER reached for a native kind).
+        let loop_handle = tokio::spawn(loop_.run());
+        // The test-only seam: store the `AbortHandle` so a test can kill the
+        // loop task DIRECTLY (no token cancel → no settle → deterministic
+        // `changed()` `Err`).
+        handle.set_loop_task(loop_handle.abort_handle());
+        // The `SessionInfo` (the `capabilities_json` has NO `piSessionFile` —
+        // resume is from the `native_messages` table; the `config_options`
+        // are SYNTHESIZED from the `ModelCatalog` in the existing shape —
+        // the frontend is unchanged). Block-scoped so the `MutexGuard`
+        // (and the `Arc` it borrows through) die BEFORE the `await` below
+        // (a `std::sync::MutexGuard` is not `Send` — the Tauri command's
+        // future must be `Send`).
+        let info = {
+            let state_guard = handle.config_state();
+            let state = state_guard.lock().unwrap();
+            SessionInfo {
+                session_id: session_id.clone(),
+                agent_id: entry.id.clone(),
+                cwd: cwd.clone(),
+                capabilities: native_capabilities(&state.model, state.thinking_level.as_deref()),
+                config_options: synthesize_catalog_config_options(
+                    &self.catalog,
+                    &state.model,
+                    state.thinking_level.as_deref(),
+                ),
+            }
+        };
+        self.driver
+            .drive_native_session(
+                handle,
+                events_rx,
+                settle_rx,
+                &entry.id,
+                cwd,
+                sink,
+                info.clone(),
+            )
+            .await?;
+        Ok(info)
+    }
+
     /// Spawn a pi agent, establish the session (`get_state`), and register
     /// it.
     ///
@@ -1265,6 +2050,13 @@ impl SessionManager {
                 id: agent_id.to_string(),
             })?;
 
+        // The NATIVE backend (Task 7): a `kind: native` entry carries a
+        // harness config, NOT a spawn spec — spawn an in-process `AgentLoop`
+        // task (the external path below is UNCHANGED for `kind: external`).
+        if entry.kind == AgentKind::Native {
+            return self.start_native_session(entry, cwd, sink).await;
+        }
+
         // Bridge wiring (ADR 0003): for a bridge agent (on a platform where
         // the bridge is available — NOT macOS), set the 4 bridge env vars
         // and pass the (client session id, socket path) to the driver so it
@@ -1279,10 +2071,19 @@ impl SessionManager {
 
         // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`
         // (the extension is inert without the env var). The tools override
-        // (Phase 2): a SECOND `-e <tools.ts>` (inert without the bridge env,
-        // which the bridge setup above already set when available).
-        let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &entry.args);
-        let args = crate::agent::tools::tools_spawn_args(self.tools_path.as_deref(), &args);
+        // (Phase 1 + Phase 2): a SECOND `-e <tools.ts>` (inert without the
+        // bridge env, which the bridge setup above already set when
+        // available) + `--no-builtin-tools` ONLY when the override will
+        // actually register the built-ins (a Linux bridge spawn — the
+        // override is self-gated on the platform; `tools_path` is `Some`
+        // on EVERY platform, so keying the flag on it would strip pi's
+        // built-ins off-Linux with nothing to replace them → zero tools).
+        let args = crate::agent::tools::spawn_args(
+            &entry.args,
+            self.gate_path.as_deref(),
+            self.tools_path.as_deref(),
+            bridge_setup.is_some() && cfg!(target_os = "linux"),
+        );
         let mut agent_env = agent_env;
         if self.gate_path.is_some() {
             crate::agent::gate::gate_env(&mut agent_env);
@@ -1374,6 +2175,18 @@ impl SessionManager {
                 id: agent_id.to_string(),
             })?;
 
+        // The NATIVE branch (reviewer-corrected Major #18) — BEFORE the
+        // `piSessionFile` extraction below (a native session's
+        // `capabilities_json` has NO `piSessionFile`, so the external path
+        // would be `NotResumable`): route `kind: native` to a fresh
+        // `AgentLoop` + `SessionStore::load_messages` (resume from the
+        // `native_messages` table).
+        if entry.kind == AgentKind::Native {
+            return self
+                .resume_native_session(entry, session_id, cwd, sink)
+                .await;
+        }
+
         // Read the stored capability envelope (the `piSessionFile` is the
         // `--session` argument). A missing row / unparseable envelope /
         // absent `piSessionFile` is unresumable (a legacy ACP row or a
@@ -1420,9 +2233,16 @@ impl SessionManager {
         args.push(session_file.to_string());
 
         // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`.
-        // The tools override (Phase 2): a second `-e <tools.ts>`.
-        let args = crate::agent::gate::gate_spawn_args(self.gate_path.as_deref(), &args);
-        let args = crate::agent::tools::tools_spawn_args(self.tools_path.as_deref(), &args);
+        // The tools override (Phase 1 + Phase 2): a second `-e <tools.ts>`
+        // + `--no-builtin-tools` ONLY when the override will actually
+        // register the built-ins (a Linux bridge spawn — see `start_session`
+        // for the zero-tools regression the condition guards against).
+        let args = crate::agent::tools::spawn_args(
+            &args,
+            self.gate_path.as_deref(),
+            self.tools_path.as_deref(),
+            bridge_setup.is_some() && cfg!(target_os = "linux"),
+        );
         let mut agent_env = agent_env;
         if self.gate_path.is_some() {
             crate::agent::gate::gate_env(&mut agent_env);
@@ -1516,8 +2336,8 @@ impl SessionManager {
         text: String,
         images: Vec<ImagePayload>,
     ) -> Result<StopReason, RpcError> {
-        // Clone just the (cheap) handle, not the whole LiveSession.
-        let (handle, pending_turn, cancel_requested) = {
+        // Clone just the (cheap) backend handle, not the whole LiveSession.
+        let (backend, pending_turn, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
@@ -1540,6 +2360,45 @@ impl SessionManager {
         // guarantee real.
         validate_images(&images)?;
 
+        // A NATIVE session is one-turn-at-a-time (the frontend's
+        // composer is locked until the turn resolves): a turn ALREADY
+        // IN FLIGHT (the `pending_turn` slot is occupied) is REJECTED
+        // rather than queued — the slot is a single last-wins resolver,
+        // and a queued prompt would be settled by the PREVIOUS turn's
+        // `agent_settled` (mis-attribution: the composer unlocks while
+        // a turn is still live). The external path keeps its
+        // steer/last-wins behavior UNCHANGED (a single steer turn).
+        //
+        // The check-and-claim is ATOMIC under ONE `pending_turn` lock
+        // acquisition (finding 2 — the pre-fix check DROPPED the lock, then
+        // `begin_user_turn` + `record_message` (two awaits) ran before the
+        // resolver was stored: two concurrent `send_prompt`s both observed
+        // an empty slot, both passed, and the second's `*slot = Some(tx)`
+        // dropped the first's sender (a phantom `Cancelled`) while the
+        // second's resolver was resolved by the FIRST turn's
+        // `agent_settled` (the composer unlocked mid-turn). Claiming the
+        // resolver BEFORE the user-row write / dispatch closes it: the
+        // user-row write order vs. the resolver is not load-bearing — what
+        // matters is that the check-and-claim is atomic (a rejected prompt
+        // writes nothing and overwrites nothing; an accepted prompt's
+        // resolver is claimed before the dispatch, so a settle arriving
+        // while the prompt is in flight is never lost on an empty slot).
+        let (tx, rx) = oneshot::channel::<StopReason>();
+        {
+            let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+            // Native: rejected if a turn is already in flight (the slot is
+            // occupied); external: last-wins (a replaced turn's sender is
+            // dropped → its `send_prompt` resolves `Cancelled` below).
+            if matches!(&backend, SessionBackend::Native(_)) && slot.is_some() {
+                return Err(RpcError::Command {
+                    error: "a turn is already in flight".to_string(),
+                });
+            }
+            *slot = Some(tx);
+        }
+        // Reset the cancel flag (a fresh turn is not a cancel).
+        *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = false;
+
         // Record the user's message in the transcript (the client owns
         // history) before the turn begins.
         self.begin_user_turn(session_id).await;
@@ -1548,59 +2407,69 @@ impl SessionManager {
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
 
-        // Build the prompt command: the text message + the image content
-        // (pi's `ImageContent` = `{type: "image", data, mimeType}` — the
-        // `ImagePayload` maps onto it verbatim; the `name` / `sizeBytes`
-        // are transcript-only, not wire fields).
-        let mut command = json!({ "type": "prompt", "message": text });
-        if !images.is_empty() {
-            command["images"] = Value::Array(
-                images
-                    .iter()
-                    .map(|img| {
-                        json!({
-                            "type": "image",
-                            "data": img.data,
-                            "mimeType": img.mime_type,
-                        })
-                    })
-                    .collect(),
-            );
-        }
-        // A prompt while the session is already streaming is a STEER (the
-        // turn continues with the new input — the frontend's composer is
-        // locked until the turn resolves, so a concurrent send means the
-        // previous turn is still running).
-        if let Ok(state) = handle.send(json!({ "type": "get_state" })).await {
-            if state.get("isStreaming").and_then(Value::as_bool) == Some(true) {
-                command["streamingBehavior"] = json!("steer");
+        // Dispatch the prompt (the `SessionBackend` generalization, Task 7):
+        // the EXTERNAL path is UNCHANGED (the pi `prompt` command — the text
+        // message + the image content + a `get_state` steer check); the
+        // NATIVE path queues the text on the loop's prompt queue (the native
+        // `Prompt` is text-only in v1 — a full queue is a best-effort drop,
+        // mapped to the same error path as a pi refusal below).
+        let send_error = match &backend {
+            SessionBackend::Pi(handle) => {
+                // Build the prompt command: the text message + the image
+                // content (pi's `ImageContent` = `{type: "image", data,
+                // mimeType}` — the `ImagePayload` maps onto it verbatim; the
+                // `name` / `sizeBytes` are transcript-only, not wire fields).
+                let mut command = json!({ "type": "prompt", "message": text });
+                if !images.is_empty() {
+                    command["images"] = Value::Array(
+                        images
+                            .iter()
+                            .map(|img| {
+                                json!({
+                                    "type": "image",
+                                    "data": img.data,
+                                    "mimeType": img.mime_type,
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                // A prompt while the session is already streaming is a STEER
+                // (the turn continues with the new input — the frontend's
+                // composer is locked until the turn resolves, so a
+                // concurrent send means the previous turn is still running).
+                if let Ok(state) = handle.send(json!({ "type": "get_state" })).await {
+                    if state.get("isStreaming").and_then(Value::as_bool) == Some(true) {
+                        command["streamingBehavior"] = json!("steer");
+                    }
+                }
+                handle.send(command).await.err()
             }
-        }
+            SessionBackend::Native(handle) => {
+                if handle.send_prompt(&text) {
+                    None
+                } else {
+                    Some(RpcError::Command {
+                        error: "the native session is busy; the prompt was dropped".to_string(),
+                    })
+                }
+            }
+        };
 
-        // Store the turn's resolver (last-wins: a replaced turn's sender is
-        // dropped → its `send_prompt` resolves `Cancelled` below) and reset
-        // the cancel flag (a fresh turn is not a cancel).
-        let (tx, rx) = oneshot::channel::<StopReason>();
-        {
-            let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
-            *slot = Some(tx);
-        }
-        *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = false;
-
-        // Send the prompt. The response arrives after preflight (start of
-        // turn); a `success: false` response is a REFUSAL — emit the error
+        // A `success: false` prompt response is a REFUSAL — emit the error
         // as a chunk (the user sees it) and resolve the turn `Refusal`
         // without waiting for a settle that never comes.
-        match handle.send(command).await {
-            Ok(_) => {}
-            Err(RpcError::Command { error }) => {
-                let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(tx) = slot.take() {
-                    let _ = tx.send(StopReason::Refusal);
+        if let Some(e) = send_error {
+            match e {
+                RpcError::Command { error } => {
+                    let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(StopReason::Refusal);
+                    }
+                    return Err(RpcError::Command { error });
                 }
-                return Err(RpcError::Command { error });
+                other => return Err(other),
             }
-            Err(e) => return Err(e),
         }
 
         // Await the turn (unbounded — the turn can block on a user-paced
@@ -1617,8 +2486,18 @@ impl SessionManager {
     /// flag is set BEFORE the `abort` is sent so a fast settle maps to
     /// `Cancelled`, not `EndTurn`. Fire-and-forget on the agent side: a
     /// no-op if there is no in-flight turn.
+    ///
+    /// BEHAVIOR (finding 8c, documented per the reviewer's request): the
+    /// EXTERNAL path is the pi `abort` — the agent aborts the TURN and the
+    /// session STAYS ALIVE (a new prompt reuses it). The NATIVE path
+    /// matches it: `handle.cancel()` cancels the loop's current TURN token
+    /// (the loop settles the turn `Cancelled` and STAYS ALIVE — a new
+    /// prompt reuses the session; only a `close_session` — `handle.close`
+    /// — tears the native session down). Pre-fix the native Stop cancelled
+    /// the loop's teardown token, which ENDED THE WHOLE SESSION (the
+    /// driver tore it down) — a silent asymmetry with the external path.
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), RpcError> {
-        let (handle, cancel_requested) = {
+        let (backend, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
@@ -1629,7 +2508,22 @@ impl SessionManager {
             live
         };
         *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        handle.send(json!({ "type": "abort" })).await?;
+        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path is the
+        // pi `abort` command (UNCHANGED — stop the turn, keep the session
+        // alive); the NATIVE path cancels the loop's current TURN token
+        // (finding 8c — the native Stop matches the external `abort`:
+        // the turn stops and the session STAYS ALIVE — a new prompt
+        // reuses it; only a `close_session` tears the native session
+        // down). The `cancel_requested` flag (set above) maps the settle
+        // to `Cancelled`.
+        match &backend {
+            SessionBackend::Pi(handle) => {
+                handle.send(json!({ "type": "abort" })).await?;
+            }
+            SessionBackend::Native(handle) => {
+                handle.cancel();
+            }
+        }
         Ok(())
     }
     /// Set a session config option (the model or the thinking level) on a
@@ -1647,64 +2541,168 @@ impl SessionManager {
         value: &str,
         sink: &Arc<dyn EventSink>,
     ) -> Result<Vec<Value>, RpcError> {
-        let handle = {
+        let (backend, config_state) = {
             let sessions = self.driver.sessions.lock().await;
-            sessions
+            let live = sessions
                 .get(session_id)
-                .map(|l| l.handle.clone())
+                .map(|l| {
+                    let state = match &l.handle {
+                        SessionBackend::Native(handle) => Some(handle.config_state()),
+                        SessionBackend::Pi(_) => None,
+                    };
+                    (l.handle.clone(), state)
+                })
                 .ok_or_else(|| RpcError::UnknownSession {
                     id: session_id.to_string(),
-                })?
+                })?;
+            live
         };
 
-        // The config id → the pi command. `model` values are
-        // `"<provider>/<modelId>"` (the synthesizer's option values).
-        let command = match config_id {
-            "model" => {
-                let (provider, model_id) =
-                    value
-                        .split_once('/')
-                        .ok_or_else(|| RpcError::InvalidPrompt {
-                            reason: format!(
-                                "invalid model value: {value} (expected provider/modelId)"
-                            ),
-                        })?;
-                json!({ "type": "set_model", "provider": provider, "modelId": model_id })
-            }
-            "thought_level" => json!({ "type": "set_thinking_level", "level": value }),
-            other => {
-                return Err(RpcError::Command {
-                    error: format!("unknown config option: {other}"),
-                })
-            }
-        };
-        handle.send(command).await?;
+        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path is
+        // UNCHANGED (the pi `set_model` / `set_thinking_level` commands +
+        // re-synthesize from `get_state` / `get_available_models` /
+        // `get_available_thinking_levels`); the NATIVE path routes to
+        // `AgentLoop::set_model` / `set_thinking_level` (the loop's control
+        // channel — applied when the loop is idle) and RE-SYNTHESIZES FROM
+        // THE `ModelCatalog` (a native session has no `get_state`).
+        match &backend {
+            SessionBackend::Pi(handle) => {
+                // The config id → the pi command. `model` values are
+                // `"<provider>/<modelId>"` (the synthesizer's option
+                // values).
+                let command = match config_id {
+                    "model" => {
+                        let (provider, model_id) =
+                            value
+                                .split_once('/')
+                                .ok_or_else(|| RpcError::InvalidPrompt {
+                                    reason: format!(
+                                        "invalid model value: {value} (expected provider/modelId)"
+                                    ),
+                                })?;
+                        json!({ "type": "set_model", "provider": provider, "modelId": model_id })
+                    }
+                    "thought_level" => {
+                        json!({ "type": "set_thinking_level", "level": value })
+                    }
+                    other => {
+                        return Err(RpcError::Command {
+                            error: format!("unknown config option: {other}"),
+                        })
+                    }
+                };
+                handle.send(command).await?;
 
-        // Re-synthesize + emit (the agent does not emit a
-        // `config_option_update` itself).
-        let state = handle.send(json!({ "type": "get_state" })).await?;
-        let models = handle
-            .send(json!({ "type": "get_available_models" }))
-            .await
-            .ok()
-            .and_then(|v| v.get("models").cloned());
-        let levels = handle
-            .send(json!({ "type": "get_available_thinking_levels" }))
-            .await
-            .ok()
-            .and_then(|v| v.get("levels").cloned());
-        let options = synthesize_config_options(&state, models.as_ref(), levels.as_ref())
-            .ok_or_else(|| RpcError::Command {
-                error: "no config options available".to_string(),
-            })?;
-        sink.emit(
-            "session-update",
-            json!({
-                "sessionId": session_id,
-                "update": { "sessionUpdate": "config_option_update", "configOptions": options },
-            }),
-        );
-        Ok(options)
+                // Re-synthesize + emit (the agent does not emit a
+                // `config_option_update` itself).
+                let state = handle.send(json!({ "type": "get_state" })).await?;
+                let models = handle
+                    .send(json!({ "type": "get_available_models" }))
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("models").cloned());
+                let levels = handle
+                    .send(json!({ "type": "get_available_thinking_levels" }))
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("levels").cloned());
+                let options = synthesize_config_options(&state, models.as_ref(), levels.as_ref())
+                    .ok_or_else(|| RpcError::Command {
+                    error: "no config options available".to_string(),
+                })?;
+                sink.emit(
+                    "session-update",
+                    json!({
+                        "sessionId": session_id,
+                        "update": { "sessionUpdate": "config_option_update", "configOptions": options },
+                    }),
+                );
+                Ok(options)
+            }
+            SessionBackend::Native(handle) => {
+                let Some(state) = config_state else {
+                    return Err(RpcError::Command {
+                        error: "no config options available".to_string(),
+                    });
+                };
+                // Apply (the loop's control channel — `AgentLoop::set_model`
+                // / `set_thinking_level` on the loop task) + mirror the
+                // change on the handle's config state (the re-synthesizer
+                // source). Mirror + emit ONLY when `try_send` SUCCEEDS
+                // (finding 12): a full / closed queue means the loop never
+                // applies the change — claiming success (a mirrored state +
+                // a `config_option_update`) would silently diverge from
+                // the model / level the loop is actually running.
+                match config_id {
+                    "model" => {
+                        let (provider, model_id) =
+                            value
+                                .split_once('/')
+                                .ok_or_else(|| RpcError::InvalidPrompt {
+                                    reason: format!(
+                                        "invalid model value: {value} (expected provider/modelId)"
+                                    ),
+                                })?;
+                        let model = self
+                            .catalog
+                            .models
+                            .iter()
+                            .find(|m| m.provider == provider && m.id == model_id)
+                            .cloned()
+                            .ok_or_else(|| RpcError::Command {
+                                error: format!("unknown model: {value}"),
+                            })?;
+                        let sent = handle
+                            .control_tx_clone()
+                            .try_send(ControlCmd::SetModel(model.clone()));
+                        if sent.is_err() {
+                            return Err(RpcError::Command {
+                                error: "the session's loop is not running; the config change could not be applied".to_string(),
+                            });
+                        }
+                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.model = model;
+                    }
+                    "thought_level" => {
+                        let sent = handle
+                            .control_tx_clone()
+                            .try_send(ControlCmd::SetThinkingLevel(Some(value.to_string())));
+                        if sent.is_err() {
+                            return Err(RpcError::Command {
+                                error: "the session's loop is not running; the config change could not be applied".to_string(),
+                            });
+                        }
+                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.thinking_level = Some(value.to_string());
+                    }
+                    other => {
+                        return Err(RpcError::Command {
+                            error: format!("unknown config option: {other}"),
+                        })
+                    }
+                }
+                // Re-synthesize FROM THE `ModelCatalog` (a native session
+                // has no `get_state`) + emit (the agent does not emit a
+                // `config_option_update` itself — the client owns the frame).
+                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                let options = synthesize_catalog_config_options(
+                    &self.catalog,
+                    &state.model,
+                    state.thinking_level.as_deref(),
+                )
+                .ok_or_else(|| RpcError::Command {
+                    error: "no config options available".to_string(),
+                })?;
+                sink.emit(
+                    "session-update",
+                    json!({
+                        "sessionId": session_id,
+                        "update": { "sessionUpdate": "config_option_update", "configOptions": options },
+                    }),
+                );
+                Ok(options)
+            }
+        }
     }
 
     /// Deliver the user's answer to a pending permission request.
@@ -1787,16 +2785,30 @@ impl SessionManager {
     /// driver teardown may also call it): closing the child's stdin is the
     /// clean pi shutdown (its `onInputEnd` → exit 0).
     pub async fn close_session(&self, session_id: &str) -> Result<(), RpcError> {
-        let (close_tx, close_kind, handle) = {
+        let (close_tx, close_kind, backend, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
-                .map(|l| (l.close_tx.clone(), l.close_kind.clone(), l.handle.clone()))
+                .map(|l| {
+                    (
+                        l.close_tx.clone(),
+                        l.close_kind.clone(),
+                        l.handle.clone(),
+                        l.cancel_requested.clone(),
+                    )
+                })
                 .ok_or_else(|| RpcError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             live
         };
+        // A close KILLS an in-flight turn: mark it a cancel BEFORE the
+        // close (the driver's settle arm may win the race over the
+        // teardown — the `cancel_requested` flag maps that settle to
+        // `Cancelled`, not `EndTurn`, for a turn that was killed, not
+        // ended; the teardown arm sends `Cancelled` too, so the outcome
+        // is `Cancelled` either way, not timing-dependent).
+        *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
         // Decide the kind BEFORE starting the close. First-set-wins: a kind
         // already present means the close is in progress (another setter won
         // the race) or the reason is already decided. The kind mutex is never
@@ -1810,11 +2822,134 @@ impl SessionManager {
         close_tx
             .send(true)
             .map_err(|_| RpcError::Io("session already closed".to_string()))?;
-        // Close the child's stdin (idempotent — the driver teardown may
-        // close it too): a clean pi shutdown.
-        handle.close().await;
+        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path closes
+        // the child's stdin (idempotent — the driver teardown may close it
+        // too): a clean pi shutdown. The NATIVE path tears the loop down
+        // (the prompt queue + the in-flight turn stop; the driver teardown
+        // cancels too — idempotent).
+        match &backend {
+            SessionBackend::Pi(handle) => {
+                handle.close().await;
+            }
+            SessionBackend::Native(handle) => {
+                handle.close();
+            }
+        }
         Ok(())
     }
+}
+
+/// Resolve a composed model key (`"<provider>/<id>"` — the catalog / config
+/// option key form) to a `Model` (the first `/` split — model ids themselves
+/// contain `/`). `None` when the key is malformed or unknown. `pub(crate)` so
+/// the `dispatch_native` driver resolves a `launch.model` override (the
+/// `:<level>` suffix is stripped by the caller BEFORE calling this — this
+/// function does not split it).
+pub(crate) fn resolve_composed_model(catalog: &ModelCatalog, key: &str) -> Option<Model> {
+    let (provider, id) = key.split_once('/')?;
+    catalog
+        .models
+        .iter()
+        .find(|m| m.provider == provider && m.id == id)
+        .cloned()
+}
+
+/// Resolve a native session's model (the harness's `default_model` composed
+/// key → the catalog; `None` (the built-in) → the catalog's default → the
+/// v1-selectable (`openai_compatible`) set — a stale configured default
+/// degrades to the set rather than a hard error).
+fn resolve_native_model(
+    catalog: &ModelCatalog,
+    default: &Option<String>,
+) -> Result<Model, RpcError> {
+    let key = default.as_deref().or(catalog.default_model.as_deref());
+    if let Some(key) = key {
+        if let Some(model) = resolve_composed_model(catalog, key) {
+            return Ok(model);
+        }
+    }
+    catalog
+        .openai_compatible()
+        .first()
+        .copied()
+        .cloned()
+        .ok_or_else(|| RpcError::Command {
+            error: "no models available for the native session".to_string(),
+        })
+}
+
+/// The capability envelope for a NATIVE session (the item-1 shape minus the
+/// pi keys — there is NO `piSessionFile`: resume is from the
+/// `native_messages` table, so `loadSession` is `true` (the frontend's
+/// Resume button); `image` is fail-closed `false` — the native `Prompt` is
+/// text-only in v1).
+fn native_capabilities(model: &Model, thinking_level: Option<&str>) -> Value {
+    let mut caps = json!({
+        "native": true,
+        "model": format!("{}/{}", model.provider, model.id),
+        "loadSession": true,
+        "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+    });
+    if let Some(level) = thinking_level {
+        caps["thinkingLevel"] = Value::String(level.to_string());
+    }
+    caps
+}
+
+/// Synthesize a NATIVE session's config options (the model / thinking-level
+/// selectors) from the `ModelCatalog` (the existing `synthesize_config_options`
+/// shape — the frontend is unchanged; a new `get_models` command driving a
+/// native-only picker would be a UI change, so there is none): model options
+/// are the `openai_compatible()` ids (`"<provider>/<id>"`); the thinking level
+/// is the current model's `thinking_levels` (absent → no selector).
+fn synthesize_catalog_config_options(
+    catalog: &ModelCatalog,
+    current: &Model,
+    thinking_level: Option<&str>,
+) -> Option<Vec<Value>> {
+    let mut out: Vec<Value> = Vec::new();
+    let options: Vec<Value> = catalog
+        .openai_compatible()
+        .iter()
+        .map(|m| {
+            json!({
+                "value": format!("{}/{}", m.provider, m.id),
+                "name": m.id.clone(),
+            })
+        })
+        .collect();
+    out.push(json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": format!("{}/{}", current.provider, current.id),
+        "options": options,
+    }));
+    if !current.thinking_levels.is_empty() {
+        let options: Vec<Value> = current
+            .thinking_levels
+            .iter()
+            .map(|s| {
+                // The display name is the capitalized level
+                // (`"medium"` → `"Medium"`).
+                let mut name = s.clone();
+                if let Some(c0) = name.chars().next() {
+                    name = format!("{}{}", c0.to_uppercase(), &name[c0.len_utf8()..]);
+                }
+                json!({ "value": s, "name": name })
+            })
+            .collect();
+        out.push(json!({
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": thinking_level.unwrap_or_default(),
+            "options": options,
+        }));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The session's capability envelope (item 1 of the swap plan) built from a
@@ -1948,7 +3083,9 @@ fn synthesize_config_options(
 /// `agent_thought_chunk` / `tool_call` / `tool_call_update` /
 /// `session_info_update` / `config_option_update`). A pure function (no
 /// I/O): the driver feeds it the event + the session's `TurnState` and
-/// emits / persists the frames it returns.
+/// emits / persists the frames it returns. `pub(crate)` so the native
+/// `AgentLoop` (Task 6) runs its `RpcEvent`s through the SAME pipeline
+/// (the frontend is unchanged — the FROZEN frames are identical).
 ///
 /// No-frame events are bookkeeping (`agent_start` / `agent_end` /
 /// `turn_start` / `turn_end` / `queue_update` / `entry_appended` /
@@ -1956,7 +3093,7 @@ fn synthesize_config_options(
 /// the delta stream already delivered the content, and the authoritative
 /// `message_end` text is NOT re-emitted) or the turn's resolution signal
 /// (`agent_settled` — the driver resolves the pending turn, not a frame).
-fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
+pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
     match e {
         // `message_start` carries ANY `AgentMessage` (user / assistant /
         // toolResult): advance the counter ONLY for `assistant` messages
@@ -2049,10 +3186,23 @@ fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 _ => Vec::new(),
             }
         }
-        RpcEvent::tool_execution_start { tool_call_id, .. } => vec![json!({
-            "sessionUpdate": "tool_call_update",
+        // The native `tool_execution_start` CARRIES the tool name + args (the
+        // provider already accumulated them — unlike the external pi path,
+        // which streams a `toolcall_start` frame first). Map it to a
+        // `tool_call` frame (with `title` + `rawInput`) so the frontend
+        // creates the tool-call `Message` with the REAL tool name — NOT just
+        // a `tool_call_update` (which has no `title`, so the frontend would
+        // fall back to displaying the `toolCallId`, e.g. `chatcmpl-tool-…`).
+        RpcEvent::tool_execution_start {
+            tool_call_id,
+            tool_name,
+            args,
+        } => vec![json!({
+            "sessionUpdate": "tool_call",
             "toolCallId": tool_call_id,
+            "title": tool_name,
             "status": "in_progress",
+            "rawInput": args,
         })],
         // `rawOutput` is the tool's result (the RPC `AgentToolResult`): a live
         // partial while the tool runs, final on `tool_execution_end`. It is
@@ -2338,8 +3488,9 @@ pub fn normalize_capabilities(raw: &str) -> Value {
 /// tool-call `merge_json` shallow-merge. (The ACP `content:
 /// ToolCallContent[]` diff channel has no RPC input in Phase 1 — pi's tool
 /// results carry no diff-structured content — so the `has_diff` branch is
-/// gone with the crate types.)
-fn persist_update(
+/// gone with the crate types). `pub(crate)` so the native `AgentLoop`
+/// (Task 6) persists through the SAME function.
+pub(crate) fn persist_update(
     db: &Db,
     session_id: &str,
     update: &Value,
@@ -2812,20 +3963,26 @@ mod normalize_tests {
         );
     }
 
-    /// `tool_execution_*` → `tool_call_update` (in_progress / partial
-    /// `rawOutput` / completed-or-failed + `rawOutput`).
+    /// `tool_execution_*` → `tool_call` (start, with the real `title` +
+    /// `rawInput`) / `tool_call_update` (partial `rawOutput` /
+    /// completed-or-failed + `rawOutput`).
     #[test]
     fn tool_execution_frames_map_to_updates() {
         let mut st = TurnState::default();
+        // `tool_execution_start` CARRIES the tool name + args (the provider
+        // already accumulated them), so it maps to a `tool_call` frame (with
+        // the real `title` + `rawInput`) — NOT a `tool_call_update` (no
+        // `title` → the frontend would display the `toolCallId`, e.g.
+        // `chatcmpl-tool-…`, instead of the tool name).
         let start = normalize(
             &ev(
-                json!({ "type": "tool_execution_start", "toolCallId": "tc1", "toolName": "bash", "args": {} }),
+                json!({ "type": "tool_execution_start", "toolCallId": "tc1", "toolName": "bash", "args": { "cmd": "ls" } }),
             ),
             &mut st,
         );
         assert_eq!(
             start[0],
-            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "tc1", "status": "in_progress" })
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "tc1", "title": "bash", "status": "in_progress", "rawInput": { "cmd": "ls" } })
         );
 
         let update = normalize(
@@ -2967,8 +4124,12 @@ mod normalize_tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    use crate::agent::harness::provider::{
+        FinishReason, ModelRequest, ProviderError, ProviderEvent,
+    };
     use crate::agent::permission::PermissionOutcome;
     use crate::storage::Db;
+    use futures_util::StreamExt;
     use std::path::Path;
     use tokio::sync::mpsc;
 
@@ -3338,6 +4499,716 @@ mod session_tests {
         assert!(found, "the config_option_update event was not emitted");
 
         let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Native-backend tests (the in-process `AgentLoop` — a NATIVE
+    // registry entry + a mock `provider_factory` seam; the production
+    // default is `OpenAiCompatibleProvider`) ──
+
+    /// Write an `agents.json` with a single NATIVE entry (the `harness`
+    /// config points at `fake/m1` — the `native_test_catalog` model).
+    fn write_agents_json_native(dir: &Path) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": { "provider": "openai-compatible", "default_model": "fake/m1" },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// The native test catalog (a single `fake/m1` OpenAI-compatible
+    /// model — `set_config_option` + `resolve_native_model` resolve it
+    /// from the composed key).
+    fn native_test_catalog() -> ModelCatalog {
+        ModelCatalog {
+            models: vec![Model {
+                id: "m1".to_string(),
+                provider: "fake".to_string(),
+                base_url: "http://fake".to_string(),
+                api_key: "k".to_string(),
+                context_window: 128000,
+                cost_per_mtok_in: 0.0,
+                cost_per_mtok_out: 0.0,
+                supports_tools: true,
+                supports_thinking: false,
+                thinking_levels: Vec::new(),
+                api: Some("openai-completions".to_string()),
+            }],
+            default_model: Some("fake/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        }
+    }
+
+    /// A `Provider` whose `complete` never resolves (the in-flight turn
+    /// hangs in the model call — the cancel / close tests).
+    struct HangingProvider;
+    #[async_trait::async_trait]
+    impl Provider for HangingProvider {
+        async fn complete(
+            &self,
+            _req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            futures_util::future::pending().await
+        }
+    }
+
+    /// Start a native session with the given `provider_factory` seam.
+    async fn start_native_session_with(
+        dir: &Path,
+        sink: &Arc<dyn EventSink>,
+        factory: impl Fn(&Model) -> Box<dyn Provider> + Send + Sync + 'static,
+    ) -> (SessionManager, SessionInfo) {
+        let db = open_db(dir);
+        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(native_test_catalog());
+        manager.set_provider_factory(factory);
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.to_path_buf(), sink)
+        })
+        .await
+        .expect("the native session started");
+        (manager, info)
+    }
+
+    /// Start a native session (the mock `provider_factory` seam — the
+    /// `HangingProvider` hangs the turn in the model call).
+    async fn start_native_session(
+        dir: &Path,
+        sink: &Arc<dyn EventSink>,
+    ) -> (SessionManager, SessionInfo) {
+        start_native_session_with(dir, sink, |_m: &Model| Box::new(HangingProvider)).await
+    }
+
+    /// (live `/v1/models` discovery) `refresh_model_metadata` applies the
+    /// live metadata (context window, thinking levels) from the provider's
+    /// `GET /v1/models`, and degrades to the static metadata when the
+    /// endpoint is unreachable (best-effort — a failure never blocks the
+    /// session).
+    #[tokio::test]
+    async fn refresh_model_metadata_applies_live_and_degrades_on_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A mock server serving `GET /v1/models` with fresh metadata.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut data = Vec::new();
+                    while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                    }
+                    let body = r#"{"data":[{"id":"m1","max_model_len":4242,
+                        "reasoningLevels":["low"],
+                        "supportsReasoningEffort":true}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.set_catalog(ModelCatalog {
+            models: vec![Model {
+                id: "m1".into(),
+                provider: "fake".into(),
+                base_url: format!("http://{addr}/v1"),
+                api_key: "k".into(),
+                context_window: 128000,
+                cost_per_mtok_in: 0.0,
+                cost_per_mtok_out: 0.0,
+                supports_tools: true,
+                supports_thinking: false,
+                thinking_levels: Vec::new(),
+                api: Some("openai-completions".into()),
+            }],
+            ..Default::default()
+        });
+        let model = manager.catalog.clone().models[0].clone();
+        // First refresh: fetches + applies the live metadata.
+        let refreshed = manager.refresh_model_metadata(&model).await;
+        assert_eq!(refreshed.context_window, 4242);
+        assert_eq!(refreshed.thinking_levels, vec!["low".to_string()]);
+        assert!(refreshed.supports_thinking);
+        // The `api_key` / `base_url` / `id` are untouched (only the metadata
+        // fields are refreshed).
+        assert_eq!(refreshed.api_key, "k");
+        assert_eq!(refreshed.base_url, model.base_url);
+        // A model whose endpoint is UNREACHABLE degrades to the static
+        // metadata (the `Model` is returned unchanged — best-effort). A
+        // distinct `provider` (a fresh cache entry) so the unreachable
+        // endpoint is actually fetched (not the first model's warm cache).
+        let unreachable = Model {
+            provider: "unreach".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            ..model.clone()
+        };
+        let degraded = manager.refresh_model_metadata(&unreachable).await;
+        assert_eq!(degraded.context_window, 128000);
+        assert!(!degraded.supports_thinking);
+        server.abort();
+    }
+
+    /// A `Provider` whose `complete` blocks until signalled (the stream
+    /// then emits a single `Done(Stop)` — the test paces the turn's
+    /// settle: a signal settles the turn, no signal hangs it).
+    struct PacedProvider {
+        settle: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PacedProvider {
+        async fn complete(
+            &self,
+            _req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            let settle = self.settle.clone();
+            // The stream BLOCKS on the signal (its first `next()` awaits
+            // it), then yields a single `Done(Stop)` and ends — the turn
+            // settles when the test signals.
+            Ok(futures_util::stream::once(async move {
+                settle.notified().await;
+                ProviderEvent::Done(FinishReason::Stop)
+            })
+            .boxed())
+        }
+    }
+
+    /// (native, finding 3a) `close_session` resolves an in-flight
+    /// `send_prompt` `Cancelled` — deterministically, whichever driver
+    /// arm wins the race: the turn is KILLED by the close (`handle.close`
+    /// cancels the turn token; the loop settles it), so the
+    /// `cancel_requested` flag set in `close_session` maps the settle to
+    /// `Cancelled` (the settle arm), and the teardown arm sends
+    /// `Cancelled` too (pre-fix the settle arm mapped a killed turn to
+    /// `EndTurn` — the outcome was timing-dependent). A native turn
+    /// blocked on a hanging model call + a `close_session` → the
+    /// `send_prompt`'s `pending_turn` resolves `Cancelled` (the driver's
+    /// teardown resolves it BEFORE the session is removed — pre-fix the
+    /// unbounded `rx.await` hung forever: a close / cancel could not
+    /// unblock the waiter).
+    #[tokio::test]
+    async fn native_close_resolves_the_in_flight_prompt() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        let (reason, close_res) = tokio::join!(
+            async { manager.send_prompt(&sid, "hi".to_string()).await },
+            async {
+                // A head start for the prompt (the turn hangs in the
+                // model call before the close arrives).
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                manager.close_session(&sid).await
+            },
+        );
+        assert_eq!(close_res, Ok(()), "close should succeed");
+        assert_eq!(
+            reason,
+            Ok(StopReason::Cancelled),
+            "the close resolved the in-flight prompt `Cancelled` (not `EndTurn` — the turn was killed)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (finding 4) A loop task that DIES mid-turn (the `loop_settle_rx`
+    /// sender is dropped — `changed()` returns `Err`) must NOT resolve the
+    /// in-flight `send_prompt` `EndTurn` (pre-fix the `_ =` pattern treated
+    /// the `Err` as a settle and resolved `pending_turn` `EndTurn` + wrote a
+    /// duplicate `(seq, reason)` to the driver watch — the `send_prompt`
+    /// caller was told "turn ended normally" when the agent actually died
+    /// mid-turn). The teardown resolves `pending_turn` with `Cancelled`
+    /// instead.
+    ///
+    /// The loop task is killed DIRECTLY (`handle.close` — NOT `close_session`,
+    /// which sets `cancel_requested` and would map the settle to `Cancelled`
+    /// even pre-fix): a loop task that dies on its own, not a user close.
+    #[tokio::test]
+    async fn native_loop_task_death_resolves_the_in_flight_prompt_cancelled() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        // Get the `NativeHandle` (to kill the loop task DIRECTLY — NOT
+        // `close_session`, which sets `cancel_requested` and would map the
+        // settle to `Cancelled` even pre-fix).
+        let handle = {
+            let sessions = manager.driver.sessions.lock().await;
+            let live = sessions.get(&sid).expect("the session is live");
+            match &live.handle {
+                SessionBackend::Native(h) => h.clone(),
+                _ => panic!("a native session has a native handle"),
+            }
+        };
+        // Start a `send_prompt` (the turn hangs in the `HangingProvider`
+        // `complete()`). Poll it (via a `select!` with a sleep arm) until
+        // the turn is IN-FLIGHT (the prompt is sent to the loop, the loop
+        // starts a turn, and `complete()` hangs) — a never-polled future
+        // would leave the loop idle (nothing to resolve).
+        let mut prompt = Box::pin(manager.send_prompt(&sid, "hi".to_string()));
+        tokio::select! {
+            r = &mut prompt => {
+                // The turn settled before the abort (unexpected — the
+                // `HangingProvider` should hang). Fail the test.
+                panic!("the turn settled before the abort: {r:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                // The turn is in-flight (hanging in `complete()`).
+            }
+        }
+        // Kill the loop task DIRECTLY (a `JoinHandle::abort` — NO token
+        // cancelled, so the loop emits NO final settle; the `settle_tx`
+        // sender drops unseen → `changed()` returns `Err` deterministically
+        // → the teardown resolves `pending_turn` `Cancelled`, NOT `EndTurn`
+        // (which pre-fix the `changed()` `Err` arm produced)).
+        handle.abort_loop_task();
+        // The `send_prompt` resolves `Cancelled` (the teardown resolves
+        // `pending_turn` with `Cancelled` — NOT `EndTurn`, which is what
+        // pre-fix the `changed()` `Err` arm produced).
+        let reason = tokio::time::timeout(Duration::from_secs(5), &mut prompt)
+            .await
+            .expect("the prompt resolved (not a hang)");
+        assert_eq!(
+            reason,
+            Ok(StopReason::Cancelled),
+            "a loop task that died mid-turn resolves the in-flight prompt `Cancelled` (not `EndTurn` — the agent died, not a normal turn end)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (finding 2) Two CONCURRENT native `send_prompt`s: the busy check +
+    /// the resolver claim are ATOMIC under one `pending_turn` lock, so
+    /// EXACTLY ONE is accepted (it claims the slot) and the other is
+    /// rejected "busy". Pre-fix the check dropped the lock, so both
+    /// observed an empty slot, both passed, and the second's claim dropped
+    /// the first's sender (a phantom `Cancelled`) while the second's
+    /// resolver was resolved by the FIRST turn's `agent_settled`.
+    ///
+    /// The prompts are fired TRULY concurrently (the `tokio::spawn` calls in
+    /// the same tick, NO sleep between them): a staggered test (task 2 200 ms
+    /// after task 1) saw an occupied slot even pre-fix (the TOCTOU window was
+    /// two awaits wide and closed in well under 200 ms), so it could not catch
+    /// an atomicity regression. Pre-fix this shape accepts BOTH (one phantom
+    /// `Cancelled`), so the exactly-one-`Ok` assertion discriminates.
+    #[tokio::test]
+    async fn two_concurrent_native_send_prompts_exactly_one_is_accepted() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        // `HangingProvider`: the turn hangs in the model call, so the
+        // claimed slot stays occupied (the second prompt is rejected).
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        let manager = Arc::new(manager);
+        // Fire BOTH `send_prompt`s TRULY concurrently (the `tokio::spawn`
+        // calls in the same tick, NO sleep between them — see the doc above).
+        let m1 = manager.clone();
+        let sid1 = sid.clone();
+        let t1 = tokio::spawn(async move { m1.send_prompt(&sid1, "A".to_string()).await });
+        let m2 = manager.clone();
+        let sid2 = sid.clone();
+        let t2 = tokio::spawn(async move { m2.send_prompt(&sid2, "B".to_string()).await });
+        // The rejected task resolves immediately (busy); the accepted task
+        // hangs in the model call (the `HangingProvider`). Give the rejected
+        // task a head start to resolve, then cancel the session (resolve the
+        // accepted task `Cancelled` — free the slot).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = manager.cancel_session(&sid).await;
+        let r1 = tokio::time::timeout(Duration::from_secs(5), t1)
+            .await
+            .expect("Task 1 resolved (not a hang)")
+            .expect("Task 1 did not panic");
+        let r2 = tokio::time::timeout(Duration::from_secs(5), t2)
+            .await
+            .expect("Task 2 resolved (not a hang)")
+            .expect("Task 2 did not panic");
+        // EXACTLY ONE is accepted (`Ok` — `Cancelled` after the cancel) + the
+        // other is rejected "busy". Pre-fix BOTH were accepted (one phantom
+        // `Cancelled`), so this discriminates.
+        let outcomes = [r1, r2];
+        let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
+        let busy = outcomes
+            .iter()
+            .filter(|r| matches!(r, Err(RpcError::Command { .. })))
+            .count();
+        assert_eq!(
+            accepted, 1,
+            "exactly one prompt is accepted, got {outcomes:?}"
+        );
+        assert_eq!(
+            busy, 1,
+            "exactly one prompt is rejected busy, got {outcomes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (finding 2, multi-round) Five ROUNDS of two CONCURRENT native
+    /// `send_prompt`s: each round fires two prompts truly concurrently
+    /// (exactly one accepted + one busy-rejected), then cancels the accepted
+    /// turn (free the slot for the next round). A staggered single-round test
+    /// could not catch an atomicity regression (the pre-fix TOCTOU window
+    /// closed in well under a 200 ms stagger), so the multi-round variant
+    /// makes the test robust.
+    #[tokio::test]
+    async fn two_concurrent_native_send_prompts_exactly_one_is_accepted_five_rounds() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        // `HangingProvider`: the turn hangs in the model call, so the
+        // claimed slot stays occupied (the second prompt is rejected).
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        let manager = Arc::new(manager);
+        // 5 rounds: each round fires TWO `send_prompt`s truly concurrently
+        // (exactly one accepted + one busy-rejected), then cancels the
+        // accepted turn (free the slot for the next round).
+        for round in 0..5 {
+            let m1 = manager.clone();
+            let sid1 = sid.clone();
+            let t1 = tokio::spawn(async move { m1.send_prompt(&sid1, format!("A{round}")).await });
+            let m2 = manager.clone();
+            let sid2 = sid.clone();
+            let t2 = tokio::spawn(async move { m2.send_prompt(&sid2, format!("B{round}")).await });
+            // The rejected task resolves immediately (busy); the accepted task
+            // hangs in the model call (the `HangingProvider`). Give the rejected
+            // task a head start to resolve, then cancel the session (resolve the
+            // accepted task `Cancelled` — free the slot for the next round).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = manager.cancel_session(&sid).await;
+            let r1 = tokio::time::timeout(Duration::from_secs(5), t1)
+                .await
+                .expect("Task 1 resolved (not a hang)")
+                .expect("Task 1 did not panic");
+            let r2 = tokio::time::timeout(Duration::from_secs(5), t2)
+                .await
+                .expect("Task 2 resolved (not a hang)")
+                .expect("Task 2 did not panic");
+            // EXACTLY ONE is accepted (`Ok`) + the other is rejected "busy".
+            let outcomes = [r1, r2];
+            let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
+            let busy = outcomes
+                .iter()
+                .filter(|r| matches!(r, Err(RpcError::Command { .. })))
+                .count();
+            assert_eq!(
+                accepted, 1,
+                "round {round}: exactly one prompt is accepted, got {outcomes:?}"
+            );
+            assert_eq!(
+                busy, 1,
+                "round {round}: exactly one prompt is rejected busy, got {outcomes:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (settle watch) `wait_for_settle` must not resolve a STALE settle when
+    /// a turn is IN FLIGHT: after turn 1 settles, a `wait_for_settle` with a
+    /// turn IN FLIGHT (the `pending_turn` slot occupied) must NOT return
+    /// turn 1's settle — it is pinned to the current version
+    /// (`mark_unchanged`) and resolves only on a NEW settle. With NO turn in
+    /// flight (the caller's turn already settled — the subagent dispatches a
+    /// raw prompt, which does NOT occupy `pending_turn`, then awaits the
+    /// settle: a fast turn settles before the await), the `mark_unchanged` is
+    /// SKIPPED: the clone inherits the stored receiver's last-seen version, so
+    /// `changed()` resolves immediately with the LATEST settle (the fast-turn
+    /// contract — hanging on a new settle that never comes would be the bug).
+    /// The `mark_unchanged` + the `pending_turn` snapshot are under ONE
+    /// `sessions` lock (finding 6), and the driver's settle arm takes the slot
+    /// + sends the watch under the same lock (watch send last), so a settle
+    /// landing between the snapshot and the mark is ordered (a settle after the
+    /// mark is a NEW version → resolves; one before empties the slot → no mark
+    /// → resolves with the latest).
+    #[tokio::test]
+    async fn wait_for_settle_does_not_return_a_stale_settle() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let settle = Arc::new(tokio::sync::Notify::new());
+        let provider_settle = settle.clone();
+        let (manager, info) = start_native_session_with(&dir, &sink, move |_m: &Model| {
+            Box::new(PacedProvider {
+                settle: provider_settle.clone(),
+            })
+        })
+        .await;
+        let sid = info.session_id.clone();
+
+        // Turn 1 settles (the signal releases the model call).
+        let (reason, r) = tokio::join!(
+            async { manager.send_prompt(&sid, "one".to_string()).await },
+            async {
+                // A head start for the prompt (the turn waits in the
+                // model call before the signal arrives).
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                settle.notify_one();
+                Ok::<(), ()>(())
+            },
+        );
+        assert_eq!(r, Ok(()), "the signal should have been sent");
+        assert_eq!(reason, Ok(StopReason::EndTurn), "turn 1 settles");
+
+        // Turn 2 starts (IN FLIGHT — `send_prompt` occupies `pending_turn`;
+        // the turn blocks in the model call until signalled). Poll `prompt`
+        // until it has dispatched the turn (it then blocks in the model
+        // call — the short timeout elapses, `prompt` stays pending).
+        let prompt = manager.send_prompt(&sid, "two".to_string());
+        tokio::pin!(prompt);
+        let _ = tokio::time::timeout(Duration::from_millis(200), &mut prompt).await;
+
+        // `wait_for_settle` while turn 2 is IN FLIGHT: it must NOT resolve
+        // on turn 1's STALE settle (500 ms ≪ the settle timeout) — the
+        // `pending_turn` slot is occupied, so the wait is pinned to the
+        // channel's current version and resolves only on a NEW settle.
+        let stale = tokio::time::timeout(
+            Duration::from_millis(500),
+            manager.driver.wait_for_settle(&sid),
+        );
+        assert!(
+            stale.await.is_err(),
+            "a stale (previous turn's) settle must not resolve the wait while a turn is in flight"
+        );
+
+        // Turn 2 settles (the signal releases the model call) → `send_prompt`
+        // resolves, and a `wait_for_settle` with NO turn in flight resolves
+        // immediately with the turn's (latest) settle — the fast-turn contract
+        // (a fast turn settles before the await; hanging on a new settle that
+        // never comes would be the bug).
+        settle.notify_one();
+        assert_eq!(prompt.await, Ok(StopReason::EndTurn), "turn 2 settles");
+        let w = manager.driver.wait_for_settle(&sid).await;
+        assert_eq!(
+            w,
+            Ok(StopReason::EndTurn),
+            "a settled turn's settle resolves immediately"
+        );
+
+        let _ = manager.close_session(&sid).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (finding 13b) A native entry with a `provider` that is NOT
+    /// `"openai-compatible"` is REJECTED at session start with a clear
+    /// error (v1 is OpenAI-compatible only — ADR 0012) rather than
+    /// silently accepting it (pre-fix any value got the OpenAI wire).
+    #[tokio::test]
+    async fn a_non_openai_compatible_harness_provider_is_rejected_at_session_start() {
+        let dir = temp_config_dir();
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": { "provider": "anthropic", "default_model": "fake/m1" },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(native_test_catalog());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let res = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.to_path_buf(), &sink)
+        })
+        .await;
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("anthropic"),
+            "the error names the unsupported provider, got {err}"
+        );
+        assert!(
+            err.contains("OpenAI-compatible"),
+            "the error explains the v1 constraint, got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (native, finding 8c) A native Stop matches the external `abort`:
+    /// the turn stops (the `send_prompt` resolves `Cancelled`) and the
+    /// session STAYS ALIVE (a new prompt reuses it — the pre-fix Stop
+    /// cancelled the loop's teardown token, which ENDED THE WHOLE
+    /// SESSION: a second `send_prompt` would be an `UnknownSession`). A
+    /// stale cancel does not settle the new turn (a fresh turn token);
+    /// a second Stop settles it.
+    #[tokio::test]
+    async fn native_cancel_stops_the_turn_and_keeps_the_session() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        // The first Stop: the turn settles `Cancelled` (the session stays
+        // alive).
+        let (reason, cancel_res) = tokio::join!(
+            async { manager.send_prompt(&sid, "hi".to_string()).await },
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                manager.cancel_session(&sid).await
+            },
+        );
+        assert_eq!(cancel_res, Ok(()), "cancel should succeed");
+        assert_eq!(
+            reason,
+            Ok(StopReason::Cancelled),
+            "the Stop settled the turn"
+        );
+        // The session is still alive: a new prompt starts (a FRESH turn —
+        // the stale cancel does not settle it), and a second Stop
+        // settles it.
+        let (reason2, cancel_res2) = tokio::join!(
+            async { manager.send_prompt(&sid, "again".to_string()).await },
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                manager.cancel_session(&sid).await
+            },
+        );
+        assert_eq!(cancel_res2, Ok(()), "the second cancel should succeed");
+        assert_eq!(
+            reason2,
+            Ok(StopReason::Cancelled),
+            "the session was reused (a stale cancel did not settle the new turn; the second Stop did)"
+        );
+        let _ = manager.close_session(&sid).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (critical) A native prompt writes EXACTLY ONE `user` row to the
+    /// display `messages`: the manager's `record_message` (in
+    /// `send_prompt_with_images`) is the SOLE write — the loop's
+    /// `handle_turn` must not re-persist the user message (the
+    /// `(session_id, kind, message_key)` key with `message_key = NULL`
+    /// treats NULLs as DISTINCT in `ON CONFLICT`, so a double write
+    /// deterministically duplicates the user bubble in restored
+    /// history).
+    #[tokio::test]
+    async fn a_native_prompt_writes_exactly_one_user_row() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        // The turn hangs in the (hanging) model call: the manager's row
+        // is written before the turn begins, and the loop's own write
+        // (when it has one) happens when the turn starts. Drive the
+        // prompt until it blocks (a 500 ms timeout) so both writes have
+        // happened.
+        let prompt = manager.send_prompt(&sid, "hi".to_string());
+        tokio::pin!(prompt);
+        let _ = tokio::time::timeout(Duration::from_millis(500), &mut prompt).await;
+        let db = open_db(&dir);
+        let rows = db.messages_for(&sid).expect("messages_for");
+        let user_rows = rows.iter().filter(|r| r.kind == "user").count();
+        assert_eq!(
+            user_rows, 1,
+            "exactly one `user` row (a double write would show a duplicate user bubble)"
+        );
+        let _ = manager.cancel_session(&sid).await;
+        assert_eq!(prompt.await, Ok(StopReason::Cancelled));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (concurrent native prompts) The frontend is one-turn-at-a-time:
+    /// a `send_prompt` on a native session with a turn ALREADY IN
+    /// FLIGHT is REJECTED ("a turn is already in flight") rather than
+    /// queued — the `pending_turn` slot is a single last-wins resolver,
+    /// and a queued prompt would be settled by the PREVIOUS turn's
+    /// `agent_settled` (mis-attribution: the composer unlocks while a
+    /// turn is still live). The external path keeps its steer/
+    /// last-wins behavior (a single steer turn).
+    #[tokio::test]
+    async fn a_concurrent_native_prompt_is_rejected_busy() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        // The first prompt's turn hangs in the model call (the
+        // `pending_turn` slot stays occupied). Drive the prompt until it
+        // blocks (a 300 ms timeout) so its resolver is stored.
+        let p1 = manager.send_prompt(&sid, "one".to_string());
+        tokio::pin!(p1);
+        let _ = tokio::time::timeout(Duration::from_millis(300), &mut p1).await;
+        let r2 = manager.send_prompt(&sid, "two".to_string()).await;
+        assert!(
+            matches!(&r2, Err(RpcError::Command { error }) if error.contains("already in flight")),
+            "the concurrent prompt is rejected busy, got {r2:?}"
+        );
+        // The first resolver was NOT overwritten: a Stop settles the
+        // FIRST prompt (not the rejected one).
+        let _ = manager.cancel_session(&sid).await;
+        assert_eq!(
+            p1.await,
+            Ok(StopReason::Cancelled),
+            "the first turn's resolver was kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (native, finding 12) A `set_config_option` whose `try_send` fails
+    /// (the control queue is FULL — the loop is busy in a hanging model
+    /// call and never consumes it) returns an error: the state is NOT
+    /// mirrored and no `config_option_update` is claimed (pre-fix the
+    /// `try_send` failure was ignored — the UI would show the new config
+    /// while the loop kept running the old one, a silent divergence).
+    #[tokio::test]
+    async fn native_set_config_option_fails_when_the_queue_is_full() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let sid = info.session_id.clone();
+        // The loop is BUSY (a hanging model call) — the control queue
+        // (8) is not consumed. The first 8 changes queue (Ok); the 9th
+        // `try_send` fails (the queue is full) → an error, NOT a silent
+        // success.
+        for i in 0..8 {
+            manager
+                .set_config_option(&sid, "thought_level", "low", &sink)
+                .await
+                .unwrap_or_else(|e| panic!("change {i} should have queued: {e:?}"));
+        }
+        let result = manager
+            .set_config_option(&sid, "thought_level", "low", &sink)
+            .await;
+        assert!(
+            matches!(result, Err(RpcError::Command { .. })),
+            "a full control queue is an error (finding 12), got {result:?}"
+        );
+        let _ = manager.close_session(&sid).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

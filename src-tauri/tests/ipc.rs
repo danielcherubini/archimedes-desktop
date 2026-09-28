@@ -329,12 +329,17 @@ fn spaces_and_agents_commands_round_trip() {
     );
     assert_eq!(check["isSpace"], false);
 
-    // list_agents: exactly the registry entries (camelCase keys); default
-    // selection is agents[0] on the frontend.
+    // list_agents: the registry entries + the built-in 'Archimedes' native
+    // agent (appended after user entries; camelCase keys). Default selection
+    // is agents[0] on the frontend (pi stays the default — the built-in is
+    // appended, never first).
     let agents = invoke(&webview, "list_agents", serde_json::json!({}));
     assert_eq!(
         agents,
-        serde_json::json!([{ "id": "fake", "name": "Fake Pi" }])
+        serde_json::json!([
+          { "id": "fake", "name": "Fake Pi" },
+          { "id": "archimedes", "name": "Archimedes" }
+        ])
     );
 
     // --- start a session in that folder (record_session → upsert_space hook) ---

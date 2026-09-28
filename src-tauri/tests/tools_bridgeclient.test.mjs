@@ -97,10 +97,21 @@ function makeTrackedController() {
   return controller;
 }
 
-/// A stub `pi` (the selfgate test's shape) — registration is irrelevant
-/// here; we only need the factory to run far enough to attach the seam.
+/// A stub `pi` (the selfgate test's shape) — `registered` / `handlers` are
+/// captured (the built-in `execute()` case below drives them); the rest of
+/// the suite only needs the factory to run far enough to attach the seam.
 function makeStubPi() {
-  return { on: () => {}, registerTool: () => {} };
+  const registered = [];
+  const handlers = {};
+  const pi = {
+    on: (event, handler) => {
+      handlers[event] = handler;
+    },
+    registerTool: (tool) => {
+      registered.push(tool);
+    },
+  };
+  return { pi, registered, handlers };
 }
 
 /// Start a Unix-socket server at `socketPath`; `handler` runs per
@@ -132,7 +143,7 @@ beforeEach(async () =>
     socketPath = path.join(tmp, "bridge.sock");
     process.env.PI_ARCHIMEDES_BRIDGE_SOCKET = socketPath;
     accepted = [];
-    const pi = makeStubPi();
+    const { pi } = makeStubPi();
     toolsFactory(pi);
     // The test-only seam (approach A — `tools.ts` stays self-contained;
     // pi loads it as a single file, so the client can't live elsewhere).
@@ -271,5 +282,48 @@ it("(7) the success path: a result frame → resolves with the frame's result", 
   });
   await expect(bridgeRequest("m", {}, new AbortController().signal, 5000)).resolves.toEqual({
     ok: true,
+  });
+});
+
+it("(8) the bash built-in override (Phase 1): execute() is a tool_exec round-trip — it sends {tool, params} and passes the desktop's ToolResult through", async () => {
+  // The factory was driven in `beforeEach` (linux + env) — drive it AGAIN with
+  // a CAPTURING stub and invoke the deferred `session_start` registration to
+  // get the registered `bash` tool (the real `execute()`; the stub server
+  // below stands in for the desktop's `tool_exec` handler).
+  const { pi, registered, handlers } = makeStubPi();
+  toolsFactory(pi);
+  handlers.session_start();
+  const bash = registered.find((t) => t.name === "bash");
+  expect(bash).toBeDefined();
+  // The stub desktop: answer the request with a ToolResult-shaped frame +
+  // record the request (the `method` + `params` assertions).
+  let frame;
+  await listen((socket) => {
+    socket.once("data", (c) => {
+      frame = JSON.parse(c.toString());
+      socket.write(
+        JSON.stringify({
+          v: 1,
+          type: "response",
+          id: frame.id,
+          result: {
+            content: [{ type: "text", text: "delegated\n" }],
+            details: { exitCode: 0, truncated: false, cancelled: false },
+            isError: false,
+          },
+        }) + "\n",
+      );
+    });
+  });
+  const r = await bash.execute("tc-1", { command: "echo delegated" }, new AbortController().signal, undefined, {});
+  // The request is a `tool_exec` round-trip with the tool name + inner params.
+  expect(frame.method).toBe("tool_exec");
+  expect(frame.params).toEqual({ tool: "bash", params: { command: "echo delegated" } });
+  // The desktop's ToolResult is passed through verbatim (the desktop owns
+  // the shaping — unlike `ask`, which the override shapes itself).
+  expect(r).toEqual({
+    content: [{ type: "text", text: "delegated\n" }],
+    details: { exitCode: 0, truncated: false, cancelled: false },
+    isError: false,
   });
 });

@@ -1,7 +1,17 @@
-// Desktop-provided override extension (Phase 2). Re-registers `ask` /
-// `sudo_exec` / `manage_todo_list` with the SAME name + label +
-// description + parameters schema as the suite's versions, but
-// `execute()` = "send the params to the desktop over the bridge, await
+// Desktop-provided override extension (Phase 1 + Phase 2). Re-registers the
+// SEVEN built-ins (`bash` / `read` / `write` / `edit` / `find` / `grep` /
+// `ls`) with the SAME name + label + description + parameters schema as pi's
+// built-ins (functionally equivalent — the LLM sees the same tool), but
+// `execute()` = a `tool_exec` bridge round-trip (the desktop executes the
+// delegated built-in itself, sandboxed + permission-gated by the unchanged
+// `gate.ts`). The desktop spawns pi with `--no-builtin-tools` (the built-in
+// execution is disabled and the override wins — first-wins merge). This is
+// the Phase 1 round-trip; the suite delegates below (Phase 2 of ADR 0009)
+// stay alongside it.
+//
+// Also re-registers `ask` / `sudo_exec` / `manage_todo_list` with the SAME
+// name + label + description + parameters schema as the suite's versions,
+// but `execute()` = "send the params to the desktop over the bridge, await
 // the result, return it (shaped, for `ask`)". The desktop owns the
 // confirmation / execution / todo store; the agent is a thin delegate.
 //
@@ -9,6 +19,10 @@
 // condition the suite's bridge uses, packages/core/src/bridge/index.ts
 // isBridgeMode — minus the mode/subagent checks, which are irrelevant
 // here). Inert without them: the suite's original tools remain (no
+// regression). The platform gate keeps the built-in re-registrations inert
+// on Windows/macOS TOO (the bridge listener is Linux-only) — and the
+// desktop's `spawn_args` mirrors it (`--no-builtin-tools` is added ONLY on
+// a Linux bridge spawn), so off-Linux pi's built-ins remain (no zero-tools
 // regression).
 //
 // Registration is DEFERRED (inside `session_start`): two extensions
@@ -731,6 +745,138 @@ When all todos are completed, the list auto-clears after a brief delay.`;
     });
   }
 
+  // ── Built-in overrides (Phase 1) ─────────────────────────────────────
+  // The seven built-ins re-registered with the SAME name + label +
+  // description + parameter schema as pi's built-ins (functionally
+  // equivalent — the LLM sees the same tool), but `execute()` = a
+  // `tool_exec` round-trip (the desktop executes the delegated built-in
+  // itself, sandboxed to the session `cwd` + permission-gated by the
+  // unchanged `gate.ts`). The schemas mirror the desktop's executors
+  // (`tools/exec.rs`) — the same param names the desktop reads.
+  //
+  // Timeouts match the desktop's `tool_exec` handler (bridge.rs): `bash`
+  // 300_000 (5 min — the desktop's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`; the
+  // inner `timeout_ms` param bounds the run), the fast tools 30_000 (the
+  // desktop's `TOOL_EXEC_FAST_TIMEOUT`). A rejection (timeout / cancel /
+  // error frame) is a tool error the LLM sees (the desktop's clean
+  // `isError` results are NOT rejections — they are `result` frames).
+  const BuiltinParamsSchemas = {
+    bash: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The shell command to run" },
+        timeout_ms: {
+          type: "number",
+          description: "Optional timeout in milliseconds (default 5 min).",
+        },
+      },
+      required: ["command"],
+    },
+    read: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to read (relative or absolute)" },
+        offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
+        limit: { type: "number", description: "Maximum number of lines to read" },
+      },
+      required: ["path"],
+    },
+    write: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to write (relative or absolute)" },
+        content: { type: "string", description: "Content to write to the file" },
+      },
+      required: ["path", "content"],
+    },
+    edit: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to edit (relative or absolute)" },
+        old_text: { type: "string", description: "Exact text for one targeted replacement. It must be unique in the original file." },
+        new_text: { type: "string", description: "Replacement text for this targeted edit." },
+        replace_all: { type: "boolean", description: "Replace every occurrence (default: the first only)." },
+      },
+      required: ["path", "old_text", "new_text"],
+    },
+    find: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "Glob pattern to match files against (e.g. `*.ts`, `**/foo.ts`)" },
+        path: { type: "string", description: "Directory to search in (default: the current directory)" },
+        max_results: { type: "number", description: "Maximum number of results (default 100)." },
+      },
+      required: ["pattern"],
+    },
+    grep: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "Regular expression to search for" },
+        path: { type: "string", description: "File or directory to search in (default: the current directory)" },
+        glob: { type: "string", description: "Only search files matching this glob" },
+        max_results: { type: "number", description: "Maximum number of matches (default 100)." },
+        "-i": { type: "boolean", description: "Case-insensitive search." },
+      },
+      required: ["pattern"],
+    },
+    ls: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Directory to list (default: the current directory)" },
+        long: { type: "boolean", description: "Prefix each entry with its file size." },
+      },
+    },
+  };
+  const BuiltinDescriptions = {
+    bash: `Run a shell command (bash) and capture its output.
+
+- Use for builds, tests, git, and any command-line task.
+- The command runs in the session's working directory.
+- timeout_ms caps the run (default 5 min); on timeout the command is killed.`,
+    read: `Read the contents of a file (text or image). For large files use offset/limit to read a range; text output is capped at 2000 lines.`,
+    write: `Write content to a file (creates the file and parent directories; overwrites existing content).`,
+    edit: `Edit a file using exact text replacement (the first occurrence, or all when replace_all).`,
+    find: `Find files by glob pattern (e.g. '*.ts', '**/foo.ts') under a directory.`,
+    grep: `Search file contents with a regular expression (ripgrep), optionally filtered by a file glob.`,
+    ls: `List the entries of a directory (directories get a '/' suffix).`,
+  };
+  const BuiltinLabels: Record<string, string> = {
+    bash: "Bash",
+    read: "Read",
+    write: "Write",
+    edit: "Edit",
+    find: "Find",
+    grep: "Grep",
+    ls: "List",
+  };
+  function registerBuiltinOverrides(pi: any) {
+    for (const name of Object.keys(BuiltinParamsSchemas)) {
+      const parameters = BuiltinParamsSchemas[name];
+      const description = BuiltinDescriptions[name];
+      const label = BuiltinLabels[name];
+      // `bash` gets the 300 s client timeout (matching the desktop's bash
+      // default); the fast tools 30 s (the desktop's fast cap). A rejection
+      // (timeout / cancel / error frame) is a tool error the LLM sees — the
+      // desktop's clean `isError` results are `result` frames, not
+      // rejections, so they pass through verbatim.
+      const timeoutMs = name === "bash" ? 300_000 : 30_000;
+      pi.registerTool({
+        name,
+        label,
+        description,
+        parameters,
+        async execute(_toolCallId: string, params: any, signal: AbortSignal | undefined, _onUpdate: undefined, _ctx: any) {
+          // The desktop executes the delegated built-in itself (Task 2's
+          // `tool_exec` handler → `tools/exec.rs`) and returns the
+          // ToolResult — the override passes it through verbatim (the
+          // desktop owns the shaping).
+          const r = await bridgeRequest("tool_exec", { tool: name, params }, signal, timeoutMs);
+          return r;
+        },
+      });
+    }
+  }
+
   // DEFERRED registration: `registerTool` at LOAD time would conflict with
   // the suite's same-name tools (process.exit(1) — see the module doc).
   // `registerTool` adds the tool AND auto-calls runtime.refreshTools(), so
@@ -739,5 +885,6 @@ When all todos are completed, the list auto-clears after a brief delay.`;
     registerAskOverride(pi);
     registerSudoOverride(pi);
     registerTodoOverride(pi);
+    registerBuiltinOverrides(pi);
   });
 };

@@ -3,4 +3,4 @@
 
 mod registry;
 
-pub use registry::{AgentEntry, ConfigError, Registry};
+pub use registry::{AgentEntry, AgentKind, ConfigError, HarnessConfig, Registry};

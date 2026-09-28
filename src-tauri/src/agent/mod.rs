@@ -5,6 +5,7 @@ pub mod bridge;
 mod errors;
 mod fs_backend;
 pub mod gate;
+pub mod harness;
 mod permission;
 pub mod rpc;
 mod session;
@@ -23,9 +24,12 @@ pub use permission::{permission_key, PendingPermissions, PermissionOutcome};
 pub use rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, PiRpcHandle, RpcEvent};
 pub use session::{
     normalize_capabilities, user_message_payload, ClosedReason, EventSink, ImagePayload,
-    SessionInfo, SessionManager, StopReason, SubagentSpawn, MAX_IMAGE_BYTES,
+    ProviderFactory, SessionInfo, SessionManager, StopReason, SubagentSpawn, MAX_IMAGE_BYTES,
 };
-pub use subagent::{SubagentMetrics, SubagentOutcome, SubagentSessionManager};
+pub use subagent::{
+    CapturingSink, LaunchConfig, NativeDeps, SubagentMetrics, SubagentOutcome,
+    SubagentSessionManager,
+};
 pub use todo::{TodoItem, TodoStatus, TodoStore};
 pub use tools::{install_tools_extension, tools_spawn_args};
 pub use worker_runtime::WorkerRuntime;

@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   listenBridgeEvent,
   listenBridgeRequest,
+  listenBridgeRequestClose,
   listenPermissionRequest,
   listenSessionClosed,
   listenSessionUpdate,
@@ -70,6 +71,16 @@ function App() {
     unlistenPromises.push(
       listenBridgeRequest((payload) =>
         useBridge.getState().addRequest(payload.sessionId, payload),
+      ),
+    );
+    // A DROPPED `sudo_exec` sub-prompt (a turn cancel skips the flow's
+    // exit-path cleanup) closes its modal (the Rust `SudoPromptCleanup`
+    // drop guard emits `bridge-request-close` — pre-fix the modal stayed
+    // open with no pending response, and a late answer got `Ok(true)` with
+    // the send silently failing).
+    unlistenPromises.push(
+      listenBridgeRequestClose((payload) =>
+        useBridge.getState().removeRequest(payload.sessionId, payload.requestId),
       ),
     );
     unlistenPromises.push(

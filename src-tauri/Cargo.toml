@@ -30,7 +30,22 @@ tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "time", "net", "rt"] }
+tokio-util = "0.7"
+# The `exec_find` fallback when `fd` is not installed (walk the cwd tree).
+walkdir = "2"
+# base64 for the `read` tool's image content blocks (pi's `ImageContent` =
+# `{type: "image", data, mimeType}` — `data` is base64, no `data:` prefix).
+base64 = "0.22"
 thiserror = "2"
+# The native harness's model client (native-agent-harness Task 4): an
+# OpenAI-compatible chat-completions client (streaming SSE). `rustls-tls`
+# (default features off) avoids a system-OpenSSL build dependency;
+# `stream` provides `bytes_stream`, `json` the request body.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+# `BoxStream` (the `Provider`'s returned stream) + `StreamExt` (consuming
+# it in the `AgentLoop`, Task 6) — `futures-core` alone has `BoxStream`
+# but no `.next()`, so the full `futures-util` is needed.
+futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -43,6 +58,13 @@ image = { version = "0.25", features = ["png"] }
 serde_json = "1"
 # Enables `tauri::test` (mock runtime) for the headless IPC test.
 tauri = { version = "2", features = ["test"] }
+# Mock HTTP server for the `Provider` integration tests (canned SSE
+# streams, canned status codes).
+wiremock = "0.6"
+# Temp dirs for the `ModelCatalog` seeding tests (Task 5) — the
+# `~/.pi/agent` fixture is written into a temp dir (pointing `seed_from`
+# at a real `HOME` would be racy).
+tempfile = "3"
 
 # Platform-gated bridge deps: `libc` is needed on ALL unix platforms — Linux
 # for the bridge's `SO_PEERCRED`/`ucred` peer verification (those specific
