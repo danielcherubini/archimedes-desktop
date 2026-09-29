@@ -317,6 +317,17 @@ export interface AppSettings {
   paneLayout: Record<string, unknown>;
 }
 
+/** One discovered skill (camelCase over IPC — the Rust `SkillInfo`). */
+export interface SkillInfo {
+  name: string;
+  description: string;
+  path: string;
+  dir: string;
+  scope: "space" | "user";
+  /** The SKILL.md content minus the frontmatter (the injected block's BODY). */
+  body: string;
+}
+
 // ---------------------------------------------------------------------------
 // Commands (invoke)
 // ---------------------------------------------------------------------------
@@ -441,6 +452,11 @@ export async function setSpaceTrusted(path: string, trusted: boolean): Promise<v
 /** Canonicalize a folder and say whether a space row already exists for it. */
 export async function spaceForPath(path: string): Promise<SpaceCheck> {
   return invoke<SpaceCheck>("space_for_path", { path });
+}
+
+/** The skill catalog for a Space (`null` = user-level skills only). */
+export async function listSkills(spacePath: string | null): Promise<SkillInfo[]> {
+  return invoke<SkillInfo[]>("list_skills", { spacePath: spacePath ?? null });
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,22 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import ReactMarkdown from "react-markdown";
 import MessageBubble from "./MessageBubble";
 import { Message } from "../store/sessions";
+import { expandSkillMentions } from "../lib/skills";
+import type { SkillInfo } from "../lib/tauri";
 import { useSubagents } from "../store/subagents";
+
+/** A full `SkillInfo` fixture (mirrors the `skills.test.ts` factory). */
+function makeSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
+  return {
+    name: "debug",
+    description: "A debug skill",
+    path: "/s/.agents/skills/debug/SKILL.md",
+    dir: "/s/.agents/skills/debug",
+    scope: "space",
+    body: "Step 1. Step 2.",
+    ...overrides,
+  };
+}
 
 // Spy on the markdown renderer: the streaming-perf test below counts how
 // often it runs when a bubble re-renders with an UNCHANGED message
@@ -174,5 +189,88 @@ describe("MessageBubble", () => {
     expect(screen.getByText("reviewer")).toBeTruthy();
     expect(screen.getByText("review the diff")).toBeTruthy();
     expect(screen.queryByText("No subagents yet.")).toBeNull();
+  });
+
+  // --- User-message skill blocks: collapsible cards (collapsed by default —
+  // ZCode's `ToolLayout` defaults `isOpen` to `false`). ---
+
+  it("a_user_message_with_no_skills_renders_verbatim", () => {
+    const message: Message = { kind: "user", text: "hello world", at: 1 };
+    render(<MessageBubble message={message} />);
+    expect(screen.getByText("hello world")).toBeTruthy();
+    // No skill card: no toggle button at all.
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("a_skill_block_renders_collapsed_by_default", () => {
+    const message: Message = {
+      kind: "user",
+      text: expandSkillMentions("fix $debug", [makeSkill()]),
+      at: 1,
+    };
+    render(<MessageBubble message={message} />);
+    // The user's text renders verbatim and the card header (the skill name)
+    // is visible ... 
+    expect(screen.getByText("fix $debug")).toBeTruthy();
+    expect(screen.getByText("debug")).toBeTruthy();
+    // ... but the card's BODY is NOT (collapsed default), `aria-expanded`
+    // is `false`.
+    expect(screen.queryByText("Step 1. Step 2.")).toBeNull();
+    expect(screen.getByRole("button").getAttribute("aria-expanded")).toBe(
+      "false",
+    );
+  });
+
+  it("clicking_the_header_expands_the_body", () => {
+    const message: Message = {
+      kind: "user",
+      text: expandSkillMentions("fix $debug", [makeSkill()]),
+      at: 1,
+    };
+    render(<MessageBubble message={message} />);
+    const header = screen.getByRole("button");
+    act(() => {
+      fireEvent.click(header);
+    });
+    expect(screen.getByText("Step 1. Step 2.")).toBeTruthy();
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    // Click again → collapsed again.
+    act(() => {
+      fireEvent.click(header);
+    });
+    expect(screen.queryByText("Step 1. Step 2.")).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("multiple_skill_blocks_render_in_order", () => {
+    const a = makeSkill({
+      name: "alpha",
+      path: "/s/.agents/skills/alpha/SKILL.md",
+      dir: "/s/.agents/skills/alpha",
+      body: "A body",
+    });
+    const b = makeSkill({
+      name: "beta",
+      path: "/s/.agents/skills/beta/SKILL.md",
+      dir: "/s/.agents/skills/beta",
+      body: "B body",
+    });
+    const message: Message = {
+      kind: "user",
+      text: expandSkillMentions("x $alpha y $beta", [a, b]),
+      at: 1,
+    };
+    render(<MessageBubble message={message} />);
+    const headers = screen.getAllByRole("button");
+    expect(headers).toHaveLength(2);
+    // Both headers visible in first-mention order ... 
+    expect(headers[0].textContent).toContain("alpha");
+    expect(headers[1].textContent).toContain("beta");
+    // ... and both collapsed by default (bodies absent).
+    expect(
+      headers.every((h) => h.getAttribute("aria-expanded") === "false"),
+    ).toBe(true);
+    expect(screen.queryByText("A body")).toBeNull();
+    expect(screen.queryByText("B body")).toBeNull();
   });
 });

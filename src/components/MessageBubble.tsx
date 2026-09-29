@@ -1,11 +1,52 @@
 import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
+import { ChevronRightIcon, WandSparklesIcon } from "lucide-react";
 import type { Message } from "../store/sessions";
+import { splitSkillBlocks, type SkillBlock } from "../lib/skills";
 import ToolCallCard from "./ToolCallCard";
 import SubagentDelegatingCard from "./SubagentDelegatingCard";
 import DiffBlock from "./DiffBlock";
 import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
+
+/**
+ * One `<skill>` block injected into a user message: a collapsible card
+ * (COLLAPSED by default — ZCode's `ToolLayout` defaults `isOpen` to
+ * `false`), styled after the `ToolCallCard`/`FileSummaryCard` conventions:
+ * icon + muted label + mono name + a chevron that rotates on open.
+ */
+function SkillBlockCard({ block }: { block: SkillBlock }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-lg border border-input-border bg-input px-3 py-2">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <WandSparklesIcon className="size-4 shrink-0 text-foreground-subtle" />
+        <span className="shrink-0 whitespace-nowrap font-medium text-foreground-subtlest">
+          Skill
+        </span>
+        <span className="min-w-0 truncate font-mono text-ui-sm text-foreground-subtle">
+          {block.name}
+        </span>
+        <ChevronRightIcon
+          aria-hidden
+          className={`ml-auto size-4 shrink-0 text-foreground-subtlest transition-transform ${
+            open ? "rotate-90" : "rotate-0"
+          }`}
+        />
+      </button>
+      {open && (
+        <div className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-ui-sm text-foreground-subtle">
+          {block.body}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // One shared highlighter for the whole app.
 let highlighterPromise: Promise<Highlighter> | null = null;
@@ -167,14 +208,25 @@ export default memo(
     sessionId?: string;
   }) {
     switch (message.kind) {
-      case "user":
+      case "user": {
         // The design reference: a plain row — no bubble, no avatar.
-        // Images render as a read-only thumbnail grid (the transcript is
-        // history — NO remove buttons). `data:` URLs are safe here: the
-        // transcript is local.
+        // `expandSkillMentions` appends `<skill>` blocks after the user's
+        // text; render the blocks as collapsible cards (collapsed by
+        // default) instead of raw text — display-only, the persisted/sent
+        // text is unchanged. Images render as a read-only thumbnail grid
+        // (the transcript is history — NO remove buttons). `data:` URLs are
+        // safe here: the transcript is local.
+        const { text, blocks } = splitSkillBlocks(message.text);
         return (
           <div className="whitespace-pre-wrap text-ui-base text-foreground">
-            {message.text}
+            {text}
+            {blocks.length > 0 && (
+              <div className="mt-2 flex flex-col gap-2">
+                {blocks.map((block, i) => (
+                  <SkillBlockCard key={i} block={block} />
+                ))}
+              </div>
+            )}
             {message.images && message.images.length > 0 && (
               <div className="mt-2 flex flex-wrap gap-2">
                 {message.images.map((img, i) => (
@@ -190,6 +242,7 @@ export default memo(
             )}
           </div>
         );
+      }
 
       case "agent-text":
         return (

@@ -7,7 +7,9 @@ import {
   resumeSession,
   readClipboardImage,
   cancelSession,
+  listSkills,
 } from "../lib/tauri";
+import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import { useSessions } from "../store/sessions";
 import { useBridge } from "../store/bridge";
 import { usePermissions } from "../store/permissions";
@@ -71,6 +73,24 @@ vi.mock("../lib/tauri", async () => {
     readClipboardImage: vi.fn().mockResolvedValue(null),
     cancelSession: vi.fn().mockResolvedValue(undefined),
     loadHistory: vi.fn().mockResolvedValue([]),
+    listSkills: vi.fn().mockResolvedValue([
+      {
+        name: "debug",
+        description: "Debug a failure",
+        path: "/s/.agents/skills/debug/SKILL.md",
+        dir: "/s/.agents/skills/debug",
+        scope: "space",
+        body: "Step 1. Step 2.",
+      },
+      {
+        name: "beta",
+        description: "Beta skill",
+        path: "/s/.agents/skills/beta/SKILL.md",
+        dir: "/s/.agents/skills/beta",
+        scope: "space",
+        body: "B body",
+      },
+    ]),
   };
 });
 
@@ -184,6 +204,21 @@ async function flush(): Promise<void> {
   });
 }
 
+/**
+ * Wait for the skill catalog to load AND render. The mocked `listSkills`
+ * resolves in a microtask; the hook's `p.then` then runs `setRows` one or
+ * more microtasks later. A `setTimeout(0)` macrotask wait guarantees every
+ * pending microtask (the whole promise chain) has run, so the re-render with
+ * the loaded rows has landed. (Needed for the send-expansion test, where the
+ * picker is NOT open — `findByText` can't be used as the wait signal.)
+ */
+async function waitForCatalog(): Promise<void> {
+  await waitFor(() => expect(vi.mocked(listSkills)).toHaveBeenCalled());
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+}
+
 beforeEach(() => {
   // Restore real timers in case a previous test installed fake ones (the
   // mid-read tests below use `vi.useFakeTimers()` to settle the macrotask-
@@ -194,6 +229,12 @@ beforeEach(() => {
   // `clearAllMocks` clears the call history (the `URL` stub implementations
   // from `beforeAll` survive — `mockClear` semantics, not `mockReset`).
   vi.clearAllMocks();
+  // The skill catalog's module-level cache is shared across tests in this
+  // file — clear it so each test starts with a COLD cache (a warm cache from
+  // a previous test's `seedLiveSession` `cwd` key would make the fresh
+  // `listSkills` mock moot: the hook would serve the cached value and never
+  // re-fetch).
+  clearSkillCatalogCache();
   useSessions.setState({
     activeSessionId: null,
     sessions: [],
@@ -1625,5 +1666,312 @@ describe("ChatStream", () => {
     // Blocked: no prompt is sent (an empty prompt + unsent images is
     // meaningless — the same fail-closed posture as `!imageCapable`).
     expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
+  });
+
+  // --- Skills: the `$`-trigger picker + the send-path expansion (Task 5). ---
+
+  it("typing $ opens the skill picker", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // A bare `$` (empty token remainder) opens the picker with the FULL list.
+    // The catalog arrives via an ASYNC effect (the `listSkills` mock), so the
+    // picker only renders once the fetch resolves — `findByText` awaits both
+    // the fetch and the render.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "$" } });
+    await screen.findByText("debug");
+  });
+
+  it("the picker filters as the token is typed", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // `$de` → the single `debug` skill matches (the catalog is still loading
+    // here — `findByText` awaits it).
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "$de" } });
+    await screen.findByText("debug");
+    // `$zzz` → no name contains `zzz` → the picker is not visible. The catalog
+    // is already warm at this point, so no await is needed for the change.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "$zzz" } });
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("enter selects the highlighted skill and inserts the token", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$de" } });
+    await screen.findByText("debug"); // catalog ready, picker open
+    // The caret is at the END of the text (where a user's caret is after
+    // typing — jsdom's `selectionStart` is 0 by default).
+    textarea.setSelectionRange(3, 3);
+    // Enter selects the highlighted row (`debug`) and inserts `$debug `.
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    // The draft is local `useState` in `ChatStream` (NOT in any store) — read
+    // it back from the TEXTAREA's `value` on the next render.
+    expect(
+      (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+    ).toBe("$debug ");
+    // The picker is closed after selection.
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("escape closes the picker without inserting", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "$de" } });
+    await screen.findByText("debug"); // catalog ready, picker open
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Escape" });
+    // The picker is gone…
+    expect(screen.queryByText("debug")).toBeNull();
+    // …and the draft is UNCHANGED (no insertion).
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("$de");
+  });
+
+  it("send expands the mention before addUserMessage and sendPrompt", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // Ensure the catalog is loaded (the expansion depends on it) — the picker
+    // is NOT open here (the trailing space closes it), so `findByText` can't
+    // be the wait signal.
+    await waitForCatalog();
+    // The trailing space ends the active token → the picker is NOT open and
+    // Enter is NOT intercepted by the picker's `selectSkill` branch. `rawText`
+    // = `draft.trim()` = `fix $debug`.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "fix $debug " },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    // The expanded text (the exact pi-format block, Task 3).
+    const expanded =
+      'fix $debug\n\n<skill name="debug" location="/s/.agents/skills/debug/SKILL.md">' +
+      "\nReferences are relative to /s/.agents/skills/debug." +
+      "\n\nStep 1. Step 2.\n</skill>";
+    // `addUserMessage` got the EXPANDED text (the live bubble = the agent
+    // input — the REFINEMENT invariant).
+    const msgs = useSessions.getState().messages["s1"];
+    const userMsg = msgs?.find((m) => m.kind === "user");
+    expect(userMsg).toBeTruthy();
+    if (userMsg?.kind === "user") {
+      expect(userMsg.text.startsWith("fix $debug")).toBe(true);
+      expect(userMsg.text).toContain(
+        '<skill name="debug" location="/s/.agents/skills/debug/SKILL.md">',
+      );
+      expect(userMsg.text).toContain(
+        "References are relative to /s/.agents/skills/debug.",
+      );
+      expect(userMsg.text).toContain("Step 1. Step 2.");
+      expect(userMsg.text).toBe(expanded);
+    }
+    // `sendPrompt` got the SAME expanded text (the 2-arg form — no images).
+    expect(sendPrompt).toHaveBeenCalledWith("s1", expanded);
+  });
+
+  it("an unmatched token is sent verbatim", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    await waitForCatalog();
+    // `$nope` matches no skill → `expandSkillMentions` finds no match and
+    // returns the text UNCHANGED. The trailing space closes the picker.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "hi $nope " },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    // `rawText` is `hi $nope` and nothing was expanded.
+    expect(sendPrompt).toHaveBeenCalledWith("s1", "hi $nope");
+  });
+
+  it("arrow_down_moves_the_highlight_and_enter_selects_the_second_row", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$" } });
+    await screen.findByText("debug"); // catalog ready, picker open (2 rows)
+    const debugRow = screen.getByRole("button", { name: /debug/ });
+    const betaRow = screen.getByRole("button", { name: /beta/ });
+    // `debug` (index 0) is highlighted by default.
+    expect(debugRow.className).toContain("bg-surface-hover");
+    expect(betaRow.className).not.toContain("bg-surface-hover");
+    // The caret is at the END of the text (where a user's caret is after
+    // typing the `$` — jsdom's `selectionStart` is 0 by default).
+    textarea.setSelectionRange(1, 1);
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+    // The highlight moved to the `beta` row.
+    expect(debugRow.className).not.toContain("bg-surface-hover");
+    expect(betaRow.className).toContain("bg-surface-hover");
+    // Enter selects the HIGHLIGHTED row (`beta`).
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("$beta ");
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("arrow_up_wraps_around_to_the_last_row", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$" } });
+    await screen.findByText("debug"); // catalog ready, picker open (2 rows)
+    const debugRow = screen.getByRole("button", { name: /debug/ });
+    const betaRow = screen.getByRole("button", { name: /beta/ });
+    textarea.setSelectionRange(1, 1);
+    fireEvent.keyDown(textarea, { key: "ArrowUp" }); // wraps to the LAST row (index 1)
+    expect(betaRow.className).toContain("bg-surface-hover");
+    expect(debugRow.className).not.toContain("bg-surface-hover");
+    fireEvent.keyDown(textarea, { key: "ArrowUp" }); // back to index 0
+    expect(debugRow.className).toContain("bg-surface-hover");
+    // Enter selects the FIRST row.
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("$debug ");
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("tab_accepts_the_highlighted_candidate", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$" } });
+    await screen.findByText("debug"); // catalog ready, picker open
+    textarea.setSelectionRange(1, 1);
+    // Tab accepts the highlighted candidate (ZCode parity: `KEY_TAB_COMMAND`
+    // → `selectOption(selectedIndex)` — the same handler Enter uses).
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(textarea.value).toBe("$debug ");
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("tab_with_the_picker_closed_falls_through", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "hello " } });
+    // No `$` → the picker never opens.
+    expect(screen.queryByText("debug")).toBeNull();
+    // Tab is NOT intercepted (no `preventDefault` — `fireEvent` returns
+    // `false` when the default was prevented) and the value is untouched.
+    const notPrevented = fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(notPrevented).toBe(true);
+    expect(textarea.value).toBe("hello ");
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("enter_after_the_caret_leaves_the_token_closes_the_picker_instead_of_sending_or_swallowing", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // `$debug` matches the `debug` skill → the picker is open, the token
+    // active at the caret.
+    fireEvent.change(textarea, { target: { value: "$debug" } });
+    await screen.findByText("debug"); // picker open
+    // Move the caret AWAY from the token WITHOUT `onChange` (a mouse click
+    // or Home does this — no keystroke fires `change`): the picker is now
+    // STALE (it would still `selectSkill` the highlighted `debug` on Enter
+    // if the keydown didn't re-evaluate the token at the caret).
+    textarea.setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    // The stale picker must NOT swallow Enter: the picker closes AND the
+    // message SENDS the draft as-typed (the send path expands the `$debug`
+    // mention — the picker did not re-select or rewrite it: the verbatim
+    // token stays in the text, the block is APPENDED by `send()`).
+    // (The picker's CLOSED state is asserted via the picker's testid — the
+    // skill's NAME now also renders in the sent message's collapsed skill
+    // card header, so a text query is no longer a picker-only signal.)
+    expect(screen.queryByTestId("skill-picker")).toBeNull();
+    expect(textarea.value).toBe("");
+    const sent =
+      "$debug\n\n" +
+      '<skill name="debug" location="/s/.agents/skills/debug/SKILL.md">' +
+      "\nReferences are relative to /s/.agents/skills/debug." +
+      "\n\nStep 1. Step 2.\n</skill>";
+    expect(sendPrompt).toHaveBeenCalledWith("s1", sent);
+  });
+
+  it("shift_enter_inserts_a_newline_with_the_picker_open", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$de" } });
+    await screen.findByText("debug"); // picker open
+    textarea.setSelectionRange(3, 3);
+    // Shift+Enter must NOT be intercepted (no `preventDefault` — the
+    // browser default inserts a newline; jsdom doesn't run it, so the
+    // value only changes if the handler itself changes it).
+    const notPrevented = fireEvent.keyDown(textarea, {
+      key: "Enter",
+      shiftKey: true,
+    });
+    expect(notPrevented).toBe(true);
+    // NOT a skill selection (the draft is unchanged — not `$debug `) and
+    // NOT swallowed.
+    expect(textarea.value).toBe("$de");
+    // Model the browser default (the newline lands): the token ends at the
+    // newline → the picker closes on `onChange`.
+    fireEvent.change(textarea, { target: { value: "$de\n" } });
+    expect(textarea.value).toBe("$de\n");
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("shift_tab_falls_through_with_the_picker_open", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "$de" } });
+    await screen.findByText("debug"); // picker open, token active
+    textarea.setSelectionRange(3, 3);
+    // Shift+Tab must NOT be intercepted (a11y: it moves focus BACKWARD —
+    // the browser default; intercepting it would be a keyboard trap). No
+    // `preventDefault` (`fireEvent` returns `false` when the default was
+    // prevented) and the draft is unchanged.
+    const notPrevented = fireEvent.keyDown(textarea, {
+      key: "Tab",
+      shiftKey: true,
+    });
+    expect(notPrevented).toBe(true);
+    expect(textarea.value).toBe("$de");
+    // The picker is still open (no selection happened).
+    expect(screen.getByTestId("skill-picker")).toBeTruthy();
+  });
+
+  it("the_insert_event_closes_the_picker", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // The picker is open with a token active at the caret (the v1.1 flow:
+    // the user typed `$x`, then clicks a SkillsDialog row).
+    fireEvent.change(textarea, { target: { value: "$de" } });
+    await screen.findByText("debug"); // picker open
+    textarea.focus();
+    textarea.setSelectionRange(3, 3); // caret at the end of the token
+    // The `act` wrap is REQUIRED (the file's insert-event test convention):
+    // a raw `dispatchEvent` does not flush React's state updates.
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent("archimedes:insert-skill", { detail: "$beta " }),
+      );
+    });
+    // The stale picker is CLOSED (no lingering popup until the next
+    // keydown) …
+    expect(screen.queryByTestId("skill-picker")).toBeNull();
+    // …and the inserted text was spliced at the caret.
+    expect(textarea.value).toBe("$de$beta ");
+  });
+
+  it("the left-pane insert event appends at the caret", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // An existing draft, caret at the end (the focus + selection the event
+    // reads from the ref/DOM).
+    fireEvent.change(textarea, { target: { value: "hello " } });
+    textarea.focus();
+    textarea.setSelectionRange(6, 6);
+    // The `act` wrap is REQUIRED: a raw `dispatchEvent` does not flush React's
+    // state updates (the listener's `setDraft` would be invisible to a
+    // synchronous assertion — the file's `fireEvent.paste` comment documents
+    // this convention). No catalog dependency: the insert event is independent
+    // of `listSkills`.
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent("archimedes:insert-skill", { detail: "$debug " }),
+      );
+    });
+    expect(textarea.value).toBe("hello $debug ");
   });
 });

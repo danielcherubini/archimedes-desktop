@@ -9,6 +9,7 @@ import {
   PlusIcon,
   ShieldCheckIcon,
   ShieldIcon,
+  SparklesIcon,
 } from "lucide-react";
 import { closeSession } from "../lib/tauri";
 import {
@@ -20,7 +21,9 @@ import {
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
+import { useSkillCatalog } from "../hooks/useSkillCatalog";
 import NewSpaceDialog from "./NewSpaceDialog";
+import SkillsDialog from "./SkillsDialog";
 import { Spinner } from "./ui/spinner";
 import { Kbd } from "./ui/kbd";
 
@@ -62,6 +65,12 @@ export default function SpacesList() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
   const openSession = useSessions((s) => s.openSession);
   const [dialogOpen, setDialogOpen] = useState(false);
+  // The Skills modal (the left pane has NO skill list — ZCode parity: the
+  // skills UI is a searchable modal, opened from the third button in the
+  // row). The catalog fetch lives in `useSkillCatalog` below (the modal
+  // receives the rows as props — same hook key as the composer → one
+  // shared fetch).
+  const [skillsOpen, setSkillsOpen] = useState(false);
 
   // Keep the `spaces` list order (`lastOpenedAt` desc from `list_spaces`):
   // groups follow the server's recent-first order.
@@ -81,6 +90,16 @@ export default function SpacesList() {
             v.storedSessionIds.includes(activeSessionId),
         );
   const newSession = useStartNewConversation(activeView);
+
+  // The active Space's path for the skill catalog: a Session's `cwd` IS
+  // the Space's folder (CONTEXT.md). Live sessions first, then stored;
+  // `null` when nothing is active (user-level skills only).
+  const activeSession = sessions.find((s) => s.sessionId === activeSessionId);
+  const activeHistory = activeSession
+    ? undefined
+    : historySessions.find((s) => s.sessionId === activeSessionId);
+  const activeSpacePath = activeSession?.cwd ?? activeHistory?.cwd ?? null;
+  const skills = useSkillCatalog(activeSpacePath);
 
   // `handleOpenSpace` is stable forever; `handleNewSession` is stable only
   // while `activeSessionId` and `newSession` are — but `useStartNewConversation`
@@ -151,6 +170,14 @@ export default function SpacesList() {
           <span className="flex-1 text-left">Open Space</span>
           <Kbd className="text-foreground-subtlest">⌘O</Kbd>
         </button>
+        <button
+          type="button"
+          onClick={() => setSkillsOpen(true)}
+          className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-ui-base hover:bg-surface-hover"
+        >
+          <SparklesIcon className="size-4" />
+          <span className="flex-1 text-left">Skills</span>
+        </button>
       </div>
       <p className="px-2.5 py-2 text-ui-base text-foreground-subtlest">
         Sessions
@@ -171,6 +198,9 @@ export default function SpacesList() {
         ))}
       </div>
       {dialogOpen && <NewSpaceDialog onClose={() => setDialogOpen(false)} />}
+      {skillsOpen && (
+        <SkillsDialog skills={skills} onClose={() => setSkillsOpen(false)} />
+      )}
     </aside>
   );
 }

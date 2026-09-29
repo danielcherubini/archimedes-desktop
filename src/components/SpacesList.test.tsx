@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { closeSession, deleteSpace, setSpaceTrusted, startSession } from "../lib/tauri";
+import { closeSession, deleteSpace, listSkills, setSpaceTrusted, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
+import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import SpacesList from "./SpacesList";
 
 // Mock the Tauri IPC layer; everything else (stores) is the real code.
@@ -24,6 +25,16 @@ vi.mock("../lib/tauri", async () => {
     closeSession: vi.fn().mockRejectedValue(new Error("boom")),
     setSpaceTrusted: vi.fn().mockResolvedValue(undefined),
     deleteSpace: vi.fn().mockResolvedValue(undefined),
+    listSkills: vi.fn().mockResolvedValue([
+      {
+        name: "alpha",
+        description: "Alpha skill",
+        path: "/p/.agents/skills/alpha/SKILL.md",
+        dir: "/p/.agents/skills/alpha",
+        scope: "space",
+        body: "B",
+      },
+    ]),
   };
 });
 
@@ -31,6 +42,7 @@ const mockedStartSession = vi.mocked(startSession);
 const mockedCloseSession = vi.mocked(closeSession);
 const mockedSetSpaceTrusted = vi.mocked(setSpaceTrusted);
 const mockedDeleteSpace = vi.mocked(deleteSpace);
+const mockedListSkills = vi.mocked(listSkills);
 
 /**
  * Fixture: two spaces. `alpha` holds a live session `s1` (in-turn, with a
@@ -79,6 +91,11 @@ beforeEach(() => {
   seed();
   vi.clearAllMocks();
 });
+// The hook's module-level catalog cache is shared across tests in a
+// file: clear it so each test refetches (without this, test 1's warm
+// cache — keyed by the `seed()` fixture's `cwd` — makes a later test's
+// fresh `listSkills` mock moot).
+beforeEach(clearSkillCatalogCache);
 
 describe("SpacesList", () => {
   it("renders the two action buttons with their labels and kbd hints", () => {
@@ -569,5 +586,29 @@ describe("SpacesList", () => {
       );
     });
     expect(screen.getByText("New space")).toBeTruthy();
+  });
+
+  it("the_skills_button_sits_in_the_button_row", async () => {
+    render(<SpacesList />);
+    // The third button in the `New Session` / `Open Space` row (the skill
+    // LIST no longer renders in the pane — the button opens a modal).
+    expect(await screen.findByText("Skills")).toBeTruthy();
+    expect(screen.getByText("Sessions")).toBeTruthy();
+    // The one-fetch property (single consumer): one `listSkills` call.
+    expect(mockedListSkills).toHaveBeenCalledTimes(1);
+  });
+
+  it("the_skills_modal_shows_the_empty_state_when_there_are_no_skills", async () => {
+    // `clearAllMocks` PRESERVES the factory's 1-skill implementation, so
+    // override it here. Declared LAST so the override cannot leak into
+    // the other test (the `beforeEach` cache-clear makes each test
+    // refetch; because implementations are preserved, this test's
+    // `mockResolvedValue([])` would leak to any test declared after it —
+    // declaration order is what keeps the two independent).
+    vi.mocked(listSkills).mockResolvedValue([]);
+    render(<SpacesList />);
+    // Open the modal from the button.
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await screen.findByText("No skills found.");
   });
 });

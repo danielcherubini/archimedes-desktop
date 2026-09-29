@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod commands;
 pub mod config;
+pub mod skills;
 pub mod storage;
 #[doc(hidden)]
 pub mod test_support;
@@ -96,6 +97,7 @@ pub fn run() {
             commands::spaces::delete_space,
             commands::spaces::space_for_path,
             commands::spaces::set_space_trusted,
+            commands::skills::list_skills,
             commands::clipboard::read_clipboard_image
         ])
         .setup(|app| {

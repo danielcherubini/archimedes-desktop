@@ -13,8 +13,10 @@ import {
   readClipboardImage,
   sendPrompt,
   setSessionConfigOption,
+  type SkillInfo,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
+import { expandSkillMentions } from "../lib/skills";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
@@ -30,6 +32,7 @@ import { useBridge } from "../store/bridge";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
+import { useSkillCatalog } from "../hooks/useSkillCatalog";
 import {
   getSidePaneCollapsed,
   setSidePaneCollapsed,
@@ -58,6 +61,27 @@ import AskQuestionCard from "./AskQuestionCard";
 import FileSummaryCard from "./FileSummaryCard";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
+
+/**
+ * The active skill token at the caret (the ONE shared helper — used by the
+ * `onChange` re-computation, the keydown re-evaluation, and `selectSkill`):
+ * the span between the nearest preceding whitespace (or start-of-line) and
+ * the caret. Returns `{ remainder, start }` when the span starts with `$`
+ * — `remainder` is the token's remainder AFTER the `$` (a bare `$` is `""`),
+ * `start` is the `$`'s index in the string — else `null` (no active token:
+ * the span doesn't start with `$`, or it contains a character that can't be
+ * part of a skill name, e.g. uppercase — the regex `[a-z0-9-]*$` simply won't
+ * reach the caret).
+ */
+function activeSkillToken(
+  value: string,
+  caret: number,
+): { remainder: string; start: number } | null {
+  const before = value.slice(0, caret);
+  const m = before.match(/(^|\s)(\$[a-z0-9-]*)$/);
+  if (!m) return null;
+  return { remainder: m[2]!.slice(1), start: (m.index ?? 0) + m[1]!.length };
+}
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -312,6 +336,82 @@ export default function ChatStream() {
     return () => window.removeEventListener("resize", apply);
   }, [draft]);
 
+  // --- Skills (Task 5): the `$`-trigger picker + the send-path expansion. ---
+  // ALL of the hooks below live in the UNCONDITIONAL top block (before the
+  // `!activeSessionId` early return further down) — placing any of them after
+  // the early return would change the hook count across the session/no-session
+  // transition and crash React (the same bug the `usePendingSubagentRequests`
+  // comment above warns about). Plain (non-hook) functions like `selectSkill`
+  // are placement-flexible (the file's own comment says so for the attachment
+  // handlers) and live with the other handlers below.
+  // The Space path is the active session's `cwd` (CONTEXT.md: a Session's
+  // `cwd` IS the Space's folder) — live first, then stored (the same
+  // derivation as Task 4's `SpacesList`). `useSkillCatalog` caches per Space,
+  // so the composer and the left pane share ONE fetch (same key).
+  const spacePath = liveSession?.cwd ?? historySession?.cwd ?? null;
+  const skills = useSkillCatalog(spacePath);
+  // The `$`-trigger picker state (the active token + the highlighted row).
+  const [picker, setPicker] = useState<{
+    query: string;
+    index: number;
+  } | null>(null);
+  // The catalog rows matching the active token (case-insensitive substring on
+  // the NAME — v1: name only, not description). `picker?.query ?? ""` yields
+  // the full list while the picker is null (harmless — the picker UI is gated
+  // on `picker && filtered.length > 0`). NULL-SAFE: the `picker` state is
+  // `{…} | null` and this `useMemo` lives in the unconditional top block, so a
+  // bare `picker.query` would be a TS18047 compile error under `strict: true`
+  // (and a `picker!` "fix" would crash at render whenever the picker is
+  // closed, i.e. nearly every render).
+  const filtered = useMemo(
+    () =>
+      skills.filter((s) =>
+        s.name.toLowerCase().includes((picker?.query ?? "").toLowerCase()),
+      ),
+    [skills, picker],
+  );
+  // The highlighted row index, DERIVED (not clamped in place): the raw
+  // `picker.index` can go stale (a Space switch refetches `skills` while the
+  // picker is open with a non-zero `index`), and `filtered[staleIndex]` would
+  // be `undefined` → a `selectSkill(undefined)` crash on Enter. `Math.max(0, …)`
+  // is belt-and-braces: the picker UI and the keyboard branch are both guarded
+  // by `filtered.length > 0`, so `filtered.length - 1` is ≥ 0 there.
+  const activeIndex = picker
+    ? Math.min(picker.index, Math.max(0, filtered.length - 1))
+    : 0;
+  // The `archimedes:insert-skill` listener (Task 4's left-pane rows dispatch
+  // it): insert `$name ` at the caret and re-focus. Read through refs (the
+  // `draftRef` mirror already exists) so the effect runs once and always sees
+  // the LIVE draft (a render closure would be stale for fast events).
+  useEffect(() => {
+    const onInsertSkill = (e: Event) => {
+      // Close the `$`-trigger picker: the insert comes from OUTSIDE the
+      // picker (a SkillsDialog row — the v1.1 flow), so a picker open at
+      // insert time is stale (it would linger rendered until the next
+      // keydown, and a token active at the caret would be spliced INTO).
+      setPicker(null);
+      const text = (e as CustomEvent<string>).detail;
+      if (typeof text !== "string") return;
+      const el = composerRef.current;
+      const draft = draftRef.current; // the LIVE value (the ref mirror above)
+      if (!el) {
+        setDraft(draft + text);
+        return;
+      }
+      const start = el.selectionStart ?? draft.length;
+      const end = el.selectionEnd ?? start;
+      const next = draft.slice(0, start) + text + draft.slice(end);
+      setDraft(next);
+      requestAnimationFrame(() => {
+        el.focus();
+        const pos = start + text.length;
+        el.setSelectionRange(pos, pos);
+      });
+    };
+    window.addEventListener("archimedes:insert-skill", onInsertSkill);
+    return () => window.removeEventListener("archimedes:insert-skill", onInsertSkill);
+  }, []);
+
   // A stored (non-live) session: its transcript is read-only unless the
   // agent negotiated `loadSession`, in which case it can be resumed.
   const isLive = !!liveSession;
@@ -394,8 +494,8 @@ export default function ChatStream() {
   let hasImages = attachments.length > 0 && imageCapable;
 
   const send = async () => {
-    const text = draft.trim();
-    if ((!text && !hasImages) || composerLocked) return;
+    const rawText = draft.trim();
+    if ((!rawText && !hasImages) || composerLocked) return;
     if (sendingRef.current) return; // guard: see the ref's comment above
     sendingRef.current = true;
     try {
@@ -418,7 +518,7 @@ export default function ChatStream() {
           .sessions.find((x) => x.sessionId === activeSessionId);
         hasImages =
           attachments.length > 0 && agentSupportsImages(fresh?.capabilities);
-        if (!hasImages && text === "") return;
+        if (!hasImages && rawText === "") return;
       }
       let images:
         | { id: string; name: string; mimeType: string; sizeBytes: number; data: string }[]
@@ -450,8 +550,22 @@ export default function ChatStream() {
       // Draft edited during the read (the composer isn't locked until
       // `beginTurn`): sending the stale text and wiping the new draft is a
       // silent data loss — abort without sending, without wiping the draft,
-      // without completing a turn (the user simply sends again).
-      if (draftRef.current.trim() !== text) return;
+      // without completing a turn (the user simply sends again). The guard
+      // compares the RAW text (expansion is re-derived from the FRESH draft
+      // below, so comparing expanded texts would be wrong).
+      if (draftRef.current.trim() !== rawText) return;
+      // EXPANSION: expand `$name` mentions into pi-format `<skill>` blocks
+      // BEFORE both `addUserMessage` and `sendPrompt` (the REFINEMENT — the
+      // live bubble, the persisted record, and the agent's input must all
+      // carry the SAME text, so the content-based dedupe key in
+      // `mergeDedupeKey` matches across a resume reload). Declared HERE
+      // (immediately after the stale-draft guard, BEFORE the images-empty
+      // block below which still references `text`) — the placement is
+      // load-bearing (a TDZ trap: a later declaration would make the
+      // unchanged `if (!text)` a "used before its declaration" error;
+      // semantically it's safe — expansion maps `""`→`""`, so `!text` is
+      // identical to `!rawText`).
+      const text = expandSkillMentions(rawText, skills);
       // Every staged image was removed during the read (the composer isn't
       // locked until `beginTurn`, so a thumbnail can be removed during the
       // read): with no text there's nothing meaningful left to send; with
@@ -471,7 +585,7 @@ export default function ChatStream() {
       // `ImageRef` has no `id` field — strip it before use.
       const imageRefs = images?.map(({ id, ...ref }) => ref); // ImageRef[] | undefined
       setDraft("");
-      addUserMessage(activeSessionId, text, imageRefs);
+      addUserMessage(activeSessionId, text, imageRefs); // EXPANDED
       beginTurn(activeSessionId);
       // Pass the third arg ONLY when there are images: a text-only send (and
       // an all-images-removed send, normalized above) calls
@@ -479,8 +593,8 @@ export default function ChatStream() {
       // assert (`toHaveBeenCalledWith("s1", "hello")`; vitest compares arg
       // arrays by length, so an explicit `undefined` third arg would break it).
       const stopReason = imageRefs
-        ? await sendPrompt(activeSessionId, text, imageRefs)
-        : await sendPrompt(activeSessionId, text);
+        ? await sendPrompt(activeSessionId, text, imageRefs) // EXPANDED
+        : await sendPrompt(activeSessionId, text); // EXPANDED
       // Release/clear ONLY the sent attachments, OUTSIDE the state updater
       // (updaters must be pure — StrictMode runs them twice).
       const still = attachmentsRef.current.filter((a) => !sentIds.has(a.id));
@@ -689,6 +803,33 @@ export default function ChatStream() {
     const next = attachmentsRef.current.filter((a) => a.id !== id);
     attachmentsRef.current = next;
     setAttachments(next);
+  };
+
+  // Select a skill from the `$`-trigger picker: replace the active token
+  // (the `$`-prefixed span at the caret — the shared `activeSkillToken`
+  // helper) with `$<name> ` (LOWERcased — the case policy: a picker-selected
+  // skill ALWAYS expands on send, and the mention regex is lowercase-only;
+  // the expansion keeps the frontmatter name verbatim in the block's `name`
+  // attribute). The `requestAnimationFrame` re-focus + caret-set is REQUIRED:
+  // `setDraft` re-renders the controlled textarea, which would otherwise drop
+  // focus/caret.
+  const selectSkill = (skill: SkillInfo) => {
+    if (!picker) return;
+    const el = composerRef.current;
+    const caret = el?.selectionStart ?? draft.length;
+    const token = activeSkillToken(draft, caret);
+    if (!token) return;
+    const inserted = `$${skill.name.toLowerCase()} `;
+    const next = draft.slice(0, token.start) + inserted + draft.slice(caret);
+    setPicker(null);
+    setDraft(next);
+    requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (!el) return;
+      el.focus();
+      const pos = token.start + inserted.length;
+      el.setSelectionRange(pos, pos);
+    });
   };
 
   // The transcript is grouped ONCE per render (not inside the map): a
@@ -904,9 +1045,37 @@ export default function ChatStream() {
         </p>
       )}
       <div
-        className="m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
+        className="relative m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
         onDrop={handleDrop}
       >
+        {picker && filtered.length > 0 && (
+          <div
+            data-testid="skill-picker"
+            className="absolute left-3 right-3 -top-2 z-10 -translate-y-full rounded-lg border border-input-border bg-input p-1 shadow-lg"
+          >
+            {filtered.map((s, i) => (
+              <button
+                key={s.name}
+                type="button"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  selectSkill(s);
+                }}
+                className={`flex w-full flex-col gap-0.5 rounded-md px-2 py-1 text-left ${i === activeIndex ? "bg-surface-hover" : ""}`}
+              >
+                <span className="text-ui-base">{s.name}</span>
+                {s.description !== "" && (
+                  <span
+                    className="truncate text-ui-sm text-foreground-subtle"
+                    title={s.description}
+                  >
+                    {s.description}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">
             {attachments.map((att) => (
@@ -934,9 +1103,84 @@ export default function ChatStream() {
         <textarea
           ref={composerRef}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            // The `$`-trigger: a bare `$` (empty token remainder) opens the
+            // picker with the FULL list, any non-`$` span closes it.
+            const token = activeSkillToken(
+              e.target.value,
+              e.target.selectionStart ?? e.target.value.length,
+            );
+            setDraft(e.target.value);
+            setPicker(token ? { query: token.remainder, index: 0 } : null);
+          }}
           onPaste={handlePaste}
           onKeyDown={(e) => {
+            // Re-evaluate the active token at KEYDOWN time (the caret is on
+            // the event's target): ArrowLeft/Right, Home/End, and a mouse
+            // click move the caret WITHOUT `onChange`, so the `picker` state
+            // (only recomputed in `onChange`) can be STALE — the caret may
+            // no longer be on the token.
+            const el = e.currentTarget;
+            const token = activeSkillToken(
+              el.value,
+              el.selectionStart ?? el.value.length,
+            );
+            if (picker && !token) {
+              // The caret left the token: CLOSE the picker instead of
+              // `selectSkill`'s silent early-return — a stale picker must
+              // never swallow keys (Enter sends, arrows move the caret, Tab
+              // falls through to the textarea default).
+              setPicker(null);
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+              return;
+            }
+            // The picker is open AND the token is active at the caret: ↑/↓
+            // move the highlight (with wrap), Enter/Tab select the highlighted
+            // row (ZCode's `MentionPlugin` registers `KEY_TAB_COMMAND` →
+            // `selectOption(selectedIndex)` — the same handler Enter uses),
+            // Escape closes. `Shift+Enter` (a newline) and `Shift+Tab`
+            // (move focus BACKWARD — intercepting it would be a
+            // keyboard/a11y trap) fall through to the textarea default
+            // (NOT a selection, NOT swallowed). The index used here is
+            // `activeIndex` (the derivation above — NOT the raw
+            // `picker.index`, which can be stale against a changed
+            // `filtered`).
+            if (picker && token && filtered.length > 0) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setPicker({
+                  ...picker,
+                  index: (activeIndex + 1) % filtered.length,
+                });
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setPicker({
+                  ...picker,
+                  index: (activeIndex + filtered.length - 1) % filtered.length,
+                });
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                selectSkill(filtered[activeIndex]!);
+                return;
+              }
+              if (e.key === "Tab" && !e.shiftKey) {
+                e.preventDefault();
+                selectSkill(filtered[activeIndex]!);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setPicker(null);
+                return;
+              }
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               void send();
