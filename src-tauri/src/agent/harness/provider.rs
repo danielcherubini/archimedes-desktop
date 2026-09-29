@@ -370,10 +370,14 @@ impl SseStream {
         let Some(delta) = choice.get("delta") else {
             return;
         };
-        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-            self.pending
-                .push_back(ProviderEvent::TextDelta(text.to_string()));
-        }
+        // A single chunk can carry BOTH a `reasoning` fragment and a
+        // `content` fragment (some providers batch the thinking's tail
+        // with the text's head — the transition chunk). The thinking
+        // block PRECEDES the text block in the model's output, so the
+        // `ThinkingDelta` must be emitted BEFORE the `TextDelta` — the
+        // reverse order would make the frontend start the text block
+        // first and file the thinking's tail under a SECOND thinking
+        // block (the "missing last word" bug).
         if let Some(thinking) = delta
             .get("reasoning")
             .or_else(|| delta.get("reasoning_content"))
@@ -381,6 +385,10 @@ impl SseStream {
         {
             self.pending
                 .push_back(ProviderEvent::ThinkingDelta(thinking.to_string()));
+        }
+        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+            self.pending
+                .push_back(ProviderEvent::TextDelta(text.to_string()));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for call in calls {
@@ -741,6 +749,33 @@ mod tests {
             vec![
                 ProviderEvent::ThinkingDelta("think".to_string()),
                 ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// A single chunk can carry BOTH a `reasoning` fragment and a
+    /// `content` fragment (some providers batch the thinking's tail with
+    /// the text's head — the transition chunk). The thinking block
+    /// PRECEDES the text block in the model's output, so the
+    /// `ThinkingDelta` must be emitted BEFORE the `TextDelta` — the
+    /// reverse order makes the frontend start the text block first and
+    /// file the thinking's tail under a SECOND thinking block (the
+    /// "missing last word" bug).
+    #[tokio::test]
+    async fn sse_chunk_with_reasoning_and_content_orders_thinking_first() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Fedora.\",\"content\":\"This project\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\" builds\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("Fedora.".to_string()),
+                ProviderEvent::TextDelta("This project".to_string()),
+                ProviderEvent::TextDelta(" builds".to_string()),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
