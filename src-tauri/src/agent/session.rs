@@ -28,7 +28,7 @@
 //! `tool_call_update` / `session_info_update` / `config_option_update`), so
 //! the frontend needs no changes for the ACP → pi-RPC swap.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -528,11 +528,20 @@ pub(crate) struct ThoughtState {
 /// `toolcall_args` is the accumulating partial-args buffer per tool-call id
 /// (the `toolcall_delta` frames are JSON fragments; `toolcall_end` carries
 /// the full `arguments` object and the buffer entry is dropped).
+///
+/// `announced_tool_calls` is the set of ids a `tool_call` (ANNOUNCE) frame
+/// has already been emitted for (a `toolcall_start` with a non-empty
+/// `toolName`, or the `toolcall_end` / `tool_execution_start` fallbacks).
+/// The first frame for an id MUST be a `tool_call` (with a real `title`) —
+/// a `tool_call_update` for an id the frontend never saw would create a
+/// message with `title = toolCallId` (e.g. `chatcmpl-tool-…`), and a second
+/// `tool_call` frame would APPEND a duplicate row.
 #[derive(Debug, Default)]
 pub struct TurnState {
     pub msg_counter: u64,
     pub current_message_id: Option<String>,
     pub toolcall_args: HashMap<String, String>,
+    pub announced_tool_calls: HashSet<String>,
 }
 
 /// The shared session-driver state. `SessionManager` (main sessions) and
@@ -3132,17 +3141,47 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 | Some("text_end")
                 | Some("thinking_start")
                 | Some("thinking_end") => Vec::new(),
-                Some("toolcall_start") => vec![json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": ev.get("id"),
-                    "title": ev.get("toolName"),
-                    "status": "in_progress",
-                    "rawInput": {},
-                })],
-                // Accumulate the partial-args JSON fragments; a complete
-                // object is sent as `rawInput`, an incomplete one as
-                // `partialArgs` (the adapter-era behavior, kept for the
-                // streaming tool-call frames).
+                // ANNOUNCE only when the name is known (a non-empty
+                // `toolName` — the OpenAI-compatible streaming delivers
+                // `function.name` in a LATER delta, so `toolcall_start`
+                // often carries `""`). An empty / missing name (or an
+                // empty `id`) defers the announcement to `toolcall_end`
+                // (where the name is known) — announcing now would make
+                // the frontend display the `toolCallId` (e.g.
+                // `chatcmpl-tool-…`) instead of the tool name.
+                Some("toolcall_start") => {
+                    let Some(id) = ev
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return Vec::new();
+                    };
+                    let Some(name) = ev
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return Vec::new();
+                    };
+                    st.announced_tool_calls.insert(id.to_string());
+                    vec![json!({
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": id,
+                        "title": name,
+                        "status": "in_progress",
+                        "rawInput": {},
+                    })]
+                }
+                // Accumulate the partial-args JSON fragments. For an
+                // ANNOUNCED id a complete object is sent as `rawInput`,
+                // an incomplete one as `partialArgs` (the adapter-era
+                // behavior, kept for the streaming tool-call frames). For
+                // an UNANNOUNCED id the delta is BUFFER ONLY — no frame:
+                // a `tool_call_update` for an id the frontend never saw
+                // would create a message with `title = toolCallId` (e.g.
+                // `chatcmpl-tool-…`); the announcement comes from
+                // `toolcall_end` (or `tool_execution_start`).
                 Some("toolcall_delta") => {
                     let Some(id) = ev.get("id").and_then(Value::as_str) else {
                         return Vec::new();
@@ -3152,6 +3191,9 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                         .entry(id.to_string())
                         .or_default()
                         .push_str(delta);
+                    if !st.announced_tool_calls.contains(id) {
+                        return Vec::new();
+                    }
                     let acc = st.toolcall_args.get(id).unwrap();
                     match serde_json::from_str::<Value>(acc) {
                         Ok(v) => vec![json!({
@@ -3168,42 +3210,103 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 }
                 // The full `arguments` object (the wire `toolCall` field —
                 // `{id, name, arguments}`); clear the partial-args buffer.
+                // If the id was ALREADY announced (a `toolcall_start` with a
+                // name), this is an update. Otherwise (the NATIVE-HARNESS
+                // turn — no `toolcall_start` at all — or a
+                // `toolcall_start` with an empty name) THIS is the
+                // announcement: a `tool_call` frame with the real `title`
+                // (NOT a `tool_call_update`, which has no `title`, so the
+                // frontend would fall back to displaying the `toolCallId`,
+                // e.g. `chatcmpl-tool-…`). A name that never arrived keeps
+                // the legacy update (the degenerate case, no worse than
+                // before).
                 Some("toolcall_end") => {
                     let Some(tc) = ev.get("toolCall") else {
                         return Vec::new();
                     };
-                    let Some(id) = tc.get("id").and_then(Value::as_str) else {
+                    let Some(id) = tc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    else {
                         return Vec::new();
                     };
                     st.toolcall_args.remove(id);
-                    vec![json!({
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": id,
-                        "rawInput": tc.get("arguments"),
-                        "status": "in_progress",
-                    })]
+                    let Some(name) = tc
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return vec![json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": id,
+                            "rawInput": tc.get("arguments"),
+                            "status": "in_progress",
+                        })];
+                    };
+                    if st.announced_tool_calls.contains(id) {
+                        vec![json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": id,
+                            "rawInput": tc.get("arguments"),
+                            "status": "in_progress",
+                        })]
+                    } else {
+                        st.announced_tool_calls.insert(id.to_string());
+                        vec![json!({
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": id,
+                            "title": name,
+                            "status": "in_progress",
+                            "rawInput": tc.get("arguments"),
+                        })]
+                    }
                 }
                 _ => Vec::new(),
             }
         }
-        // The native `tool_execution_start` CARRIES the tool name + args (the
-        // provider already accumulated them — unlike the external pi path,
-        // which streams a `toolcall_start` frame first). Map it to a
-        // `tool_call` frame (with `title` + `rawInput`) so the frontend
-        // creates the tool-call `Message` with the REAL tool name — NOT just
-        // a `tool_call_update` (which has no `title`, so the frontend would
+        // The native `tool_execution_start` CARRIES the tool name + args
+        // (the provider already accumulated them). If the id was ALREADY
+        // announced (a `toolcall_start` with a name, or `toolcall_end` —
+        // the native-harness turn), this is an UPDATE: the frontend applies
+        // `title` / `rawInput` / `status` in place (a second `tool_call`
+        // frame would APPEND a duplicate row). If it was NOT announced (no
+        // `toolcall_*` frames at all — the defensive fallback), THIS is the
+        // announcement: a `tool_call` frame with the real `title` (NOT just
+        // a `tool_call_update`, which has no `title`, so the frontend would
         // fall back to displaying the `toolCallId`, e.g. `chatcmpl-tool-…`).
         RpcEvent::tool_execution_start {
             tool_call_id,
             tool_name,
             args,
-        } => vec![json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": tool_call_id,
-            "title": tool_name,
-            "status": "in_progress",
-            "rawInput": args,
-        })],
+        } => {
+            if st.announced_tool_calls.contains(tool_call_id) {
+                // A `null` `title` is a no-op for the frontend (`update.title
+                // ?? prev.title` keeps the existing title) — never overwrite
+                // a good title with an empty one.
+                let title = if tool_name.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(tool_name.clone())
+                };
+                vec![json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id,
+                    "title": title,
+                    "rawInput": args,
+                    "status": "in_progress",
+                })]
+            } else {
+                st.announced_tool_calls.insert(tool_call_id.clone());
+                vec![json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_call_id,
+                    "title": tool_name,
+                    "status": "in_progress",
+                    "rawInput": args,
+                })]
+            }
+        }
         // `rawOutput` is the tool's result (the RPC `AgentToolResult`): a live
         // partial while the tool runs, final on `tool_execution_end`. It is
         // consumed by the frontend (the `tool-call` `Message` carries it) AND
@@ -4009,6 +4112,134 @@ mod normalize_tests {
             &mut st,
         );
         assert_eq!(end_err[0]["status"], "failed");
+    }
+
+    /// The NATIVE-HARNESS flow (no `toolcall_start` at all — the harness
+    /// emits `toolcall_delta` + `toolcall_end` only): the FIRST frame for
+    /// an id must be a `tool_call` with the real `title` (a
+    /// `tool_call_update` for an id the frontend never saw would create a
+    /// message with `title = toolCallId`, e.g. `chatcmpl-tool-…`), and
+    /// `tool_execution_start` must NOT re-announce (the frontend's
+    /// `tool_call` case always APPENDS — a second `tool_call` frame would
+    /// duplicate the row).
+    #[test]
+    fn native_harness_toolcall_end_announces_single_row() {
+        let mut st = TurnState::default();
+        // `toolcall_delta` (the harness's first frame for the id):
+        // buffer only — NO frame.
+        for delta in ["{\"cmd\":", "\"ls\"}"] {
+            let frames = normalize(
+                &ev(json!({
+                    "type": "message_update",
+                    "usage": null,
+                    "assistantMessageEvent": { "type": "toolcall_delta", "id": "chatcmpl-tool-x", "delta": delta },
+                })),
+                &mut st,
+            );
+            assert!(
+                frames.is_empty(),
+                "an unannounced delta must not emit a frame"
+            );
+        }
+
+        // `toolcall_end` (the name is known here): the ANNOUNCEMENT — a
+        // `tool_call` with the real `title` + the full `rawInput`.
+        let end = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "toolCall": { "id": "chatcmpl-tool-x", "name": "bash", "arguments": { "cmd": "ls" } },
+                },
+            })),
+            &mut st,
+        );
+        assert_eq!(
+            end[0],
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "chatcmpl-tool-x", "title": "bash", "status": "in_progress", "rawInput": { "cmd": "ls" } })
+        );
+
+        // `tool_execution_start` for the ANNOUNCED id: an UPDATE (the
+        // frontend applies `title` / `rawInput` / `status` in place), NOT
+        // a re-announcement.
+        let start = normalize(
+            &ev(
+                json!({ "type": "tool_execution_start", "toolCallId": "chatcmpl-tool-x", "toolName": "bash", "args": { "cmd": "ls" } }),
+            ),
+            &mut st,
+        );
+        assert_eq!(start[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(start[0]["title"], "bash");
+        assert_eq!(start[0]["rawInput"], json!({ "cmd": "ls" }));
+        assert_eq!(start[0]["status"], "in_progress");
+
+        // `tool_execution_end` completes the single row.
+        let done = normalize(
+            &ev(
+                json!({ "type": "tool_execution_end", "toolCallId": "chatcmpl-tool-x", "toolName": "bash", "result": "done", "isError": false }),
+            ),
+            &mut st,
+        );
+        assert_eq!(done[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(done[0]["status"], "completed");
+        assert_eq!(done[0]["rawOutput"], "done");
+    }
+
+    /// An external-pi `toolcall_start` with an EMPTY `toolName` (the
+    /// OpenAI-compatible streaming delivers `function.name` in a LATER
+    /// delta) must NOT announce — the announcement is deferred to
+    /// `toolcall_end` (where the name is known). A `tool_call` frame with
+    /// the empty title would make the frontend display the `toolCallId`
+    /// (e.g. `chatcmpl-tool-…`).
+    #[test]
+    fn empty_toolname_defers_announcement_to_toolcall_end() {
+        let mut st = TurnState::default();
+        let start = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "toolcall_start", "contentIndex": 0, "id": "tc1", "toolName": "" },
+            })),
+            &mut st,
+        );
+        assert!(start.is_empty(), "an empty toolName must not announce");
+
+        let delta = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "toolcall_delta", "contentIndex": 0, "id": "tc1", "delta": "{\"cmd\":\"ls\"}" },
+            })),
+            &mut st,
+        );
+        assert!(delta.is_empty(), "an unannounced id must buffer only");
+
+        let end = normalize(
+            &ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": {
+                    "type": "toolcall_end",
+                    "toolCall": { "id": "tc1", "name": "bash", "arguments": { "cmd": "ls" } },
+                },
+            })),
+            &mut st,
+        );
+        assert_eq!(
+            end[0],
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "tc1", "title": "bash", "status": "in_progress", "rawInput": { "cmd": "ls" } })
+        );
+
+        // `tool_execution_start` for the announced id: an update, not a
+        // re-announcement (no duplicate row).
+        let exec_start = normalize(
+            &ev(
+                json!({ "type": "tool_execution_start", "toolCallId": "tc1", "toolName": "bash", "args": { "cmd": "ls" } }),
+            ),
+            &mut st,
+        );
+        assert_eq!(exec_start[0]["sessionUpdate"], "tool_call_update");
     }
 
     /// The bookkeeping one-liners (stable strings for tests) + the
