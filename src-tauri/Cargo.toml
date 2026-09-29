@@ -27,6 +27,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
+# The on-disk state dirs (`~/.config/archimedes`, `~/.local/share/archimedes`,
+# `~/Library/Application Support/archimedes`, …) — the same crate Tauri uses
+# to resolve the platform base dirs, joined with a bare `archimedes` (NOT
+# the bundle identifier: Tauri's own `config_dir()` / `app_data_dir()`
+# append the identifier, which would give `…/codes.archimedes.desktop`).
+dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "time", "net", "rt"] }

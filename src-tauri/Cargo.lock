@@ -102,6 +102,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "base64 0.22.1",
+ "dirs",
  "futures-util",
  "image",
  "libc",

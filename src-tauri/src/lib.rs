@@ -101,14 +101,26 @@ pub fn run() {
             commands::clipboard::read_clipboard_image
         ])
         .setup(|app| {
-            let config_dir = app
-                .path()
-                .config_dir()
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // The on-disk dirs are named `archimedes` (NOT the bundle
+            // identifier — Tauri's `config_dir()` / `app_data_dir()`
+            // append the identifier, which would give
+            // `…/codes.archimedes.desktop`): `~/.config/archimedes` +
+            // `~/.local/share/archimedes` (Linux), `~/Library/Application
+            // Support/archimedes` (macOS), `%APPDATA%/archimedes` +
+            // `%LOCALAPPDATA%/archimedes` (Windows). `dirs` resolves the
+            // platform base dirs the same way Tauri does; a `None` base
+            // means the platform home is undeterminable — a hard error
+            // (the app has nowhere to persist state).
+            let config_dir = dirs::config_dir()
+                .map(|p| p.join("archimedes"))
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    "could not resolve the platform config dir".into()
+                })?;
+            let app_data_dir = dirs::data_dir().map(|p| p.join("archimedes")).ok_or_else(
+                || -> Box<dyn std::error::Error> {
+                    "could not resolve the platform data dir".into()
+                },
+            )?;
             setup_dirs(app, config_dir, app_data_dir)?;
             // The "Check for updates" menu item asks the webview to run the
             // updater check (the updater plugin lives in the JS context).
