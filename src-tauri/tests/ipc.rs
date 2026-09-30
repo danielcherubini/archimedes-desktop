@@ -75,6 +75,7 @@ fn build_app(
             archimedes_lib::commands::history::delete_session,
             archimedes_lib::commands::settings::get_settings,
             archimedes_lib::commands::settings::save_settings,
+            archimedes_lib::commands::settings::list_models,
             archimedes_lib::commands::spaces::list_agents,
             archimedes_lib::commands::spaces::list_spaces,
             archimedes_lib::commands::spaces::delete_space,
@@ -659,6 +660,86 @@ fn send_prompt_images_ipc() {
 
     // Clean up (best effort).
     drop(app);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&app_data_dir);
+}
+
+/// `list_models` (the effective catalog, ADR 0014): a user provider saved
+/// via `save_settings` is discovered on the NEXT call (a fresh
+/// `settings.json` read — no in-memory sync), and the wire shape is
+/// camelCase (`contextWindow` — the `Model` struct itself is NOT renamed,
+/// so the command returns the `ModelDto` projection; the Value-shape
+/// assertion is the mechanism — `ModelDto` is wire-out-only by design, so
+/// it deliberately has no `Deserialize`).
+#[test]
+fn list_models_discovers_a_saved_user_provider_with_camel_case_shape() {
+    let config_dir = temp_dir("config");
+    let app_data_dir = temp_dir("data");
+    write_agents_json(&config_dir);
+
+    // A local `GET /v1/models` endpoint (multi-accept — the app's
+    // `SessionManager` may fetch more than once). Driven by a background
+    // multi-threaded runtime (the spawned server task keeps running after
+    // `block_on` returns; `drop(runtime)` reaps it).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = runtime.block_on(archimedes_lib::test_support::raw_json_server(
+        listener,
+        200,
+        r#"{"data":[{"id":"m/1","max_model_len":99999}]}"#,
+        None,
+    ));
+
+    let (events_tx, _events_rx) = std::sync::mpsc::channel();
+    let app = build_app(config_dir.clone(), app_data_dir.clone(), events_tx);
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview should build");
+
+    // Save a user provider (a FRESH `settings.json` write).
+    invoke(
+        &webview,
+        "save_settings",
+        serde_json::json!({
+            "settings": {
+                "theme": "dark",
+                "providers": [
+                    { "id": "tama", "name": "Tama", "baseUrl": format!("http://{addr}/v1"), "apiKey": "k" }
+                ]
+            }
+        }),
+    );
+
+    // The next `list_models` discovers it (best-effort over the REAL
+    // command path). The seeded catalog (the real `~/.pi/agent`, if any)
+    // may also be present — assert the discovered entry's presence + its
+    // camelCase shape, not the exact length.
+    let models = invoke(&webview, "list_models", serde_json::json!({}));
+    let arr = models.as_array().expect("list_models returns an array");
+    let found = arr
+        .iter()
+        .find(|m| m["provider"] == "tama" && m["id"] == "m/1")
+        .expect("the discovered user-provider model is in the list: {models}");
+    // The wire shape is camelCase (the `Model` struct is NOT renamed —
+    // the `ModelDto` projection renames explicitly).
+    assert_eq!(found["contextWindow"], 99999);
+    assert!(
+        found.get("context_window").is_none(),
+        "the wire shape must be camelCase, got: {found}"
+    );
+
+    // Clean up (best effort — aborting the server task + dropping the
+    // runtime reap it so the test binary cannot hang).
+    drop(app);
+    server.abort();
+    drop(runtime);
     let _ = std::fs::remove_dir_all(&config_dir);
     let _ = std::fs::remove_dir_all(&app_data_dir);
 }

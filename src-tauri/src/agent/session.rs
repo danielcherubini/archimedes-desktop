@@ -41,13 +41,14 @@ use tokio::sync::{oneshot, watch, Mutex};
 use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
 use crate::agent::errors::RpcError;
 use crate::agent::harness::{
-    discover_models, seed_from_pi_config, AgentLoop, ControlCmd, Model, ModelCatalog,
-    OpenAiCompatibleProvider, Prompt, Provider, ProviderDiscovery, RetryPolicy, SessionStore,
-    SudoDeps,
+    discover_models, merge_catalog, seed_from_pi_config, AgentLoop, ControlCmd, Model,
+    ModelCatalog, OpenAiCompatibleProvider, Prompt, Provider, ProviderDiscovery, RetryPolicy,
+    SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
 };
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
+use crate::commands::settings::load_settings;
 use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
 use tokio::sync::mpsc;
@@ -1692,6 +1693,64 @@ impl SessionManager {
             updated.supports_thinking = st;
         }
         updated
+    }
+
+    /// The effective catalog: the seeded catalog (ADR 0012) + the user's
+    /// providers from `settings.json` (fresh read via `load_settings`),
+    /// discovered via `discover_models` (best-effort; the existing
+    /// per-provider `discovery_cache` — `force_refresh` bypasses the cache
+    /// for provider `force_refresh` when `Some`). A provider whose discovery
+    /// fails contributes 0 models but still shadows the seeded models for
+    /// its id (ADR 0014 — via `merge_catalog`'s `shadowed_provider_ids`).
+    pub async fn effective_catalog(&self, force_refresh: Option<&str>) -> ModelCatalog {
+        let settings = load_settings(&self.config_dir);
+        let mut user_models: Vec<Model> = Vec::new();
+        let mut cache = self.discovery_cache.lock().await;
+        for provider in &settings.providers {
+            let entry = cache
+                .entry(provider.id.clone())
+                .or_insert_with(ProviderDiscovery::default);
+            // `force_refresh` (a provider id) bypasses the cache for that
+            // provider (the settings page's refresh affordance); a failed
+            // re-fetch clears the stale entry (0 models — the provider row
+            // shows `unreachable` + refresh, the stale seeded models stay
+            // shadowed).
+            let bypass = Some(provider.id.as_str()) == force_refresh;
+            if !entry.attempted || bypass {
+                entry.attempted = true;
+                match discover_models(&provider.base_url, &provider.api_key).await {
+                    Ok(models) => entry.models = models,
+                    Err(_) => entry.models.clear(),
+                }
+            }
+            // A discovered model becomes a `Model`: the provider's
+            // `base_url` / `api_key`; `context_window` falls back to
+            // `DEFAULT_CONTEXT_WINDOW` (a user model has no static metadata);
+            // the thinking fields map straight from the `DiscoveredMeta`
+            // (`None` → `vec![]` / `false` — the `refresh_model_metadata`
+            // field-mapping pattern, minus the static-value fallback); v1 is
+            // OpenAI-compatible only (ADR 0012).
+            for (id, meta) in &entry.models {
+                user_models.push(Model {
+                    id: id.clone(),
+                    provider: provider.id.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key.clone(),
+                    context_window: meta.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                    cost_per_mtok_in: 0.0,
+                    cost_per_mtok_out: 0.0,
+                    supports_tools: true,
+                    supports_thinking: meta.supports_thinking.unwrap_or(false),
+                    thinking_levels: meta.thinking_levels.clone().unwrap_or_default(),
+                    api: Some("openai-completions".to_string()),
+                });
+            }
+        }
+        // EVERY configured provider id shadows (regardless of whether its
+        // discovery succeeded — a provider that discovered 0 models still
+        // replaces the stale seeded models for its id, ADR 0014).
+        let shadowed: Vec<String> = settings.providers.iter().map(|p| p.id.clone()).collect();
+        merge_catalog(&self.catalog, &user_models, &shadowed)
     }
 
     /// Attach the persistence database. Sets BOTH `db` (transcript
@@ -4898,6 +4957,182 @@ mod session_tests {
         assert_eq!(degraded.context_window, 128000);
         assert!(!degraded.supports_thinking);
         server.abort();
+    }
+
+    /// Write a `settings.json` with a single user provider (the
+    /// `effective_catalog` tests — the desktop-owned provider store, ADR
+    /// 0014; the camelCase wire shape).
+    fn write_settings_provider(dir: &Path, id: &str, base_url: &str) {
+        let settings = serde_json::json!({
+            "providers": [
+                { "id": id, "name": id, "baseUrl": base_url, "apiKey": "k" }
+            ]
+        });
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A full `Model` literal (the `provider` / `base_url` are
+    /// parameterized — `session.rs` has no `Model` helper of its own).
+    fn provider_model(id: &str, provider: &str, base_url: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: base_url.to_string(),
+            api_key: "k".to_string(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// (ADR 0014) `effective_catalog` discovers a user provider's models
+    /// via `GET {base_url}/models` (a fresh `settings.json` read) and
+    /// maps them onto `Model` rows (the provider's `base_url` / `api_key`;
+    /// `context_window` falls back to `DEFAULT_CONTEXT_WINDOW` when the
+    /// response lacks `max_model_len`).
+    #[tokio::test]
+    async fn effective_catalog_discovers_a_user_provider() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::test_support::raw_json_server(
+            listener,
+            200,
+            r#"{"data":[{"id":"m/1"}]}"#, // no `max_model_len` → the default window
+            None,
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
+        // A seeded catalog under a DIFFERENT provider id (coexists — no
+        // clash).
+        let mut manager = SessionManager::new(dir).unwrap();
+        manager.set_catalog(ModelCatalog {
+            models: vec![provider_model("s/1", "other", "https://other/v1")],
+            ..Default::default()
+        });
+        let effective = manager.effective_catalog(None).await;
+        let user: Vec<&Model> = effective
+            .models
+            .iter()
+            .filter(|m| m.provider == "tama")
+            .collect();
+        assert_eq!(user.len(), 1, "the discovered model is in the catalog");
+        assert_eq!(user[0].id, "m/1");
+        assert_eq!(user[0].api.as_deref(), Some("openai-completions"));
+        assert_eq!(user[0].api_key, "k");
+        assert_eq!(user[0].base_url, format!("http://{addr}/v1"));
+        // The response lacks `max_model_len` → the default window.
+        assert_eq!(user[0].context_window, DEFAULT_CONTEXT_WINDOW);
+        // The seeded model coexists (no id clash).
+        assert!(effective.models.iter().any(|m| m.provider == "other"));
+        server.abort();
+    }
+
+    /// (ADR 0014) A provider whose discovery FAILS (unreachable endpoint)
+    /// still SHADOWS the seeded models for its id (a transient failure
+    /// must not resurrect stale seeded models under the same id).
+    #[tokio::test]
+    async fn effective_catalog_a_failed_discovery_still_shadows_the_seeded_provider() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        write_settings_provider(&dir, "tama", "http://127.0.0.1:1/v1"); // unreachable
+        let mut manager = SessionManager::new(dir).unwrap();
+        manager.set_catalog(ModelCatalog {
+            models: vec![
+                provider_model("stale/1", "tama", "https://stale/v1"),
+                provider_model("q/1", "q", "https://q/v1"),
+            ],
+            default_model: Some("tama/stale/1".to_string()),
+            ..Default::default()
+        });
+        let effective = manager.effective_catalog(None).await;
+        assert!(
+            !effective.models.iter().any(|m| m.provider == "tama"),
+            "a failed discovery must NOT resurrect the stale seeded models"
+        );
+        // A non-shadowed provider's seeded models survive.
+        assert!(effective.models.iter().any(|m| m.provider == "q"));
+        // The seeded default belonged to the shadowed provider → `None`.
+        assert_eq!(effective.default_model, None);
+    }
+
+    /// (ADR 0014) The discovery is CACHED per provider (a second
+    /// `effective_catalog` is not re-fetched), and a `force_refresh` for
+    /// the provider BYPASSES the cache (a fresh fetch overwrites the
+    /// entry — even a re-pointed `base_url` is honored, the `settings.json`
+    /// read is fresh).
+    #[tokio::test]
+    async fn effective_catalog_caches_and_force_refresh_bypasses_the_cache() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::test_support::raw_json_server(
+            listener,
+            200,
+            r#"{"data":[{"id":"v1"}]}"#,
+            Some(counter.clone()),
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.set_catalog(ModelCatalog::default());
+        let first = manager.effective_catalog(None).await;
+        assert!(first.models.iter().any(|m| m.id == "v1"));
+        // Second call: the cache serves it (the server is NOT hit again).
+        let second = manager.effective_catalog(None).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second call must be cache-served"
+        );
+        assert!(second.models.iter().any(|m| m.id == "v1"));
+        // A `force_refresh` for the provider bypasses the cache (a fresh
+        // fetch overwrites the entry — a NEW response body is asserted via
+        // the counter-driven flow: re-point the provider at a second
+        // listener serving `v2`).
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = crate::test_support::raw_json_server(
+            listener2,
+            200,
+            r#"{"data":[{"id":"v2"}]}"#,
+            Some(counter.clone()),
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr2}/v1"));
+        let refreshed = manager.effective_catalog(Some("tama")).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the force refresh must re-fetch"
+        );
+        assert!(refreshed.models.iter().any(|m| m.id == "v2"));
+        assert!(!refreshed.models.iter().any(|m| m.id == "v1"));
+        server.abort();
+        server2.abort();
     }
 
     /// A `Provider` whose `complete` blocks until signalled (the stream

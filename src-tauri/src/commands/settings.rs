@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
+use crate::agent::harness::Model;
 use crate::agent::SessionManager;
 
 /// A user-managed LLM provider.
@@ -173,6 +174,50 @@ pub async fn save_settings(
     .map_err(|e| e.to_string())
 }
 
+/// The effective catalog's models (the frontend's Default-model select +
+/// the provider rows' discovery status).
+/// `force_refresh` = a provider id whose discovery cache entry is bypassed
+/// (the settings page's refresh affordance); `None` = cached.
+#[tauri::command]
+pub async fn list_models(
+    state: State<'_, Arc<SessionManager>>,
+    force_refresh: Option<String>,
+) -> Result<Vec<ModelDto>, String> {
+    Ok(state
+        .effective_catalog(force_refresh.as_deref())
+        .await
+        .models
+        .iter()
+        .map(ModelDto::from)
+        .collect())
+}
+
+/// The camelCase wire shape (the `Model` struct itself is NOT renamed —
+/// `capabilities_json` embeds composed keys, not `Model`, so a DTO here
+/// is the safe choice over renaming the struct). Wire-out-only by design
+/// (no `Deserialize` — the command only returns it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDto {
+    pub id: String,
+    pub provider: String,
+    pub context_window: u32,
+    pub supports_thinking: bool,
+    pub thinking_levels: Vec<String>,
+}
+
+impl From<&Model> for ModelDto {
+    fn from(m: &Model) -> Self {
+        Self {
+            id: m.id.clone(),
+            provider: m.provider.clone(),
+            context_window: m.context_window,
+            supports_thinking: m.supports_thinking,
+            thinking_levels: m.thinking_levels.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +334,36 @@ mod tests {
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "light");
         assert_eq!(back.pane_layout["chatWidth"], 480);
+    }
+
+    #[test]
+    fn list_models_dto_mapping() {
+        // The `Model` struct itself is NOT `#[serde(rename_all)]` (it is
+        // embedded in composed `capabilities_json` keys), so the
+        // `list_models` command returns the explicit camelCase `ModelDto`
+        // projection — the serialized output must carry `contextWindow`
+        // (NOT `context_window`).
+        let model = crate::agent::harness::Model {
+            id: "m/1".into(),
+            provider: "tama".into(),
+            base_url: "https://tama.wizards.town/v1".into(),
+            api_key: "k".into(),
+            context_window: 99999,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: true,
+            thinking_levels: vec!["low".to_string()],
+            api: Some("openai-completions".into()),
+        };
+        let dto = ModelDto::from(&model);
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(v["id"], "m/1");
+        assert_eq!(v["provider"], "tama");
+        assert_eq!(v["contextWindow"], 99999);
+        assert_eq!(v["supportsThinking"], true);
+        assert_eq!(v["thinkingLevels"], serde_json::json!(["low"]));
+        // NOT snake_case on the wire.
+        assert!(v.get("context_window").is_none());
     }
 }
