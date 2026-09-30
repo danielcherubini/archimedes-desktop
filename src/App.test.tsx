@@ -27,6 +27,7 @@ vi.mock("./lib/tauri", async () => {
       defaultModel: null,
       providers: [],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     listAgents: vi.fn().mockResolvedValue([]),

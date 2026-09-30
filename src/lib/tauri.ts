@@ -340,6 +340,8 @@ export interface AppSettings {
   defaultModel: string | null;
   providers: ProviderConfig[];
   font: FontSettings;
+  /** Per-model remembered thinking level (ADR 0015): `"<provider>/<id>"` → the last level the user set for that model. */
+  defaultThinkingLevels: Record<string, string>;
 }
 
 /** The effective catalog's model (the Default-model select + provider discovery status). */

@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import SettingsPage from "./SettingsPage";
 import {
+  getSettings,
   listModels,
   saveSettings,
   type AppSettings,
@@ -19,6 +20,7 @@ const baseSettings: AppSettings = {
     { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
   ],
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
+  defaultThinkingLevels: {},
 };
 
 vi.mock("../../lib/tauri", async () => {
@@ -37,6 +39,7 @@ vi.mock("../../lib/tauri", async () => {
         { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
       ],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
     }),
     listAgents: vi.fn().mockResolvedValue([
       { id: "pi", name: "Pi" },
@@ -214,5 +217,26 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
         expect.objectContaining({ defaultModel: null }),
       ),
     );
+  });
+
+  it("the_update_round_trip_preserves_the_default_thinking_levels", async () => {
+    // (ADR 0015) The loaded document remembers a per-model thinking level
+    // (`"<provider>/<id>"` → level).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultThinkingLevels: { "tama/Qwen3.8": "xhigh" },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // ANY update (theme → Light) = one save of the complete document.
+    fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
+    const trigger = await screen.findByRole("combobox", { name: "Theme" });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("option", { name: "Light" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    // The `{ ...settings, ...patch }` round-trip loses no field — the
+    // per-model memory rides along untouched (no new UI, ADR 0015).
+    expect(saved.defaultThinkingLevels).toEqual({ "tama/Qwen3.8": "xhigh" });
   });
 });

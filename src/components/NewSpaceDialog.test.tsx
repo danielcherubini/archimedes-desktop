@@ -14,6 +14,7 @@ const baseSettings: AppSettings = {
   defaultModel: null,
   providers: [],
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
+  defaultThinkingLevels: {},
 };
 
 // Mock the Tauri IPC layer: the agent picker's data source is `list_agents`
@@ -34,6 +35,7 @@ vi.mock("../lib/tauri", async () => {
       defaultModel: null,
       providers: [],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
     }),
     listAgents: vi.fn().mockResolvedValue([
       { id: "pi", name: "Pi" },

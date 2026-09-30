@@ -24,6 +24,7 @@ vi.mock("../lib/tauri", async () => {
       defaultModel: null,
       providers: [],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
     }),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "new1",
