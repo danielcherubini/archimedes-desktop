@@ -26,7 +26,6 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-updater = "2"
 # The on-disk state dirs (`~/.config/archimedes`, `~/.local/share/archimedes`,
 # `~/Library/Application Support/archimedes`, …) — the same crate Tauri uses
 # to resolve the platform base dirs, joined with a bare `archimedes` (NOT

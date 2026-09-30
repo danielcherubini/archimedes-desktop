@@ -1,6 +1,4 @@
 import { useEffect } from "react";
-import { ask, message } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
 import {
   listenBridgeEvent,
   listenBridgeRequest,
@@ -13,7 +11,6 @@ import {
   listSessions,
   listSpaces,
 } from "./lib/tauri";
-import { checkForUpdate, installUpdate } from "./lib/updater";
 import { createBatchedSessionUpdate } from "./lib/batchSessionUpdates";
 import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
@@ -22,6 +19,7 @@ import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 import SidePane from "./components/SidePane";
+import WindowControls from "./components/WindowControls";
 import SubagentDetailHost from "./components/SubagentDetailHost";
 
 function App() {
@@ -169,43 +167,30 @@ function App() {
       );
   }, []);
 
-  // The "Check for updates" menu item (Rust side) emits this event; the
-  // updater plugin runs in the JS context, so the check happens here.
-  useEffect(() => {
-    const pending = listen("update-check-requested", async () => {
-      try {
-        const { available, version, currentVersion } = await checkForUpdate();
-        if (!available) {
-          await message(`You're up to date (v${currentVersion ?? "unknown"}).`);
-          return;
-        }
-        const ok = await ask(
-          `Version ${version} is available (you have v${currentVersion ?? "?"}). Install now?`,
-          { title: "Update available", kind: "info" },
-        );
-        if (!ok) return;
-        await installUpdate();
-        await message("Update installed — restart the app to run the new version.");
-      } catch (err) {
-        console.error("update check failed", err);
-      }
-    });
-    return () => {
-      pending.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, []);
-
   return (
-    <div className="flex h-screen w-screen bg-background text-foreground">
-      <SpacesList />
-      <ChatStream />
-      <SidePane />
-      {/* The dedicated subagent transcript view (Task 5): the single
-          ALWAYS-MOUNTED host — the visible modal for the selected
-          subagent + a hidden `SubagentTranscript` for every other one
-          (a `fixed` overlay, so its position in the flex row does not
-          affect layout). */}
-      <SubagentDetailHost />
+    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl bg-background text-foreground">
+      {/* Frameless window chrome (the window is `decorations: false` in
+          tauri.conf.json, so this bar replaces the native titlebar). The left
+          region is the drag area — `data-tauri-drag-region` moves the window;
+          the controls sit OUTSIDE it so a click on a button never starts a
+          drag. */}
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-background pr-2 pl-3">
+        <div data-tauri-drag-region className="flex h-full flex-1 items-center">
+          <span className="text-ui-caption text-foreground-subtle">Archimedes</span>
+        </div>
+        <WindowControls />
+      </div>
+      <div className="flex min-h-0 flex-1">
+        <SpacesList />
+        <ChatStream />
+        <SidePane />
+        {/* The dedicated subagent transcript view (Task 5): the single
+            ALWAYS-MOUNTED host — the visible modal for the selected
+            subagent + a hidden `SubagentTranscript` for every other one
+            (a `fixed` overlay, so its position in the flex row does not
+            affect layout). */}
+        <SubagentDetailHost />
+      </div>
     </div>
   );
 }
