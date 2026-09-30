@@ -7,17 +7,26 @@
 # One-time setup (system packages, NOT done by `setup`):
 #   - Rust >= 1.88, Node >= 22.19
 #   - Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-#     (on Fedora the webkit2gtk build additionally needs NO_STRIP=1 —
-#     see README)
 #
 # `build` (release) signs the updater artifacts: it needs
 # TAURI_SIGNING_PRIVATE_KEY_PATH pointing at the secret key (a clean
 # single-line base64 file — no trailing newline) and prompts for the
-# key password.
+# key password. On Fedora (41+) it also auto-sets NO_STRIP=1 — the
+# AppImage bundling step (linuxdeploy) fails there because the old
+# `strip` frozen inside the linuxdeploy AppImage can't parse the newer
+# `.relr.dyn` ELF sections in Fedora's system libraries (see README);
+# override with `make build NO_STRIP=` (force off) or `NO_STRIP=1` (force on).
 
 PNPM     := pnpm
 CARGO    := cargo
 RUST_DIR := src-tauri
+
+# The Fedora AppImage workaround (see header): auto-detected from
+# /etc/os-release. A command-line `NO_STRIP=…` always wins (GNU make
+# gives command-line variables precedence over this `?=`), and the var
+# is only exported when NON-EMPTY — a non-Fedora build is untouched
+# regardless of how Tauri interprets an empty value.
+NO_STRIP ?= $(shell grep -q '^ID=fedora' /etc/os-release 2>/dev/null && echo 1)
 
 .DEFAULT_GOAL := help
 
@@ -66,8 +75,8 @@ fmt-check: ## Rust format check (the CI gate)
 # ── Release ───────────────────────────────────────────────────────────
 
 .PHONY: build
-build: ## Release build → src-tauri/target/release/bundle/ (signs the updater artifacts; prompts for the key password)
-	$(PNPM) tauri build
+build: ## Release build → src-tauri/target/release/bundle/ (signs the updater artifacts; prompts for the key password; auto NO_STRIP=1 on Fedora)
+	$(if $(NO_STRIP),NO_STRIP=$(NO_STRIP) ,)$(PNPM) tauri build
 
 .PHONY: clean
 clean: ## Remove build artifacts (cargo target + dist)
