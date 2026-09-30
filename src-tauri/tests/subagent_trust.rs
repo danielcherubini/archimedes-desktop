@@ -116,7 +116,9 @@ fn trusted_fixture(trusted: bool) -> (PathBuf, PathBuf, String, Arc<Db>) {
     write_agents_gate(&config_dir);
     let (cwd, cwd_str) = temp_cwd("subagent-trust-cwd");
     let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
-    db.upsert_space(&cwd_str)
+    // `false` (the pre-change behavior — the row is born untrusted; the
+    // settings flag is threaded only by `record_session`).
+    db.upsert_space(&cwd_str, false)
         .expect("upsert_space should succeed");
     db.set_space_trusted(&cwd_str, trusted)
         .expect("set_space_trusted should succeed");

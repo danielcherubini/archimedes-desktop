@@ -299,9 +299,11 @@ fn spaces_upsert_find_delete_and_order() {
         "a fresh db has no spaces"
     );
 
-    db.upsert_space("/tmp/pa").expect("upsert_space /tmp/pa");
+    db.upsert_space("/tmp/pa", false)
+        .expect("upsert_space /tmp/pa");
     std::thread::sleep(std::time::Duration::from_millis(5));
-    db.upsert_space("/tmp/pb").expect("upsert_space /tmp/pb");
+    db.upsert_space("/tmp/pb", false)
+        .expect("upsert_space /tmp/pb");
 
     let spaces = db.list_spaces().expect("list_spaces");
     assert_eq!(spaces.len(), 2, "exactly two spaces should be stored");
@@ -314,7 +316,7 @@ fn spaces_upsert_find_delete_and_order() {
 
     // A re-touch wins the ordering.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    db.upsert_space("/tmp/pa")
+    db.upsert_space("/tmp/pa", false)
         .expect("upsert_space /tmp/pa again");
     let spaces = db.list_spaces().expect("list_spaces");
     assert_eq!(
@@ -334,7 +336,7 @@ fn spaces_upsert_find_delete_and_order() {
     assert_eq!(spaces[0].path, "/tmp/pa");
     let pa_before = spaces[0].clone();
     std::thread::sleep(std::time::Duration::from_millis(5));
-    db.upsert_space("/tmp/pb")
+    db.upsert_space("/tmp/pb", false)
         .expect("upsert_space /tmp/pb again");
     let spaces = db.list_spaces().expect("list_spaces");
     assert_eq!(
@@ -459,7 +461,7 @@ fn spaces_trusted_column_fresh_and_migrated() {
         .to_string();
     let fresh = temp_db_path();
     let db = Db::open(&fresh).expect("db should open");
-    db.upsert_space(&p).expect("upsert_space");
+    db.upsert_space(&p, false).expect("upsert_space");
     assert!(
         !db.space_trusted(Path::new(&p)).expect("space_trusted"),
         "a just-upserted space is untrusted by default"
@@ -533,7 +535,7 @@ fn set_space_trusted_updates_and_flag_reads() {
         .display()
         .to_string();
 
-    db.upsert_space(&p).expect("upsert_space");
+    db.upsert_space(&p, false).expect("upsert_space");
     assert!(
         db.set_space_trusted(&p, true)
             .expect("set_space_trusted true"),
@@ -602,7 +604,7 @@ fn space_methods_agree_on_the_canonical_key() {
 
     // A write via the symlink path keys the row by the CANONICAL path —
     // never by the raw (non-canonical) string.
-    db.upsert_space(&link.display().to_string())
+    db.upsert_space(&link.display().to_string(), false)
         .expect("upsert via symlink");
     let canonical = std::fs::canonicalize(&real).expect("canonical");
     let cp = canonical.display().to_string();

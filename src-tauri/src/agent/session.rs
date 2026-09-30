@@ -1831,10 +1831,17 @@ impl SessionManager {
     fn record_session(&self, info: &SessionInfo) {
         if let Some(db) = &self.driver.db {
             let _ = db.record_session(info);
-            // A start/resume updates or creates the space row (and `resume`
-            // re-touches `last_opened_at`): a space is born/touched when a
-            // conversation starts or resumes in it.
-            let _ = db.upsert_space(&info.cwd.display().to_string());
+            // (settings) A start/resume updates or creates the space row
+            // (and `resume` re-touches `last_opened_at`): a space is
+            // born/touched when a conversation starts or resumes in it.
+            // A NEW row is born `trusted` per the settings'
+            // `default_trust_new_spaces` (the sync `load_settings` —
+            // `record_session` is sync); the CONFLICT branch never touches
+            // an existing row's flag (no retroactive trust).
+            let _ = db.upsert_space(
+                &info.cwd.display().to_string(),
+                load_settings(&self.config_dir).default_trust_new_spaces,
+            );
         }
     }
 
@@ -1896,14 +1903,20 @@ impl SessionManager {
         let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
             error: "the native entry has no harness config".to_string(),
         })?;
-        // The model: the stored `model` (a composed key → the catalog);
-        // an absent / stale key falls back to the harness / catalog
-        // default (never a hard error — the transcript still loads).
+        // The model: the stored `model` (a composed key → the EFFECTIVE
+        // catalog — a user-provider model resolves); an absent / stale key
+        // falls back to the resolution chain (the harness / the settings /
+        // the catalog default — never a hard error; the transcript still
+        // loads).
+        let catalog = self.effective_catalog(None).await;
+        let settings = load_settings(&self.config_dir);
         let model = caps
             .get("model")
             .and_then(Value::as_str)
-            .and_then(|key| resolve_composed_model(&self.catalog, key))
-            .or_else(|| resolve_native_model(&self.catalog, &harness.default_model).ok());
+            .and_then(|key| resolve_composed_model(&catalog, key))
+            .or_else(|| {
+                resolve_native_model(&catalog, &harness.default_model, &settings.default_model).ok()
+            });
         let Some(model) = model else {
             return Err(RpcError::Command {
                 error: "no models available for the native session".to_string(),
@@ -1952,16 +1965,26 @@ impl SessionManager {
                 ),
             });
         }
-        // The model: the harness's `default_model` (a composed key) → the
-        // catalog; `None` (the built-in) → the catalog's default → the
-        // v1-selectable (`openai_compatible`) set. A resume overrides it
-        // with the stored model (see `resume_native_session`).
+        // The EFFECTIVE catalog (Task 2 — the seeded catalog + the user's
+        // providers, a fresh `load_settings` read; the per-provider
+        // `discovery_cache` makes the fetch cheap): the model resolution,
+        // the `AgentLoop`'s catalog, and the synthesized config options
+        // all run against it (a user-provider model is selectable +
+        // switchable in-session).
+        let catalog = self.effective_catalog(None).await;
+        // The model: the resolution chain (the harness's `default_model`
+        // → the `Settings.default_model` (a fresh `load_settings` read)
+        // → the catalog's `default_model` → the v1-selectable
+        // (`openai_compatible`) set — an unresolvable key at any rung
+        // falls through to the next rung). A resume overrides it with the
+        // stored model (see `resume_native_session`).
+        let settings = load_settings(&self.config_dir);
         let is_resume = resume.is_some();
         let (session_id, model, thinking_level) = match resume {
             Some((id, model, level)) => (id.to_string(), model.clone(), level),
             None => (
                 uuid::Uuid::new_v4().to_string(),
-                resolve_native_model(&self.catalog, &harness.default_model)?,
+                resolve_native_model(&catalog, &harness.default_model, &settings.default_model)?,
                 harness.default_thinking_level.clone(),
             ),
         };
@@ -1997,7 +2020,7 @@ impl SessionManager {
             cwd.clone(),
             model.clone(),
             provider,
-            self.catalog.clone(),
+            catalog.clone(),
             store.clone(),
             events_tx,
             cancel.clone(),
@@ -2072,7 +2095,7 @@ impl SessionManager {
                 cwd: cwd.clone(),
                 capabilities: native_capabilities(&state.model, state.thinking_level.as_deref()),
                 config_options: synthesize_catalog_config_options(
-                    &self.catalog,
+                    &catalog,
                     &state.model,
                     state.thinking_level.as_deref(),
                 ),
@@ -2161,6 +2184,9 @@ impl SessionManager {
 
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
+        // The `config_dir` is captured into the establisher closure (a
+        // `PathBuf` — cloned; the closure is `move`).
+        let config_dir = self.config_dir.clone();
 
         let info = self
             .driver
@@ -2173,6 +2199,32 @@ impl SessionManager {
                 bridge_setup,
                 None,
                 move |handle: PiRpcHandle| async move {
+                    // The default model (settings): a validly-shaped
+                    // `default_model` (a `"provider/id"` split — the CATALOG
+                    // is NOT consulted: pi's own `get_available_models` is
+                    // the real source for an external session, and a model
+                    // pi doesn't know about is rejected by pi) → `set_model`
+                    // sent BEFORE the first `get_state` (LENIENT — a failure
+                    // is logged and the session establishes on pi's own
+                    // default; an absent/unset setting sends nothing). The
+                    // `get_state` response then reflects the applied model
+                    // (`build_capabilities` picks up `state.model`).
+                    if let Some(key) = load_settings(&config_dir).default_model {
+                        if let Some((provider, model_id)) = key.split_once('/') {
+                            if let Err(e) = handle
+                                .send(json!({
+                                    "type": "set_model",
+                                    "provider": provider,
+                                    "modelId": model_id
+                                }))
+                                .await
+                            {
+                                eprintln!(
+                                    "settings default model: set_model failed at start: {e} (establishing on pi's default)"
+                                );
+                            }
+                        }
+                    }
                     // The establisher: `get_state` (the session's identity)
                     // + the config-option sources (models / levels —
                     // lenient: a missing source just means no selectors).
@@ -2693,6 +2745,11 @@ impl SessionManager {
                         error: "no config options available".to_string(),
                     });
                 };
+                // The EFFECTIVE catalog (Task 2 — the seeded catalog +
+                // the user's providers): the model lookup + the re-
+                // synthesizer run against it (a user-provider model can
+                // be switched TO mid-session, not just the seeded ones).
+                let catalog = self.effective_catalog(None).await;
                 // Apply (the loop's control channel — `AgentLoop::set_model`
                 // / `set_thinking_level` on the loop task) + mirror the
                 // change on the handle's config state (the re-synthesizer
@@ -2711,8 +2768,7 @@ impl SessionManager {
                                         "invalid model value: {value} (expected provider/modelId)"
                                     ),
                                 })?;
-                        let model = self
-                            .catalog
+                        let model = catalog
                             .models
                             .iter()
                             .find(|m| m.provider == provider && m.id == model_id)
@@ -2754,7 +2810,7 @@ impl SessionManager {
                 // `config_option_update` itself — the client owns the frame).
                 let state = state.lock().unwrap_or_else(|p| p.into_inner());
                 let options = synthesize_catalog_config_options(
-                    &self.catalog,
+                    &catalog,
                     &state.model,
                     state.thinking_level.as_deref(),
                 )
@@ -2923,15 +2979,26 @@ pub(crate) fn resolve_composed_model(catalog: &ModelCatalog, key: &str) -> Optio
 }
 
 /// Resolve a native session's model (the harness's `default_model` composed
-/// key → the catalog; `None` (the built-in) → the catalog's default → the
-/// v1-selectable (`openai_compatible`) set — a stale configured default
-/// degrades to the set rather than a hard error).
+/// key → the catalog; `None` (the built-in) → the `Settings.default_model`
+/// (the middle rung — a fresh `load_settings` read) → the catalog's
+/// `default_model` → the v1-selectable (`openai_compatible`) set). Each rung
+/// is tried IN ORDER: an UNRESOLVABLE key at any rung falls through to the
+/// NEXT rung (only when all three rungs are absent/unresolvable does it fall
+/// to the set) — a stale configured default degrades rather than a hard
+/// error.
 fn resolve_native_model(
     catalog: &ModelCatalog,
-    default: &Option<String>,
+    harness_default: &Option<String>,
+    settings_default: &Option<String>,
 ) -> Result<Model, RpcError> {
-    let key = default.as_deref().or(catalog.default_model.as_deref());
-    if let Some(key) = key {
+    for key in [
+        harness_default.as_deref(),
+        settings_default.as_deref(),
+        catalog.default_model.as_deref(),
+    ]
+    .iter()
+    .flatten()
+    {
         if let Some(model) = resolve_composed_model(catalog, key) {
             return Ok(model);
         }
@@ -4792,6 +4859,62 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Write a `settings.json` with the given `defaultModel` (the
+    /// camelCase wire shape — `None` = the key present-but-null, which
+    /// parses to `default_model: None`).
+    fn write_settings_default_model(dir: &Path, default_model: Option<&str>) {
+        let settings = serde_json::json!({ "defaultModel": default_model });
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// (settings) an EXTERNAL session started with a validly-shaped
+    /// `Settings.default_model` (a `"provider/id"` split) gets a
+    /// `set_model` sent BEFORE the first `get_state` (LENIENT — a failure
+    /// is logged and the session establishes on pi's own default; an
+    /// absent/unset setting sends nothing): the `get_state`-based
+    /// `info.capabilities.model` reflects the applied model (`fake_pi`'s
+    /// `set_model` handler updates `current_model_id` and its
+    /// `get_state` response substitutes it).
+    #[tokio::test]
+    async fn an_external_session_start_sends_set_model_for_the_settings_default() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        write_settings_default_model(&dir, Some("fake/fake-model-2"));
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["model"], "fake/fake-model-2",
+            "the settings default model is applied before the first get_state"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // The negative: NO `defaultModel` → no `set_model` sent → the
+        // session establishes on pi's own default.
+        write_settings_default_model(&dir, None);
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["model"], "fake/fake-model",
+            "an absent settings default sends no set_model (pi's own default)"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Native-backend tests (the in-process `AgentLoop` — a NATIVE
     // registry entry + a mock `provider_factory` seam; the production
     // default is `OpenAiCompatibleProvider`) ──
@@ -4873,6 +4996,125 @@ mod session_tests {
         sink: &Arc<dyn EventSink>,
     ) -> (SessionManager, SessionInfo) {
         start_native_session_with(dir, sink, |_m: &Model| Box::new(HangingProvider)).await
+    }
+
+    /// A full `Model` literal for the `resolve_native_model` chain test
+    /// (`base_url` EMPTY so `refresh_model_metadata` is a no-op — no
+    /// network; `openai-completions` so the model is v1-selectable).
+    fn chain_test_model(provider: &str, id: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            api_key: "k".to_string(),
+            context_window: 128000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// Write an `agents.json` with a single NATIVE entry whose harness
+    /// `default_model` is `harness_default` (`None` = the built-in).
+    fn write_agents_json_native_with_default(dir: &Path, harness_default: Option<&str>) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": {
+                    "provider": "openai-compatible",
+                    "default_model": harness_default,
+                },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// (settings chain) the native model resolution chain: per-agent
+    /// `HarnessConfig.default_model` > `Settings.default_model` (the new
+    /// MIDDLE rung — a fresh `load_settings` read) > the catalog's
+    /// `default_model` > the v1-selectable (`openai_compatible`) set. An
+    /// UNRESOLVABLE key at any rung falls through to the NEXT rung (the
+    /// settings rung is tried BEFORE the catalog default — not skipped).
+    #[tokio::test]
+    async fn the_native_model_chain_settings_default_sits_between_per_agent_and_catalog() {
+        let catalog = ModelCatalog {
+            models: vec![
+                chain_test_model("s", "m1"),
+                chain_test_model("c", "m2"),
+                chain_test_model("h", "m3"),
+            ],
+            default_model: Some("c/m2".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        // Phase 1: harness `None` + settings `s/m1` → the settings rung
+        // wins (it sits between the per-agent and the catalog default).
+        write_agents_json_native_with_default(&dir, None);
+        write_settings_default_model(&dir, Some("s/m1"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "s/m1",
+            "the settings default sits between the per-agent and the catalog default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // Phase 2: harness `h/m3` (in the catalog) + settings `s/m1` →
+        // the per-agent rung wins.
+        write_agents_json_native_with_default(&dir, Some("h/m3"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "h/m3",
+            "the per-agent default wins over the settings default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // Phase 3: harness `None` + settings `gone/m1` (NOT in the
+        // catalog) → the unresolvable settings key falls through to the
+        // CATALOG DEFAULT rung (not straight to the v1-selectable set).
+        write_agents_json_native_with_default(&dir, None);
+        write_settings_default_model(&dir, Some("gone/m1"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "c/m2",
+            "an unresolvable settings key degrades to the catalog default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (live `/v1/models` discovery) `refresh_model_metadata` applies the
