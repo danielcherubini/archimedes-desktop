@@ -10,6 +10,7 @@ import {
   ShieldCheckIcon,
   ShieldIcon,
   SparklesIcon,
+  SettingsIcon,
 } from "lucide-react";
 import { closeSession } from "../lib/tauri";
 import {
@@ -57,7 +58,14 @@ function titleFor(messages: Message[] | undefined, spaceName: string): string {
   return firstUser.text.length > 80 ? firstUser.text.slice(0, 80) : firstUser.text;
 }
 
-export default function SpacesList() {
+export default function SpacesList({
+  onOpenSettings,
+}: {
+  // Optional — the gear icon (the footer's bottom-right entry point into
+  // the settings page) only fires the callback when the parent supplies
+  // one; the button itself always renders.
+  onOpenSettings?: () => void;
+}) {
   const spaces = useSessions((s) => s.spaces);
   const sessions = useSessions((s) => s.sessions);
   const historySessions = useSessions((s) => s.historySessions);
@@ -201,6 +209,19 @@ export default function SpacesList() {
       {skillsOpen && (
         <SkillsDialog skills={skills} onClose={() => setSkillsOpen(false)} />
       )}
+      {/* The footer (the ZCode `WorkspaceSidebarFooter` position — bottom
+          right): the gear icon opens the settings page as a full
+          content-area view (the parent swaps the workspace out). */}
+      <div className="flex justify-end border-t border-border/50 p-2">
+        <button
+          type="button"
+          aria-label="Settings"
+          onClick={() => onOpenSettings?.()}
+          className="rounded-md size-6 hover:bg-surface-hover"
+        >
+          <SettingsIcon className="size-4" />
+        </button>
+      </div>
     </aside>
   );
 }

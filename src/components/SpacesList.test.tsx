@@ -611,6 +611,23 @@ describe("SpacesList", () => {
     expect(mockedListSkills).toHaveBeenCalledTimes(1);
   });
 
+  it("the_gear_icon_opens_settings", () => {
+    const onOpenSettings = vi.fn();
+    render(<SpacesList onOpenSettings={onOpenSettings} />);
+    // The footer's gear icon (bottom right, the `SpaceGroup` hover-action
+    // button pattern) exists and fires the callback.
+    const gear = screen.getByRole("button", { name: "Settings" });
+    expect(gear).toBeTruthy();
+    fireEvent.click(gear);
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    // Without the prop (the existing tests' shape) the button still
+    // renders (the optional prop is guarded with `onOpenSettings?.()`).
+    const second = render(<SpacesList />);
+    expect(
+      second.container.querySelector('button[aria-label="Settings"]'),
+    ).not.toBeNull();
+  });
+
   it("the_skills_modal_shows_the_empty_state_when_there_are_no_skills", async () => {
     // `clearAllMocks` PRESERVES the factory's 1-skill implementation, so
     // override it here. Declared LAST so the override cannot leak into

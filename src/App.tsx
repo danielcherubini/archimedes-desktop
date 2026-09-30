@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   listenBridgeEvent,
   listenBridgeRequest,
@@ -21,6 +21,7 @@ import ChatStream from "./components/ChatStream";
 import SidePane from "./components/SidePane";
 import WindowControls from "./components/WindowControls";
 import SubagentDetailHost from "./components/SubagentDetailHost";
+import SettingsPage from "./components/settings/SettingsPage";
 
 function App() {
   // Register the Tauri event listeners once; dispatch into the stores.
@@ -156,6 +157,16 @@ function App() {
   // every session survives a restart). `setSpaces` auto-selects (Task 5)
   // the recent landing for boot. No listener changes: close reasons flow
   // through the existing `handleSessionClosed`).
+  //
+  // The content-area view: the workspace (the default) OR the settings
+  // page (opened from the `SpacesList`'s gear icon). While settings is
+  // open the workspace UNMOUNTS (the ZCode `opacity-0` + `inert` pattern
+  // is for keeping the workspace MOUNTED — the stores are the source of
+  // truth and re-hydrate on remount, so the simpler unmount is used): a
+  // session running in the background keeps streaming into the stores
+  // (the listener `useEffect`s above are view-independent), and the
+  // `SpacesList` / `ChatStream` / `SidePane` re-read them on remount.
+  const [view, setView] = useState<"workspace" | "settings">("workspace");
   useEffect(() => {
     Promise.all([listSessions(), listSpaces()])
       .then(([rows, spaces]) => {
@@ -181,15 +192,24 @@ function App() {
         <WindowControls />
       </div>
       <div className="flex min-h-0 flex-1">
-        <SpacesList />
-        <ChatStream />
-        <SidePane />
-        {/* The dedicated subagent transcript view (Task 5): the single
-            ALWAYS-MOUNTED host — the visible modal for the selected
-            subagent + a hidden `SubagentTranscript` for every other one
-            (a `fixed` overlay, so its position in the flex row does not
-            affect layout). */}
-        <SubagentDetailHost />
+        {view === "settings" ? (
+          // Full width — the `SpacesList` is NOT rendered in the settings
+          // view (the `SettingsPage`'s own 268px section sidebar is the
+          // left edge).
+          <SettingsPage onBack={() => setView("workspace")} />
+        ) : (
+          <>
+            <SpacesList onOpenSettings={() => setView("settings")} />
+            <ChatStream />
+            <SidePane />
+            {/* The dedicated subagent transcript view (Task 5): the single
+                ALWAYS-MOUNTED host — the visible modal for the selected
+                subagent + a hidden `SubagentTranscript` for every other one
+                (a `fixed` overlay, so its position in the flex row does not
+                affect layout). */}
+            <SubagentDetailHost />
+          </>
+        )}
       </div>
     </div>
   );
