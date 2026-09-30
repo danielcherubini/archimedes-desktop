@@ -12,6 +12,19 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
+    // `NewSpaceDialog` fetches the settings for its default-agent precedence
+    // (the dialog's `.catch` keeps a rejection from going unhandled, but the
+    // mock makes the dialog's effective selection deterministic here): a full
+    // `AppSettings` with `defaultAgent: null` (the `agents[0]` behavior holds).
+    getSettings: vi.fn().mockResolvedValue({
+      theme: "dark",
+      paneLayout: {},
+      defaultAgent: null,
+      defaultTrustNewSpaces: false,
+      defaultModel: null,
+      providers: [],
+      font: { sizePx: 14, uiFamily: null, codeFamily: null },
+    }),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "new1",
       agentId: "pi",

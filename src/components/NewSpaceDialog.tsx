@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  getSettings,
   listAgents,
   spaceForPath,
   startSession,
   type AgentEntryDto,
+  type AppSettings,
   type SpaceCheck,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
@@ -22,10 +24,11 @@ import { Input } from "./ui/input";
 
 /**
  * Modal for starting a space: pick an agent (registry-driven dropdown,
- * first entry as default) and a working folder (directory picker via
- * @tauri-apps/plugin-dialog, validated with `space_for_path`). Starting
- * IS the space: the session starts in the folder and the space row is
- * upserted by the response's canonical `cwd` — one flow, one action
+ * default = an explicit selection > `settings.defaultAgent` (when in the
+ * registry) > the first registry entry) and a working folder (directory
+ * picker via @tauri-apps/plugin-dialog, validated with `space_for_path`).
+ * Starting IS the space: the session starts in the folder and the space
+ * row is upserted by the response's canonical `cwd` — one flow, one action
  * (no empty spaces: a space is born when a conversation starts in it).
  */
 export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
@@ -39,10 +42,25 @@ export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
   const [folderError, setFolderError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The settings (read ONCE on mount — the dialog is modal): the
+  // default-agent precedence source. A `getSettings` failure → `null` (a
+  // `.catch` — `getSettings` rejects in jsdom without the Tauri internals,
+  // and an unhandled rejection would fail the vitest run).
+  const [settings, setSettings] = useState<AppSettings | null>(null);
 
-  // The first registry entry IS the default (on the default registry that
-  // is `pi`) — replaces the broken free-text `"fake"` default.
-  const effectiveAgentId = selectedAgentId || agents[0]?.id || "";
+  // The default-agent precedence: an explicit selection > the settings'
+  // `defaultAgent` (only when it is in the registry — an unknown id, the
+  // agent was removed from `agents.json`, falls back) > `agents[0]` (on
+  // the default registry that is `pi` — the built-in `archimedes` entry
+  // is appended, never prepended).
+  const effectiveAgentId =
+    selectedAgentId ||
+    (settings?.defaultAgent &&
+      agents.some((a) => a.id === settings.defaultAgent)
+      ? settings.defaultAgent
+      : null) ||
+    agents[0]?.id ||
+    "";
 
   useEffect(() => {
     listAgents()
@@ -53,6 +71,9 @@ export default function NewSpaceDialog({ onClose }: { onClose: () => void }) {
       .catch((err) => {
         setAgentsError(err instanceof Error ? err.message : String(err));
       });
+    getSettings()
+      .then(setSettings)
+      .catch(() => null);
   }, []);
 
   /**
