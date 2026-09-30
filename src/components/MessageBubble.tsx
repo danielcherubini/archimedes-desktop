@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { createHighlighter, type Highlighter } from "shiki";
 import { ChevronRightIcon, WandSparklesIcon } from "lucide-react";
 import type { Message } from "../store/sessions";
@@ -94,14 +95,14 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 
   if (!html) {
     return (
-      <pre className="overflow-x-auto rounded-lg bg-surface p-3 font-mono text-sm">
+      <pre className="my-4 overflow-x-auto rounded-lg border border-border bg-card p-3 font-mono text-sm">
         <code>{code}</code>
       </pre>
     );
   }
   return (
     <div
-      className="overflow-x-auto rounded-lg bg-surface p-3 font-mono text-sm"
+      className="my-4 overflow-x-auto rounded-lg border border-border bg-card p-3 font-mono text-sm"
       // Shiki output is produced locally from the user's own agent output.
       dangerouslySetInnerHTML={{ __html: html }}
     />
@@ -109,49 +110,103 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
 }
 
 /**
- * The ZCode markdown scale (the `@tailwindcss/typography` `prose*` classes
- * are NOT used — the component mapping below replaces them): h1 `text-ui-xl`,
- * h2 `text-ui-lg`, h3–h6 `text-ui-base` + weight ramp, inline code
- * `font-mono text-ui-sm` on the inline-code token, code blocks
- * `rounded-lg bg-surface` at 14px mono, links `text-ui-base` in the
- * icon-blue token, blocks on the 4px rhythm (`my-2`/`space-y-2`).
+ * The ZCode markdown scale, ported from `zcode/packages/ui/src/components/ai-elements/`
+ * (`@tailwindcss/typography` `prose*` classes are NOT used — the component
+ * mapping below replaces them):
+ * - root: `text-ui-base` on `leading-[1.75] tracking-wide`, first/last block
+ *   margins trimmed;
+ * - plain `p`: unstyled (preflight zero — paragraphs ride the 1.75 leading);
+ * - `strong` `font-medium` (not the default bold);
+ * - headings `mt-6 mb-4` + the size/weight ramp (h1 `text-ui-xl` … h6
+ *   `text-ui-base` `font-normal`);
+ * - lists `my-3` + `space-y-1.5` + `marker:text-foreground-subtlest` (ol is
+ *   `list-inside` so multi-digit markers never clip), `li` `pl-1` with direct
+ *   `p`s inlined;
+ * - blockquote `my-4` + `border-l-2 pl-3 text-foreground-subtle`;
+ * - code: inline `font-mono text-ui-sm` on the inline-code token (50%), blocks
+ *   `my-4` on a `border border-border bg-card` panel at 14px mono;
+ * - links `text-ui-base font-medium` in the icon-blue token, dotted underline
+ *   shown on hover;
+ * - tables (the ZCode `markdown-table` scale): a `my-3` frame that is
+ *   `overflow-x-auto rounded-xl border border-border` (wide tables scroll
+ *   instead of breaking the bubble), the table itself `w-max min-w-full`,
+ *   cells `px-3 py-2` with a `border-b` row rule, `th` unbolded +
+ *   `text-foreground-subtlest`, `td` `align-top`, rows highlight on hover and
+ *   the last row drops its rule.
  */
 function AgentMarkdown({ text }: { text: string }) {
   const components = useMemo(
     () => ({
       h1: ({ children }: { children?: ReactNode }) => (
-        <h1 className="my-2 text-ui-xl">{children}</h1>
+        <h1 className="mt-6 mb-4 text-ui-xl font-semibold">{children}</h1>
       ),
       h2: ({ children }: { children?: ReactNode }) => (
-        <h2 className="my-2 text-ui-lg">{children}</h2>
+        <h2 className="mt-6 mb-4 text-ui-lg font-semibold">{children}</h2>
       ),
       h3: ({ children }: { children?: ReactNode }) => (
-        <h3 className="my-2 text-ui-base font-semibold">{children}</h3>
+        <h3 className="mt-6 mb-4 text-ui-base font-semibold">{children}</h3>
       ),
       h4: ({ children }: { children?: ReactNode }) => (
-        <h4 className="my-2 text-ui-base font-semibold">{children}</h4>
+        <h4 className="mt-6 mb-4 text-ui-base font-semibold">{children}</h4>
       ),
       h5: ({ children }: { children?: ReactNode }) => (
-        <h5 className="my-2 text-ui-base font-medium">{children}</h5>
+        <h5 className="mt-6 mb-4 text-ui-base font-medium">{children}</h5>
       ),
       h6: ({ children }: { children?: ReactNode }) => (
-        <h6 className="my-2 text-ui-base font-normal">{children}</h6>
+        <h6 className="mt-6 mb-4 text-ui-base font-normal">{children}</h6>
       ),
-      p: ({ children }: { children?: ReactNode }) => (
-        <p className="my-2 text-ui-base">{children}</p>
+      strong: ({ children }: { children?: ReactNode }) => (
+        <strong className="font-medium">{children}</strong>
       ),
       ul: ({ children }: { children?: ReactNode }) => (
-        <ul className="my-2 list-disc space-y-2 pl-5 text-ui-base">
+        <ul className="my-3 list-outside list-disc space-y-1.5 pl-5 marker:text-foreground-subtlest [&_ul]:my-1.5 [&_ol]:my-1.5">
           {children}
         </ul>
       ),
       ol: ({ children }: { children?: ReactNode }) => (
-        <ol className="my-2 list-decimal space-y-2 pl-5 text-ui-base">
+        <ol className="my-3 list-inside list-decimal space-y-1.5 pl-0 marker:text-foreground-subtlest [&_ul]:my-1.5 [&_ol]:my-1.5">
           {children}
         </ol>
       ),
+      li: ({ children }: { children?: ReactNode }) => (
+        <li className="pl-1 [&>p]:my-0 [&>p]:inline">{children}</li>
+      ),
+      blockquote: ({ children }: { children?: ReactNode }) => (
+        <blockquote className="my-4 border-border border-l-2 pl-3 text-foreground-subtle [&_p]:my-0 [&_p+p]:mt-2">
+          {children}
+        </blockquote>
+      ),
+      // The ZCode `markdown-table` scale: a bordered, horizontally
+      // scrollable frame around a content-width table (wide tables scroll
+      // instead of breaking the bubble); cells get a bottom border, padding,
+      // and a min/max width so long content wraps instead of blowing out a
+      // column. (ZCode's virtual scrollbar / toolbar / preview dialog are NOT
+      // ported — the app's global native-scrollbar styling covers scrolling.)
       table: ({ children }: { children?: ReactNode }) => (
-        <table className="my-2 text-ui-base">{children}</table>
+        <div className="my-3 w-full overflow-x-auto rounded-xl border border-border">
+          <table className="w-max min-w-full text-ui-base">{children}</table>
+        </div>
+      ),
+      thead: ({ children }: { children?: ReactNode }) => (
+        <thead>{children}</thead>
+      ),
+      tbody: ({ children }: { children?: ReactNode }) => (
+        <tbody>{children}</tbody>
+      ),
+      tr: ({ children }: { children?: ReactNode }) => (
+        <tr className="transition-colors last:[&>td]:border-b-0 hover:bg-hover/20">
+          {children}
+        </tr>
+      ),
+      th: ({ children }: { children?: ReactNode }) => (
+        <th className="border-border border-b px-3 py-2 text-left font-normal text-foreground-subtlest min-w-16 max-w-md whitespace-normal break-words">
+          {children}
+        </th>
+      ),
+      td: ({ children }: { children?: ReactNode }) => (
+        <td className="border-border border-b px-3 py-2 text-foreground align-top min-w-16 max-w-md whitespace-normal break-words">
+          {children}
+        </td>
       ),
       a: ({
         children,
@@ -160,7 +215,10 @@ function AgentMarkdown({ text }: { text: string }) {
         children?: ReactNode;
         href?: string;
       }) => (
-        <a href={href} className="text-ui-base text-icon-blue underline">
+        <a
+          href={href}
+          className="text-ui-base font-medium text-icon-blue no-underline decoration-dotted underline-offset-4 hover:underline"
+        >
           {children}
         </a>
       ),
@@ -171,7 +229,7 @@ function AgentMarkdown({ text }: { text: string }) {
           return <CodeBlock code={codeText} lang={lang} />;
         }
         return (
-          <code className="rounded-sm bg-markdown-inline-code px-1 font-mono text-ui-sm">
+          <code className="rounded-md bg-markdown-inline-code/50 mx-0.5 px-1.5 py-0.5 font-mono text-ui-sm">
             {children}
           </code>
         );
@@ -181,8 +239,13 @@ function AgentMarkdown({ text }: { text: string }) {
   );
 
   return (
-    <div className="break-words text-ui-base">
-      <ReactMarkdown components={components}>{text}</ReactMarkdown>
+    <div className="break-words text-ui-base leading-[1.75] tracking-wide [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      {/* `remark-gfm` is NOT included by default in react-markdown v10 —
+       * without it GFM tables (and strikethrough / task lists) fall back to
+       * raw pipe text, which is what made tables look broken in the chat. */}
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        {text}
+      </ReactMarkdown>
     </div>
   );
 }
