@@ -48,7 +48,7 @@ use crate::agent::harness::{
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
-use crate::commands::settings::load_settings;
+use crate::commands::settings::{load_settings, write_settings};
 use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
 use tokio::sync::mpsc;
@@ -1877,7 +1877,9 @@ impl SessionManager {
     /// `native_messages` table). The model comes from the stored
     /// `capabilities.model` (a stale / unknown key falls back to the
     /// harness / catalog default); the thinking level from the stored
-    /// `thinkingLevel` (falling back to the harness default).
+    /// `thinkingLevel` (the raw value — the resolution chain (memory →
+    /// stored → harness seed) resolves in `build_native_session`, after
+    /// the model metadata refresh).
     async fn resume_native_session(
         &self,
         entry: &AgentEntry,
@@ -1922,11 +1924,13 @@ impl SessionManager {
                 error: "no models available for the native session".to_string(),
             });
         };
+        // The raw STORED `thinkingLevel` (NO harness fallback — the
+        // resolution chain (memory → stored → harness seed) resolves in
+        // `build_native_session`, after the model metadata refresh).
         let thinking_level = caps
             .get("thinkingLevel")
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| harness.default_thinking_level.clone());
+            .map(str::to_string);
 
         let info = self
             .build_native_session(entry, cwd, sink, Some((session_id, model, thinking_level)))
@@ -1980,12 +1984,16 @@ impl SessionManager {
         // stored model (see `resume_native_session`).
         let settings = load_settings(&self.config_dir);
         let is_resume = resume.is_some();
-        let (session_id, model, thinking_level) = match resume {
+        // The resume carries the raw STORED `thinkingLevel` (NO harness
+        // fallback — the resolution chain (memory → stored → harness seed)
+        // resolves BELOW, after the model metadata refresh); the start arm
+        // has no stored level.
+        let (session_id, model, stored_level) = match resume {
             Some((id, model, level)) => (id.to_string(), model.clone(), level),
             None => (
                 uuid::Uuid::new_v4().to_string(),
                 resolve_native_model(&catalog, &harness.default_model, &settings.default_model)?,
-                harness.default_thinking_level.clone(),
+                None,
             ),
         };
         // (live `/v1/models` discovery) Best-effort refresh the model's
@@ -1994,6 +2002,23 @@ impl SessionManager {
         // pattern). Bounded + cached per-provider; a failure degrades to
         // the static (`models-store.json`) metadata.
         let model = self.refresh_model_metadata(&model).await;
+        // (ADR 0015) The effective thinking level: the remembered (VALIDATED
+        // against the model's live `thinking_levels`) > the stored (LENIENT
+        // — non-empty levels must be a member; empty levels apply as-is, the
+        // pre-change behavior) > the harness seed > `None` (the model's own
+        // default). Validated against the POST-refresh model (the live
+        // `thinking_levels` are the freshest).
+        let thinking_level = remembered_thinking_level(&settings.default_thinking_levels, &model)
+            .or_else(|| {
+                stored_level
+                    .as_ref()
+                    .filter(|l| {
+                        model.thinking_levels.is_empty()
+                            || model.thinking_levels.iter().any(|t| t == *l)
+                    })
+                    .cloned()
+            })
+            .or_else(|| harness.default_thinking_level.clone());
 
         let store = SessionStore::new(db.clone());
         let (events_tx, events_rx) = mpsc::channel(256);
@@ -2209,7 +2234,8 @@ impl SessionManager {
                     // default; an absent/unset setting sends nothing). The
                     // `get_state` response then reflects the applied model
                     // (`build_capabilities` picks up `state.model`).
-                    if let Some(key) = load_settings(&config_dir).default_model {
+                    let settings = load_settings(&config_dir);
+                    if let Some(key) = settings.default_model.clone() {
                         if let Some((provider, model_id)) = key.split_once('/') {
                             if let Err(e) = handle
                                 .send(json!({
@@ -2221,6 +2247,27 @@ impl SessionManager {
                             {
                                 eprintln!(
                                     "settings default model: set_model failed at start: {e} (establishing on pi's default)"
+                                );
+                            }
+                        }
+                    }
+                    // (ADR 0015) The remembered thinking level for the
+                    // starting model: sent LENIENT after the `set_model`
+                    // (a failure is logged — the session establishes on pi's
+                    // own default level; pi is the authority, so NO
+                    // validation). When `defaultModel` is absent the
+                    // starting model is unknown → nothing is sent.
+                    if let Some(key) = &settings.default_model {
+                        if let Some(level) = settings.default_thinking_levels.get(key) {
+                            if let Err(e) = handle
+                                .send(json!({
+                                    "type": "set_thinking_level",
+                                    "level": level
+                                }))
+                                .await
+                            {
+                                eprintln!(
+                                    "remembered thinking level: set_thinking_level failed at start: {e} (establishing on pi's default level)"
                                 );
                             }
                         }
@@ -2716,6 +2763,28 @@ impl SessionManager {
                 // Re-synthesize + emit (the agent does not emit a
                 // `config_option_update` itself).
                 let state = handle.send(json!({ "type": "get_state" })).await?;
+                // (ADR 0015) An EXPLICIT thinking-level change remembers
+                // the level for the session's CURRENT model (the
+                // `get_state` response's `model` — absent → skip;
+                // best-effort: a write failure is logged and does NOT
+                // fail the config change, which pi applied either way).
+                if config_id == "thought_level" && !value.is_empty() {
+                    if let Some(model) = state.get("model") {
+                        let provider = model
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let key = format!("{provider}/{id}");
+                        let mut settings = load_settings(&self.config_dir);
+                        settings
+                            .default_thinking_levels
+                            .insert(key, value.to_string());
+                        if let Err(e) = write_settings(&self.config_dir, &settings) {
+                            eprintln!("remembered thinking level: save failed: {e}");
+                        }
+                    }
+                }
                 let models = handle
                     .send(json!({ "type": "get_available_models" }))
                     .await
@@ -2785,7 +2854,34 @@ impl SessionManager {
                             });
                         }
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.model = model;
+                        state.model = model.clone();
+                        // (ADR 0015) Minimal-surprise reset: the current
+                        // level is KEPT across the switch when valid for
+                        // the new model (its `thinking_levels` are
+                        // non-empty and contain it — or EMPTY, the status
+                        // quo); it is replaced (the new model's
+                        // remembered level, or `None`) only when the new
+                        // model doesn't support it. The second `try_send`
+                        // mirrors ONLY on success (finding 12): a failed
+                        // send leaves the mirror untouched (the loop never
+                        // applies the reset). The arm does NOT write
+                        // memory.
+                        if let Some(level) = state.thinking_level.as_deref() {
+                            let valid = model.thinking_levels.is_empty()
+                                || model.thinking_levels.iter().any(|t| t == level);
+                            if !valid {
+                                let reset = remembered_thinking_level(
+                                    &load_settings(&self.config_dir).default_thinking_levels,
+                                    &model,
+                                );
+                                let sent = handle
+                                    .control_tx_clone()
+                                    .try_send(ControlCmd::SetThinkingLevel(reset.clone()));
+                                if sent.is_ok() {
+                                    state.thinking_level = reset;
+                                }
+                            }
+                        }
                     }
                     "thought_level" => {
                         let sent = handle
@@ -2798,6 +2894,21 @@ impl SessionManager {
                         }
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
                         state.thinking_level = Some(value.to_string());
+                        // (ADR 0015) Remember the level for the session's
+                        // CURRENT model (best-effort: a write failure is
+                        // logged and does NOT fail the config change — the
+                        // level is applied in the loop either way). Only a
+                        // non-empty `value` is remembered.
+                        if !value.is_empty() {
+                            let key = format!("{}/{}", state.model.provider, state.model.id);
+                            let mut settings = load_settings(&self.config_dir);
+                            settings
+                                .default_thinking_levels
+                                .insert(key, value.to_string());
+                            if let Err(e) = write_settings(&self.config_dir, &settings) {
+                                eprintln!("remembered thinking level: save failed: {e}");
+                            }
+                        }
                     }
                     other => {
                         return Err(RpcError::Command {
@@ -2975,6 +3086,20 @@ pub(crate) fn resolve_composed_model(catalog: &ModelCatalog, key: &str) -> Optio
         .models
         .iter()
         .find(|m| m.provider == provider && m.id == id)
+        .cloned()
+}
+
+/// The remembered thinking level for a model (ADR 0015): the map entry,
+/// `Some` only when the model's `thinking_levels` is non-empty AND
+/// contains the entry (a stale entry — the provider changed its levels —
+/// is ignored; a model with no advertised levels gets nothing).
+fn remembered_thinking_level(levels: &HashMap<String, String>, model: &Model) -> Option<String> {
+    if model.thinking_levels.is_empty() {
+        return None;
+    }
+    levels
+        .get(&format!("{}/{}", model.provider, model.id))
+        .filter(|l| model.thinking_levels.iter().any(|t| t == *l))
         .cloned()
 }
 
@@ -5032,6 +5157,393 @@ mod session_tests {
             }]
         });
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// Write an `agents.json` with a single NATIVE entry whose harness
+    /// `default_model` is `harness_default` and `default_thinking_level` is
+    /// `harness_level` (both `None`-able).
+    fn write_agents_json_native_with_thinking(
+        dir: &Path,
+        harness_default: Option<&str>,
+        harness_level: Option<&str>,
+    ) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": {
+                    "provider": "openai-compatible",
+                    "default_model": harness_default,
+                    "default_thinking_level": harness_level,
+                },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// Write a `settings.json` with arbitrary JSON (the camelCase wire
+    /// shape — absent keys parse to the defaults).
+    fn write_settings_json(dir: &Path, settings: serde_json::Value) {
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A `Model` with the given `thinking_levels` (`base_url` EMPTY so
+    /// `refresh_model_metadata` is a no-op — no network).
+    fn level_test_model(provider: &str, id: &str, levels: &[&str]) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            api_key: "k".to_string(),
+            context_window: 128000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: !levels.is_empty(),
+            thinking_levels: levels.iter().map(|s| s.to_string()).collect(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// Start a native session with the given catalog (the `HangingProvider`
+    /// seam — the turn hangs in the model call).
+    async fn start_native_session_with_catalog(
+        dir: &Path,
+        sink: &Arc<dyn EventSink>,
+        catalog: ModelCatalog,
+    ) -> (SessionManager, SessionInfo) {
+        let db = open_db(dir);
+        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog);
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.to_path_buf(), sink)
+        })
+        .await
+        .expect("the native session started");
+        (manager, info)
+    }
+
+    /// (ADR 0015) Native start: the remembered level (VALIDATED against the
+    /// model's `thinking_levels`) wins over the harness's
+    /// `default_thinking_level` seed.
+    #[tokio::test]
+    async fn a_native_session_starts_with_the_remembered_level_over_the_harness_default() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "medium", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevels": { "tama/m1": "xhigh" },
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "xhigh",
+            "the remembered (validated) level beats the harness seed"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A STALE remembered entry (not a member of the model's
+    /// current `thinking_levels` — the provider changed its levels) is
+    /// IGNORED: the harness seed applies.
+    #[tokio::test]
+    async fn a_stale_remembered_level_falls_back_to_the_harness_default() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "medium", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevels": { "tama/m1": "ultra" },
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "high",
+            "a stale (unvalidated) entry is ignored — the harness seed applies"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A model that advertises NO `thinking_levels` gets NO
+    /// remembered level (the memory is only applied to a member of a
+    /// NON-EMPTY level set): the `thinkingLevel` key is ABSENT (the model's
+    /// own default — `None`).
+    #[tokio::test]
+    async fn a_remembered_level_is_ignored_for_a_model_without_levels() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model("tama", "m1", &[])],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), None);
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert!(
+            info.capabilities.get("thinkingLevel").is_none(),
+            "a model with no advertised levels gets no remembered level, got {:?}",
+            info.capabilities
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) An EXPLICIT `thought_level` change (native) persists
+    /// `memory[<the session's model key>] = level` to `settings.json`
+    /// (best-effort — the change itself is applied regardless).
+    #[tokio::test]
+    async fn a_native_thought_level_change_remembers_the_level() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        write_settings_json(&dir, serde_json::json!({}));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "medium", &sink)
+            .await
+            .expect("the level change applies");
+        let settings = load_settings(&dir);
+        assert_eq!(
+            settings.default_thinking_levels.get("fake/m1"),
+            Some(&"medium".to_string()),
+            "the explicit change writes the memory for the session's model"
+        );
+        // The file on disk is updated (a fresh read — not just the in-memory map).
+        let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(on_disk["defaultThinkingLevels"]["fake/m1"], "medium");
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A native model switch is a MINIMAL-SURPRISE reset: the
+    /// current level is invalid for the NEW model (its `thinking_levels`
+    /// are non-empty and don't contain it) → the level resets to the new
+    /// model's remembered level (or `None`).
+    #[tokio::test]
+    async fn a_native_model_switch_resets_an_invalid_level_to_the_new_model_s_memory() {
+        let catalog = ModelCatalog {
+            models: vec![
+                level_test_model("tama", "a", &["off", "high"]),
+                level_test_model("tama", "b", &["off", "low", "medium", "xhigh"]),
+            ],
+            default_model: Some("tama/a".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/b": "xhigh" } }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        // The current level (valid for `a` — also writes `a`'s memory).
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "high", &sink)
+            .await
+            .expect("the level change applies");
+        // The switch: `"high"` is NOT a member of `b`'s levels → the reset
+        // to `b`'s remembered level.
+        let updated = manager
+            .set_config_option(&info.session_id, "model", "tama/b", &sink)
+            .await
+            .expect("the model switch applies");
+        let thought = updated
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .expect("a thought_level selector");
+        assert_eq!(
+            thought["currentValue"], "xhigh",
+            "an invalid level resets to the new model's remembered level"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) The flip side: a current level that IS a member of the
+    /// new model's `thinking_levels` is KEPT across the switch (minimal
+    /// surprise — no reset).
+    #[tokio::test]
+    async fn a_native_model_switch_keeps_a_valid_level() {
+        let catalog = ModelCatalog {
+            models: vec![
+                level_test_model("tama", "a", &["off", "high"]),
+                level_test_model("tama", "c", &["off", "high", "medium"]),
+            ],
+            default_model: Some("tama/a".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
+        write_settings_json(&dir, serde_json::json!({}));
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "high", &sink)
+            .await
+            .expect("the level change applies");
+        let updated = manager
+            .set_config_option(&info.session_id, "model", "tama/c", &sink)
+            .await
+            .expect("the model switch applies");
+        let thought = updated
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .expect("a thought_level selector");
+        assert_eq!(
+            thought["currentValue"], "high",
+            "a valid level is kept across the switch"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) Native resume: the remembered level (VALIDATED) wins over
+    /// the STORED `thinkingLevel` (the start-of-session value — stale after
+    /// a mid-session change), which wins over the harness seed.
+    #[tokio::test]
+    async fn a_resume_prefers_the_remembered_level_over_the_stale_stored_value() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "high", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("low"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
+        );
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        manager.set_catalog(catalog);
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        // The stored row: the start-of-session level (`"high"` — valid for
+        // the model; a mid-session change to `xhigh` is only in the memory).
+        db.record_session(&SessionInfo {
+            session_id: "nat-resume-1".to_string(),
+            agent_id: "nativetest".to_string(),
+            cwd: dir.clone(),
+            capabilities: json!({
+                "native": true,
+                "model": "tama/m1",
+                "thinkingLevel": "high",
+                "loadSession": true,
+            }),
+            config_options: None,
+        })
+        .expect("record_session should succeed");
+        let info = crate::test_support::run_with_retry(|| {
+            manager.resume_session("nativetest", "nat-resume-1", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native resume works");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "xhigh",
+            "memory wins over the stale stored value"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) External (pi) start: a remembered level for
+    /// `settings.defaultModel` is sent LENIENT (`set_thinking_level` after
+    /// `set_model`, BEFORE the first `get_state` — the `get_state` response
+    /// reflects it). `fake_pi`'s `get_state` substitutes `__LEVEL__` with
+    /// the level it was sent (default `"off"`).
+    #[tokio::test]
+    async fn an_external_session_start_sends_the_remembered_thinking_level() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": "fake/fake-model-2",
+                "defaultThinkingLevels": { "fake/fake-model-2": "medium" },
+            }),
+        );
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "medium",
+            "the remembered level is sent before the first get_state"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // The negative: the same `defaultModel` but NO memory entry →
+        // nothing sent → pi's own default level.
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultModel": "fake/fake-model-2" }),
+        );
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "off",
+            "no memory entry → no set_thinking_level → pi's default level"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (settings chain) the native model resolution chain: per-agent

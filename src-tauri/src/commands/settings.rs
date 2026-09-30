@@ -6,6 +6,7 @@
 //! migration needed). A corrupt file yields the defaults + a logged warning
 //! — a bad file must never block app startup.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -80,6 +81,11 @@ pub struct Settings {
     /// Font settings.
     #[serde(default)]
     pub font: FontSettings,
+    /// (ADR 0015) The per-model remembered thinking level: the composed
+    /// model key (`"<provider>/<id>"`) → the last EXPLICITLY chosen level.
+    /// `#[serde(default)]` — a pre-feature file parses to an empty map.
+    #[serde(default)]
+    pub default_thinking_levels: HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -92,6 +98,7 @@ impl Default for Settings {
             default_model: None,
             providers: Vec::new(),
             font: FontSettings::default(),
+            default_thinking_levels: HashMap::new(),
         }
     }
 }
@@ -159,19 +166,25 @@ pub async fn get_settings(state: State<'_, Arc<SessionManager>>) -> Result<Setti
     Ok(load_settings(state.config_dir()))
 }
 
+/// Persist the settings (overwrites the file). In-process writers (the
+/// `set_config_option` memory writes — ADR 0015) call this directly; the
+/// command delegates to it.
+pub fn write_settings(config_dir: &Path, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(config_dir);
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Persist the settings (overwrites the file).
 #[tauri::command]
 pub async fn save_settings(
     state: State<'_, Arc<SessionManager>>,
     settings: Settings,
 ) -> Result<(), String> {
-    let config_dir = state.config_dir().clone();
-    let path = settings_path(&config_dir);
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+    write_settings(state.config_dir(), &settings)
 }
 
 /// The effective catalog's models (the frontend's Default-model select +
@@ -248,6 +261,34 @@ mod tests {
     }
 
     #[test]
+    fn default_thinking_levels_defaults_to_empty_and_round_trips() {
+        // (ADR 0015) The per-model remembered thinking-level map defaults to
+        // empty and round-trips in camelCase.
+        assert!(Settings::default().default_thinking_levels.is_empty());
+        // A pre-feature file (WITHOUT the field) parses to an empty map
+        // (`#[serde(default)]` — no migration needed).
+        let settings: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
+        assert!(settings.default_thinking_levels.is_empty());
+        // A file WITH the field parses to the entry.
+        let with_map: Settings =
+            serde_json::from_str(r#"{ "defaultThinkingLevels": { "a/b": "xhigh" } }"#).unwrap();
+        assert_eq!(with_map.default_thinking_levels["a/b"], "xhigh");
+        // camelCase on the wire (a populated map serializes the field).
+        let settings = Settings {
+            default_thinking_levels: std::collections::HashMap::from([(
+                "a/b".to_string(),
+                "xhigh".to_string(),
+            )]),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(
+            json.contains("\"defaultThinkingLevels\""),
+            "missing key in {json}"
+        );
+    }
+
+    #[test]
     fn font_settings_default_is_size_14_not_zero() {
         // Guards against a regression to a `#[derive(Default)]` (which would
         // give `size_px: 0`, a second "default" diverging from the serde
@@ -274,6 +315,10 @@ mod tests {
                 ui_family: Some("Inter".to_string()),
                 code_family: Some("JetBrains Mono".to_string()),
             },
+            default_thinking_levels: std::collections::HashMap::from([(
+                "a/b".to_string(),
+                "xhigh".to_string(),
+            )]),
         };
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
@@ -283,6 +328,7 @@ mod tests {
             "\"providers\"",
             "\"font\"",
             "\"sizePx\"",
+            "\"defaultThinkingLevels\"",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
