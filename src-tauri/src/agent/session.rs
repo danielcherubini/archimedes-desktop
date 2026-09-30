@@ -244,6 +244,10 @@ pub struct SessionInfo {
     /// nothing (or for stored sessions — `list_sessions` always reports
     /// `None`).
     pub config_options: Option<Vec<Value>>,
+    /// The desktop's archived flag (ADR 0016). `false` for a newly
+    /// started or ephemeral session; the resume paths and
+    /// `list_sessions` read it from the stored row.
+    pub archived: bool,
 }
 
 /// A live, in-memory session handle.
@@ -1824,15 +1828,18 @@ impl SessionManager {
         })?;
         // The stored row must exist (a native session is recorded at start
         // — `record_session`; a missing row is unresumable, like the
-        // external path's missing row).
-        let caps_json = db
+        // external path's missing row). KEEP THE WHOLE ROW: the resume
+        // carries the desktop's `archived` flag (ADR 0016 — the desktop
+        // is the source of truth; a resumed session may be re-archived
+        // later and the client's sticky view must agree with the DB).
+        let row = db
             .session(session_id)
             .ok()
             .flatten()
-            .map(|row| row.capabilities_json)
             .ok_or_else(|| RpcError::NotResumable {
                 id: session_id.to_string(),
             })?;
+        let caps_json = row.capabilities_json;
         let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
         let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
             error: "the native entry has no harness config".to_string(),
@@ -1856,9 +1863,15 @@ impl SessionManager {
             .map(str::to_string)
             .or_else(|| harness.default_thinking_level.clone());
 
-        let info = self
+        let mut info = self
             .build_native_session(entry, cwd, sink, Some((session_id, model, thinking_level)))
             .await?;
+        // The desktop's `archived` flag (ADR 0016): a native start mints a
+        // fresh session (`build_native_session` reports `false`); a resume
+        // carries the stored row's flag (the `record_session` re-record
+        // below never clears it — the `DO UPDATE` branch never touches
+        // `archived`).
+        info.archived = row.archived;
         self.record_session(&info);
         Ok(info)
     }
@@ -2017,6 +2030,10 @@ impl SessionManager {
                     &state.model,
                     state.thinking_level.as_deref(),
                 ),
+                // A native START mints a fresh session (ADR 0016); a
+                // resume overrides `archived` with the stored row's flag
+                // (`resume_native_session`).
+                archived: false,
             }
         };
         self.driver
@@ -2143,6 +2160,8 @@ impl SessionManager {
                             models.as_ref(),
                             levels.as_ref(),
                         ),
+                        // A fresh START is never archived (ADR 0016).
+                        archived: false,
                     })
                 },
             )
@@ -2295,6 +2314,18 @@ impl SessionManager {
                         .await
                         .ok()
                         .and_then(|v| v.get("levels").cloned());
+                    // The desktop's `archived` flag (ADR 0016): the desktop
+                    // is the source of truth (a resumed session may be
+                    // re-archived later; the client's sticky view must
+                    // agree with the DB). A missing row fails closed to
+                    // `false` — the command's pre-check has already
+                    // rejected an unresumable row, so in practice the row
+                    // exists.
+                    let archived = db
+                        .as_ref()
+                        .and_then(|db| db.session(&session_id_owned).ok().flatten())
+                        .map(|row| row.archived)
+                        .unwrap_or(false);
                     Ok(SessionInfo {
                         session_id: session_id_owned,
                         agent_id: agent_id_owned,
@@ -2305,6 +2336,7 @@ impl SessionManager {
                             models.as_ref(),
                             levels.as_ref(),
                         ),
+                        archived,
                     })
                 },
             )
@@ -4560,6 +4592,7 @@ mod session_tests {
                 "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
             }),
             config_options: None,
+            archived: false,
         })
         .expect("record_session should succeed");
         // Two stored rows the resume must CLEAR (the replay re-populates).
@@ -4614,6 +4647,7 @@ mod session_tests {
             cwd: dir.clone(),
             capabilities: serde_json::json!({ "promptCapabilities": { "image": true } }),
             config_options: None,
+            archived: false,
         })
         .expect("record_session should succeed");
         assert_eq!(
@@ -4632,6 +4666,130 @@ mod session_tests {
 
         let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) The EXTERNAL resume carries the stored `archived` flag:
+    /// `set_session_archived` before the resume; the resumed `SessionInfo`
+    /// reports the stored flag, and the resume's `record_session` re-record
+    /// did NOT clear it (the `DO UPDATE` branch never touches `archived`).
+    #[tokio::test]
+    async fn resume_carries_the_archived_flag() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        // Pre-seed the stored row (a resumption of a session with a file)
+        // and archive it BEFORE the resume.
+        db.record_session(&SessionInfo {
+            session_id: "resume-arch-1".to_string(),
+            agent_id: "fake".to_string(),
+            cwd: dir.clone(),
+            capabilities: serde_json::json!({
+                "piSessionId": "resume-arch-1",
+                "piSessionFile": "/tmp/resume-arch-1.jsonl",
+                "model": "fake/fake-model",
+                "thinkingLevel": "off",
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+            }),
+            config_options: None,
+            archived: false,
+        })
+        .expect("record_session should succeed");
+        db.set_session_archived("resume-arch-1", true)
+            .expect("set_session_archived should succeed");
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.resume_session("fake", "resume-arch-1", dir.clone(), &sink)
+        })
+        .await
+        .unwrap();
+        assert_eq!(info.session_id, "resume-arch-1");
+        assert!(
+            info.archived,
+            "the external resume carries the stored archived flag"
+        );
+        let row = db
+            .session("resume-arch-1")
+            .expect("session should work")
+            .expect("the row exists");
+        assert!(
+            row.archived,
+            "the resume's re-record did not clear the stored flag"
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) The NATIVE resume carries the stored `archived` flag:
+    /// a fresh native start is `archived: false`; after
+    /// `set_session_archived`, the resumed `SessionInfo` reports the stored
+    /// flag and the resume's `record_session` re-record did NOT clear it.
+    #[tokio::test]
+    async fn native_resume_carries_the_archived_flag() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        manager.set_catalog(native_test_catalog());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert!(!info.archived, "a fresh native start is never archived");
+        db.set_session_archived(&info.session_id, true)
+            .expect("set_session_archived should succeed");
+
+        let resumed = crate::test_support::run_with_retry(|| {
+            manager.resume_session("nativetest", &info.session_id, dir.clone(), &sink)
+        })
+        .await
+        .expect("the native resume succeeded");
+        assert_eq!(resumed.session_id, info.session_id);
+        assert!(
+            resumed.archived,
+            "the native resume carries the stored archived flag"
+        );
+        let row = db
+            .session(&info.session_id)
+            .expect("session should work")
+            .expect("the row exists");
+        assert!(
+            row.archived,
+            "the resume's re-record did not clear the stored flag"
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) `SessionInfo` round-trips the `archived` flag (a
+    /// single-word key — the `camelCase` rename leaves it as `archived`).
+    #[test]
+    fn session_info_round_trips_the_archived_flag_camel_case() {
+        let info = SessionInfo {
+            session_id: "s1".to_string(),
+            agent_id: "fake".to_string(),
+            cwd: PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({ "loadSession": true }),
+            config_options: None,
+            archived: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"archived\":true"), "got: {json}");
+        let back: SessionInfo = serde_json::from_str(&json).unwrap();
+        assert!(back.archived);
     }
 
     /// (cancel) `send_prompt` + `cancel_session` (`FAKE_PI_WAIT_ABORT=1` —

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { closeSession, deleteSpace, listSkills, setSpaceTrusted, startSession } from "../lib/tauri";
+import { closeSession, deleteSession, deleteSpace, listSkills, setSessionArchived, setSpaceTrusted, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useBridge } from "../store/bridge";
@@ -17,6 +17,7 @@ vi.mock("../lib/tauri", async () => {
       agentId: "pi",
       cwd: "/tmp/ws",
       capabilities: { loadSession: false },
+      archived: false,
     }),
     listAgents: vi.fn().mockResolvedValue([{ id: "pi", name: "pi" }]),
     respondPermission: vi.fn(),
@@ -35,6 +36,8 @@ vi.mock("../lib/tauri", async () => {
         body: "B",
       },
     ]),
+    setSessionArchived: vi.fn().mockResolvedValue(true),
+    deleteSession: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -43,6 +46,7 @@ const mockedCloseSession = vi.mocked(closeSession);
 const mockedSetSpaceTrusted = vi.mocked(setSpaceTrusted);
 const mockedDeleteSpace = vi.mocked(deleteSpace);
 const mockedListSkills = vi.mocked(listSkills);
+const mockedDeleteSession = vi.mocked(deleteSession);
 
 /**
  * Fixture: two spaces. `alpha` holds a live session `s1` (in-turn, with a
@@ -60,11 +64,11 @@ function seed(): void {
       { path: "/tmp/beta", createdAt: now, lastOpenedAt: now, trusted: true },
     ],
     sessions: [
-      { sessionId: "s1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {} },
+      { sessionId: "s1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {}, archived: false },
     ],
     historySessions: [
-      { sessionId: "h1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {} },
-      { sessionId: "h2", agentId: "pi", cwd: "/tmp/beta", capabilities: {} },
+      { sessionId: "h1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+      { sessionId: "h2", agentId: "pi", cwd: "/tmp/beta", capabilities: {}, archived: false },
     ],
     activeSessionId: "s1",
     closeReasons: {},
@@ -134,6 +138,7 @@ describe("SpacesList", () => {
           agentId: "pi",
           cwd: "/tmp/gamma",
           capabilities: {},
+          archived: false,
         },
       ],
       activeSessionId: "s-orphan",
@@ -610,5 +615,223 @@ describe("SpacesList", () => {
     // Open the modal from the button.
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
     await screen.findByText("No skills found.");
+  });
+});
+
+describe("SpacesList (archive, ADR 0016)", () => {
+  /** Seed an archived (flag-on) stored session in the `alpha` space.
+   * `messages` (when given) makes the row's title message-derived. */
+  function seedArchived(
+    id: string = "a1",
+    opts: { live?: boolean; messages?: { text: string; at: number } } = {},
+  ): void {
+    const row = {
+      sessionId: id,
+      agentId: "pi",
+      cwd: "/tmp/alpha",
+      capabilities: {},
+      archived: true,
+    };
+    useSessions.setState({
+      sessions: opts.live ? [row] : [],
+      archivedSessions: [row],
+      activeSessionId: id,
+      ...(opts.messages
+        ? { messages: { [id]: [{ kind: "user" as const, ...opts.messages }] } }
+        : {}),
+    });
+  }
+
+  it("a stored row offers an Archive hover action that archives it", async () => {
+    render(<SpacesList />);
+    // `h1`'s title is "Refactor the parser" (its first user message).
+    fireEvent.click(
+      screen.getByRole("button", { name: "Archive Refactor the parser" }),
+    );
+    // The store action moved the entry (the backend call resolved via
+    // the mock) — `historySessions` lost it, `archivedSessions` gained it.
+    await waitFor(() => {
+      const { archivedSessions, historySessions } = useSessions.getState();
+      expect(
+        archivedSessions.some((s) => s.sessionId === "h1"),
+      ).toBe(true);
+      expect(
+        historySessions.some((s) => s.sessionId === "h1"),
+      ).toBe(false);
+    });
+    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith("h1", true);
+  });
+
+  it("a live row offers Pause, not Archive", () => {
+    render(<SpacesList />);
+    // `s1` is live: the hover action is the Pause button (unchanged).
+    expect(
+      screen.queryByRole("button", { name: "Archive Fix the login bug" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: /Pause/ })).toBeTruthy();
+  });
+
+  it("the Archived section is collapsed by default and lists archived sessions", () => {
+    seedArchived("a1", {
+      messages: { text: "Archive the logs", at: Date.now() - 3_600_000 },
+    });
+    render(<SpacesList />);
+    // The header renders (with the count badge) even when collapsed…
+    expect(screen.getByText("Archived")).toBeTruthy();
+    expect(screen.getByText("1")).toBeTruthy();
+    // …and the row is NOT rendered while collapsed. (The row's title
+    // carries a `· alpha` suffix as a nested span, so match on a
+    // prefix, not the exact title text.)
+    expect(screen.queryByText(/^Archive the logs/)).toBeNull();
+    // Expanding the section (clicking the header) reveals the row.
+    fireEvent.click(screen.getByText("Archived"));
+    expect(screen.getByText(/^Archive the logs/)).toBeTruthy();
+  });
+
+  it("unarchive moves the row back", async () => {
+    seedArchived();
+    render(<SpacesList />);
+    fireEvent.click(screen.getByText("Archived"));
+    fireEvent.click(screen.getByRole("button", { name: /Unarchive/ }));
+    await waitFor(() => {
+      const { archivedSessions, historySessions } = useSessions.getState();
+      expect(
+        archivedSessions.some((s) => s.sessionId === "a1"),
+      ).toBe(false);
+      expect(
+        historySessions.some((s) => s.sessionId === "a1"),
+      ).toBe(true);
+    });
+    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith("a1", false);
+  });
+
+  it("delete from the Archived section confirms and removes", async () => {
+    seedArchived();
+    render(<SpacesList />);
+    fireEvent.click(screen.getByText("Archived"));
+    // The destructive action opens the confirm dialog.
+    fireEvent.click(screen.getByRole("button", { name: /Delete/ }));
+    expect(screen.getByText("Delete session?")).toBeTruthy();
+    // Cancel: the row remains, the dialog closes.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText("Delete session?")).toBeNull();
+    expect(
+      useSessions.getState().archivedSessions.some((s) => s.sessionId === "a1"),
+    ).toBe(true);
+    // Delete: the row vanishes from the store and the dialog closes.
+    fireEvent.click(screen.getByRole("button", { name: /Delete/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() =>
+      expect(
+        useSessions.getState().archivedSessions.some((s) => s.sessionId === "a1"),
+      ).toBe(false),
+    );
+    expect(screen.queryByText("Delete session?")).toBeNull();
+    expect(mockedDeleteSession).toHaveBeenCalledWith("a1");
+  });
+
+  it("a live session that is also archived is view-filtered out of the Archived section", () => {
+    seedArchived("a1", { live: true, messages: { text: "Both lists", at: Date.now() - 10_000 } });
+    render(<SpacesList />);
+    fireEvent.click(screen.getByText("Archived"));
+    // The row renders exactly ONCE — as the live row in its Space group
+    // (the sticky live id is view-filtered out of the Archived section).
+    // Prefix match: the row's title carries a `· alpha` suffix span.
+    expect(screen.getAllByText(/^Both lists/)).toHaveLength(1);
+  });
+
+  it("New Session with an archived session active starts a conversation in that space (not the Open Space dialog)", async () => {
+    seedArchived();
+    render(<SpacesList />);
+    fireEvent.click(screen.getByRole("button", { name: /New Session/ }));
+    // The `activeView` predicate matches via `archivedSessionIds` → the
+    // hook starts in that space (no live/stored session → the registry
+    // default agent `pi`).
+    await waitFor(() =>
+      expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/alpha"),
+    );
+    expect(screen.queryByText("New space")).toBeNull();
+  });
+
+  it("an archived-only active session still resolves its space for the skill catalog", async () => {
+    seedArchived();
+    render(<SpacesList />);
+    // The `useSkillCatalog` input path (`activeSession ? undefined :
+    // activeHistory ?? archivedSessions.find(…)`): the active session's
+    // Space path, NOT `null` (which would silently degrade the catalog
+    // to user-level skills). `listSkills` is called with the fetch key.
+    await waitFor(() =>
+      expect(mockedListSkills).toHaveBeenCalledWith("/tmp/alpha"),
+    );
+  });
+
+  it("logs a console error when Archive fails (the row is NOT moved)", async () => {
+    vi.mocked(setSessionArchived).mockRejectedValueOnce(new Error("boom"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<SpacesList />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Archive Refactor the parser" }),
+    );
+    // The rejection is logged (no unhandled rejection in the webview)...
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Failed to archive session:",
+        expect.anything(),
+      ),
+    );
+    // ...and the move did NOT land: the row is still a stored session.
+    const { archivedSessions, historySessions } = useSessions.getState();
+    expect(archivedSessions.some((s) => s.sessionId === "h1")).toBe(false);
+    expect(historySessions.some((s) => s.sessionId === "h1")).toBe(true);
+    consoleError.mockRestore();
+  });
+
+  it("logs a console error when Unarchive fails (the row is NOT moved)", async () => {
+    seedArchived();
+    vi.mocked(setSessionArchived).mockRejectedValueOnce(new Error("boom"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<SpacesList />);
+    fireEvent.click(screen.getByText("Archived"));
+    fireEvent.click(screen.getByRole("button", { name: /Unarchive/ }));
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Failed to unarchive session:",
+        expect.anything(),
+      ),
+    );
+    // The row is still archived (the mirror move did NOT land).
+    const { archivedSessions, historySessions } = useSessions.getState();
+    expect(archivedSessions.some((s) => s.sessionId === "a1")).toBe(true);
+    expect(historySessions.some((s) => s.sessionId === "a1")).toBe(false);
+    consoleError.mockRestore();
+  });
+
+  it("closes the delete dialog and logs a console error when Delete fails (the row remains)", async () => {
+    seedArchived();
+    mockedDeleteSession.mockRejectedValueOnce(new Error("boom"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<SpacesList />);
+    fireEvent.click(screen.getByText("Archived"));
+    fireEvent.click(screen.getByRole("button", { name: /Delete/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    // The dialog closes even on failure (a stuck-open dialog is worse
+    // than a logged failure) — the close is deferred into the `.catch`,
+    // so wait for it.
+    await waitFor(() =>
+      expect(screen.queryByText("Delete session?")).toBeNull(),
+    );
+    // ...and the rejection is logged (no unhandled rejection).
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Failed to delete session:",
+        expect.anything(),
+      ),
+    );
+    // The row remains: the store's delete only lands after the command
+    // resolves.
+    expect(
+      useSessions.getState().archivedSessions.some((s) => s.sessionId === "a1"),
+    ).toBe(true);
+    consoleError.mockRestore();
   });
 });

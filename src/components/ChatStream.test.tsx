@@ -58,6 +58,7 @@ vi.mock("../lib/tauri", async () => {
       agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: {},
+      archived: false,
     }),
     closeSession: vi.fn().mockResolvedValue(undefined),
     sendPrompt: vi.fn().mockResolvedValue("end_turn"),
@@ -66,6 +67,7 @@ vi.mock("../lib/tauri", async () => {
       agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true, promptCapabilities: { image: true } },
+      archived: false,
     }),
     respondPermission: vi.fn().mockResolvedValue(undefined),
     respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
@@ -101,7 +103,7 @@ function seedLiveSession(): void {
   useSessions.setState({
     activeSessionId: "s1",
     sessions: [
-      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
     ],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [],
@@ -126,9 +128,33 @@ function seedStoredSession(
     sessions: [],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [
-      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities },
+      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities, archived: false },
     ],
     messages: { s1: [] },
+    inTurn: {},
+    stopReasons: {},
+    closeReasons: {},
+    configOptions: {},
+  });
+}
+
+/**
+ * Seed a session that lives ONLY in `archivedSessions` (opened from the
+ * Archived section): `sessions` and `historySessions` are empty, so the
+ * session is neither live nor in the stored list.
+ */
+function seedArchivedSession(
+  capabilities: Record<string, unknown> = {},
+): void {
+  useSessions.setState({
+    activeSessionId: "s9",
+    sessions: [],
+    spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
+    historySessions: [],
+    archivedSessions: [
+      { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities, archived: true },
+    ],
+    messages: { s9: [] },
     inTurn: {},
     stopReasons: {},
     closeReasons: {},
@@ -149,6 +175,7 @@ function seedLiveSessionWithImages(): void {
         agentId: "a1",
         cwd: "/home/u/proj",
         capabilities: { promptCapabilities: { image: true } },
+        archived: false,
       },
     ],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
@@ -239,6 +266,7 @@ beforeEach(() => {
     activeSessionId: null,
     sessions: [],
     historySessions: [],
+    archivedSessions: [],
     spaces: [],
     messages: {},
     inTurn: {},
@@ -549,6 +577,151 @@ describe("ChatStream", () => {
     expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
   });
 
+  // --- Task 5 (ADR 0016): the manual Resume affordances are GONE — the
+  // banner is purely informational and the first send auto-resumes. ---
+
+  it("a resumable stored session renders an informational banner with no Resume button", () => {
+    seedStoredSession({ loadSession: true });
+    render(<ChatStream />);
+    // The banner is text ONLY — no Resume button (the first send resumes).
+    expect(
+      screen.getByText("This session is stored. Sending a message resumes it."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("the header dropdown has no Resume item", () => {
+    seedStoredSession({ loadSession: true });
+    render(<ChatStream />);
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Session actions" }),
+    );
+    // A stored session has no Pause either — the ONLY item is
+    // "New Session in this Space".
+    expect(
+      screen.getByRole("menuitem", { name: "New Session in this Space" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Pause" })).toBeNull();
+  });
+
+  it("the conversation selector lists the active archived session", () => {
+    seedArchivedSession();
+    render(<ChatStream />);
+    // A space whose ONLY session is archived still renders its space bar
+    // + conversation selector, and the archived session appears as the
+    // `Archived` option (without it the `Select` has zero items and its
+    // `value` matches nothing — an empty trigger + empty dropdown).
+    expect(screen.getByText("Archived")).toBeTruthy();
+  });
+
+  it("renders ONE option (Live) for a sticky-archived live session (no duplicate Live+Archived entry)", () => {
+    // STICKY state (the store's `resumeSession` deliberately leaves a
+    // resumed archived session in `archivedSessions` while it's live):
+    // the id is in BOTH `sessions` and `archivedSessions`.
+    useSessions.setState({
+      activeSessionId: "s9",
+      sessions: [
+        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
+      ],
+      spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
+      historySessions: [],
+      archivedSessions: [
+        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
+      ],
+      messages: { s9: [] },
+      inTurn: {},
+      stopReasons: {},
+      closeReasons: {},
+      configOptions: {},
+    });
+    render(<ChatStream />);
+    // Open the conversation selector: the sticky session must appear
+    // exactly ONCE — as `Live` (it's live). A duplicate `Archived` entry
+    // with the same `key`/`value` would be a React duplicate-key warning
+    // and an ambiguous `SelectValue` match.
+    fireEvent.click(screen.getByRole("combobox", { name: "Conversation" }));
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+    expect(screen.getByRole("option", { name: "Live" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "Archived" })).toBeNull();
+  });
+
+  it("labels a sticky-archived live session 'Live' when the space holds a second (more recent) live session", () => {
+    // Multi-live space (the one-live cap is lifted, ADR 0002): the sticky
+    // session (s9) is live — in BOTH `sessions` and `archivedSessions` —
+    // but is NOT `view.liveSessionId` because the OTHER live session (s1)
+    // is more recent (last in `sessions`). Its selector entry must be
+    // labeled `Live` (it IS live), not `Archived`.
+    useSessions.setState({
+      activeSessionId: "s9",
+      sessions: [
+        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
+        { sessionId: "s1", agentId: "a1", cwd: "/home/u/arch", capabilities: {}, archived: false },
+      ],
+      spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
+      historySessions: [],
+      archivedSessions: [
+        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
+      ],
+      messages: { s9: [], s1: [] },
+      inTurn: {},
+      stopReasons: {},
+      closeReasons: {},
+      configOptions: {},
+    });
+    render(<ChatStream />);
+    // The trigger shows the ACTIVE session's label: it must be `Live` (the
+    // session IS live), not `Archived`.
+    expect(
+      screen.getByRole("combobox", { name: "Conversation" }).textContent,
+    ).toBe("Live");
+    fireEvent.click(screen.getByRole("combobox", { name: "Conversation" }));
+    // Both live sessions are options (2 total — the active session appears
+    // exactly ONCE, not duplicated). The active session's entry (AFTER the
+    // view's live session s1 — it is not `view.liveSessionId`) must be
+    // labeled `Live` (it IS live), not `Archived`.
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(2);
+    expect(options[1].textContent).toBe("Live");
+    expect(screen.queryByRole("option", { name: "Archived" })).toBeNull();
+  });
+
+  it("an archived-only session renders the stored banner and an enabled composer, and first send resumes", async () => {
+    seedArchivedSession({ loadSession: true, promptCapabilities: { image: true } });
+    render(<ChatStream />);
+    // The `historySession` selector searches BOTH stored lists, so an
+    // archived-only session gets the stored banner AND an enabled
+    // composer (not "This session is closed").
+    expect(
+      screen.getByText("This session is stored. Sending a message resumes it."),
+    ).toBeTruthy();
+    const textarea = screen.getByRole("textbox");
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    fireEvent.change(textarea, {
+      target: { value: "resume the archived one" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // The first send auto-resumes the archived session…
+    await waitFor(() =>
+      expect(resumeSession).toHaveBeenCalledWith(
+        "a1",
+        "s9",
+        "/home/u/arch",
+      ),
+    );
+    // …and the message landed in `messages[s9]`.
+    await waitFor(() =>
+      expect(useSessions.getState().messages["s9"]).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "user",
+            text: "resume the archived one",
+          }),
+        ]),
+      ),
+    );
+  });
+
   it("paste stages a thumbnail in a resumable stored session (capability read from the stored session)", () => {
     seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
     render(<ChatStream />);
@@ -843,8 +1016,8 @@ describe("ChatStream", () => {
     useSessions.setState({
       activeSessionId: "s1",
       sessions: [
-        { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
-        { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {} },
+        { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
+        { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
       ],
       spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
       historySessions: [],
@@ -1166,6 +1339,7 @@ describe("ChatStream", () => {
             agentId: "a1",
             cwd: "/home/u/proj",
             capabilities: {},
+            archived: false,
           },
         ],
       });
@@ -1361,6 +1535,7 @@ describe("ChatStream", () => {
             agentId: "a1",
             cwd: "/home/u/proj",
             capabilities: {},
+            archived: false,
           },
         ],
       });
@@ -1515,12 +1690,14 @@ describe("ChatStream", () => {
           agentId: "a1",
           cwd: "/home/u/proj",
           capabilities: { promptCapabilities: { image: true } },
+          archived: false,
         },
         {
           sessionId: "s2",
           agentId: "a1",
           cwd: "/home/u/proj",
           capabilities: { promptCapabilities: { image: true } },
+          archived: false,
         },
       ],
     });
@@ -1625,6 +1802,7 @@ describe("ChatStream", () => {
       agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true },
+      archived: false,
     });
     render(<ChatStream />);
     pasteToComposer(
@@ -1653,6 +1831,7 @@ describe("ChatStream", () => {
       agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true },
+      archived: false,
     });
     render(<ChatStream />);
     pasteToComposer(

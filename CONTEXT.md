@@ -32,6 +32,10 @@ _Avoid_: In-process session, local session, built-in session
 A **Session** whose **Agent harness** is a spawned external agent process (today: pi, `pi --mode rpc`). The desktop is the RPC client; tools execute in the child (pre-tool-move) or are delegated to the desktop (tool-move+).
 _Avoid_: pi session, child session, remote session
 
+**Archived session**:
+A stored **Session** hidden from its **Space** group by an explicit user action (the `archived` flag on the `sessions` row) — listed in the sidebar's **Archived** section instead of its Space group. Archiving is a *view* property, not a lifecycle one: the transcript stays in the desktop's storage, the session is still openable and resumable (first send resumes it, as for any stored session), and the flag is **sticky** — it survives resume/pause and changes only via explicit archive/unarchive. Delete is offered only from the Archived section (ADR 0016).
+_Avoid_: Paused session, closed session, hidden session
+
 **Subagent session**:
 A desktop-spawned pi RPC session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
 _Avoid_: Worker, delegated task, child session, background session

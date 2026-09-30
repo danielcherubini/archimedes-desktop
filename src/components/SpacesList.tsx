@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ArchiveIcon,
+  ArchiveXIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   FolderIcon,
@@ -10,8 +12,10 @@ import {
   ShieldCheckIcon,
   ShieldIcon,
   SparklesIcon,
+  Trash2Icon,
 } from "lucide-react";
-import { closeSession } from "../lib/tauri";
+import { closeSession, type SessionInfo } from "../lib/tauri";
+import { basenameOfPath } from "../lib/paths";
 import {
   useSessions,
   spaceViewFor,
@@ -24,6 +28,7 @@ import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
 import NewSpaceDialog from "./NewSpaceDialog";
 import SkillsDialog from "./SkillsDialog";
+import DeleteSessionDialog from "./DeleteSessionDialog";
 import { Spinner } from "./ui/spinner";
 import { Kbd } from "./ui/kbd";
 
@@ -57,13 +62,26 @@ function titleFor(messages: Message[] | undefined, spaceName: string): string {
   return firstUser.text.length > 80 ? firstUser.text.slice(0, 80) : firstUser.text;
 }
 
+/**
+ * A session's Space name (the `spaceViewFor` pattern): a session's
+ * `cwd` IS the Space's `path` (both canonical-path keys) — the base
+ * name of the matching space, or of the `cwd` itself when NO space
+ * matches (a legacy session whose cwd is no longer a Space).
+ */
+function spaceNameFor(cwd: string, spaces: { path: string }[]): string {
+  const match = spaces.find((s) => s.path === cwd);
+  return match ? basenameOfPath(match.path) : basenameOfPath(cwd);
+}
+
 export default function SpacesList() {
   const spaces = useSessions((s) => s.spaces);
   const sessions = useSessions((s) => s.sessions);
   const historySessions = useSessions((s) => s.historySessions);
+  const archivedSessions = useSessions((s) => s.archivedSessions);
   const closeReasons = useSessions((s) => s.closeReasons);
   const activeSessionId = useSessions((s) => s.activeSessionId);
   const openSession = useSessions((s) => s.openSession);
+  const deleteSession = useSessions((s) => s.deleteSession);
   const [dialogOpen, setDialogOpen] = useState(false);
   // The Skills modal (the left pane has NO skill list — ZCode parity: the
   // skills UI is a searchable modal, opened from the third button in the
@@ -75,31 +93,59 @@ export default function SpacesList() {
   // Keep the `spaces` list order (`lastOpenedAt` desc from `list_spaces`):
   // groups follow the server's recent-first order.
   const views = useMemo(
-    () => spaces.map((s) => spaceViewFor(s, sessions, historySessions, closeReasons)),
-    [spaces, sessions, historySessions, closeReasons],
+    () =>
+      spaces.map((s) =>
+        spaceViewFor(s, sessions, historySessions, closeReasons, archivedSessions),
+      ),
+    [spaces, sessions, historySessions, closeReasons, archivedSessions],
   );
   // The view owning `activeSessionId` (the same `view` `ChatStream`
-  // computes): the active session's Space, matched by live or stored
-  // membership. `undefined` when nothing is active.
+  // computes): the active session's Space, matched by live, stored, OR
+  // archived membership (`archivedSessionIds` is view-membership-only —
+  // an archived session is never rendered in the Space group, so a
+  // space whose only sessions are archived still resolves its `view`;
+  // ⌘N / New Session while an archived session is active routes to
+  // THAT space, not the Open Space dialog). `undefined` when nothing is
+  // active.
   const activeView =
     activeSessionId === null
       ? undefined
       : views.find(
           (v) =>
             v.liveSessionId === activeSessionId ||
-            v.storedSessionIds.includes(activeSessionId),
+            v.storedSessionIds.includes(activeSessionId) ||
+            v.archivedSessionIds.includes(activeSessionId),
         );
   const newSession = useStartNewConversation(activeView);
 
   // The active Space's path for the skill catalog: a Session's `cwd` IS
-  // the Space's folder (CONTEXT.md). Live sessions first, then stored;
-  // `null` when nothing is active (user-level skills only).
+  // the Space's folder (CONTEXT.md). Live sessions first, then stored,
+  // then ARCHIVED (an archived-only active session must still resolve
+  // its Space — otherwise the catalog silently degrades to user-level
+  // skills); `null` when nothing is active.
   const activeSession = sessions.find((s) => s.sessionId === activeSessionId);
   const activeHistory = activeSession
     ? undefined
-    : historySessions.find((s) => s.sessionId === activeSessionId);
+    : historySessions.find((s) => s.sessionId === activeSessionId) ??
+      archivedSessions.find((s) => s.sessionId === activeSessionId);
   const activeSpacePath = activeSession?.cwd ?? activeHistory?.cwd ?? null;
   const skills = useSkillCatalog(activeSpacePath);
+
+  // The session awaiting delete confirmation (the ONLY destructive
+  // action in the sidebar — archive/unarchive are reversible and have
+  // no confirm). `null` = no dialog. (The selector is unconditional and
+  // returns stable references — `undefined` or the transcript array —
+  // so Zustand does not re-render in a loop.)
+  const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
+  const deleteTargetMessages = useSessions(
+    (s) => (deleteTarget ? s.messages[deleteTarget.sessionId] : undefined),
+  );
+  const deleteTargetTitle = deleteTarget
+    ? titleFor(
+        deleteTargetMessages,
+        spaceNameFor(deleteTarget.cwd, spaces),
+      )
+    : "";
 
   // `handleOpenSpace` is stable forever; `handleNewSession` is stable only
   // while `activeSessionId` and `newSession` are — but `useStartNewConversation`
@@ -196,10 +242,33 @@ export default function SpacesList() {
             onOpen={openSession}
           />
         ))}
+        <ArchivedSection
+          activeSessionId={activeSessionId}
+          onOpen={openSession}
+          onDelete={setDeleteTarget}
+        />
       </div>
       {dialogOpen && <NewSpaceDialog onClose={() => setDialogOpen(false)} />}
       {skillsOpen && (
         <SkillsDialog skills={skills} onClose={() => setSkillsOpen(false)} />
+      )}
+      {deleteTarget && (
+        <DeleteSessionDialog
+          title={deleteTargetTitle}
+          onConfirm={() => {
+            // The store's `deleteSession` removes the id from ALL lists
+            // (live / stored / archived + messages + activeSessionId). The
+            // dialog closes on success AND on failure (a stuck-open dialog
+            // is worse); a failure is logged (no unhandled rejection).
+            deleteSession(deleteTarget.sessionId)
+              .then(() => setDeleteTarget(null))
+              .catch((err) => {
+                console.error("Failed to delete session:", err);
+                setDeleteTarget(null);
+              });
+          }}
+          onClose={() => setDeleteTarget(null)}
+        />
       )}
     </aside>
   );
@@ -303,8 +372,9 @@ function SpaceGroup({
  * the right slot: the relative time of last activity, the green "Waiting"
  * attention pill (a pending permission prompt OR a pending bridge
  * `ask`/`confirm`/`password` request — `password` included: a pending sudo
- * password shows no "Waiting" cue anywhere else), or — on row hover for a
- * live session — a Pause button (the existing `closeSession` path).
+ * password shows no "Waiting" cue anywhere else) — swapped on row hover
+ * for a Pause button (live sessions, the existing `closeSession` path) or
+ * an Archive button (stored sessions, reversible — no confirm).
  */
 function SessionRow({
   sessionId,
@@ -320,6 +390,7 @@ function SessionRow({
   const messages = useSessions((s) => s.messages[sessionId]);
   const isLive = useSessions((s) => s.sessions.some((x) => x.sessionId === sessionId));
   const inTurn = useSessions((s) => !!s.inTurn[sessionId]);
+  const archiveSession = useSessions((s) => s.archiveSession);
   // Selectors return stable references (no fresh `[]` fallbacks INSIDE the
   // selector) or Zustand re-renders forever.
   const prompts = usePermissions((s) => s.prompts[sessionId]) ?? [];
@@ -393,8 +464,192 @@ function SessionRow({
           </button>
         </>
       ) : (
-        rightSlot
+        // Stored row: the time/pill slot swaps for an Archive hover
+        // button (the same pattern as the live row's Pause — archive is
+        // reversible, so it needs no confirm). The slot still renders
+        // when NOT hovering.
+        <>
+          <span className="group-hover:hidden">{rightSlot}</span>
+          <button
+            type="button"
+            title="Archive"
+            aria-label={`Archive ${title}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              void archiveSession(sessionId).catch((err) => {
+                console.error("Failed to archive session:", err);
+              });
+            }}
+            className="hidden size-6 items-center justify-center rounded-md group-hover:flex hover:bg-surface-hover"
+          >
+            <ArchiveIcon className="size-4" />
+          </button>
+        </>
       )}
+    </div>
+  );
+}
+
+/**
+ * The flat, cross-space Archived section (ZCode's
+ * `WorkspaceArchivedTasksFlatSection` model adapted to Archimedes' row
+ * style): rendered AFTER the Space groups, scrolling with the list.
+ * COLLAPSED by default; the header (icon + "Archived" + count + chevron)
+ * toggles it. The sticky live ids are view-filtered out — a resumed
+ * archived session renders in its Space group (live), not here.
+ */
+function ArchivedSection({
+  activeSessionId,
+  onOpen,
+  onDelete,
+}: {
+  activeSessionId: string | null;
+  onOpen: (sessionId: string) => void;
+  onDelete: (session: SessionInfo) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const archived = useSessions((s) => s.archivedSessions);
+  const sessions = useSessions((s) => s.sessions);
+  const visible = archived.filter(
+    (s) => !sessions.some((l) => l.sessionId === s.sessionId),
+  );
+  return (
+    <div className="px-2.5 py-1">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen(!open)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") setOpen(!open);
+        }}
+        className="group flex cursor-pointer items-center gap-1 rounded-lg px-1 hover:bg-surface-hover"
+      >
+        <ArchiveIcon className="size-4 shrink-0 text-foreground-subtlest" />
+        <span className="flex-1 truncate text-ui-base text-foreground-subtlest group-hover:text-foreground-subtle">
+          Archived
+        </span>
+        <span className="text-ui-sm text-foreground-subtlest">
+          {visible.length}
+        </span>
+        {open ? (
+          <ChevronDownIcon className="size-4 shrink-0 text-foreground-subtlest" />
+        ) : (
+          <ChevronRightIcon className="size-4 shrink-0 text-foreground-subtlest" />
+        )}
+      </div>
+      {open && (
+        <div className="mt-1 flex flex-col gap-0.5">
+          {visible.length === 0 ? (
+            <p className="px-1 py-1 text-ui-sm text-foreground-subtlest">
+              No archived sessions.
+            </p>
+          ) : (
+            visible.map((session) => (
+              <ArchivedSessionRow
+                key={session.sessionId}
+                session={session}
+                active={activeSessionId === session.sessionId}
+                onOpen={onOpen}
+                onDelete={onDelete}
+              />
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One archived-session row (the `SessionRow` visual pattern): 16px
+ * leading slot (empty — archived sessions are NEVER live, so no
+ * spinner), the title + a subtle `· {spaceName}` suffix ONLY when the
+ * title is message-derived (skipped when the title IS the space name —
+ * avoid "alpha · alpha"), and the relative time (empty slot when the
+ * transcript was not loaded this boot). Hover: Unarchive (`ArchiveX`,
+ * reversible — no confirm) + Delete (`Trash2`, the only destructive
+ * action — confirm dialog). Click opens the transcript (identical to a
+ * stored row — the first send resumes it).
+ */
+function ArchivedSessionRow({
+  session,
+  active,
+  onOpen,
+  onDelete,
+}: {
+  session: SessionInfo;
+  active: boolean;
+  onOpen: (sessionId: string) => void;
+  onDelete: (session: SessionInfo) => void;
+}) {
+  const messages = useSessions((s) => s.messages[session.sessionId]);
+  const spaces = useSessions((s) => s.spaces);
+  const unarchiveSession = useSessions((s) => s.unarchiveSession);
+  const spaceName = spaceNameFor(session.cwd, spaces);
+  const title = titleFor(messages, spaceName);
+  const time = relativeTimeFor(messages);
+  const showSuffix = title !== spaceName;
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(session.sessionId)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onOpen(session.sessionId);
+      }}
+      className={`group flex cursor-pointer items-center gap-2 rounded-lg pl-2.5 pr-1 py-1 ${
+        active ? "bg-selected" : "hover:bg-surface-hover"
+      }`}
+    >
+      <span className="size-4 shrink-0" />
+      <span
+        className="min-w-0 flex-1 overflow-hidden whitespace-nowrap text-ui-base text-foreground"
+        style={{
+          maskImage:
+            "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+          WebkitMaskImage:
+            "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+        }}
+      >
+        {title}
+        {showSuffix && (
+          <span className="text-foreground-subtlest"> · {spaceName}</span>
+        )}
+      </span>
+      <span className="group-hover:hidden">
+        {time !== null ? (
+          <span className="text-ui-sm text-foreground-subtle">{time}</span>
+        ) : (
+          // Empty slot — keeps alignment when there is no loaded transcript.
+          <span className="size-4" />
+        )}
+      </span>
+      <button
+        type="button"
+        title="Unarchive"
+        aria-label={`Unarchive ${title}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          void unarchiveSession(session.sessionId).catch((err) => {
+            console.error("Failed to unarchive session:", err);
+          });
+        }}
+        className="hidden size-6 items-center justify-center rounded-md group-hover:flex hover:bg-surface-hover"
+      >
+        <ArchiveXIcon className="size-4" />
+      </button>
+      <button
+        type="button"
+        title="Delete"
+        aria-label={`Delete ${title}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete(session);
+        }}
+        className="hidden size-6 items-center justify-center rounded-md group-hover:flex hover:bg-surface-hover"
+      >
+        <Trash2Icon className="size-4" />
+      </button>
     </div>
   );
 }

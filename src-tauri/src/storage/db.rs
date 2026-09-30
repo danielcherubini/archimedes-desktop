@@ -42,6 +42,9 @@ pub struct SessionRow {
     pub title: Option<String>,
     /// The negotiated `agent_capabilities`, serialized (camelCase).
     pub capabilities_json: String,
+    /// The desktop's archived flag (ADR 0016): `true` hides the session from
+    /// its Space group into the Archived section; the transcript is kept.
+    pub archived: bool,
 }
 
 /// A row from the `messages` table.
@@ -136,6 +139,21 @@ impl Db {
         if has_trusted == 0 {
             conn.execute(
                 "ALTER TABLE spaces ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // One-time migration for pre-existing databases: add `archived` to
+        // `sessions` (fresh databases already have it from SCHEMA). The same
+        // pragma-gated pattern as the `trusted` migration above — the ALTER
+        // runs only when the column is absent, so a re-open never issues it.
+        let has_archived: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'archived'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_archived == 0 {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -275,8 +293,10 @@ impl Db {
     /// `--session` argument of the resume spawn).
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = guard
-            .prepare("SELECT id, agent_id, cwd, created_at, title, capabilities_json FROM sessions WHERE id = ?1")?;
+        let mut stmt = guard.prepare(
+            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived \
+             FROM sessions WHERE id = ?1",
+        )?;
         let row = stmt
             .query_map(params![id], |row| {
                 Ok(SessionRow {
@@ -286,6 +306,7 @@ impl Db {
                     created_at: row.get(3)?,
                     title: row.get(4)?,
                     capabilities_json: row.get(5)?,
+                    archived: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .next()
@@ -294,13 +315,23 @@ impl Db {
     }
 
     /// All stored sessions, newest first.
-    pub fn list_sessions(&self) -> Result<Vec<SessionRow>, DbError> {
+    ///
+    /// `include_archived = false` (the default) excludes archived rows — the
+    /// sidebar's Space groups render stored sessions only; the boot fetches
+    /// with `true` and splits client-side by the flag (ADR 0016).
+    pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = guard.prepare(
-            "SELECT id, agent_id, cwd, created_at, title, capabilities_json
+        let sql = if include_archived {
+            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived
              FROM sessions
-             ORDER BY created_at DESC, id DESC",
-        )?;
+             ORDER BY created_at DESC, id DESC"
+        } else {
+            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived
+             FROM sessions
+             WHERE archived = 0
+             ORDER BY created_at DESC, id DESC"
+        };
+        let mut stmt = guard.prepare(sql)?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(SessionRow {
@@ -310,10 +341,24 @@ impl Db {
                     created_at: row.get(3)?,
                     title: row.get(4)?,
                     capabilities_json: row.get(5)?,
+                    archived: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Set (or clear) a session's archived flag (ADR 0016): the transcript
+    /// is NOT touched — only the flag on the `sessions` row.
+    ///
+    /// Returns `true` when a row matched, `false` when nothing matched (a
+    /// missing row is a no-op, not an error — mirroring `set_space_trusted`).
+    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<bool, DbError> {
+        let n = self.conn.lock().expect("db mutex poisoned").execute(
+            "UPDATE sessions SET archived = ?2 WHERE id = ?1",
+            params![id, archived],
+        )?;
+        Ok(n > 0)
     }
 
     /// A session's messages in insertion order (the transcript order).
@@ -577,7 +622,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     title TEXT,
-    capabilities_json TEXT NOT NULL
+    capabilities_json TEXT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -760,6 +806,214 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "the transcript row survived the recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) A pre-existing database whose `sessions` table predates
+    /// the `archived` column must open CLEANLY (the one-time migration adds
+    /// the column with a `DEFAULT 0` backfill) and the pre-existing rows
+    /// must read `archived == false` (the default).
+    #[test]
+    fn archived_column_migration_on_a_preexisting_db() {
+        let dir = std::env::temp_dir().join(format!("db-archived-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // A pre-existing database: the LEGACY `sessions` table (WITHOUT
+        // `archived`) + the rest of the schema.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                message_key TEXT,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, kind, message_key)
+            );
+            CREATE TABLE native_messages (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            CREATE TABLE spaces (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');",
+        )
+        .unwrap();
+        drop(conn);
+        // The next `Db::open` must SUCCEED (the migration adds the column).
+        let db = Db::open(&path).expect("the archived migration is one-time and idempotent");
+        // ...and the column is in place now.
+        let has: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'archived'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has, 1,
+            "the archived column is in place after the migration"
+        );
+        // ...and the pre-existing row reads `archived == false` (the default).
+        let rows = db
+            .list_sessions(true)
+            .expect("list_sessions should succeed");
+        assert_eq!(rows.len(), 1, "the pre-existing row survived");
+        assert_eq!(rows[0].id, "s1");
+        assert!(
+            !rows[0].archived,
+            "a pre-existing row reads archived == false"
+        );
+        // ...and a SECOND open of the already-migrated database is a clean
+        // no-op (the `pragma_table_info` gate skips the ALTER) — the
+        // migration is idempotent: the row survives re-opening intact with
+        // `archived == false`.
+        drop(db);
+        let db = Db::open(&path).expect("a re-open of the migrated db must succeed");
+        let rows = db
+            .list_sessions(true)
+            .expect("list_sessions should succeed on the second open");
+        assert_eq!(rows.len(), 1, "the pre-existing row survived the re-open");
+        assert_eq!(rows[0].id, "s1");
+        assert!(
+            !rows[0].archived,
+            "the re-opened row still reads archived == false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) `list_sessions(false)` never returns archived rows;
+    /// `list_sessions(true)` returns them with the flag set. Mixed-list
+    /// parity: with a mix of archived and non-archived rows, the default
+    /// list returns EXACTLY the non-archived row and the full list returns
+    /// both with the correct flags.
+    #[test]
+    fn list_sessions_filters_archived_by_default() {
+        let dir = std::env::temp_dir().join(format!("db-archived-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).expect("db should open");
+        let mk = |id: &str| SessionInfo {
+            session_id: id.to_string(),
+            agent_id: "fake".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({
+                "piSessionId": id,
+                "loadSession": true,
+            }),
+            config_options: None,
+            archived: false,
+        };
+        // Two sessions; one of them gets archived.
+        db.record_session(&mk("sess-1"))
+            .expect("record_session should succeed");
+        db.record_session(&mk("sess-2"))
+            .expect("record_session should succeed");
+        assert!(
+            db.set_session_archived("sess-1", true)
+                .expect("set_session_archived should succeed"),
+            "a matching row returns true"
+        );
+        let visible = db
+            .list_sessions(false)
+            .expect("list_sessions(false) should succeed");
+        assert_eq!(
+            visible.len(),
+            1,
+            "list_sessions(false) returns exactly the non-archived row"
+        );
+        assert_eq!(
+            visible[0].id, "sess-2",
+            "the default list returns the non-archived row"
+        );
+        assert!(
+            !visible[0].archived,
+            "list_sessions(false) never returns archived rows"
+        );
+        let all = db
+            .list_sessions(true)
+            .expect("list_sessions(true) should succeed");
+        assert_eq!(all.len(), 2, "list_sessions(true) returns both rows");
+        let by_id: std::collections::HashMap<&str, &bool> =
+            all.iter().map(|r| (r.id.as_str(), &r.archived)).collect();
+        assert_eq!(
+            by_id["sess-1"], &true,
+            "the archived flag is set on the row"
+        );
+        assert_eq!(by_id["sess-2"], &false, "the non-archived flag is clear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) `set_session_archived` on an id with no row is a no-op:
+    /// `Ok(false)` (mirrors `set_space_trusted`'s documented behavior).
+    #[test]
+    fn set_session_archived_is_a_noop_for_an_unknown_id() {
+        let dir = std::env::temp_dir().join(format!("db-archived-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).expect("db should open");
+        assert!(
+            !db.set_session_archived("no-such-session", true)
+                .expect("should not error"),
+            "a missing row is a no-op returning false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0016) A re-`record_session` (the resume re-record) never clears
+    /// the archived flag — the `ON CONFLICT … DO UPDATE` branch must not
+    /// touch `archived` (no retroactive un-archive).
+    #[test]
+    fn record_session_preserves_the_archived_flag() {
+        let dir = std::env::temp_dir().join(format!("db-archived-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).expect("db should open");
+        let session = SessionInfo {
+            session_id: "sess-1".to_string(),
+            agent_id: "fake".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({
+                "piSessionId": "sess-1",
+                "loadSession": true,
+            }),
+            config_options: None,
+            archived: false,
+        };
+        db.record_session(&session)
+            .expect("record_session should succeed");
+        db.set_session_archived("sess-1", true)
+            .expect("set_session_archived should succeed");
+        // The resume re-record (the same upsert, a refreshed row).
+        db.record_session(&session)
+            .expect("re-record should succeed");
+        let all = db
+            .list_sessions(true)
+            .expect("list_sessions(true) should succeed");
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].archived,
+            "a re-record never clears the archived flag"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,7 +11,7 @@ import {
   type Message,
 } from "./sessions";
 import { useSubagents } from "./subagents";
-import { loadHistory } from "../lib/tauri";
+import { loadHistory, setSessionArchived } from "../lib/tauri";
 import type {
   CloseReasonStr,
   MessageRow,
@@ -28,14 +28,20 @@ vi.mock("../lib/tauri", async () => {
       agentId: "a1",
       cwd: "/x",
       capabilities: {},
+      archived: false,
       configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "gpt-4" }],
     }),
     loadHistory: vi.fn().mockResolvedValue([]),
+    // The store's `archiveSession` / `unarchiveSession` / `deleteSession` call
+    // these: mock them (the REAL wrappers would `invoke` and reject in
+    // jsdom — no global Tauri mock exists).
+    setSessionArchived: vi.fn().mockResolvedValue(true),
+    deleteSession: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 /**
- * Fixtures use EXACTLY the four `SessionInfo` wire fields — `SessionInfo`
+ * Fixtures use EXACTLY the five `SessionInfo` wire fields — `SessionInfo`
  * over IPC has NO `createdAt` (see the ordering note in `sessions.ts`), so
  * the pure helpers must rely on input order, not invented timestamps.
  */
@@ -44,6 +50,7 @@ const info = (sessionId: string, cwd: string): SessionInfo => ({
   agentId: "clack-1.0",
   cwd,
   capabilities: {},
+  archived: false,
 });
 
 /**
@@ -503,12 +510,13 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
   };
 
   it("groups a space with a live session and a stored session", () => {
-    const view = spaceViewFor(spaces[0], sessions, historySessions, closeReasons);
+    const view = spaceViewFor(spaces[0], sessions, historySessions, closeReasons, []);
     expect(view).toEqual({
       path: "/workspaces/alpha",
       title: "alpha",
       liveSessionId: "live-alpha",
       storedSessionIds: ["stored-alpha"],
+      archivedSessionIds: [],
       trusted: false,
       // The newest session's reason: the live one's (`live-alpha` →
       // `user`), NOT the stored session's (`stored-alpha` → `error`) —
@@ -518,12 +526,13 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
   });
 
   it("returns storedSessionIds in the given input order (no re-sort)", () => {
-    const view = spaceViewFor(spaces[1], sessions, historySessions, closeReasons);
+    const view = spaceViewFor(spaces[1], sessions, historySessions, closeReasons, []);
     expect(view).toEqual({
       path: "/workspaces/bravo",
       title: "bravo",
       liveSessionId: null,
       storedSessionIds: ["idX", "idY"],
+      archivedSessionIds: [],
       trusted: false,
       // No live session: the head of the stored subsequence's reason.
       lastReason: "agent-exited",
@@ -531,12 +540,13 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
   });
 
   it("returns an empty shape for a space with no sessions", () => {
-    const view = spaceViewFor(spaces[2], sessions, historySessions, closeReasons);
+    const view = spaceViewFor(spaces[2], sessions, historySessions, closeReasons, []);
     expect(view).toEqual({
       path: "/workspaces/charlie",
       title: "charlie",
       liveSessionId: null,
       storedSessionIds: [],
+      archivedSessionIds: [],
       trusted: false,
       lastReason: undefined,
     });
@@ -551,7 +561,7 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
       info("first", "/workspaces/alpha"),
       info("second", "/workspaces/alpha"),
     ];
-    const view = spaceViewFor(spaces[0], twoLive, historySessions, closeReasons);
+    const view = spaceViewFor(spaces[0], twoLive, historySessions, closeReasons, []);
     expect(view.liveSessionId).toBe("second");
     expect(view.storedSessionIds).toEqual(["stored-alpha"]);
   });
@@ -940,6 +950,7 @@ describe("configOptions state", () => {
       agentId: "a1",
       cwd: "/x",
       capabilities: {},
+      archived: false,
       configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "gpt-4" }],
     });
     expect(useSessions.getState().configOptions.s1).toEqual([
@@ -951,6 +962,7 @@ describe("configOptions state", () => {
       agentId: "a2",
       cwd: "/x",
       capabilities: {},
+      archived: false,
     });
     expect("s2" in useSessions.getState().configOptions).toBe(false);
   });
@@ -958,7 +970,7 @@ describe("configOptions state", () => {
   it("seeds configOptions from a resumed session's SessionInfo", async () => {
     useSessions.setState({
       historySessions: [
-        { sessionId: "s1", agentId: "a1", cwd: "/x", capabilities: {} },
+        { sessionId: "s1", agentId: "a1", cwd: "/x", capabilities: {}, archived: false },
       ],
     });
     await useSessions.getState().resumeSession("s1");
@@ -1138,6 +1150,7 @@ describe("resumeSession (history reload race)", () => {
           agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
+          archived: false,
         },
       ],
       messages: {
@@ -1199,6 +1212,7 @@ describe("resumeSession (history reload race)", () => {
           agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
+          archived: false,
         },
       ],
       messages: {
@@ -1268,6 +1282,7 @@ describe("resumeSession (history reload race)", () => {
           agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
+          archived: false,
         },
       ],
       messages: {
@@ -1308,5 +1323,245 @@ describe("resumeSession (history reload race)", () => {
     // The new local copy (created just now, NOT the reloaded row's `at: 1`)
     // is present.
     expect(hi.some((m) => m.at > 1)).toBe(true);
+  });
+});
+
+describe("archivedSessions (sticky, ADR 0016)", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      archivedSessions: [],
+      activeSessionId: null,
+      closeReasons: {},
+      messages: {},
+      configOptions: {},
+    });
+  });
+
+  it("setHistorySessions splits rows by the archived flag (live ids in neither list)", () => {
+    useSessions.setState({
+      sessions: [info("live-1", "/x")],
+    });
+    useSessions.getState().setHistorySessions([
+      info("live-1", "/x"), // live id → excluded from BOTH lists
+      { ...info("arch-1", "/x"), archived: true },
+      info("hist-1", "/x"),
+    ]);
+    const st = useSessions.getState();
+    expect(st.historySessions.map((s) => s.sessionId)).toEqual(["hist-1"]);
+    expect(st.archivedSessions.map((s) => s.sessionId)).toEqual(["arch-1"]);
+  });
+
+  it("archiveSession moves the entry historySessions → archivedSessions and calls the backend", async () => {
+    useSessions.setState({
+      historySessions: [info("h1", "/x")],
+    });
+    await useSessions.getState().archiveSession("h1");
+    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith("h1", true);
+    const st = useSessions.getState();
+    expect(st.historySessions).toEqual([]);
+    expect(st.archivedSessions).toEqual([info("h1", "/x")]);
+  });
+
+  it("archiveSession is a no-op for an unknown id (does not call the backend)", async () => {
+    useSessions.setState({ historySessions: [] });
+    await useSessions.getState().archiveSession("missing");
+    expect(vi.mocked(setSessionArchived)).not.toHaveBeenCalled();
+  });
+
+  it("unarchiveSession is the mirror", async () => {
+    useSessions.setState({
+      archivedSessions: [info("h1", "/x")],
+    });
+    await useSessions.getState().unarchiveSession("h1");
+    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith("h1", false);
+    const st = useSessions.getState();
+    expect(st.archivedSessions).toEqual([]);
+    expect(st.historySessions).toEqual([info("h1", "/x")]);
+  });
+
+  it("archiveSession is idempotent under concurrent invocation (double-click)", async () => {
+    // Two invocations both pass the pre-await membership check; the move
+    // must still land the id in `archivedSessions` EXACTLY ONCE.
+    useSessions.setState({
+      historySessions: [info("h1", "/x")],
+    });
+    const p1 = useSessions.getState().archiveSession("h1");
+    const p2 = useSessions.getState().archiveSession("h1");
+    await Promise.all([p1, p2]);
+    const st = useSessions.getState();
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("h1");
+    expect(
+      st.archivedSessions.map((s) => s.sessionId).filter((id) => id === "h1"),
+    ).toHaveLength(1);
+  });
+
+  it("unarchiveSession is idempotent under concurrent invocation (double-click)", async () => {
+    useSessions.setState({
+      archivedSessions: [info("h1", "/x")],
+    });
+    const p1 = useSessions.getState().unarchiveSession("h1");
+    const p2 = useSessions.getState().unarchiveSession("h1");
+    await Promise.all([p1, p2]);
+    const st = useSessions.getState();
+    expect(st.archivedSessions.map((s) => s.sessionId)).not.toContain("h1");
+    expect(
+      st.historySessions.map((s) => s.sessionId).filter((id) => id === "h1"),
+    ).toHaveLength(1);
+  });
+
+  it("a delete that completes mid-archive-await leaves no ghost row", async () => {
+    useSessions.setState({
+      historySessions: [info("h1", "/x")],
+    });
+    // Manual deferred resolution: the delete's `set` must land BEFORE the
+    // archive's `set`. With plain `mockResolvedValue` the mock resolves in
+    // call order (archive first — it called the backend first), which would
+    // let the delete clear the row and hide the bug.
+    let resolveArchived: (v: boolean) => void = () => {};
+    vi.mocked(setSessionArchived).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveArchived = resolve;
+        }),
+    );
+    const pArchive = useSessions.getState().archiveSession("h1");
+    const pDelete = useSessions.getState().deleteSession("h1");
+    await pDelete; // delete's `set` clears both lists first
+    resolveArchived(true);
+    await pArchive; // archive's `set` must re-check and no-op
+    const st = useSessions.getState();
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("h1");
+    expect(st.archivedSessions.map((s) => s.sessionId)).not.toContain("h1");
+  });
+
+  it("an archive that lands after a resume of the same session keeps client and DB in agreement (sticky live)", async () => {
+    // The mocked `resumeSession` resolves to a FIXED `SessionInfo` with
+    // `sessionId: "s1"` — seed the history list with that id.
+    useSessions.setState({
+      historySessions: [info("s1", "/x")],
+    });
+    // Manual deferred resolution: the resume's `set` must land BEFORE the
+    // archive's `set` (the row's Archive hover button stays clickable
+    // until the resume's `set` lands). With plain `mockResolvedValue`
+    // the archive's backend resolves first (it was called first) and the
+    // race would not be exercised.
+    let resolveArchived: (v: boolean) => void = () => {};
+    vi.mocked(setSessionArchived).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveArchived = resolve;
+        }),
+    );
+    const pArchive = useSessions.getState().archiveSession("s1");
+    const pResume = useSessions.getState().resumeSession("s1");
+    await pResume; // resume's `set` removes the id from `historySessions`,
+                   // adds it to `sessions`, leaves it OUT of
+                   // `archivedSessions` (the pre-sticky state)
+    resolveArchived(true);
+    await pArchive; // the DB flag is now `true` — the client must land
+                    // the id in `archivedSessions` (sticky live), not no-op
+    const st = useSessions.getState();
+    expect(st.sessions.map((s) => s.sessionId)).toContain("s1");
+    expect(st.archivedSessions.map((s) => s.sessionId)).toContain("s1");
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("s1");
+  });
+
+  it("an unarchive that lands after a resume of the same session does not duplicate the live id into historySessions", async () => {
+    useSessions.setState({
+      archivedSessions: [info("s1", "/x")],
+    });
+    // Manual deferred resolution: the resume's `set` must land BEFORE the
+    // unarchive's `set` (see the archive race above).
+    let resolveArchived: (v: boolean) => void = () => {};
+    vi.mocked(setSessionArchived).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveArchived = resolve;
+        }),
+    );
+    const pUnarchive = useSessions.getState().unarchiveSession("s1");
+    const pResume = useSessions.getState().resumeSession("s1");
+    await pResume; // the id is now live: in `sessions` AND (sticky)
+                   // `archivedSessions`
+    resolveArchived(false);
+    await pUnarchive; // must remove it from `archivedSessions` but NOT
+                      // append it to `historySessions` (the close handler
+                      // lands it there on close)
+    const st = useSessions.getState();
+    expect(st.sessions.map((s) => s.sessionId)).toContain("s1");
+    expect(st.archivedSessions.map((s) => s.sessionId)).not.toContain("s1");
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("s1");
+  });
+
+  it("resumeSession finds an archived session and keeps it sticky (in BOTH live and archived)", async () => {
+    // The mocked `resumeSession` (tauri) resolves to a FIXED `SessionInfo`
+    // with `sessionId: "s1"` — seed the archived list with that id.
+    useSessions.setState({
+      archivedSessions: [info("s1", "/x")],
+    });
+    await useSessions.getState().resumeSession("s1");
+    const st = useSessions.getState();
+    expect(st.sessions.map((s) => s.sessionId)).toContain("s1");
+    // STICKY: the entry stays in `archivedSessions` while the session is
+    // live (the Archived view filters out live ids).
+    expect(st.archivedSessions.map((s) => s.sessionId)).toContain("s1");
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("s1");
+  });
+
+  it("a resumed-then-closed archived session stays archived (NOT in historySessions)", async () => {
+    useSessions.setState({
+      archivedSessions: [info("s1", "/x")],
+    });
+    await useSessions.getState().resumeSession("s1");
+    useSessions.getState().handleSessionClosed("s1", "user");
+    const st = useSessions.getState();
+    expect(st.archivedSessions.map((s) => s.sessionId)).toContain("s1");
+    expect(st.historySessions.map((s) => s.sessionId)).not.toContain("s1");
+  });
+
+  it("deleteSession removes the id from all three lists", async () => {
+    useSessions.setState({
+      sessions: [info("d1", "/x")],
+      historySessions: [info("d1", "/x")],
+      archivedSessions: [info("d1", "/x")],
+      activeSessionId: "d1",
+    });
+    await useSessions.getState().deleteSession("d1");
+    const st = useSessions.getState();
+    expect(st.sessions).toEqual([]);
+    expect(st.historySessions).toEqual([]);
+    expect(st.archivedSessions).toEqual([]);
+    expect(st.activeSessionId).toBeNull();
+  });
+});
+
+describe("spaceViewFor — archivedSessionIds (view membership only)", () => {
+  it("reports archivedSessionIds without polluting storedSessionIds, and lastReason falls back to the archived head", () => {
+    const space = row("/w/alpha", 1000);
+    const live = info("live-a", "/w/alpha");
+    const stored = info("stored-a", "/w/alpha");
+    const archived = { ...info("arch-a", "/w/alpha"), archived: true };
+    const reasons: Record<string, CloseReasonStr> = {
+      "live-a": "user",
+      "stored-a": "error",
+      "arch-a": "agent-exited",
+    };
+    const view = spaceViewFor(space, [live], [stored], reasons, [archived]);
+    expect(view.archivedSessionIds).toEqual(["arch-a"]);
+    // `storedSessionIds` is UNCHANGED: stored sessions only (the archived
+    // id must NOT appear — the Space group renders stored sessions only).
+    expect(view.storedSessionIds).toEqual(["stored-a"]);
+    // The live session is the newest: its reason wins.
+    expect(view.lastReason).toBe("user");
+
+    // No live session, no stored sessions: the ARCHIVED head is still the
+    // space's newest stored session — the close-reason banner must not
+    // silently vanish for an archived-only space.
+    const archivedOnly = spaceViewFor(space, [], [], reasons, [archived]);
+    expect(archivedOnly.archivedSessionIds).toEqual(["arch-a"]);
+    expect(archivedOnly.storedSessionIds).toEqual([]);
+    expect(archivedOnly.lastReason).toBe("agent-exited");
   });
 });

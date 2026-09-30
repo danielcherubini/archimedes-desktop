@@ -139,6 +139,7 @@ async fn build_harness(
         cwd: PathBuf::from("/tmp"),
         capabilities: json!({}),
         config_options: None,
+        archived: false,
     })
     .unwrap();
     let store = SessionStore::new(db.clone());

@@ -21,6 +21,7 @@ vi.mock("../lib/tauri", async () => {
       agentId: "archimedes",
       cwd: "/tmp/ws",
       capabilities: { loadSession: true },
+      archived: false,
       configOptions: [
         {
           id: "model",

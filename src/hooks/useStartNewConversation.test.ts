@@ -19,6 +19,7 @@ vi.mock("../lib/tauri", async () => {
       agentId: "pi",
       cwd: "/tmp/ws",
       capabilities: { loadSession: false },
+      archived: false,
     }),
     listAgents: vi.fn().mockResolvedValue([{ id: "pi", name: "pi" }]),
     respondPermission: vi.fn(),
@@ -40,12 +41,12 @@ const spaces: SpaceRow[] = [
   { path: "/tmp/alpha", createdAt: 1, lastOpenedAt: 1, trusted: false },
 ];
 const sessions: SessionInfo[] = [
-  { sessionId: "s-live", agentId: "a-live", cwd: "/tmp/alpha", capabilities: {} },
+  { sessionId: "s-live", agentId: "a-live", cwd: "/tmp/alpha", capabilities: {}, archived: false },
 ];
 const historySessions: SessionInfo[] = [
-  { sessionId: "s-stored", agentId: "a-stored", cwd: "/tmp/alpha", capabilities: {} },
+  { sessionId: "s-stored", agentId: "a-stored", cwd: "/tmp/alpha", capabilities: {}, archived: false },
 ];
-const view = spaceViewFor(spaces[0]!, sessions, historySessions, {});
+const view = spaceViewFor(spaces[0]!, sessions, historySessions, {}, []);
 
 beforeEach(() => {
   // Seed via `setState` directly — NOT `getState().setSpaces(…)` (that

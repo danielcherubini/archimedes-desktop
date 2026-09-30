@@ -1,8 +1,9 @@
-//! Tauri commands for session history: list, load, delete.
+//! Tauri commands for session history: list, load, archive, delete.
 //!
 //! History is owned by the client (this app): the frontend calls
 //! `list_sessions` on boot to populate the session list, `load_history`
-//! when a stored session is opened, and `delete_session` to remove a
+//! when a stored session is opened, `set_session_archived` to archive /
+//! unarchive a session (ADR 0016), and `delete_session` to remove a
 //! session (and, via `ON DELETE CASCADE`, its messages).
 
 use std::path::PathBuf;
@@ -15,13 +16,23 @@ use crate::storage::{Db, MessageRow};
 
 /// All stored sessions, newest first, as `SessionInfo` (camelCase over IPC).
 ///
+/// `include_archived` (ADR 0016, `Option` → the frontend may omit the
+/// argument): `false` (the default) hides archived sessions; `true`
+/// returns them with the `archived` flag set (the frontend splits the
+/// boot list client-side).
+///
 /// The stored `capabilities_json` is NORMALIZED on the way out (item 6b of
 /// the swap plan): a pre-swap ACP row (or an unparseable blob) becomes
-/// `{ "loadSession": false }` — the frontend's Resume button then stays
+/// `{ "loadSession": false }` — the frontend's resume path then stays
 /// hidden and the history-only banner is the honest view.
 #[tauri::command]
-pub async fn list_sessions(state: State<'_, Arc<Db>>) -> Result<Vec<SessionInfo>, String> {
-    let rows = state.list_sessions().map_err(|e| e.to_string())?;
+pub async fn list_sessions(
+    state: State<'_, Arc<Db>>,
+    include_archived: Option<bool>,
+) -> Result<Vec<SessionInfo>, String> {
+    let rows = state
+        .list_sessions(include_archived.unwrap_or(false))
+        .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|row| SessionInfo {
@@ -30,6 +41,7 @@ pub async fn list_sessions(state: State<'_, Arc<Db>>) -> Result<Vec<SessionInfo>
             cwd: PathBuf::from(row.cwd),
             capabilities: normalize_capabilities(&row.capabilities_json),
             config_options: None,
+            archived: row.archived,
         })
         .collect())
 }
@@ -41,6 +53,19 @@ pub async fn load_history(
     session_id: String,
 ) -> Result<Vec<MessageRow>, String> {
     state.messages_for(&session_id).map_err(|e| e.to_string())
+}
+
+/// Archive (or unarchive) a stored session (ADR 0016): sets the
+/// `sessions.archived` flag. The transcript is NOT touched.
+#[tauri::command]
+pub async fn set_session_archived(
+    state: State<'_, Arc<Db>>,
+    session_id: String,
+    archived: bool,
+) -> Result<bool, String> {
+    state
+        .set_session_archived(&session_id, archived)
+        .map_err(|e| e.to_string())
 }
 
 /// Delete a stored session; its messages are removed by the cascade.

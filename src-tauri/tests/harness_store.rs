@@ -32,6 +32,7 @@ fn record_session(db: &Db, id: &str) {
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: json!({}),
         config_options: None,
+        archived: false,
     })
     .unwrap();
 }

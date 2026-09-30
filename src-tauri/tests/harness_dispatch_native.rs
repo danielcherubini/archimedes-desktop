@@ -1058,6 +1058,7 @@ fn agent_loop_getters_and_prepend_system() {
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: serde_json::json!({}),
         config_options: None,
+        archived: false,
     })
     .expect("record_session");
     let model = test_model("m1", "fake", vec!["high".to_string()]);
@@ -1473,6 +1474,7 @@ async fn dispatch_subagent_a_parent_turn_cancel_propagates_to_the_hanging_child(
         cwd: parent_dir.clone(),
         capabilities: serde_json::json!({}),
         config_options: None,
+        archived: false,
     })
     .expect("record_session");
     let (parent_provider, _requests) = RecordingProvider::new(vec![MockResponse::Stream(vec![
@@ -1612,6 +1614,7 @@ fn trusted_space_db() -> (Arc<Db>, PathBuf) {
         cwd: space.clone(),
         capabilities: serde_json::json!({}),
         config_options: None,
+        archived: false,
     })
     .expect("record_session");
     db.upsert_space(&space.display().to_string())

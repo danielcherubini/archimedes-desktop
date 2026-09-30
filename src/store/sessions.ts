@@ -5,6 +5,7 @@ import {
   deleteSpace as deleteSpaceCommand,
   loadHistory,
   resumeSession as resumeSessionCommand,
+  setSessionArchived as setSessionArchivedCommand,
   setSpaceTrusted as setSpaceTrustedCommand,
   type AcpSessionUpdate,
   type AcpToolCallStatus,
@@ -436,9 +437,15 @@ export interface SpaceView {
   liveSessionId: string | null;
   /** Stored sessions of this space, in `historySessions` order (newest-first as delivered by `list_sessions` — do NOT re-sort). */
   storedSessionIds: string[];
+  /**
+   * Archived sessions of this space (NOT rendered in the Space group —
+   * used only for `view` membership, so a space whose only sessions are
+   * archived still resolves its `view`).
+   */
+  archivedSessionIds: string[];
   /** Whether the space is trusted (permission prompts for gated tools are auto-approved). */
   trusted: boolean;
-  /** Close reason of the space's newest session (live one preferred, else the head of the stored subsequence), if any. */
+  /** Close reason of the space's newest session (live one preferred, else the head of the stored subsequence, else the head of the archived subsequence), if any. */
   lastReason: CloseReasonStr | undefined;
 }
 
@@ -447,6 +454,7 @@ export function spaceViewFor(
   sessions: SessionInfo[],
   historySessions: SessionInfo[],
   closeReasons: Record<string, CloseReasonStr>,
+  archivedSessions: SessionInfo[],
 ): SpaceView {
   // A space may hold MORE than one live session (the one-live cap is
   // lifted, ADR 0002): show the most-recently-started one (coherent with
@@ -457,14 +465,24 @@ export function spaceViewFor(
   const storedSessionIds = historySessions
     .filter((s) => s.cwd === space.path)
     .map((s) => s.sessionId);
+  // Archived sessions are view-membership only (never rendered in the
+  // Space group — see `SpaceView.archivedSessionIds`).
+  const archivedSessionIds = archivedSessions
+    .filter((s) => s.cwd === space.path)
+    .map((s) => s.sessionId);
   // The newest session's close reason: the live one, else the head of the
-  // stored subsequence; nothing when the space has no sessions.
-  const newestId = liveSessionId ?? storedSessionIds[0];
+  // stored subsequence, else the head of the archived subsequence (an
+  // archived session is still the space's newest stored session — the
+  // close-reason banner must not silently vanish for an archived-only
+  // space); nothing when the space has no sessions.
+  const newestId =
+    liveSessionId ?? storedSessionIds[0] ?? archivedSessionIds[0];
   return {
     path: space.path,
     title: basenameOfPath(space.path),
     liveSessionId,
     storedSessionIds,
+    archivedSessionIds,
     trusted: space.trusted,
     lastReason:
       newestId === undefined ? undefined : closeReasons[newestId],
@@ -474,8 +492,20 @@ export function spaceViewFor(
 interface SessionsState {
   /** Live (in-memory) sessions for this app run. */
   sessions: SessionInfo[];
-  /** Stored sessions from the database that are not currently live. */
+  /** Stored sessions from the database that are not currently live (archived flag OFF). */
   historySessions: SessionInfo[];
+  /**
+   * Stored sessions with the archived flag ON (ADR 0016). STICKY: a
+   * resumed archived session stays here while it is live (the Archived
+   * view filters out live ids), and a closing archived session does NOT
+   * land in `historySessions`. The flag changes only via
+   * `archiveSession` / `unarchiveSession` (which call the backend).
+   */
+  archivedSessions: SessionInfo[];
+  /** Archive a stored session (`historySessions` → `archivedSessions` + `set_session_archived`). */
+  archiveSession: (sessionId: string) => Promise<void>;
+  /** Unarchive a session (`archivedSessions` → `historySessions` + `set_session_archived`). */
+  unarchiveSession: (sessionId: string) => Promise<void>;
   activeSessionId: string | null;
   /** Space bookkeeping rows (from `list_spaces` on boot; upserted by `addSpace`). */
   spaces: SpaceRow[];
@@ -569,6 +599,7 @@ const committedTrusted = new Map<string, boolean>();
 export const useSessions = create<SessionsState>((set, get) => ({
   sessions: [],
   historySessions: [],
+  archivedSessions: [],
   activeSessionId: null,
   spaces: [],
   closeReasons: {},
@@ -584,6 +615,12 @@ export const useSessions = create<SessionsState>((set, get) => ({
         info,
       ],
       historySessions: state.historySessions.filter(
+        (s) => s.sessionId !== info.sessionId,
+      ),
+      // A fresh session id never collides with an archived one (defensive
+      // no-op — keeps the "live ids are out of Archived" invariant cheaply
+      // at the write site).
+      archivedSessions: state.archivedSessions.filter(
         (s) => s.sessionId !== info.sessionId,
       ),
       // A session that was just *started* (dialog or "new conversation")
@@ -697,11 +734,108 @@ export const useSessions = create<SessionsState>((set, get) => ({
   },
 
   setHistorySessions: (rows) =>
-    set((state) => ({
-      historySessions: rows.filter(
-        (row) => !state.sessions.some((s) => s.sessionId === row.sessionId),
-      ),
-    })),
+    set((state) => {
+      // Split by the archived flag; live ids go in NEITHER list (they are
+      // already in `sessions`). Boot-only: do NOT re-run this mid-run
+      // (re-splitting would drop sticky live+archived entries and silently
+      // un-archive on the next close).
+      const liveIds = new Set(state.sessions.map((s) => s.sessionId));
+      const archived = rows.filter(
+        (r) => r.archived && !liveIds.has(r.sessionId),
+      );
+      const history = rows.filter(
+        (r) => !r.archived && !liveIds.has(r.sessionId),
+      );
+      return { historySessions: history, archivedSessions: archived };
+    }),
+
+  archiveSession: async (sessionId) => {
+    // No-op when the entry is not a stored (flag-off) session — the UI
+    // only offers archive there. (Re-checked inside `set` below as well —
+    // the entry may have been deleted or moved mid-await, and a double
+    // click may have landed the move already.)
+    const entry = get().historySessions.find(
+      (s) => s.sessionId === sessionId,
+    );
+    if (!entry) return;
+    await setSessionArchivedCommand(sessionId, true);
+    set((state) => {
+      // Re-validate against the CURRENT state: a concurrent delete (or a
+      // prior move of the same id) must leave no ghost row, and the
+      // dedupe below keeps the id in `archivedSessions` exactly once.
+      // Distinguish "gone" (in NEITHER list — deleted) from "live" (in
+      // `sessions` — a resume landed mid-await and removed the id from
+      // `historySessions`): the DB flag is now `true`, so a live id must
+      // land in `archivedSessions` (the sticky semantics) — not no-op.
+      const inHistory = state.historySessions.some(
+        (s) => s.sessionId === sessionId,
+      );
+      const isLive = state.sessions.some(
+        (s) => s.sessionId === sessionId,
+      );
+      if (!inHistory && !isLive) return state;
+      return {
+        // Only remove from `historySessions` when it is still there (a
+        // resume already removed it — the "move" is then just "ensure it
+        // is in `archivedSessions`").
+        historySessions: inHistory
+          ? state.historySessions.filter((s) => s.sessionId !== sessionId)
+          : state.historySessions,
+        // Append, preserving order (deduped — a concurrent move of the
+        // same id already landed it here).
+        archivedSessions: [
+          ...state.archivedSessions.filter((s) => s.sessionId !== sessionId),
+          entry,
+        ],
+      };
+    });
+  },
+
+  unarchiveSession: async (sessionId) => {
+    // The mirror of `archiveSession`: no-op when the entry is not in the
+    // archived list. (Re-checked inside `set` below as well — the entry
+    // may have been deleted or moved mid-await, and a double click may
+    // have landed the move already.)
+    const entry = get().archivedSessions.find(
+      (s) => s.sessionId === sessionId,
+    );
+    if (!entry) return;
+    await setSessionArchivedCommand(sessionId, false);
+    set((state) => {
+      // Re-validate against the CURRENT state: a concurrent delete (or a
+      // prior move of the same id) must leave no ghost row, and the
+      // dedupe below keeps the id in `historySessions` exactly once.
+      // Distinguish "gone" (in NEITHER list — deleted) from "live" (in
+      // `sessions` — a resume landed mid-await): a live id must NOT be
+      // appended to `historySessions` (it would be in BOTH lists at once
+      // — a duplicate sidebar row) — `handleSessionClosed` lands it in
+      // `historySessions` on close (and only when not archived, which it
+      // no longer is).
+      const inArchived = state.archivedSessions.some(
+        (s) => s.sessionId === sessionId,
+      );
+      const isLive = state.sessions.some(
+        (s) => s.sessionId === sessionId,
+      );
+      if (!inArchived && !isLive) return state;
+      return {
+        archivedSessions: state.archivedSessions.filter(
+          (s) => s.sessionId !== sessionId,
+        ),
+        // Append, preserving order (deduped — a concurrent move of the
+        // same id already landed it here). Skipped while live — see
+        // above.
+        historySessions: isLive
+          ? state.historySessions
+          : [
+              ...state.historySessions.filter(
+                (s) => s.sessionId !== sessionId,
+              ),
+              entry,
+            ],
+      };
+    });
+  },
 
   openSession: (sessionId) => {
     set({ activeSessionId: sessionId });
@@ -730,6 +864,9 @@ export const useSessions = create<SessionsState>((set, get) => ({
         historySessions: state.historySessions.filter(
           (s) => s.sessionId !== sessionId,
         ),
+        archivedSessions: state.archivedSessions.filter(
+          (s) => s.sessionId !== sessionId,
+        ),
         activeSessionId:
           state.activeSessionId === sessionId ? null : state.activeSessionId,
         messages: rest,
@@ -739,11 +876,18 @@ export const useSessions = create<SessionsState>((set, get) => ({
 
   resumeSession: async (sessionId) => {
     const state = get();
-    const session = [...state.sessions, ...state.historySessions].find(
-      (s) => s.sessionId === sessionId,
-    );
+    // Search ALL THREE lists: an archived session must be resumable from
+    // the Archived section (otherwise this throws `unknown session`).
+    const session = [
+      ...state.sessions,
+      ...state.historySessions,
+      ...state.archivedSessions,
+    ].find((s) => s.sessionId === sessionId);
     if (!session) throw new Error(`unknown session: ${sessionId}`);
     const info = await resumeSessionCommand(session.agentId, sessionId, session.cwd);
+    // STICKY: `archivedSessions` is deliberately NOT touched — a resumed
+    // archived session stays in it while live (the Archived view filters
+    // out live ids).
     set((st) => ({
       sessions: [
         ...st.sessions.filter((s) => s.sessionId !== sessionId),
@@ -928,15 +1072,19 @@ export const useSessions = create<SessionsState>((set, get) => ({
       const { [sessionId]: _goneConfig, ...restConfig } = state.configOptions;
       return {
         sessions: state.sessions.filter((s) => s.sessionId !== sessionId),
-        // The session remains in the database: it moves to the history list.
-        historySessions: closedInfo
-          ? [
-              ...state.historySessions.filter(
-                (s) => s.sessionId !== sessionId,
-              ),
-              closedInfo,
-            ]
-          : state.historySessions,
+        // The session remains in the database: it moves to the history
+        // list — UNLESS it is archived (sticky, ADR 0016): a closing
+        // archived session stays ONLY in `archivedSessions`.
+        historySessions:
+          closedInfo &&
+          !state.archivedSessions.some((s) => s.sessionId === sessionId)
+            ? [
+                ...state.historySessions.filter(
+                  (s) => s.sessionId !== sessionId,
+                ),
+                closedInfo,
+              ]
+            : state.historySessions,
         // A close is a PAUSE, not a discard: the conversation moves to the
         // history list but STAYS the displayed one, so `ChatStream` renders
         // its stored/paused banner instead of the `No active session` empty

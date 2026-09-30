@@ -90,6 +90,7 @@ pub fn run() {
             commands::history::list_sessions,
             commands::history::load_history,
             commands::history::delete_session,
+            commands::history::set_session_archived,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::spaces::list_agents,

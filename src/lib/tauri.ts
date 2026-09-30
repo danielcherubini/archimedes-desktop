@@ -54,6 +54,8 @@ export interface SessionInfo {
   cwd: string;
   capabilities: Record<string, unknown>;
   configOptions?: SessionConfigOption[];
+  /** The desktop's archived flag (ADR 0016): `true` hides the session from its Space group into the Archived section (the transcript is kept). Always present over IPC. */
+  archived: boolean;
 }
 
 /** A registry entry over IPC (camelCase). */
@@ -402,9 +404,11 @@ export async function readClipboardImage(): Promise<number[] | null> {
 // History (SQLite) + settings commands
 // ---------------------------------------------------------------------------
 
-/** All stored sessions, newest first. */
-export async function listSessions(): Promise<SessionInfo[]> {
-  return invoke<SessionInfo[]>("list_sessions");
+/** All stored sessions, newest first. `includeArchived` includes the archived rows (their `archived` flag is set); `undefined` → the Rust default `false`. */
+export async function listSessions(
+  includeArchived?: boolean,
+): Promise<SessionInfo[]> {
+  return invoke<SessionInfo[]>("list_sessions", { includeArchived });
 }
 
 /** A stored session's transcript, in insertion order. */
@@ -415,6 +419,14 @@ export async function loadHistory(sessionId: string): Promise<MessageRow[]> {
 /** Delete a stored session (its messages cascade). */
 export async function deleteSession(sessionId: string): Promise<void> {
   return invoke("delete_session", { sessionId });
+}
+
+/** Archive (or unarchive) a stored session (ADR 0016): sets the `sessions.archived` flag; the transcript is NOT touched. `false` when no row matched. */
+export async function setSessionArchived(
+  sessionId: string,
+  archived: boolean,
+): Promise<boolean> {
+  return invoke("set_session_archived", { sessionId, archived });
 }
 
 export async function getSettings(): Promise<AppSettings> {

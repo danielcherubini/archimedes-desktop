@@ -96,16 +96,23 @@ export default function ChatStream() {
       ? s.sessions.find((x) => x.sessionId === s.activeSessionId)
       : undefined,
   );
+  // Searches BOTH stored lists: a session living ONLY in
+  // `archivedSessions` (opened from the Archived section) must still resolve
+  // here — otherwise it renders no banner, a disabled composer ("This session
+  // is closed"), and an unreachable `send()` auto-resume. One selector
+  // returning a `??` of two finds (stable-reference rule preserved).
   const historySession = useSessions((s) =>
     s.activeSessionId
-      ? s.historySessions.find(
-          (x) => x.sessionId === s.activeSessionId,
-        )
+      ? (s.historySessions.find((x) => x.sessionId === s.activeSessionId) ??
+          s.archivedSessions.find(
+            (x) => x.sessionId === s.activeSessionId,
+          ))
       : undefined,
   );
   const spaces = useSessions((s) => s.spaces);
   const sessions = useSessions((s) => s.sessions);
   const historySessions = useSessions((s) => s.historySessions);
+  const archivedSessions = useSessions((s) => s.archivedSessions);
   const closeReasons = useSessions((s) => s.closeReasons);
   const openSession = useSessions((s) => s.openSession);
   const inTurn = useSessions((s) => (s.activeSessionId ? !!s.inTurn[s.activeSessionId] : false));
@@ -427,12 +434,18 @@ export default function ChatStream() {
   // owns it — by its live session OR any of its stored sessions (NOT
   // `[0]`-only: the conversation selector below lets the user open
   // `#2`+ sessions, which are stored sessions of the space too, and the
-  // space bar must stay rendered while they are open). `undefined` when
-  // the active session belongs to no space (e.g. a legacy pre-Spaces DB
-  // row) — rendered exactly as today (no space chip, no selector).
+  // space bar must stay rendered while they are open) OR any of its
+  // ARCHIVED sessions (a space whose only sessions are archived still
+  // resolves its `view` — the space bar + conversation selector stay
+  // rendered). `undefined` when the active session belongs to no space
+  // (e.g. a legacy pre-Spaces DB row) — rendered exactly as today (no space
+  // chip, no selector).
   const views = useMemo(
-    () => spaces.map((s) => spaceViewFor(s, sessions, historySessions, closeReasons)),
-    [spaces, sessions, historySessions, closeReasons],
+    () =>
+      spaces.map((s) =>
+        spaceViewFor(s, sessions, historySessions, closeReasons, archivedSessions),
+      ),
+    [spaces, sessions, historySessions, closeReasons, archivedSessions],
   );
   const view: SpaceView | undefined =
     activeSessionId === null
@@ -440,7 +453,8 @@ export default function ChatStream() {
       : views.find(
           (v) =>
             v.liveSessionId === activeSessionId ||
-            v.storedSessionIds.includes(activeSessionId),
+            v.storedSessionIds.includes(activeSessionId) ||
+            v.archivedSessionIds.includes(activeSessionId),
         );
 
   // `New session` in this space (the extracted hook): `agentId =
@@ -642,6 +656,10 @@ export default function ChatStream() {
   // Conversation selector options for the space: the live session first
   // (label `Live`), then stored sessions in order (`#1`, `#2`, …); when
   // the live session is absent the first stored gets the label `Latest`.
+  // An ARCHIVED session is NOT in `storedSessionIds` (the Space group
+  // renders stored sessions only) — but the active session must still have
+  // a matching item, or the `Select` renders an empty trigger + empty
+  // dropdown (zero items with a `value` matching nothing).
   const options: Array<{ id: string; label: string }> = [];
   if (view && view.liveSessionId !== null) {
     options.push({ id: view.liveSessionId, label: "Live" });
@@ -650,6 +668,25 @@ export default function ChatStream() {
     view.storedSessionIds.forEach((id, i) => {
       options.push({ id, label: view.liveSessionId === null && i === 0 ? "Latest" : `#${i + 1}` });
     });
+    // Only add the fallback when the active session is NOT already
+    // represented above: `spaceViewFor` does NOT filter live ids
+    // out of `archivedSessionIds` (it's view-membership only), so a
+    // STICKY-archived session (resumed, now live — the id is in BOTH
+    // `sessions` and `archivedSessions`) would otherwise be pushed TWICE
+    // (once as `Live`, once as `Archived` — two `SelectItem`s with the
+    // same `key`/`value`). Label it `Live` when it IS live (in `sessions`
+    // — a multi-live space where a second, more recent live session is
+    // `view.liveSessionId`, ADR 0002); `Archived` only when it isn't.
+    if (
+      activeSessionId !== view.liveSessionId &&
+      !view.storedSessionIds.includes(activeSessionId) &&
+      view.archivedSessionIds.includes(activeSessionId)
+    ) {
+      options.push({
+        id: activeSessionId,
+        label: sessions.some((s) => s.sessionId === activeSessionId) ? "Live" : "Archived",
+      });
+    }
   }
 
   const spaceTitle = view
@@ -842,18 +879,15 @@ export default function ChatStream() {
       {isHistoryOnly && (
         <div className="m-2 flex items-center justify-between gap-2 rounded-md bg-surface px-3 py-2 text-ui-sm">
           {canResume ? (
+            // Informational ONLY (the manual Resume button is gone — the
+            // first `send()` auto-resumes the session before sending).
             <span className="text-foreground-subtle">
-              This session is stored. Resuming reconnects it to the agent.
+              This session is stored. Sending a message resumes it.
             </span>
           ) : (
             <span className="text-warning">
               History only — continuing starts a new session.
             </span>
-          )}
-          {canResume && (
-            <Button size="xs" disabled={resuming} onClick={() => void resume()}>
-              {resuming ? "Resuming…" : "Resume"}
-            </Button>
           )}
         </div>
       )}
@@ -906,11 +940,6 @@ export default function ChatStream() {
             {isLive && (
               <DropdownMenuItem onSelect={() => void pause()}>
                 Pause
-              </DropdownMenuItem>
-            )}
-            {canResume && (
-              <DropdownMenuItem onSelect={() => void resume()}>
-                Resume
               </DropdownMenuItem>
             )}
             <DropdownMenuItem onSelect={() => void startNewConversation()}>

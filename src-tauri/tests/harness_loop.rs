@@ -142,6 +142,7 @@ async fn build_harness(
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: serde_json::json!({}),
         config_options: None,
+        archived: false,
     })
     .unwrap();
     let store = SessionStore::new(db.clone());

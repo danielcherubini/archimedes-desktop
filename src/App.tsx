@@ -155,11 +155,12 @@ function App() {
   }, []);
 
   // On boot, load the stored sessions AND spaces (the client owns history:
-  // every session survives a restart). `setSpaces` auto-selects (Task 5)
-  // the recent landing for boot. No listener changes: close reasons flow
-  // through the existing `handleSessionClosed`).
+  // every session survives a restart). `listSessions(true)` fetches the
+  // FULL list (archived included); the store splits it by the flag. No
+  // listener changes: close reasons flow through the existing
+  // `handleSessionClosed`).
   useEffect(() => {
-    Promise.all([listSessions(), listSpaces()])
+    Promise.all([listSessions(true), listSpaces()])
       .then(([rows, spaces]) => {
         useSessions.getState().setHistorySessions(rows);
         useSessions.getState().setSpaces(spaces);

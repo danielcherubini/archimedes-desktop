@@ -73,6 +73,7 @@ fn build_app(
             archimedes_lib::commands::history::list_sessions,
             archimedes_lib::commands::history::load_history,
             archimedes_lib::commands::history::delete_session,
+            archimedes_lib::commands::history::set_session_archived,
             archimedes_lib::commands::settings::get_settings,
             archimedes_lib::commands::settings::save_settings,
             archimedes_lib::commands::spaces::list_agents,
@@ -287,6 +288,102 @@ fn history_settings_and_resume_commands_round_trip() {
         serde_json::json!({ "sessionId": session_id }),
     );
     assert!(history.as_array().unwrap().is_empty());
+
+    // Clean up (best effort).
+    drop(app);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_dir_all(&app_data_dir);
+}
+
+#[test]
+fn set_session_archived_ipc() {
+    let config_dir = temp_dir("config");
+    let app_data_dir = temp_dir("data");
+    write_agents_json(&config_dir);
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let app = build_app(config_dir.clone(), app_data_dir.clone(), events_tx);
+    let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("mock webview should build");
+
+    // --- record a session via the existing setup (start_session's
+    // record_session hook persists the row) ---
+    let info = invoke(
+        &webview,
+        "start_session",
+        serde_json::json!({ "agentId": "fake", "cwd": config_dir.to_string_lossy() }),
+    );
+    let session_id = info["sessionId"].as_str().unwrap().to_string();
+    assert!(
+        session_id.starts_with(FAKE_SESSION_PREFIX),
+        "a fresh session gets a unique pi id, got {session_id}"
+    );
+
+    // --- set_session_archived over the REAL IPC wire (camelCase args) ---
+    // The `sessionId` / `archived` keys must reach the command's
+    // snake_case fields through Tauri's argument deserialization — a
+    // rename mismatch here fails ONLY at the wire level (the unit tests
+    // never exercise Tauri's arg deserialization).
+    let set = invoke(
+        &webview,
+        "set_session_archived",
+        serde_json::json!({ "sessionId": session_id, "archived": true }),
+    );
+    assert_eq!(set, true, "a matching row resolves true");
+
+    // The flag is visible via list_sessions with includeArchived: true —
+    // and the camelCase `archived` key round-trips on the way out too.
+    let all = invoke(
+        &webview,
+        "list_sessions",
+        serde_json::json!({ "includeArchived": true }),
+    );
+    let arr = all.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["sessionId"], session_id);
+    assert_eq!(arr[0]["archived"], true);
+
+    // ...and the DEFAULT list (no includeArchived) hides it.
+    let visible = invoke(&webview, "list_sessions", serde_json::json!({}));
+    assert!(
+        visible.as_array().unwrap().is_empty(),
+        "the default list hides archived sessions"
+    );
+
+    // Unarchive: the flag clears and the row is visible again.
+    let unset = invoke(
+        &webview,
+        "set_session_archived",
+        serde_json::json!({ "sessionId": session_id, "archived": false }),
+    );
+    assert_eq!(unset, true, "unarchiving a matching row resolves true");
+    let visible = invoke(&webview, "list_sessions", serde_json::json!({}));
+    assert_eq!(visible.as_array().unwrap().len(), 1);
+    assert_eq!(visible.as_array().unwrap()[0]["archived"], false);
+
+    // An unknown id is a no-op resolving false (not an error).
+    let noop = invoke(
+        &webview,
+        "set_session_archived",
+        serde_json::json!({ "sessionId": "no-such-session", "archived": true }),
+    );
+    assert_eq!(noop, false, "a missing row resolves false");
+
+    // --- close the session and wait for the driver task's teardown ---
+    invoke(
+        &webview,
+        "close_session",
+        serde_json::json!({ "sessionId": session_id }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match events_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((event, _)) if event == "session-closed" => break,
+            Ok(_) => continue,
+            Err(_) => panic!("session-closed event should arrive after close"),
+        }
+    }
 
     // Clean up (best effort).
     drop(app);

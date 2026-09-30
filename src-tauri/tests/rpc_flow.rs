@@ -287,6 +287,7 @@ async fn resume_without_load_session_is_not_resumable() {
         cwd: config_dir.clone(),
         capabilities: serde_json::json!({ "promptCapabilities": { "image": true } }),
         config_options: None,
+        archived: false,
     })
     .expect("record_session should succeed");
     let cwd = config_dir.clone();

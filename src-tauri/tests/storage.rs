@@ -26,6 +26,7 @@ fn sample_session() -> SessionInfo {
             "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
         }),
         config_options: None,
+        archived: false,
     }
 }
 
@@ -60,7 +61,9 @@ fn records_sessions_and_messages_with_upsert_semantics() {
     .expect("record_message should succeed");
 
     // --- list_sessions ---
-    let sessions = db.list_sessions().expect("list_sessions should succeed");
+    let sessions = db
+        .list_sessions(true)
+        .expect("list_sessions should succeed");
     assert_eq!(sessions.len(), 1, "exactly one session should be stored");
     assert_eq!(sessions[0].id, "sess-1");
     assert_eq!(sessions[0].agent_id, "fake");
@@ -100,7 +103,7 @@ fn records_sessions_and_messages_with_upsert_semantics() {
     db.delete_session("sess-1")
         .expect("delete_session should succeed");
     assert!(
-        db.list_sessions()
+        db.list_sessions(true)
             .expect("list_sessions should succeed")
             .is_empty(),
         "the session should be gone after delete"
@@ -284,7 +287,7 @@ fn reopens_an_existing_database() {
     }
     // A second open (simulating an app restart) must see the same data.
     let db = Db::open(&path).expect("db should reopen");
-    assert_eq!(db.list_sessions().expect("list_sessions").len(), 1);
+    assert_eq!(db.list_sessions(true).expect("list_sessions").len(), 1);
     assert_eq!(db.messages_for("sess-1").expect("messages_for").len(), 1);
     let _ = std::fs::remove_file(&path);
 }
@@ -377,6 +380,7 @@ fn open_backfills_space_rows_from_existing_sessions() {
             "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
         }),
         config_options: None,
+        archived: false,
     };
 
     let db1 = Db::open(&db_path).expect("db should open");
