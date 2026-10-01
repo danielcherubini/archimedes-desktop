@@ -37,7 +37,7 @@ A stored **Session** hidden from its **Space** group by an explicit user action 
 _Avoid_: Paused session, closed session, hidden session
 
 **Subagent session**:
-A desktop-spawned pi RPC session that runs a task delegated by the main agent via the bridge (bridge mode only). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. The subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent.
+A **Session** the desktop spawns to run a task delegated by the main agent — either a pi RPC session (bridge mode) or an in-process native **AgentLoop** child (native-native: the parent's model/tools minus `subagent`, plus optional `launch` overrides; its `agentName` is a free-form UI label only, ADR 0017). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. In bridge mode the subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime._
 _Avoid_: Worker, delegated task, child session, background session
 
 **Suite tool**:
