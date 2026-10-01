@@ -644,8 +644,11 @@ async fn dispatch_native_model_and_thinking_overrides_reach_the_child() {
 
 /// (5) **`system_prompt` override**: `launch.system_prompt = Some(…)`
 /// seeds the child's provider transcript — the child's FIRST model
-/// request carries a LEADING `System` message with that text (the task
-/// prompt is the SECOND message).
+/// request carries a LEADING `System` message (the task prompt is the
+/// SECOND message). ADR 0017: the system message is the prompt + the
+/// todo guidance line (the parent's tools = `Vec::new()` = ALL → the
+/// child HAS `manage_todo_list`), so the leading message is the
+/// prompt + the todo line, not the prompt alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_native_system_prompt_seeds_the_child_transcript() {
     let config_dir = temp_config_dir();
@@ -681,7 +684,9 @@ async fn dispatch_native_system_prompt_seeds_the_child_transcript() {
     );
 
     // The child's first model request: a LEADING `System` message with
-    // the override text, then the task prompt.
+    // the prompt + the todo line (ADR 0017 — the child's tools = the
+    // parent's `Vec::new()` = ALL minus `subagent` → the child HAS
+    // `manage_todo_list`), then the task prompt.
     let reqs = requests.lock().unwrap();
     assert!(!reqs.is_empty(), "the child made a model request");
     let first = &reqs[0];
@@ -693,7 +698,10 @@ async fn dispatch_native_system_prompt_seeds_the_child_transcript() {
     );
     match &first.messages.first().unwrap().content {
         archimedes_lib::agent::harness::MessageContent::Text(t) => {
-            assert_eq!(t, "You are terse.")
+            assert_eq!(
+                t,
+                "You are terse.\nUse manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go"
+            )
         }
         other => panic!("the seeded prompt is text — got {other:?}"),
     }

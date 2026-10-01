@@ -41,9 +41,9 @@ use tokio::sync::{oneshot, watch, Mutex};
 use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
 use crate::agent::errors::RpcError;
 use crate::agent::harness::{
-    discover_models, seed_from_pi_config, AgentLoop, ControlCmd, Model, ModelCatalog,
-    OpenAiCompatibleProvider, Prompt, Provider, ProviderDiscovery, RetryPolicy, SessionStore,
-    SudoDeps,
+    build_main_prompt, discover_models, seed_from_pi_config, AgentLoop, ControlCmd, Model,
+    ModelCatalog, OpenAiCompatibleProvider, Prompt, PromptContext, Provider, ProviderDiscovery,
+    RetryPolicy, SessionStore, SudoDeps,
 };
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
@@ -1987,14 +1987,8 @@ impl SessionManager {
         if let Some(level) = &thinking_level {
             loop_.set_thinking_level(Some(level.clone()));
         }
-        // A RESUME: `load_messages` restores the stored provider transcript
-        // (the `native_messages` table) BEFORE the first model call (the
-        // `Compactor` is re-estimated on the loaded context).
-        if is_resume {
-            if let Ok(messages) = store.load_messages(&session_id) {
-                loop_.load_transcript(messages);
-            }
-        }
+        // (MOVED UP) the handle — the `info` block below reads
+        // `handle.config_state()`.
         let handle = NativeHandle::new(
             prompt_tx,
             loop_.control_tx.clone(),
@@ -2003,13 +1997,6 @@ impl SessionManager {
             model.clone(),
             thinking_level.clone(),
         );
-        // SPAWN the loop task (in-process — no subprocess; the external
-        // path's `PiRpc::spawn` is NEVER reached for a native kind).
-        let loop_handle = tokio::spawn(loop_.run());
-        // The test-only seam: store the `AbortHandle` so a test can kill the
-        // loop task DIRECTLY (no token cancel → no settle → deterministic
-        // `changed()` `Err`).
-        handle.set_loop_task(loop_handle.abort_handle());
         // The `SessionInfo` (the `capabilities_json` has NO `piSessionFile` —
         // resume is from the `native_messages` table; the `config_options`
         // are SYNTHESIZED from the `ModelCatalog` in the existing shape —
@@ -2036,6 +2023,56 @@ impl SessionManager {
                 archived: false,
             }
         };
+        // (NEW) The `sessions` row BEFORE the seq-0 persist (the FK fix):
+        // `native_messages.session_id` references `sessions(id)`
+        // (`PRAGMA foreign_keys = ON`) — the caller's `record_session`
+        // runs AFTER `build_native_session` returns, so the seq-0 persist
+        // below would hit an FK violation and be silently dropped without
+        // this early record (the caller's `record_session` stays — an
+        // idempotent refresh).
+        self.record_session(&info);
+        // (NEW) The system prompt (ADR 0017) — NEW sessions only: a
+        // resume replays the stored transcript verbatim (the
+        // `load_transcript` below restores the system message at index 0;
+        // NO rebuild — a changed `AGENTS.md` applies from the next new
+        // session). Built from the `advertised_specs` (the `<tools>`
+        // section matches the `tools[]` API param) + the discovered skills
+        // (ADR 0013) + the global context dir `~/.pi/agent` (best-effort:
+        // no home dir → no global file).
+        if !is_resume {
+            let agent_dir = crate::skills::home_dir()
+                .map(|h| h.join(".pi/agent"))
+                .unwrap_or_default();
+            let skills = crate::skills::discover_skills(Some(&cwd));
+            let specs = loop_.advertised_specs();
+            let prompt = build_main_prompt(&PromptContext {
+                cwd: &cwd,
+                agent_dir: &agent_dir,
+                tools: &specs,
+                skills: &skills,
+            });
+            loop_.prepend_system(prompt);
+        }
+        // A RESUME: `load_messages` restores the stored provider transcript
+        // (the `native_messages` table) BEFORE the first model call (the
+        // `Compactor` is re-estimated on the loaded context).
+        if is_resume {
+            // A corrupt transcript row must NOT silently load as an empty
+            // one (store.rs): the next persist would upsert over the
+            // stored rows (seq 0 = the system prompt, cascading to seq
+            // 1, 2, …), so a load failure fails the session start.
+            let messages = store
+                .load_messages(&session_id)
+                .map_err(|e| RpcError::Io(e.to_string()))?;
+            loop_.load_transcript(messages);
+        }
+        // SPAWN the loop task (in-process — no subprocess; the external
+        // path's `PiRpc::spawn` is NEVER reached for a native kind).
+        let loop_handle = tokio::spawn(loop_.run());
+        // The test-only seam: store the `AbortHandle` so a test can kill the
+        // loop task DIRECTLY (no token cancel → no settle → deterministic
+        // `changed()` `Err`).
+        handle.set_loop_task(loop_handle.abort_handle());
         self.driver
             .drive_native_session(
                 handle,
@@ -4388,7 +4425,7 @@ mod normalize_tests {
 mod session_tests {
     use super::*;
     use crate::agent::harness::provider::{
-        FinishReason, ModelRequest, ProviderError, ProviderEvent,
+        ChatRole, FinishReason, MessageContent, ModelRequest, ProviderError, ProviderEvent,
     };
     use crate::agent::permission::PermissionOutcome;
     use crate::storage::Db;
@@ -5771,5 +5808,361 @@ mod session_tests {
             "the todo list is cleared at the session boundary"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Native system prompt (ADR 0017, Task 3: the prompt is built
+    // ONCE at a NEW session's start — persisted at seq 0 — and a
+    // RESUME replays the stored transcript verbatim) ──
+
+    /// A `Provider` that RECORDS every `ModelRequest` it receives (pushed
+    /// into the shared vec) and then answers with a short canned stream
+    /// (`TextDelta` + `Done(Stop)` — the turn settles `EndTurn`).
+    struct RecordingProvider {
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(futures_util::stream::iter(vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ])
+            .boxed())
+        }
+    }
+
+    /// Build a `SessionManager` (a temp config dir + a native `AgentEntry`
+    /// with the given `enabled_tools`) + a Space dir (an EMPTY `.git/` dir
+    /// bounds the project-context walk at the Space, per the Task 1
+    /// scratch-dir rule; the optional `AGENTS.md` is the controlled project
+    /// context) + the `RecordingProvider` seam. Returns the manager, the
+    /// Space dir, the shared request vec, the `Db` (the FK assertions), and
+    /// the sink.
+    async fn native_manager_with_recording(
+        enabled_tools: &[&str],
+        agents_md: Option<&str>,
+    ) -> (
+        SessionManager,
+        PathBuf,
+        Arc<StdMutex<Vec<ModelRequest>>>,
+        std::sync::Arc<Db>,
+        Arc<dyn EventSink>,
+    ) {
+        let dir = temp_config_dir();
+        let space = dir.join("space");
+        std::fs::create_dir_all(space.join(".git")).unwrap();
+        if let Some(content) = agents_md {
+            std::fs::write(space.join("AGENTS.md"), content).unwrap();
+        }
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": {
+                    "provider": "openai-compatible",
+                    "default_model": "fake/m1",
+                    "enabled_tools": enabled_tools,
+                },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+        let db = open_db(&dir);
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let factory_requests = requests.clone();
+        let mut manager = SessionManager::new(dir).unwrap();
+        manager.attach_db(db.clone());
+        manager.set_catalog(native_test_catalog());
+        manager.set_provider_factory(move |_m: &Model| {
+            Box::new(RecordingProvider {
+                requests: factory_requests.clone(),
+            })
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        (manager, space, requests, db, sink)
+    }
+
+    /// Start a native session in `space` and drive ONE turn (the
+    /// `RecordingProvider` settles it `EndTurn`); returns the `SessionInfo`
+    /// + the turn's recorded `ModelRequest`.
+    async fn start_and_drive_one_turn(
+        manager: &SessionManager,
+        space: &Path,
+        requests: &Arc<StdMutex<Vec<ModelRequest>>>,
+        sink: &Arc<dyn EventSink>,
+    ) -> (SessionInfo, ModelRequest) {
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", space.to_path_buf(), sink)
+        })
+        .await
+        .expect("the native session started");
+        let sid = info.session_id.clone();
+        let reason = tokio::time::timeout(Duration::from_secs(15), {
+            manager.send_prompt(&sid, "hello".to_string())
+        })
+        .await
+        .expect("the turn settled (not a hang)")
+        .expect("the turn settled");
+        assert_eq!(reason, StopReason::EndTurn, "a normal turn settles EndTurn");
+        let req = requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the model was called");
+        (info, req)
+    }
+
+    /// The `messages[0]` text (a `System` message with plain text content).
+    fn system_text(req: &ModelRequest) -> String {
+        let first = &req.messages[0];
+        assert!(
+            matches!(first.role, ChatRole::System),
+            "messages[0] is the system message, got {:?}",
+            first.role
+        );
+        match &first.content {
+            MessageContent::Text(t) => t.clone(),
+            other => panic!("the system message is plain text, got {other:?}"),
+        }
+    }
+
+    /// (ADR 0017) A NEW native session's first model request carries the
+    /// built system prompt at `messages[0]` (the preamble + a `<tools>`
+    /// section + the project context + the `<cwd>` section), AND the seq-0
+    /// `native_messages` row exists — the FK fix: the session row is
+    /// recorded BEFORE the seq-0 persist inside `build_native_session`
+    /// (a persist BEFORE the row would hit an FK violation and be dropped).
+    #[tokio::test]
+    async fn start_native_session_persists_system_prompt() {
+        let (manager, space, requests, db, sink) =
+            native_manager_with_recording(&[], Some("project rules")).await;
+        let space_canon = std::fs::canonicalize(&space).unwrap();
+        let space_str = space_canon.to_string_lossy().into_owned();
+        let (info, req) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
+
+        // The prompt assertions are `contains`-based: the real `~/.pi/agent`
+        // context file + the discovered skills leak in (not injectable at
+        // this level) — assert on the controlled content.
+        let text = system_text(&req);
+        assert!(
+            text.contains("You are an expert coding assistant operating inside Archimedes Desktop"),
+            "the preamble: {text}"
+        );
+        assert!(
+            text.contains("- read:"),
+            "a <tools> section with the read line: {text}"
+        );
+        assert!(
+            text.contains("<project_context>"),
+            "a <project_context> section: {text}"
+        );
+        assert!(
+            text.contains("project rules"),
+            "the Space's AGENTS.md: {text}"
+        );
+        assert!(text.contains("<cwd>"), "a <cwd> section: {text}");
+        assert!(
+            text.contains(&space_str),
+            "the <cwd> section carries the Space path: {text}"
+        );
+
+        // The FK fix: the session row exists AND a `native_messages` row
+        // with the system content exists (the persist did NOT hit an FK
+        // violation — the row was recorded BEFORE the prompt block).
+        assert!(
+            db.session(&info.session_id)
+                .expect("the db works")
+                .is_some(),
+            "the session row exists"
+        );
+        let rows = db
+            .load_native_messages(&info.session_id)
+            .expect("the db works");
+        assert!(!rows.is_empty(), "a native_messages row exists");
+        assert!(
+            rows[0].contains("\"role\":\"system\""),
+            "the FIRST row (seq 0) is the system message, got: {}",
+            &rows[0]
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(space.parent().unwrap());
+    }
+
+    /// The `<rules>` section body (the text between `<rules>\n` and
+    /// `\n</rules>`): built purely from the advertised specs (the two pi
+    /// lines + the conditional guidance lines) — env-independent, so
+    /// negative assertions are scoped to it (a whole-prompt `!contains`
+    /// would be flaky-by-construction: a global `AGENTS.md` / skill
+    /// containing the phrase would turn CI red).
+    fn rules_body(prompt: &str) -> &str {
+        let start = prompt
+            .find("<rules>\n")
+            .unwrap_or_else(|| panic!("a <rules> section: {prompt}"));
+        let end = prompt
+            .find("\n</rules>")
+            .unwrap_or_else(|| panic!("the </rules> close: {prompt}"));
+        &prompt[start + "<rules>\n".len()..end]
+    }
+
+    /// (ADR 0017) `enabled_tools` restricts the prompt's `<tools>` section
+    /// (the `advertised_specs` — the prompt matches the `tools[]` API param
+    /// exactly) AND the conditional `<rules>` guidance lines (`[
+    /// "read", "bash"]` → neither the `manage_todo_list` nor the
+    /// `subagent` guidance line).
+    #[tokio::test]
+    async fn start_native_session_prompt_respects_enabled_tools() {
+        let (manager, space, requests, _db, sink) =
+            native_manager_with_recording(&["read", "bash"], Some("project rules")).await;
+        let (info, req) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
+
+        let text = system_text(&req);
+        // The `<tools>` body: EXACTLY the `read` + `bash` lines (no
+        // `subagent` line, no other tool line).
+        let start = text.find("<tools>\n").expect("a <tools> section: {text}");
+        let end = text.find("\n</tools>").expect("the </tools> close: {text}");
+        let body = &text[start + "<tools>\n".len()..end];
+        let lines: Vec<&str> = body.split('\n').collect();
+        assert_eq!(lines.len(), 2, "exactly the read + bash lines, got: {body}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("- read:")),
+            "the read line: {body}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("- bash:")),
+            "the bash line: {body}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("subagent")),
+            "no subagent line: {body}"
+        );
+        // The conditional guidance: `manage_todo_list` + `subagent` are NOT
+        // advertised → both guidance lines absent from the `<rules>`
+        // section (scoped to the section — a whole-prompt `!contains` would
+        // be flaky-by-construction: a global `AGENTS.md` / skill containing
+        // the phrase would turn CI red; the section is built purely from
+        // the advertised specs, so it is env-independent).
+        let rules = rules_body(&text);
+        assert!(
+            !rules.contains("manage_todo_list to track"),
+            "no TODO guidance in <rules>: {rules}"
+        );
+        assert!(
+            !rules.contains("Delegate independent subtasks"),
+            "no subagent guidance in <rules>: {rules}"
+        );
+        assert!(
+            rules.contains("Be concise in your responses")
+                && rules.contains("Show file paths clearly when working with files"),
+            "the two pi lines in <rules>: {rules}"
+        );
+        assert!(
+            text.contains("- Be concise in your responses")
+                && text.contains("- Show file paths clearly when working with files"),
+            "the two pi lines: {text}"
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(space.parent().unwrap());
+    }
+
+    /// (ADR 0017, the static-per-session decision) A RESUME replays the
+    /// stored transcript verbatim — the prompt is NOT rebuilt: a changed
+    /// `AGENTS.md` applies from the next NEW session, not the resume.
+    #[tokio::test]
+    async fn resume_native_session_replays_system_prompt_verbatim() {
+        let (manager, space, requests, _db, sink) =
+            native_manager_with_recording(&[], Some("v1 rules")).await;
+        let (info, _req1) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
+
+        // The context CHANGES after the start (the Space's `.git` bounds
+        // the walk, so the overwrite is the only context change). A FRESH
+        // marker makes the negative assertion collision-proof (a whole-prompt
+        // `!contains("v2 rules")` would be flaky-by-construction: a global
+        // `AGENTS.md` / skill containing the phrase would turn CI red; the
+        // marker cannot collide — `v1` lives in the `.git`-bounded temp
+        // Space, so its positive `contains` stays unmarked).
+        let marker = uuid::Uuid::new_v4().to_string();
+        std::fs::write(space.join("AGENTS.md"), format!("v2 rules {marker}")).unwrap();
+
+        let resumed = crate::test_support::run_with_retry(|| {
+            manager.resume_session("nativetest", &info.session_id, space.clone(), &sink)
+        })
+        .await
+        .expect("the native resume succeeded");
+        assert_eq!(resumed.session_id, info.session_id);
+        let sid = resumed.session_id.clone();
+        let reason = tokio::time::timeout(Duration::from_secs(15), {
+            manager.send_prompt(&sid, "again".to_string())
+        })
+        .await
+        .expect("the turn settled (not a hang)")
+        .expect("the turn settled");
+        assert_eq!(reason, StopReason::EndTurn);
+
+        // The resumed session's model request replays the STORED prompt
+        // verbatim (the seq-0 row from the start — "v1 rules", NOT the
+        // overwritten "v2 rules {marker}").
+        let req = requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the model was called");
+        let text = system_text(&req);
+        assert!(
+            text.contains("v1 rules"),
+            "the stored prompt is replayed verbatim: {text}"
+        );
+        assert!(
+            !text.contains(&marker),
+            "a changed AGENTS.md does NOT leak into the resumed prompt: {text}"
+        );
+
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(space.parent().unwrap());
+    }
+
+    /// (review finding 1) A RESUME whose `load_messages` errors (a corrupt
+    /// transcript row) must FAIL the session start — the old swallow
+    /// proceeded with an empty transcript, and the next persist would
+    /// upsert over the stored rows (seq 0 = the system prompt, cascading
+    /// to seq 1, 2, …).
+    #[tokio::test]
+    async fn resume_native_session_fails_on_corrupt_transcript() {
+        let (manager, space, _requests, db, sink) =
+            native_manager_with_recording(&[], Some("v1 rules")).await;
+        let (info, _req) = start_and_drive_one_turn(&manager, &space, &_requests, &sink).await;
+        let sid = info.session_id.clone();
+
+        // Corrupt the seq-0 row (invalid JSON → `load_messages` `Json`
+        // error — "a corrupt transcript must not silently load as an
+        // empty one").
+        db.insert_native_message(&sid, 0, "system", "not valid json")
+            .expect("the db works");
+
+        // The resume FAILS (the load error is propagated as
+        // `RpcError::Io` — NOT silently swallowed into an empty
+        // transcript).
+        let err = crate::test_support::run_with_retry(|| {
+            manager.resume_session("nativetest", &sid, space.clone(), &sink)
+        })
+        .await
+        .expect_err("a corrupt transcript must fail the resume");
+        assert!(
+            matches!(err, RpcError::Io(_)),
+            "the load error is propagated as `RpcError::Io`, got: {err:?}"
+        );
+
+        let _ = manager.close_session(&sid).await;
+        let _ = std::fs::remove_dir_all(space.parent().unwrap());
     }
 }

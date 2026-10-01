@@ -318,12 +318,18 @@ async fn native_session_end_to_end() {
     let chunk = wait_for_update(&mut sink_rx, "agent_message_chunk").await;
     assert_eq!(chunk["content"]["text"], "Hello");
 
-    // (4) The provider transcript (the `native_messages` table): user +
-    // assistant.
+    // (4) The provider transcript (the `native_messages` table): the
+    // system prompt (seq 0 — the NEW-session prompt, ADR 0017, persisted
+    // at session start) + user + assistant.
     let db = Db::open(&dir.join("archimedes.db")).unwrap();
     let rows = db.load_native_messages(&sid).unwrap();
-    assert_eq!(rows.len(), 2, "user + assistant persisted");
-    let user_msg: ChatMessage = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(rows.len(), 3, "system + user + assistant persisted");
+    // seq 0 is the system prompt (persisted at session start, before the
+    // first prompt).
+    let sys_msg: ChatMessage = serde_json::from_str(&rows[0]).unwrap();
+    assert_eq!(sys_msg.role, ChatRole::System, "seq 0 is the system prompt");
+    // seq 1 is the user message.
+    let user_msg: ChatMessage = serde_json::from_str(&rows[1]).unwrap();
     assert_eq!(
         user_msg,
         ChatMessage {
@@ -369,7 +375,8 @@ async fn native_session_end_to_end() {
             .expect("the resumed loop made a model call")
     };
     let loaded: Vec<&(String, String)> = req.iter().collect();
-    // The loaded transcript (2 messages) precedes the new prompt.
+    // The loaded transcript (the system prompt + user "hi" + assistant
+    // "Hello" — 3 messages) precedes the new prompt.
     assert!(
         loaded.len() >= 3,
         "the request carries the loaded transcript + the new prompt, got {loaded:?}"

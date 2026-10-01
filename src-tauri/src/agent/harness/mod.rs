@@ -9,6 +9,7 @@
 pub mod catalog;
 pub mod compact;
 pub mod r#loop;
+pub mod prompt;
 pub mod provider;
 pub mod retry;
 pub mod store;
@@ -18,6 +19,9 @@ pub use catalog::{
     ProviderDiscovery,
 };
 pub use compact::{split_for_compaction, Compactor};
+pub use prompt::{
+    build_child_system_message, build_main_prompt, load_project_context, PromptContext,
+};
 pub use provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest,
     OpenAiCompatibleProvider, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta,
