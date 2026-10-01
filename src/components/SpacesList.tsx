@@ -12,6 +12,7 @@ import {
   ShieldCheckIcon,
   ShieldIcon,
   SparklesIcon,
+  SettingsIcon,
   Trash2Icon,
 } from "lucide-react";
 import { closeSession, type SessionInfo } from "../lib/tauri";
@@ -62,18 +63,19 @@ function titleFor(messages: Message[] | undefined, spaceName: string): string {
   return firstUser.text.length > 80 ? firstUser.text.slice(0, 80) : firstUser.text;
 }
 
-/**
- * A session's Space name (the `spaceViewFor` pattern): a session's
- * `cwd` IS the Space's `path` (both canonical-path keys) — the base
- * name of the matching space, or of the `cwd` itself when NO space
- * matches (a legacy session whose cwd is no longer a Space).
- */
 function spaceNameFor(cwd: string, spaces: { path: string }[]): string {
   const match = spaces.find((s) => s.path === cwd);
   return match ? basenameOfPath(match.path) : basenameOfPath(cwd);
 }
 
-export default function SpacesList() {
+export default function SpacesList({
+  onOpenSettings,
+}: {
+  // Optional — the gear icon (the footer's bottom-right entry point into
+  // the settings page) only fires the callback when the parent supplies
+  // one; the button itself always renders.
+  onOpenSettings?: () => void;
+}) {
   const spaces = useSessions((s) => s.spaces);
   const sessions = useSessions((s) => s.sessions);
   const historySessions = useSessions((s) => s.historySessions);
@@ -270,6 +272,19 @@ export default function SpacesList() {
           onClose={() => setDeleteTarget(null)}
         />
       )}
+      {/* The footer (the ZCode `WorkspaceSidebarFooter` position — bottom
+          right): the gear icon opens the settings page as a full
+          content-area view (the parent swaps the workspace out). */}
+      <div className="flex justify-end border-t border-border/50 p-2">
+        <button
+          type="button"
+          aria-label="Settings"
+          onClick={() => onOpenSettings?.()}
+          className="rounded-md size-6 hover:bg-surface-hover"
+        >
+          <SettingsIcon className="size-4" />
+        </button>
+      </div>
     </aside>
   );
 }

@@ -1,6 +1,4 @@
-import { useEffect } from "react";
-import { ask, message } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
 import {
   listenBridgeEvent,
   listenBridgeRequest,
@@ -13,7 +11,6 @@ import {
   listSessions,
   listSpaces,
 } from "./lib/tauri";
-import { checkForUpdate, installUpdate } from "./lib/updater";
 import { createBatchedSessionUpdate } from "./lib/batchSessionUpdates";
 import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
@@ -22,7 +19,9 @@ import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
 import SidePane from "./components/SidePane";
+import WindowControls from "./components/WindowControls";
 import SubagentDetailHost from "./components/SubagentDetailHost";
+import SettingsPage from "./components/settings/SettingsPage";
 
 function App() {
   // Register the Tauri event listeners once; dispatch into the stores.
@@ -156,9 +155,20 @@ function App() {
 
   // On boot, load the stored sessions AND spaces (the client owns history:
   // every session survives a restart). `listSessions(true)` fetches the
-  // FULL list (archived included); the store splits it by the flag. No
+  // FULL list (archived included); the store splits it by the flag, and
+  // `setSpaces` auto-selects (Task 5) the recent landing for boot. No
   // listener changes: close reasons flow through the existing
   // `handleSessionClosed`).
+  //
+  // The content-area view: the workspace (the default) OR the settings
+  // page (opened from the `SpacesList`'s gear icon). While settings is
+  // open the workspace UNMOUNTS (the ZCode `opacity-0` + `inert` pattern
+  // is for keeping the workspace MOUNTED — the stores are the source of
+  // truth and re-hydrate on remount, so the simpler unmount is used): a
+  // session running in the background keeps streaming into the stores
+  // (the listener `useEffect`s above are view-independent), and the
+  // `SpacesList` / `ChatStream` / `SidePane` re-read them on remount.
+  const [view, setView] = useState<"workspace" | "settings">("workspace");
   useEffect(() => {
     Promise.all([listSessions(true), listSpaces()])
       .then(([rows, spaces]) => {
@@ -170,43 +180,39 @@ function App() {
       );
   }, []);
 
-  // The "Check for updates" menu item (Rust side) emits this event; the
-  // updater plugin runs in the JS context, so the check happens here.
-  useEffect(() => {
-    const pending = listen("update-check-requested", async () => {
-      try {
-        const { available, version, currentVersion } = await checkForUpdate();
-        if (!available) {
-          await message(`You're up to date (v${currentVersion ?? "unknown"}).`);
-          return;
-        }
-        const ok = await ask(
-          `Version ${version} is available (you have v${currentVersion ?? "?"}). Install now?`,
-          { title: "Update available", kind: "info" },
-        );
-        if (!ok) return;
-        await installUpdate();
-        await message("Update installed — restart the app to run the new version.");
-      } catch (err) {
-        console.error("update check failed", err);
-      }
-    });
-    return () => {
-      pending.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, []);
-
   return (
-    <div className="flex h-screen w-screen bg-background text-foreground">
-      <SpacesList />
-      <ChatStream />
-      <SidePane />
-      {/* The dedicated subagent transcript view (Task 5): the single
-          ALWAYS-MOUNTED host — the visible modal for the selected
-          subagent + a hidden `SubagentTranscript` for every other one
-          (a `fixed` overlay, so its position in the flex row does not
-          affect layout). */}
-      <SubagentDetailHost />
+    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl bg-background text-foreground">
+      {/* Frameless window chrome (the window is `decorations: false` in
+          tauri.conf.json, so this bar replaces the native titlebar). The left
+          region is the drag area — `data-tauri-drag-region` moves the window;
+          the controls sit OUTSIDE it so a click on a button never starts a
+          drag. */}
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-background pr-2 pl-3">
+        <div data-tauri-drag-region className="flex h-full flex-1 items-center">
+          <span className="text-ui-caption text-foreground-subtle">Archimedes</span>
+        </div>
+        <WindowControls />
+      </div>
+      <div className="flex min-h-0 flex-1">
+        {view === "settings" ? (
+          // Full width — the `SpacesList` is NOT rendered in the settings
+          // view (the `SettingsPage`'s own 268px section sidebar is the
+          // left edge).
+          <SettingsPage onBack={() => setView("workspace")} />
+        ) : (
+          <>
+            <SpacesList onOpenSettings={() => setView("settings")} />
+            <ChatStream />
+            <SidePane />
+            {/* The dedicated subagent transcript view (Task 5): the single
+                ALWAYS-MOUNTED host — the visible modal for the selected
+                subagent + a hidden `SubagentTranscript` for every other one
+                (a `fixed` overlay, so its position in the flex row does not
+                affect layout). */}
+            <SubagentDetailHost />
+          </>
+        )}
+      </div>
     </div>
   );
 }

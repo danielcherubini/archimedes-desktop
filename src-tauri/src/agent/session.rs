@@ -41,13 +41,14 @@ use tokio::sync::{oneshot, watch, Mutex};
 use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
 use crate::agent::errors::RpcError;
 use crate::agent::harness::{
-    build_main_prompt, discover_models, seed_from_pi_config, AgentLoop, ControlCmd, Model,
-    ModelCatalog, OpenAiCompatibleProvider, Prompt, PromptContext, Provider, ProviderDiscovery,
-    RetryPolicy, SessionStore, SudoDeps,
+    build_main_prompt, discover_models, merge_catalog, seed_from_pi_config, AgentLoop, ControlCmd,
+    Model, ModelCatalog, OpenAiCompatibleProvider, Prompt, PromptContext, Provider,
+    ProviderDiscovery, RetryPolicy, SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
 };
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
+use crate::commands::settings::{load_settings, write_settings};
 use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
 use tokio::sync::mpsc;
@@ -1698,6 +1699,64 @@ impl SessionManager {
         updated
     }
 
+    /// The effective catalog: the seeded catalog (ADR 0012) + the user's
+    /// providers from `settings.json` (fresh read via `load_settings`),
+    /// discovered via `discover_models` (best-effort; the existing
+    /// per-provider `discovery_cache` — `force_refresh` bypasses the cache
+    /// for provider `force_refresh` when `Some`). A provider whose discovery
+    /// fails contributes 0 models but still shadows the seeded models for
+    /// its id (ADR 0014 — via `merge_catalog`'s `shadowed_provider_ids`).
+    pub async fn effective_catalog(&self, force_refresh: Option<&str>) -> ModelCatalog {
+        let settings = load_settings(&self.config_dir);
+        let mut user_models: Vec<Model> = Vec::new();
+        let mut cache = self.discovery_cache.lock().await;
+        for provider in &settings.providers {
+            let entry = cache
+                .entry(provider.id.clone())
+                .or_insert_with(ProviderDiscovery::default);
+            // `force_refresh` (a provider id) bypasses the cache for that
+            // provider (the settings page's refresh affordance); a failed
+            // re-fetch clears the stale entry (0 models — the provider row
+            // shows `unreachable` + refresh, the stale seeded models stay
+            // shadowed).
+            let bypass = Some(provider.id.as_str()) == force_refresh;
+            if !entry.attempted || bypass {
+                entry.attempted = true;
+                match discover_models(&provider.base_url, &provider.api_key).await {
+                    Ok(models) => entry.models = models,
+                    Err(_) => entry.models.clear(),
+                }
+            }
+            // A discovered model becomes a `Model`: the provider's
+            // `base_url` / `api_key`; `context_window` falls back to
+            // `DEFAULT_CONTEXT_WINDOW` (a user model has no static metadata);
+            // the thinking fields map straight from the `DiscoveredMeta`
+            // (`None` → `vec![]` / `false` — the `refresh_model_metadata`
+            // field-mapping pattern, minus the static-value fallback); v1 is
+            // OpenAI-compatible only (ADR 0012).
+            for (id, meta) in &entry.models {
+                user_models.push(Model {
+                    id: id.clone(),
+                    provider: provider.id.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key.clone(),
+                    context_window: meta.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                    cost_per_mtok_in: 0.0,
+                    cost_per_mtok_out: 0.0,
+                    supports_tools: true,
+                    supports_thinking: meta.supports_thinking.unwrap_or(false),
+                    thinking_levels: meta.thinking_levels.clone().unwrap_or_default(),
+                    api: Some("openai-completions".to_string()),
+                });
+            }
+        }
+        // EVERY configured provider id shadows (regardless of whether its
+        // discovery succeeded — a provider that discovered 0 models still
+        // replaces the stale seeded models for its id, ADR 0014).
+        let shadowed: Vec<String> = settings.providers.iter().map(|p| p.id.clone()).collect();
+        merge_catalog(&self.catalog, &user_models, &shadowed)
+    }
+
     /// Attach the persistence database. Sets BOTH `db` (transcript
     /// persistence) and `trust_db` (the ADR 0010 trust lookup) to the same
     /// db — main-session behavior is unchanged (same db, same lookup).
@@ -1776,10 +1835,17 @@ impl SessionManager {
     fn record_session(&self, info: &SessionInfo) {
         if let Some(db) = &self.driver.db {
             let _ = db.record_session(info);
-            // A start/resume updates or creates the space row (and `resume`
-            // re-touches `last_opened_at`): a space is born/touched when a
-            // conversation starts or resumes in it.
-            let _ = db.upsert_space(&info.cwd.display().to_string());
+            // (settings) A start/resume updates or creates the space row
+            // (and `resume` re-touches `last_opened_at`): a space is
+            // born/touched when a conversation starts or resumes in it.
+            // A NEW row is born `trusted` per the settings'
+            // `default_trust_new_spaces` (the sync `load_settings` —
+            // `record_session` is sync); the CONFLICT branch never touches
+            // an existing row's flag (no retroactive trust).
+            let _ = db.upsert_space(
+                &info.cwd.display().to_string(),
+                load_settings(&self.config_dir).default_trust_new_spaces,
+            );
         }
     }
 
@@ -1815,7 +1881,9 @@ impl SessionManager {
     /// `native_messages` table). The model comes from the stored
     /// `capabilities.model` (a stale / unknown key falls back to the
     /// harness / catalog default); the thinking level from the stored
-    /// `thinkingLevel` (falling back to the harness default).
+    /// `thinkingLevel` (the raw value — the resolution chain (memory →
+    /// stored → harness seed) resolves in `build_native_session`, after
+    /// the model metadata refresh).
     async fn resume_native_session(
         &self,
         entry: &AgentEntry,
@@ -1844,24 +1912,32 @@ impl SessionManager {
         let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
             error: "the native entry has no harness config".to_string(),
         })?;
-        // The model: the stored `model` (a composed key → the catalog);
-        // an absent / stale key falls back to the harness / catalog
-        // default (never a hard error — the transcript still loads).
+        // The model: the stored `model` (a composed key → the EFFECTIVE
+        // catalog — a user-provider model resolves); an absent / stale key
+        // falls back to the resolution chain (the harness / the settings /
+        // the catalog default — never a hard error; the transcript still
+        // loads).
+        let catalog = self.effective_catalog(None).await;
+        let settings = load_settings(&self.config_dir);
         let model = caps
             .get("model")
             .and_then(Value::as_str)
-            .and_then(|key| resolve_composed_model(&self.catalog, key))
-            .or_else(|| resolve_native_model(&self.catalog, &harness.default_model).ok());
+            .and_then(|key| resolve_composed_model(&catalog, key))
+            .or_else(|| {
+                resolve_native_model(&catalog, &harness.default_model, &settings.default_model).ok()
+            });
         let Some(model) = model else {
             return Err(RpcError::Command {
                 error: "no models available for the native session".to_string(),
             });
         };
+        // The raw STORED `thinkingLevel` (NO harness fallback — the
+        // resolution chain (memory → stored → harness seed) resolves in
+        // `build_native_session`, after the model metadata refresh).
         let thinking_level = caps
             .get("thinkingLevel")
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| harness.default_thinking_level.clone());
+            .map(str::to_string);
 
         let mut info = self
             .build_native_session(entry, cwd, sink, Some((session_id, model, thinking_level)))
@@ -1906,17 +1982,31 @@ impl SessionManager {
                 ),
             });
         }
-        // The model: the harness's `default_model` (a composed key) → the
-        // catalog; `None` (the built-in) → the catalog's default → the
-        // v1-selectable (`openai_compatible`) set. A resume overrides it
-        // with the stored model (see `resume_native_session`).
+        // The EFFECTIVE catalog (Task 2 — the seeded catalog + the user's
+        // providers, a fresh `load_settings` read; the per-provider
+        // `discovery_cache` makes the fetch cheap): the model resolution,
+        // the `AgentLoop`'s catalog, and the synthesized config options
+        // all run against it (a user-provider model is selectable +
+        // switchable in-session).
+        let catalog = self.effective_catalog(None).await;
+        // The model: the resolution chain (the harness's `default_model`
+        // → the `Settings.default_model` (a fresh `load_settings` read)
+        // → the catalog's `default_model` → the v1-selectable
+        // (`openai_compatible`) set — an unresolvable key at any rung
+        // falls through to the next rung). A resume overrides it with the
+        // stored model (see `resume_native_session`).
+        let settings = load_settings(&self.config_dir);
         let is_resume = resume.is_some();
-        let (session_id, model, thinking_level) = match resume {
+        // The resume carries the raw STORED `thinkingLevel` (NO harness
+        // fallback — the resolution chain (memory → stored → harness seed)
+        // resolves BELOW, after the model metadata refresh); the start arm
+        // has no stored level.
+        let (session_id, model, stored_level) = match resume {
             Some((id, model, level)) => (id.to_string(), model.clone(), level),
             None => (
                 uuid::Uuid::new_v4().to_string(),
-                resolve_native_model(&self.catalog, &harness.default_model)?,
-                harness.default_thinking_level.clone(),
+                resolve_native_model(&catalog, &harness.default_model, &settings.default_model)?,
+                None,
             ),
         };
         // (live `/v1/models` discovery) Best-effort refresh the model's
@@ -1925,6 +2015,23 @@ impl SessionManager {
         // pattern). Bounded + cached per-provider; a failure degrades to
         // the static (`models-store.json`) metadata.
         let model = self.refresh_model_metadata(&model).await;
+        // (ADR 0015) The effective thinking level: the remembered (VALIDATED
+        // against the model's live `thinking_levels`) > the stored (LENIENT
+        // — non-empty levels must be a member; empty levels apply as-is, the
+        // pre-change behavior) > the harness seed > `None` (the model's own
+        // default). Validated against the POST-refresh model (the live
+        // `thinking_levels` are the freshest).
+        let thinking_level = remembered_thinking_level(&settings.default_thinking_levels, &model)
+            .or_else(|| {
+                stored_level
+                    .as_ref()
+                    .filter(|l| {
+                        model.thinking_levels.is_empty()
+                            || model.thinking_levels.iter().any(|t| t == *l)
+                    })
+                    .cloned()
+            })
+            .or_else(|| harness.default_thinking_level.clone());
 
         let store = SessionStore::new(db.clone());
         let (events_tx, events_rx) = mpsc::channel(256);
@@ -1951,7 +2058,7 @@ impl SessionManager {
             cwd.clone(),
             model.clone(),
             provider,
-            self.catalog.clone(),
+            catalog.clone(),
             store.clone(),
             events_tx,
             cancel.clone(),
@@ -2013,7 +2120,7 @@ impl SessionManager {
                 cwd: cwd.clone(),
                 capabilities: native_capabilities(&state.model, state.thinking_level.as_deref()),
                 config_options: synthesize_catalog_config_options(
-                    &self.catalog,
+                    &catalog,
                     &state.model,
                     state.thinking_level.as_deref(),
                 ),
@@ -2156,6 +2263,9 @@ impl SessionManager {
 
         let agent_id_owned = agent_id.to_string();
         let cwd_owned = cwd.clone();
+        // The `config_dir` is captured into the establisher closure (a
+        // `PathBuf` — cloned; the closure is `move`).
+        let config_dir = self.config_dir.clone();
 
         let info = self
             .driver
@@ -2168,6 +2278,54 @@ impl SessionManager {
                 bridge_setup,
                 None,
                 move |handle: PiRpcHandle| async move {
+                    // The default model (settings): a validly-shaped
+                    // `default_model` (a `"provider/id"` split — the CATALOG
+                    // is NOT consulted: pi's own `get_available_models` is
+                    // the real source for an external session, and a model
+                    // pi doesn't know about is rejected by pi) → `set_model`
+                    // sent BEFORE the first `get_state` (LENIENT — a failure
+                    // is logged and the session establishes on pi's own
+                    // default; an absent/unset setting sends nothing). The
+                    // `get_state` response then reflects the applied model
+                    // (`build_capabilities` picks up `state.model`).
+                    let settings = load_settings(&config_dir);
+                    if let Some(key) = settings.default_model.clone() {
+                        if let Some((provider, model_id)) = key.split_once('/') {
+                            if let Err(e) = handle
+                                .send(json!({
+                                    "type": "set_model",
+                                    "provider": provider,
+                                    "modelId": model_id
+                                }))
+                                .await
+                            {
+                                eprintln!(
+                                    "settings default model: set_model failed at start: {e} (establishing on pi's default)"
+                                );
+                            }
+                        }
+                    }
+                    // (ADR 0015) The remembered thinking level for the
+                    // starting model: sent LENIENT after the `set_model`
+                    // (a failure is logged — the session establishes on pi's
+                    // own default level; pi is the authority, so NO
+                    // validation). When `defaultModel` is absent the
+                    // starting model is unknown → nothing is sent.
+                    if let Some(key) = &settings.default_model {
+                        if let Some(level) = settings.default_thinking_levels.get(key) {
+                            if let Err(e) = handle
+                                .send(json!({
+                                    "type": "set_thinking_level",
+                                    "level": level
+                                }))
+                                .await
+                            {
+                                eprintln!(
+                                    "remembered thinking level: set_thinking_level failed at start: {e} (establishing on pi's default level)"
+                                );
+                            }
+                        }
+                    }
                     // The establisher: `get_state` (the session's identity)
                     // + the config-option sources (models / levels —
                     // lenient: a missing source just means no selectors).
@@ -2674,6 +2832,28 @@ impl SessionManager {
                 // Re-synthesize + emit (the agent does not emit a
                 // `config_option_update` itself).
                 let state = handle.send(json!({ "type": "get_state" })).await?;
+                // (ADR 0015) An EXPLICIT thinking-level change remembers
+                // the level for the session's CURRENT model (the
+                // `get_state` response's `model` — absent → skip;
+                // best-effort: a write failure is logged and does NOT
+                // fail the config change, which pi applied either way).
+                if config_id == "thought_level" && !value.is_empty() {
+                    if let Some(model) = state.get("model") {
+                        let provider = model
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let key = format!("{provider}/{id}");
+                        let mut settings = load_settings(&self.config_dir);
+                        settings
+                            .default_thinking_levels
+                            .insert(key, value.to_string());
+                        if let Err(e) = write_settings(&self.config_dir, &settings) {
+                            eprintln!("remembered thinking level: save failed: {e}");
+                        }
+                    }
+                }
                 let models = handle
                     .send(json!({ "type": "get_available_models" }))
                     .await
@@ -2703,6 +2883,11 @@ impl SessionManager {
                         error: "no config options available".to_string(),
                     });
                 };
+                // The EFFECTIVE catalog (Task 2 — the seeded catalog +
+                // the user's providers): the model lookup + the re-
+                // synthesizer run against it (a user-provider model can
+                // be switched TO mid-session, not just the seeded ones).
+                let catalog = self.effective_catalog(None).await;
                 // Apply (the loop's control channel — `AgentLoop::set_model`
                 // / `set_thinking_level` on the loop task) + mirror the
                 // change on the handle's config state (the re-synthesizer
@@ -2721,8 +2906,7 @@ impl SessionManager {
                                         "invalid model value: {value} (expected provider/modelId)"
                                     ),
                                 })?;
-                        let model = self
-                            .catalog
+                        let model = catalog
                             .models
                             .iter()
                             .find(|m| m.provider == provider && m.id == model_id)
@@ -2739,7 +2923,34 @@ impl SessionManager {
                             });
                         }
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.model = model;
+                        state.model = model.clone();
+                        // (ADR 0015) Minimal-surprise reset: the current
+                        // level is KEPT across the switch when valid for
+                        // the new model (its `thinking_levels` are
+                        // non-empty and contain it — or EMPTY, the status
+                        // quo); it is replaced (the new model's
+                        // remembered level, or `None`) only when the new
+                        // model doesn't support it. The second `try_send`
+                        // mirrors ONLY on success (finding 12): a failed
+                        // send leaves the mirror untouched (the loop never
+                        // applies the reset). The arm does NOT write
+                        // memory.
+                        if let Some(level) = state.thinking_level.as_deref() {
+                            let valid = model.thinking_levels.is_empty()
+                                || model.thinking_levels.iter().any(|t| t == level);
+                            if !valid {
+                                let reset = remembered_thinking_level(
+                                    &load_settings(&self.config_dir).default_thinking_levels,
+                                    &model,
+                                );
+                                let sent = handle
+                                    .control_tx_clone()
+                                    .try_send(ControlCmd::SetThinkingLevel(reset.clone()));
+                                if sent.is_ok() {
+                                    state.thinking_level = reset;
+                                }
+                            }
+                        }
                     }
                     "thought_level" => {
                         let sent = handle
@@ -2752,6 +2963,21 @@ impl SessionManager {
                         }
                         let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
                         state.thinking_level = Some(value.to_string());
+                        // (ADR 0015) Remember the level for the session's
+                        // CURRENT model (best-effort: a write failure is
+                        // logged and does NOT fail the config change — the
+                        // level is applied in the loop either way). Only a
+                        // non-empty `value` is remembered.
+                        if !value.is_empty() {
+                            let key = format!("{}/{}", state.model.provider, state.model.id);
+                            let mut settings = load_settings(&self.config_dir);
+                            settings
+                                .default_thinking_levels
+                                .insert(key, value.to_string());
+                            if let Err(e) = write_settings(&self.config_dir, &settings) {
+                                eprintln!("remembered thinking level: save failed: {e}");
+                            }
+                        }
                     }
                     other => {
                         return Err(RpcError::Command {
@@ -2764,7 +2990,7 @@ impl SessionManager {
                 // `config_option_update` itself — the client owns the frame).
                 let state = state.lock().unwrap_or_else(|p| p.into_inner());
                 let options = synthesize_catalog_config_options(
-                    &self.catalog,
+                    &catalog,
                     &state.model,
                     state.thinking_level.as_deref(),
                 )
@@ -2932,16 +3158,41 @@ pub(crate) fn resolve_composed_model(catalog: &ModelCatalog, key: &str) -> Optio
         .cloned()
 }
 
+/// The remembered thinking level for a model (ADR 0015): the map entry,
+/// `Some` only when the model's `thinking_levels` is non-empty AND
+/// contains the entry (a stale entry — the provider changed its levels —
+/// is ignored; a model with no advertised levels gets nothing).
+fn remembered_thinking_level(levels: &HashMap<String, String>, model: &Model) -> Option<String> {
+    if model.thinking_levels.is_empty() {
+        return None;
+    }
+    levels
+        .get(&format!("{}/{}", model.provider, model.id))
+        .filter(|l| model.thinking_levels.iter().any(|t| t == *l))
+        .cloned()
+}
+
 /// Resolve a native session's model (the harness's `default_model` composed
-/// key → the catalog; `None` (the built-in) → the catalog's default → the
-/// v1-selectable (`openai_compatible`) set — a stale configured default
-/// degrades to the set rather than a hard error).
+/// key → the catalog; `None` (the built-in) → the `Settings.default_model`
+/// (the middle rung — a fresh `load_settings` read) → the catalog's
+/// `default_model` → the v1-selectable (`openai_compatible`) set). Each rung
+/// is tried IN ORDER: an UNRESOLVABLE key at any rung falls through to the
+/// NEXT rung (only when all three rungs are absent/unresolvable does it fall
+/// to the set) — a stale configured default degrades rather than a hard
+/// error.
 fn resolve_native_model(
     catalog: &ModelCatalog,
-    default: &Option<String>,
+    harness_default: &Option<String>,
+    settings_default: &Option<String>,
 ) -> Result<Model, RpcError> {
-    let key = default.as_deref().or(catalog.default_model.as_deref());
-    if let Some(key) = key {
+    for key in [
+        harness_default.as_deref(),
+        settings_default.as_deref(),
+        catalog.default_model.as_deref(),
+    ]
+    .iter()
+    .flatten()
+    {
         if let Some(model) = resolve_composed_model(catalog, key) {
             return Ok(model);
         }
@@ -4928,6 +5179,62 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Write a `settings.json` with the given `defaultModel` (the
+    /// camelCase wire shape — `None` = the key present-but-null, which
+    /// parses to `default_model: None`).
+    fn write_settings_default_model(dir: &Path, default_model: Option<&str>) {
+        let settings = serde_json::json!({ "defaultModel": default_model });
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// (settings) an EXTERNAL session started with a validly-shaped
+    /// `Settings.default_model` (a `"provider/id"` split) gets a
+    /// `set_model` sent BEFORE the first `get_state` (LENIENT — a failure
+    /// is logged and the session establishes on pi's own default; an
+    /// absent/unset setting sends nothing): the `get_state`-based
+    /// `info.capabilities.model` reflects the applied model (`fake_pi`'s
+    /// `set_model` handler updates `current_model_id` and its
+    /// `get_state` response substitutes it).
+    #[tokio::test]
+    async fn an_external_session_start_sends_set_model_for_the_settings_default() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        write_settings_default_model(&dir, Some("fake/fake-model-2"));
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["model"], "fake/fake-model-2",
+            "the settings default model is applied before the first get_state"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // The negative: NO `defaultModel` → no `set_model` sent → the
+        // session establishes on pi's own default.
+        write_settings_default_model(&dir, None);
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["model"], "fake/fake-model",
+            "an absent settings default sends no set_model (pi's own default)"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Native-backend tests (the in-process `AgentLoop` — a NATIVE
     // registry entry + a mock `provider_factory` seam; the production
     // default is `OpenAiCompatibleProvider`) ──
@@ -5009,6 +5316,513 @@ mod session_tests {
         sink: &Arc<dyn EventSink>,
     ) -> (SessionManager, SessionInfo) {
         start_native_session_with(dir, sink, |_m: &Model| Box::new(HangingProvider)).await
+    }
+
+    /// A full `Model` literal for the `resolve_native_model` chain test
+    /// (`base_url` EMPTY so `refresh_model_metadata` is a no-op — no
+    /// network; `openai-completions` so the model is v1-selectable).
+    fn chain_test_model(provider: &str, id: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            api_key: "k".to_string(),
+            context_window: 128000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// Write an `agents.json` with a single NATIVE entry whose harness
+    /// `default_model` is `harness_default` (`None` = the built-in).
+    fn write_agents_json_native_with_default(dir: &Path, harness_default: Option<&str>) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": {
+                    "provider": "openai-compatible",
+                    "default_model": harness_default,
+                },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// Write an `agents.json` with a single NATIVE entry whose harness
+    /// `default_model` is `harness_default` and `default_thinking_level` is
+    /// `harness_level` (both `None`-able).
+    fn write_agents_json_native_with_thinking(
+        dir: &Path,
+        harness_default: Option<&str>,
+        harness_level: Option<&str>,
+    ) {
+        let agents = serde_json::json!({
+            "agents": [{
+                "id": "nativetest",
+                "name": "Native Test",
+                "kind": "native",
+                "harness": {
+                    "provider": "openai-compatible",
+                    "default_model": harness_default,
+                    "default_thinking_level": harness_level,
+                },
+            }]
+        });
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+    }
+
+    /// Write a `settings.json` with arbitrary JSON (the camelCase wire
+    /// shape — absent keys parse to the defaults).
+    fn write_settings_json(dir: &Path, settings: serde_json::Value) {
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A `Model` with the given `thinking_levels` (`base_url` EMPTY so
+    /// `refresh_model_metadata` is a no-op — no network).
+    fn level_test_model(provider: &str, id: &str, levels: &[&str]) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            api_key: "k".to_string(),
+            context_window: 128000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: !levels.is_empty(),
+            thinking_levels: levels.iter().map(|s| s.to_string()).collect(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// Start a native session with the given catalog (the `HangingProvider`
+    /// seam — the turn hangs in the model call).
+    async fn start_native_session_with_catalog(
+        dir: &Path,
+        sink: &Arc<dyn EventSink>,
+        catalog: ModelCatalog,
+    ) -> (SessionManager, SessionInfo) {
+        let db = open_db(dir);
+        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog);
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.to_path_buf(), sink)
+        })
+        .await
+        .expect("the native session started");
+        (manager, info)
+    }
+
+    /// (ADR 0015) Native start: the remembered level (VALIDATED against the
+    /// model's `thinking_levels`) wins over the harness's
+    /// `default_thinking_level` seed.
+    #[tokio::test]
+    async fn a_native_session_starts_with_the_remembered_level_over_the_harness_default() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "medium", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevels": { "tama/m1": "xhigh" },
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "xhigh",
+            "the remembered (validated) level beats the harness seed"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A STALE remembered entry (not a member of the model's
+    /// current `thinking_levels` — the provider changed its levels) is
+    /// IGNORED: the harness seed applies.
+    #[tokio::test]
+    async fn a_stale_remembered_level_falls_back_to_the_harness_default() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "medium", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevels": { "tama/m1": "ultra" },
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "high",
+            "a stale (unvalidated) entry is ignored — the harness seed applies"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A model that advertises NO `thinking_levels` gets NO
+    /// remembered level (the memory is only applied to a member of a
+    /// NON-EMPTY level set): the `thinkingLevel` key is ABSENT (the model's
+    /// own default — `None`).
+    #[tokio::test]
+    async fn a_remembered_level_is_ignored_for_a_model_without_levels() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model("tama", "m1", &[])],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), None);
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert!(
+            info.capabilities.get("thinkingLevel").is_none(),
+            "a model with no advertised levels gets no remembered level, got {:?}",
+            info.capabilities
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) An EXPLICIT `thought_level` change (native) persists
+    /// `memory[<the session's model key>] = level` to `settings.json`
+    /// (best-effort — the change itself is applied regardless).
+    #[tokio::test]
+    async fn a_native_thought_level_change_remembers_the_level() {
+        let dir = temp_config_dir();
+        write_agents_json_native(&dir);
+        write_settings_json(&dir, serde_json::json!({}));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "medium", &sink)
+            .await
+            .expect("the level change applies");
+        let settings = load_settings(&dir);
+        assert_eq!(
+            settings.default_thinking_levels.get("fake/m1"),
+            Some(&"medium".to_string()),
+            "the explicit change writes the memory for the session's model"
+        );
+        // The file on disk is updated (a fresh read — not just the in-memory map).
+        let raw = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(on_disk["defaultThinkingLevels"]["fake/m1"], "medium");
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) A native model switch is a MINIMAL-SURPRISE reset: the
+    /// current level is invalid for the NEW model (its `thinking_levels`
+    /// are non-empty and don't contain it) → the level resets to the new
+    /// model's remembered level (or `None`).
+    #[tokio::test]
+    async fn a_native_model_switch_resets_an_invalid_level_to_the_new_model_s_memory() {
+        let catalog = ModelCatalog {
+            models: vec![
+                level_test_model("tama", "a", &["off", "high"]),
+                level_test_model("tama", "b", &["off", "low", "medium", "xhigh"]),
+            ],
+            default_model: Some("tama/a".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/b": "xhigh" } }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        // The current level (valid for `a` — also writes `a`'s memory).
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "high", &sink)
+            .await
+            .expect("the level change applies");
+        // The switch: `"high"` is NOT a member of `b`'s levels → the reset
+        // to `b`'s remembered level.
+        let updated = manager
+            .set_config_option(&info.session_id, "model", "tama/b", &sink)
+            .await
+            .expect("the model switch applies");
+        let thought = updated
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .expect("a thought_level selector");
+        assert_eq!(
+            thought["currentValue"], "xhigh",
+            "an invalid level resets to the new model's remembered level"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) The flip side: a current level that IS a member of the
+    /// new model's `thinking_levels` is KEPT across the switch (minimal
+    /// surprise — no reset).
+    #[tokio::test]
+    async fn a_native_model_switch_keeps_a_valid_level() {
+        let catalog = ModelCatalog {
+            models: vec![
+                level_test_model("tama", "a", &["off", "high"]),
+                level_test_model("tama", "c", &["off", "high", "medium"]),
+            ],
+            default_model: Some("tama/a".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
+        write_settings_json(&dir, serde_json::json!({}));
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        let _ = manager
+            .set_config_option(&info.session_id, "thought_level", "high", &sink)
+            .await
+            .expect("the level change applies");
+        let updated = manager
+            .set_config_option(&info.session_id, "model", "tama/c", &sink)
+            .await
+            .expect("the model switch applies");
+        let thought = updated
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .expect("a thought_level selector");
+        assert_eq!(
+            thought["currentValue"], "high",
+            "a valid level is kept across the switch"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) Native resume: the remembered level (VALIDATED) wins over
+    /// the STORED `thinkingLevel` (the start-of-session value — stale after
+    /// a mid-session change), which wins over the harness seed.
+    #[tokio::test]
+    async fn a_resume_prefers_the_remembered_level_over_the_stale_stored_value() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "high", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("low"));
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
+        );
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db.clone());
+        manager.set_catalog(catalog);
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        // The stored row: the start-of-session level (`"high"` — valid for
+        // the model; a mid-session change to `xhigh` is only in the memory).
+        db.record_session(&SessionInfo {
+            session_id: "nat-resume-1".to_string(),
+            agent_id: "nativetest".to_string(),
+            cwd: dir.clone(),
+            capabilities: json!({
+                "native": true,
+                "model": "tama/m1",
+                "thinkingLevel": "high",
+                "loadSession": true,
+            }),
+            config_options: None,
+            archived: false,
+        })
+        .expect("record_session should succeed");
+        let info = crate::test_support::run_with_retry(|| {
+            manager.resume_session("nativetest", "nat-resume-1", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native resume works");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "xhigh",
+            "memory wins over the stale stored value"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0015) External (pi) start: a remembered level for
+    /// `settings.defaultModel` is sent LENIENT (`set_thinking_level` after
+    /// `set_model`, BEFORE the first `get_state` — the `get_state` response
+    /// reflects it). `fake_pi`'s `get_state` substitutes `__LEVEL__` with
+    /// the level it was sent (default `"off"`).
+    #[tokio::test]
+    async fn an_external_session_start_sends_the_remembered_thinking_level() {
+        let dir = temp_config_dir();
+        write_agents_json_pi(&dir, &[]);
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": "fake/fake-model-2",
+                "defaultThinkingLevels": { "fake/fake-model-2": "medium" },
+            }),
+        );
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "medium",
+            "the remembered level is sent before the first get_state"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // The negative: the same `defaultModel` but NO memory entry →
+        // nothing sent → pi's own default level.
+        write_settings_json(
+            &dir,
+            serde_json::json!({ "defaultModel": "fake/fake-model-2" }),
+        );
+        let manager = SessionManager::new(dir.clone()).unwrap();
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("fake", dir.clone(), &sink)
+        })
+        .await
+        .expect("the external session started");
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "off",
+            "no memory entry → no set_thinking_level → pi's default level"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (settings chain) the native model resolution chain: per-agent
+    /// `HarnessConfig.default_model` > `Settings.default_model` (the new
+    /// MIDDLE rung — a fresh `load_settings` read) > the catalog's
+    /// `default_model` > the v1-selectable (`openai_compatible`) set. An
+    /// UNRESOLVABLE key at any rung falls through to the NEXT rung (the
+    /// settings rung is tried BEFORE the catalog default — not skipped).
+    #[tokio::test]
+    async fn the_native_model_chain_settings_default_sits_between_per_agent_and_catalog() {
+        let catalog = ModelCatalog {
+            models: vec![
+                chain_test_model("s", "m1"),
+                chain_test_model("c", "m2"),
+                chain_test_model("h", "m3"),
+            ],
+            default_model: Some("c/m2".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        // Phase 1: harness `None` + settings `s/m1` → the settings rung
+        // wins (it sits between the per-agent and the catalog default).
+        write_agents_json_native_with_default(&dir, None);
+        write_settings_default_model(&dir, Some("s/m1"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "s/m1",
+            "the settings default sits between the per-agent and the catalog default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // Phase 2: harness `h/m3` (in the catalog) + settings `s/m1` →
+        // the per-agent rung wins.
+        write_agents_json_native_with_default(&dir, Some("h/m3"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "h/m3",
+            "the per-agent default wins over the settings default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // Phase 3: harness `None` + settings `gone/m1` (NOT in the
+        // catalog) → the unresolvable settings key falls through to the
+        // CATALOG DEFAULT rung (not straight to the v1-selectable set).
+        write_agents_json_native_with_default(&dir, None);
+        write_settings_default_model(&dir, Some("gone/m1"));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = crate::test_support::run_with_retry(|| {
+            manager.start_session("nativetest", dir.clone(), &sink)
+        })
+        .await
+        .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "c/m2",
+            "an unresolvable settings key degrades to the catalog default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (live `/v1/models` discovery) `refresh_model_metadata` applies the
@@ -5093,6 +5907,182 @@ mod session_tests {
         assert_eq!(degraded.context_window, 128000);
         assert!(!degraded.supports_thinking);
         server.abort();
+    }
+
+    /// Write a `settings.json` with a single user provider (the
+    /// `effective_catalog` tests — the desktop-owned provider store, ADR
+    /// 0014; the camelCase wire shape).
+    fn write_settings_provider(dir: &Path, id: &str, base_url: &str) {
+        let settings = serde_json::json!({
+            "providers": [
+                { "id": id, "name": id, "baseUrl": base_url, "apiKey": "k" }
+            ]
+        });
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A full `Model` literal (the `provider` / `base_url` are
+    /// parameterized — `session.rs` has no `Model` helper of its own).
+    fn provider_model(id: &str, provider: &str, base_url: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: base_url.to_string(),
+            api_key: "k".to_string(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// (ADR 0014) `effective_catalog` discovers a user provider's models
+    /// via `GET {base_url}/models` (a fresh `settings.json` read) and
+    /// maps them onto `Model` rows (the provider's `base_url` / `api_key`;
+    /// `context_window` falls back to `DEFAULT_CONTEXT_WINDOW` when the
+    /// response lacks `max_model_len`).
+    #[tokio::test]
+    async fn effective_catalog_discovers_a_user_provider() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::test_support::raw_json_server(
+            listener,
+            200,
+            r#"{"data":[{"id":"m/1"}]}"#, // no `max_model_len` → the default window
+            None,
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
+        // A seeded catalog under a DIFFERENT provider id (coexists — no
+        // clash).
+        let mut manager = SessionManager::new(dir).unwrap();
+        manager.set_catalog(ModelCatalog {
+            models: vec![provider_model("s/1", "other", "https://other/v1")],
+            ..Default::default()
+        });
+        let effective = manager.effective_catalog(None).await;
+        let user: Vec<&Model> = effective
+            .models
+            .iter()
+            .filter(|m| m.provider == "tama")
+            .collect();
+        assert_eq!(user.len(), 1, "the discovered model is in the catalog");
+        assert_eq!(user[0].id, "m/1");
+        assert_eq!(user[0].api.as_deref(), Some("openai-completions"));
+        assert_eq!(user[0].api_key, "k");
+        assert_eq!(user[0].base_url, format!("http://{addr}/v1"));
+        // The response lacks `max_model_len` → the default window.
+        assert_eq!(user[0].context_window, DEFAULT_CONTEXT_WINDOW);
+        // The seeded model coexists (no id clash).
+        assert!(effective.models.iter().any(|m| m.provider == "other"));
+        server.abort();
+    }
+
+    /// (ADR 0014) A provider whose discovery FAILS (unreachable endpoint)
+    /// still SHADOWS the seeded models for its id (a transient failure
+    /// must not resurrect stale seeded models under the same id).
+    #[tokio::test]
+    async fn effective_catalog_a_failed_discovery_still_shadows_the_seeded_provider() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        write_settings_provider(&dir, "tama", "http://127.0.0.1:1/v1"); // unreachable
+        let mut manager = SessionManager::new(dir).unwrap();
+        manager.set_catalog(ModelCatalog {
+            models: vec![
+                provider_model("stale/1", "tama", "https://stale/v1"),
+                provider_model("q/1", "q", "https://q/v1"),
+            ],
+            default_model: Some("tama/stale/1".to_string()),
+            ..Default::default()
+        });
+        let effective = manager.effective_catalog(None).await;
+        assert!(
+            !effective.models.iter().any(|m| m.provider == "tama"),
+            "a failed discovery must NOT resurrect the stale seeded models"
+        );
+        // A non-shadowed provider's seeded models survive.
+        assert!(effective.models.iter().any(|m| m.provider == "q"));
+        // The seeded default belonged to the shadowed provider → `None`.
+        assert_eq!(effective.default_model, None);
+    }
+
+    /// (ADR 0014) The discovery is CACHED per provider (a second
+    /// `effective_catalog` is not re-fetched), and a `force_refresh` for
+    /// the provider BYPASSES the cache (a fresh fetch overwrites the
+    /// entry — even a re-pointed `base_url` is honored, the `settings.json`
+    /// read is fresh).
+    #[tokio::test]
+    async fn effective_catalog_caches_and_force_refresh_bypasses_the_cache() {
+        let dir = temp_config_dir();
+        std::fs::write(
+            dir.join("agents.json"),
+            serde_json::json!({ "agents": [] }).to_string(),
+        )
+        .unwrap();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::test_support::raw_json_server(
+            listener,
+            200,
+            r#"{"data":[{"id":"v1"}]}"#,
+            Some(counter.clone()),
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
+        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        manager.set_catalog(ModelCatalog::default());
+        let first = manager.effective_catalog(None).await;
+        assert!(first.models.iter().any(|m| m.id == "v1"));
+        // Second call: the cache serves it (the server is NOT hit again).
+        let second = manager.effective_catalog(None).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second call must be cache-served"
+        );
+        assert!(second.models.iter().any(|m| m.id == "v1"));
+        // A `force_refresh` for the provider bypasses the cache (a fresh
+        // fetch overwrites the entry — a NEW response body is asserted via
+        // the counter-driven flow: re-point the provider at a second
+        // listener serving `v2`).
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = crate::test_support::raw_json_server(
+            listener2,
+            200,
+            r#"{"data":[{"id":"v2"}]}"#,
+            Some(counter.clone()),
+        )
+        .await;
+        write_settings_provider(&dir, "tama", &format!("http://{addr2}/v1"));
+        let refreshed = manager.effective_catalog(Some("tama")).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the force refresh must re-fetch"
+        );
+        assert!(refreshed.models.iter().any(|m| m.id == "v2"));
+        assert!(!refreshed.models.iter().any(|m| m.id == "v1"));
+        server.abort();
+        server2.abort();
     }
 
     /// A `Provider` whose `complete` blocks until signalled (the stream

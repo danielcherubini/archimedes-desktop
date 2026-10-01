@@ -2,6 +2,20 @@ import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import NewSpaceDialog from "./NewSpaceDialog";
 import * as tauri from "../lib/tauri";
+import type { AppSettings } from "../lib/tauri";
+
+// The dialog's `getSettings` fixture default: a full `AppSettings` with
+// `defaultAgent: null` (the existing tests' `agents[0]` behavior holds).
+const baseSettings: AppSettings = {
+  theme: "dark",
+  paneLayout: {},
+  defaultAgent: null,
+  defaultTrustNewSpaces: false,
+  defaultModel: null,
+  providers: [],
+  font: { sizePx: 14, uiFamily: null, codeFamily: null },
+  defaultThinkingLevels: {},
+};
 
 // Mock the Tauri IPC layer: the agent picker's data source is `list_agents`
 // (the backend's `Registry::load` merge appends the built-in `archimedes`
@@ -11,6 +25,18 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
+    // Inlined (NOT the `baseSettings` const): the factory is hoisted above
+    // the const's initializer (a TDZ reference would throw at import time).
+    getSettings: vi.fn().mockResolvedValue({
+      theme: "dark",
+      paneLayout: {},
+      defaultAgent: null,
+      defaultTrustNewSpaces: false,
+      defaultModel: null,
+      providers: [],
+      font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
+    }),
     listAgents: vi.fn().mockResolvedValue([
       { id: "pi", name: "Pi" },
       { id: "archimedes", name: "Archimedes" },
@@ -67,6 +93,14 @@ async function setFolder(path: string) {
   await waitFor(() => expect(tauri.spaceForPath).toHaveBeenCalled());
 }
 
+/** Wait for the registry fetch to land, then return the agent `<select>`. */
+async function waitForSelect(): Promise<HTMLSelectElement> {
+  await waitFor(() => expect(tauri.listAgents).toHaveBeenCalled());
+  const select = document.querySelector("select") as HTMLSelectElement;
+  expect(select).toBeTruthy();
+  return select;
+}
+
 describe("NewSpaceDialog (the agent picker, native-agent-harness Task 7)", () => {
   it("shows the 'Archimedes' native agent entry (it flows via list_agents)", async () => {
     render(<NewSpaceDialog onClose={vi.fn()} />);
@@ -104,6 +138,29 @@ describe("NewSpaceDialog (the agent picker, native-agent-harness Task 7)", () =>
     await waitFor(() => expect(tauri.spaceForPath).toHaveBeenCalled());
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(tauri.startSession).toHaveBeenCalledWith("pi", "/tmp/ws"));
+  });
+
+  it("the_settings_default_agent_wins_over_agents_0", async () => {
+    vi.mocked(tauri.getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultAgent: "archimedes",
+    });
+    render(<NewSpaceDialog onClose={vi.fn()} />);
+    const select = await waitForSelect();
+    // `settings.defaultAgent` (in the registry) beats `agents[0]`.
+    await waitFor(() => expect(select.value).toBe("archimedes"));
+  });
+
+  it("an_unknown_settings_default_agent_falls_back_to_agents_0", async () => {
+    // The agent was removed from `agents.json` — `defaultAgent` is not in
+    // the registry, so the effective selection falls back to `agents[0]`.
+    vi.mocked(tauri.getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultAgent: "gone",
+    });
+    render(<NewSpaceDialog onClose={vi.fn()} />);
+    const select = await waitForSelect();
+    await waitFor(() => expect(select.value).toBe("pi"));
   });
 
   it("has NO `get_models` command (the native model picker is the synthesized configOptions)", () => {

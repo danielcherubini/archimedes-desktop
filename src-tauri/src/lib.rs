@@ -9,8 +9,7 @@ pub mod test_support;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::menu::{Menu, MenuItem};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use crate::agent::{EventSink, SessionManager, SubagentSessionManager};
 use crate::storage::Db;
@@ -76,7 +75,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::sessions::start_session,
@@ -93,6 +91,7 @@ pub fn run() {
             commands::history::set_session_archived,
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::list_models,
             commands::spaces::list_agents,
             commands::spaces::list_spaces,
             commands::spaces::delete_space,
@@ -123,28 +122,7 @@ pub fn run() {
                 },
             )?;
             setup_dirs(app, config_dir, app_data_dir)?;
-            // The "Check for updates" menu item asks the webview to run the
-            // updater check (the updater plugin lives in the JS context).
-            let check_item = MenuItem::with_id(
-                app,
-                "check-updates",
-                "Check for updates",
-                true,
-                None::<&str>,
-            )
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            let menu = Menu::with_items(app, &[&check_item])
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            app.set_menu(menu)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             Ok(())
-        })
-        .on_menu_event(|app, event| {
-            if event.id() == "check-updates" {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.emit("update-check-requested", ());
-                }
-            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

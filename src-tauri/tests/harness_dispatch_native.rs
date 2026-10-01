@@ -1625,7 +1625,7 @@ fn trusted_space_db() -> (Arc<Db>, PathBuf) {
         archived: false,
     })
     .expect("record_session");
-    db.upsert_space(&space.display().to_string())
+    db.upsert_space(&space.display().to_string(), false)
         .expect("upsert_space");
     db.set_space_trusted(&space.display().to_string(), true)
         .expect("set_space_trusted");

@@ -1,5 +1,5 @@
 ---
-status: committed
+status: done
 done-when: The gear icon in the left sidebar opens a ZCode-parity settings page (full view + 268px section sidebar + immediate save) where the user can set the theme (system/dark/light), fonts (size + UI/code family), default agent, trust-new-Spaces default, default model, and CRUD provider connections — all persisted in `settings.json` and taking effect per the wiring below.
 ---
 

@@ -16,9 +16,14 @@
   --ui-font-size: 14px;
 }
 
+/* Frameless transparent window: html/body must be transparent so the
+ * rounded, opaque root (App.tsx) shows the desktop through its corners.
+ * (The window is created `transparent: true` in tauri.conf.json.) */
+html,
 body {
   margin: 0;
   overflow: hidden;
+  background: transparent;
 }
 
 #root {
@@ -49,6 +54,17 @@ body {
 }
 
 @theme {
+  /* Pin the sans stack explicitly so it does NOT drift with Tailwind's
+   * version-dependent default. Tailwind 4.3 (this app) changed the default
+   * to a longer stack (-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+   * 'Helvetica Neue', 'Noto Sans', Arial, sans-serif, ...); ZCode is on
+   * 4.2.2 (ui-sans-serif, system-ui, sans-serif, ...). Left unpinned, a box
+   * with Roboto/Segoe installed would render the two apps in different body
+   * fonts. Pinning to ZCode's 4.2.2 stack keeps them in lockstep everywhere
+   * (on this machine both already resolve to Noto Sans, so no visible change). */
+  --font-sans:
+    ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+    "Segoe UI Symbol", "Noto Color Emoji";
   /* Windows 的 Consolas 不含中文字形，Tailwind 默认栈最终会让中文落到宋体。
    * 保留各平台西文等宽字体，并在通用 monospace 前显式加入各平台 CJK 无衬线字体。 */
   --font-mono:

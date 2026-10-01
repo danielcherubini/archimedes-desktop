@@ -491,8 +491,10 @@ async fn untrusted_space_prompts_with_third_option_and_trust_space_outcome_trust
     let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
     manager.attach_db(db.clone());
     // The space row exists (an UNTRUSTED row — `set_space_trusted` is an
-    // UPDATE, so the `trust-space` outcome's write needs it).
-    db.upsert_space(&cwd_str)
+    // UPDATE, so the `trust-space` outcome's write needs it). `false`
+    // (the pre-change behavior — rows born untrusted via the schema
+    // default; the settings flag is threaded only by `record_session`).
+    db.upsert_space(&cwd_str, false)
         .expect("upsert_space should succeed");
 
     let info = archimedes_lib::test_support::run_with_retry(|| async {
@@ -588,7 +590,7 @@ async fn trusted_space_skips_the_permission_prompt() {
     let db = Arc::new(Db::open(&config_dir.join("archimedes.db")).expect("db should open"));
     manager.attach_db(db.clone());
     // The space row exists and is TRUSTED (BEFORE the session starts).
-    db.upsert_space(&cwd_str)
+    db.upsert_space(&cwd_str, false)
         .expect("upsert_space should succeed");
     db.set_space_trusted(&cwd_str, true)
         .expect("set_space_trusted should succeed");
@@ -661,7 +663,7 @@ async fn trusted_space_never_auto_answers_select_requests() {
     // The space row exists and is TRUSTED (BEFORE the session starts —
     // the same precondition the auto-answer test sets, which is exactly
     // the state a regression would abuse to suppress this prompt).
-    db.upsert_space(&cwd_str)
+    db.upsert_space(&cwd_str, false)
         .expect("upsert_space should succeed");
     db.set_space_trusted(&cwd_str, true)
         .expect("set_space_trusted should succeed");

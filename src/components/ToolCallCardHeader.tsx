@@ -103,7 +103,7 @@ export function ToolCallCardHeader({
           )}
         </>
       ) : isShell && typeof command === "string" && command !== "" ? (
-        <span className="min-w-0 truncate font-sans text-foreground-subtle">
+        <span className="min-w-0 truncate font-mono text-ui-sm text-foreground-subtle">
           {command}
         </span>
       ) : summary ? (

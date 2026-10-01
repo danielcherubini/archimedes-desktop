@@ -506,17 +506,22 @@ impl Db {
     ///
     /// Keyed by the canonical path (the single key form, ADR 0010) — the
     /// input is canonicalized here, falling back to the raw string when the
-    /// folder no longer exists (a best-effort write; reads stay fail-closed).
-    /// `created_at` is preserved on conflict; `last_opened_at` is always
-    /// refreshed (an actual start/resume is a real "open"). No folder
+    /// folder no longer exists (a best-effort write; reads stay
+    /// fail-closed). `created_at` is preserved on conflict; `last_opened_at`
+    /// is always refreshed (an actual start/resume is a real "open"). No folder
     /// validation happens here — whether the folder exists is the caller's
     /// problem (the canonicalizing gate is in `start_session`/`space_for_path`).
-    pub fn upsert_space(&self, path: &str) -> Result<(), DbError> {
+    ///
+    /// `default_trusted` is written ONLY on INSERT (a NEW row is born
+    /// `trusted` per the flag — the settings' `default_trust_new_spaces`);
+    /// the CONFLICT branch never touches `trusted` (an existing row's flag
+    /// is never changed by a re-upsert — no retroactive trust).
+    pub fn upsert_space(&self, path: &str, default_trusted: bool) -> Result<(), DbError> {
         let key = space_key(path).unwrap_or_else(|| path.to_string());
         self.conn.lock().expect("db mutex poisoned").execute(
-            "INSERT INTO spaces (path, created_at, last_opened_at) VALUES (?1, ?2, ?2)
+            "INSERT INTO spaces (path, created_at, last_opened_at, trusted) VALUES (?1, ?2, ?2, ?3)
                  ON CONFLICT(path) DO UPDATE SET last_opened_at = excluded.last_opened_at",
-            params![key, now_ms()],
+            params![key, now_ms(), default_trusted],
         )?;
         Ok(())
     }
@@ -654,6 +659,61 @@ CREATE TABLE IF NOT EXISTS spaces (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (settings trust) a NEW space row is born `trusted` per the flag
+    /// (the INSERT writes `trusted` from the flag). Asserted via
+    /// `list_spaces()` (NOT `space_trusted` — a canonicalize failure
+    /// fail-closes to `false` on a nonexistent path, a misleading red).
+    /// Real temp dirs for the paths (a nonexistent path canonicalize-
+    /// fails → `space_key` falls back to the raw string; the canonical
+    /// key is asserted here).
+    #[test]
+    fn upsert_space_insert_sets_trusted_from_the_flag() {
+        let dir = std::env::temp_dir().join(format!("db-trusted-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        let a = dir.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let b = dir.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        db.upsert_space(a.to_str().unwrap(), true).unwrap();
+        db.upsert_space(b.to_str().unwrap(), false).unwrap();
+        let rows = db.list_spaces().unwrap();
+        let a_canon = std::fs::canonicalize(&a).unwrap().display().to_string();
+        let b_canon = std::fs::canonicalize(&b).unwrap().display().to_string();
+        let row_a = rows.iter().find(|r| r.path == a_canon).unwrap();
+        let row_b = rows.iter().find(|r| r.path == b_canon).unwrap();
+        assert!(
+            row_a.trusted,
+            "the INSERT writes `trusted` from the flag (true)"
+        );
+        assert!(
+            !row_b.trusted,
+            "the INSERT writes `trusted` from the flag (false)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (settings trust) a re-upsert on an EXISTING row never touches the
+    /// trust flag (the CONFLICT branch only refreshes `last_opened_at`
+    /// — no retroactive trust): `false` → trust ON → re-upsert `false`
+    /// → the row is STILL trusted.
+    #[test]
+    fn upsert_space_conflict_leaves_the_existing_trust_untouched() {
+        let dir = std::env::temp_dir().join(format!("db-trusted-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        let c = dir.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        let c_canon = std::fs::canonicalize(&c).unwrap().display().to_string();
+        db.upsert_space(&c_canon, false).unwrap();
+        db.set_space_trusted(&c_canon, true).unwrap();
+        db.upsert_space(&c_canon, false).unwrap();
+        let rows = db.list_spaces().unwrap();
+        let row = rows.iter().find(|r| r.path == c_canon).unwrap();
+        assert!(row.trusted, "the CONFLICT branch never touches `trusted`");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// (the FK migration) A crash MID-BATCH leaves a stale
     /// `native_messages_migrated` table behind (the original

@@ -12,6 +12,20 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
+    // `NewSpaceDialog` fetches the settings for its default-agent precedence
+    // (the dialog's `.catch` keeps a rejection from going unhandled, but the
+    // mock makes the dialog's effective selection deterministic here): a full
+    // `AppSettings` with `defaultAgent: null` (the `agents[0]` behavior holds).
+    getSettings: vi.fn().mockResolvedValue({
+      theme: "dark",
+      paneLayout: {},
+      defaultAgent: null,
+      defaultTrustNewSpaces: false,
+      defaultModel: null,
+      providers: [],
+      font: { sizePx: 14, uiFamily: null, codeFamily: null },
+      defaultThinkingLevels: {},
+    }),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "new1",
       agentId: "pi",
@@ -601,6 +615,23 @@ describe("SpacesList", () => {
     expect(screen.getByText("Sessions")).toBeTruthy();
     // The one-fetch property (single consumer): one `listSkills` call.
     expect(mockedListSkills).toHaveBeenCalledTimes(1);
+  });
+
+  it("the_gear_icon_opens_settings", () => {
+    const onOpenSettings = vi.fn();
+    render(<SpacesList onOpenSettings={onOpenSettings} />);
+    // The footer's gear icon (bottom right, the `SpaceGroup` hover-action
+    // button pattern) exists and fires the callback.
+    const gear = screen.getByRole("button", { name: "Settings" });
+    expect(gear).toBeTruthy();
+    fireEvent.click(gear);
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    // Without the prop (the existing tests' shape) the button still
+    // renders (the optional prop is guarded with `onOpenSettings?.()`).
+    const second = render(<SpacesList />);
+    expect(
+      second.container.querySelector('button[aria-label="Settings"]'),
+    ).not.toBeNull();
   });
 
   it("the_skills_modal_shows_the_empty_state_when_there_are_no_skills", async () => {

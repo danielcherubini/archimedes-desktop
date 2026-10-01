@@ -313,10 +313,46 @@ export interface MessageRow {
   createdAt: number;
 }
 
-/** The persisted app settings (`settings.json` in the config dir). */
+/** A user-configured model provider (`settings.json` `providers` entry). */
+export interface ProviderConfig {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+}
+
+/** The font settings (the settings UI's size slider + optional family overrides). */
+export interface FontSettings {
+  sizePx: number;
+  uiFamily: string | null;
+  codeFamily: string | null;
+}
+
+/**
+ * The persisted app settings (`settings.json` in the config dir).
+ * Mirrors the Rust `Settings` struct's camelCase shape exactly (a
+ * `saveSettings` round-trip loses no field).
+ */
 export interface AppSettings {
-  theme: "dark" | "light";
+  /** "system" follows the OS scheme live (the `matchMedia` listener in theme.ts). */
+  theme: "system" | "dark" | "light";
   paneLayout: Record<string, unknown>;
+  defaultAgent: string | null;
+  defaultTrustNewSpaces: boolean;
+  defaultModel: string | null;
+  providers: ProviderConfig[];
+  font: FontSettings;
+  /** Per-model remembered thinking level (ADR 0015): `"<provider>/<id>"` → the last level the user set for that model. */
+  defaultThinkingLevels: Record<string, string>;
+}
+
+/** The effective catalog's model (the Default-model select + provider discovery status). */
+export interface ModelDto {
+  id: string;
+  provider: string;
+  contextWindow: number;
+  supportsThinking: boolean;
+  thinkingLevels: string[];
 }
 
 /** One discovered skill (camelCase over IPC — the Rust `SkillInfo`). */
@@ -435,6 +471,11 @@ export async function getSettings(): Promise<AppSettings> {
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
   return invoke("save_settings", { settings });
+}
+
+/** The effective catalog's models (the Default-model select + provider discovery status). `forceRefresh` = a provider id whose discovery cache is bypassed. */
+export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
+  return invoke("list_models", { forceRefresh: forceRefresh ?? null });
 }
 
 // ---------------------------------------------------------------------------
