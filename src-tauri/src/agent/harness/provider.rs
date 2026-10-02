@@ -36,6 +36,8 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     /// Sampling / limits.
     pub options: ModelOptions,
+    /// The session id for LiteLLM session / request tracking (if known).
+    pub session_id: Option<String>,
 }
 
 /// A message's content: plain text, or a list of content blocks (mirrors
@@ -594,9 +596,13 @@ impl Provider for OpenAiCompatibleProvider {
             Duration::from_secs(30),     // a generous CONNECT bound
             Duration::from_secs(5 * 60), // 5 min of SILENCE = a stalled provider
         );
-        let resp = client
-            .post(&url)
-            .bearer_auth(&self.api_key)
+        let mut builder = client.post(&url).bearer_auth(&self.api_key);
+        if let Some(ref sid) = req.session_id {
+            builder = builder
+                .header("x-litellm-session-id", sid)
+                .header("x-request-id", sid);
+        }
+        let resp = builder
             .json(&request_body(req))
             .send()
             .await
@@ -1079,6 +1085,7 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
                 stream: true,
             },
+            session_id: None,
         };
         let body = request_body(&req);
         assert_eq!(body["model"], "m");
@@ -1181,6 +1188,7 @@ mod tests {
                 reasoning_effort: None,
                 stream: true,
             },
+            session_id: None,
         };
         let body = request_body(&req);
         let calls = body["messages"][0]["tool_calls"]
@@ -1239,6 +1247,7 @@ mod tests {
                 reasoning_effort: None,
                 stream: true,
             },
+            session_id: None,
         };
         let body = request_body(&req);
         assert!(body.get("tools").is_none());
