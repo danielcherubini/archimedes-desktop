@@ -87,8 +87,25 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
       const tasks = input.tasks;
       return Array.isArray(tasks) ? `${tasks.length} tasks` : undefined;
     }
-    case "mcp":
-      return str("tool");
+    case "mcp": {
+      const tool = str("tool");
+      const server = str("server");
+      const search = str("search");
+      const describe = str("describe");
+      const connect = str("connect");
+      const action = str("action");
+      // The tool being called (most specific), optionally with the server
+      // it is called on.
+      if (tool) return server ? `${tool} (${server})` : tool;
+      // A server-scoped action (list / auth / connect) → the server name.
+      if (server) return server;
+      // A cross-server action (search / describe / connect).
+      if (search) return `search: ${search}`;
+      if (describe) return `describe: ${describe}`;
+      if (connect) return `connect ${connect}`;
+      if (action) return action;
+      return undefined; // the bare status call (mcp({})).
+    }
     default: {
       const text = JSON.stringify(rawInput);
       return text === "{}" || text === "null" ? undefined : truncate(text, 80);

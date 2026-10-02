@@ -8,6 +8,7 @@ import {
   readLineRange,
   normalizeToolOutput,
   summarizeSubagentFor,
+  summarizeToolCall,
   subagentActivityFor,
 } from "./toolOutput";
 import {
@@ -403,5 +404,69 @@ describe("subagentActivityFor (the one-line activity)", () => {
       "task-a",
     );
     expect(out).toBe("done-a");
+  });
+});
+
+describe("summarizeToolCall", () => {
+  it("shows the bash / sudo command", () => {
+    expect(summarizeToolCall("bash", { command: "ls -la" })).toBe("ls -la");
+    expect(summarizeToolCall("sudo_exec", { command: "apt install x" })).toBe(
+      "apt install x",
+    );
+  });
+  it("shows the read path (+ line range when offset + limit)", () => {
+    expect(summarizeToolCall("read", { path: "/foo/bar.ts" })).toBe("/foo/bar.ts");
+    expect(summarizeToolCall("read", { path: "/foo", offset: 1, limit: 10 })).toBe(
+      "/foo (L1–10)",
+    );
+  });
+  it("shows the grep / find pattern", () => {
+    expect(summarizeToolCall("grep", { pattern: "foo" })).toBe("foo");
+    expect(summarizeToolCall("grep", { pattern: "foo", path: "/bar" })).toBe(
+      "foo in /bar",
+    );
+  });
+  it("shows the subagent task (truncated)", () => {
+    expect(summarizeToolCall("subagent", { task: "a".repeat(80) })).toBe(
+      "a".repeat(60) + "…",
+    );
+  });
+  it("returns undefined for an empty object (unknown tool)", () => {
+    expect(summarizeToolCall("some_tool", {})).toBeUndefined();
+  });
+  it("falls back to a truncated JSON dump for unknown tools", () => {
+    expect(summarizeToolCall("some_tool", { a: 1, b: 2 })).toBe('{"a":1,"b":2}');
+  });
+});
+
+describe("summarizeToolCall (mcp — the server name on the side)", () => {
+  it("shows the tool being called", () => {
+    expect(summarizeToolCall("mcp", { tool: "echo" })).toBe("echo");
+  });
+  it("shows the tool + the server it is called on", () => {
+    expect(summarizeToolCall("mcp", { tool: "echo", server: "postgres" })).toBe(
+      "echo (postgres)",
+    );
+  });
+  it("shows the server for a server-scoped action (list / auth)", () => {
+    expect(summarizeToolCall("mcp", { server: "postgres" })).toBe("postgres");
+    expect(summarizeToolCall("mcp", { action: "auth", server: "postgres" })).toBe(
+      "postgres",
+    );
+  });
+  it("shows the search / describe / connect queries", () => {
+    expect(summarizeToolCall("mcp", { search: "echo" })).toBe("search: echo");
+    expect(summarizeToolCall("mcp", { describe: "echo" })).toBe(
+      "describe: echo",
+    );
+    expect(summarizeToolCall("mcp", { connect: "postgres" })).toBe(
+      "connect postgres",
+    );
+  });
+  it("shows the action when no server / tool is named (status)", () => {
+    expect(summarizeToolCall("mcp", { action: "status" })).toBe("status");
+  });
+  it("returns undefined for the bare status call (mcp({}))", () => {
+    expect(summarizeToolCall("mcp", {})).toBeUndefined();
   });
 });
