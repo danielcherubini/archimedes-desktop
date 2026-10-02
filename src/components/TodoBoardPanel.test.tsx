@@ -213,4 +213,25 @@ describe("TodoBoardPanel", () => {
       "raw two",
     ]);
   });
+
+  it("renders multi-line todo items with wrapping and min-height rather than fixed height", () => {
+    useBridge.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [
+        {
+          content:
+            "Task 1: Fix hardcoded discriminator literal in UserPartyRestrictionDao and ensure proper wrapping",
+          status: "in_progress",
+        },
+      ],
+    });
+    render(<TodoBoardPanel sessionId="main1" />);
+    const textNode = screen.getByText(/Task 1: Fix hardcoded discriminator/);
+    expect(textNode.className).toContain("break-words");
+    const row = textNode.closest("li");
+    expect(row).not.toBeNull();
+    expect(row!.className).toContain("min-h-8");
+    expect(row!.className).toContain("items-start");
+    expect(row!.classList.contains("h-8")).toBe(false);
+  });
 });

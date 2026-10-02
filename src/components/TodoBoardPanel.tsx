@@ -78,15 +78,29 @@ export function useMainOpenTodoCount(sessionId: string | null): number {
 function TodoIndicator({ status }: { status: TodoItem["status"] }) {
   if (status === "completed") {
     return (
-      <span className="flex size-4 shrink-0 items-center justify-center rounded-full border border-success text-success">
+      <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-success text-success">
         <Check className="size-3" />
       </span>
     );
   }
   if (status === "in_progress") {
-    return <span aria-hidden className="text-ui-base text-warning">◉</span>;
+    return (
+      <span
+        aria-hidden
+        className="mt-0.5 flex size-4 shrink-0 items-center justify-center text-ui-base text-warning leading-none"
+      >
+        ◉
+      </span>
+    );
   }
-  return <span aria-hidden className="text-ui-base text-foreground-subtlest">○</span>;
+  return (
+    <span
+      aria-hidden
+      className="mt-0.5 flex size-4 shrink-0 items-center justify-center text-ui-base text-foreground-subtlest leading-none"
+    >
+      ○
+    </span>
+  );
 }
 
 function TodoItems({ items }: { items: TodoItem[] }) {
@@ -95,14 +109,14 @@ function TodoItems({ items }: { items: TodoItem[] }) {
       {items.map((item, i) => (
         <li
           key={i}
-          className="flex h-8 items-center gap-2 rounded-md hover:bg-surface-hover"
+          className="flex min-h-8 items-start gap-2 rounded-md px-1.5 py-1.5 hover:bg-surface-hover"
         >
           <TodoIndicator status={item.status} />
           <span
             className={
               item.status === "completed"
-                ? "text-ui-base text-foreground-subtle"
-                : "text-ui-base text-foreground"
+                ? "min-w-0 flex-1 text-ui-base leading-snug break-words text-foreground-subtle"
+                : "min-w-0 flex-1 text-ui-base leading-snug break-words text-foreground"
             }
           >
             {item.content}
@@ -188,14 +202,14 @@ export default function TodoBoardPanel({
             {items.map((item, i) => (
               <div
                 key={i}
-                className="flex h-7 items-center gap-2 text-ui-sm"
+                className="flex min-h-7 items-start gap-2 rounded-md px-1 py-1 text-ui-sm hover:bg-surface-hover"
               >
                 <TodoIndicator status={item.status} />
                 <span
                   className={
                     item.status === "completed"
-                      ? "text-foreground-subtle"
-                      : "text-foreground"
+                      ? "min-w-0 flex-1 leading-snug break-words text-foreground-subtle"
+                      : "min-w-0 flex-1 leading-snug break-words text-foreground"
                   }
                 >
                   {item.content}
