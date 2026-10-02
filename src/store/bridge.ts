@@ -56,6 +56,15 @@ export interface TodoClearPayload {
   source: string;
 }
 
+export interface CostUpdatePayload {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cost?: number;
+  source?: string;
+}
+
 interface BridgeState {
   /** Pending interactive requests, keyed by the ACP session id. */
   requests: Record<string, BridgeRequestData[]>;
@@ -155,7 +164,22 @@ export const useBridge = create<BridgeState>((set) => ({
     }),
 
   applyCost: (sessionId, payload) =>
-    set((state) => ({ cost: { ...state.cost, [sessionId]: payload } })),
+    set((state) => {
+      const p = payload as CostUpdatePayload | undefined;
+      const prev = state.cost[sessionId] as CostUpdatePayload | undefined;
+      if (!prev || typeof prev !== "object") {
+        return { cost: { ...state.cost, [sessionId]: payload } };
+      }
+      const next: CostUpdatePayload = {
+        inputTokens: (prev.inputTokens ?? 0) + (p?.inputTokens ?? 0),
+        outputTokens: (prev.outputTokens ?? 0) + (p?.outputTokens ?? 0),
+        cacheReadTokens: (prev.cacheReadTokens ?? 0) + (p?.cacheReadTokens ?? 0),
+        cacheWriteTokens: (prev.cacheWriteTokens ?? 0) + (p?.cacheWriteTokens ?? 0),
+        cost: (prev.cost ?? 0) + (p?.cost ?? 0),
+        source: p?.source ?? prev.source,
+      };
+      return { cost: { ...state.cost, [sessionId]: next } };
+    }),
 
   applySession: (sessionId, payload) =>
     set((state) => ({ session: { ...state.session, [sessionId]: payload } })),

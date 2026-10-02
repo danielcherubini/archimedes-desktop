@@ -167,6 +167,19 @@ export function extractThinkingFromModel(model?: string): string | undefined {
   return parts[parts.length - 1];
 }
 
+export function getModelContextWindow(model?: string): number {
+  if (!model) return 200_000;
+  const lower = model.toLowerCase();
+  if (lower.includes("gemini")) return 1_000_000;
+  if (lower.includes("claude")) return 200_000;
+  if (lower.includes("o1") || lower.includes("o3")) return 200_000;
+  if (lower.includes("gpt-4")) return 128_000;
+  if (lower.includes("deepseek")) return 64_000;
+  if (lower.includes("qwen")) return 128_000;
+  if (lower.includes("llama")) return 128_000;
+  return 128_000;
+}
+
 /**
  * One subagent's ACTIVITY line (the pi-archimedes `buildActivityLine`
  * treatment, condensed): the failure reason, or `Done` / `Failed`, or

@@ -16,6 +16,7 @@ import {
   formatDuration,
   formatThinkingIndicator,
   formatTokens,
+  getModelContextWindow,
   subagentActivityLine,
 } from "./toolOutput";
 import {
@@ -538,6 +539,14 @@ describe("subagent metadata and activity formatting helpers", () => {
       ],
     });
     expect(out).toBe("✗ bash: cargo test");
+  });
+
+  it("resolves model context windows", () => {
+    expect(getModelContextWindow("protector/gemini-3.8-flash")).toBe(1_000_000);
+    expect(getModelContextWindow("anthropic/claude-3-7-sonnet")).toBe(200_000);
+    expect(getModelContextWindow("openai/gpt-4o")).toBe(128_000);
+    expect(getModelContextWindow("deepseek/deepseek-chat")).toBe(64_000);
+    expect(getModelContextWindow(undefined)).toBe(200_000);
   });
 });
 

@@ -4,6 +4,7 @@ import SubagentDelegatingCard from "./SubagentDelegatingCard";
 import { useSubagents } from "../store/subagents";
 import { useSubagentSelection } from "../store/subagentSelection";
 import { useSessions } from "../store/sessions";
+import { useBridge } from "../store/bridge";
 import type { SubagentEntry } from "../store/subagents";
 
 const entry = (over: Partial<SubagentEntry>): SubagentEntry => ({
@@ -21,6 +22,7 @@ beforeEach(() => {
     useSubagents.getState().dismiss(id);
   }
   useSubagentSelection.getState().select(null);
+  useBridge.setState({ cost: {} });
 });
 
 describe("SubagentDelegatingCard (the subagent tool card with the nested list)", () => {
@@ -124,9 +126,40 @@ describe("SubagentDelegatingCard (the subagent tool card with the nested list)",
     expect(screen.getByText("claude-3-7-sonnet")).toBeTruthy();
     expect(screen.getByText("◕ high")).toBeTruthy();
     // Shows context percentage / tokens
-    expect(screen.getByText("8%")).toBeTruthy();
+    expect(screen.getByText("15.4k tok (8%)")).toBeTruthy();
     // Does NOT render "running" chip text
     expect(screen.queryByText("running")).toBeNull();
+  });
+
+  it("reads live accumulated cost and tokens from useBridge.cost", () => {
+    useSubagents.getState().addSession(
+      entry({
+        sessionId: "sub1",
+        agentName: "coder",
+        task: "Task 5: UserDao case normalization",
+        status: "running",
+        model: "protector/gemini-3.8-flash",
+      }),
+    );
+
+    useBridge.getState().applyCost("sub1", {
+      inputTokens: 25000,
+      outputTokens: 5000,
+      cost: 0.035,
+    });
+
+    render(
+      <SubagentDelegatingCard
+        title="subagent"
+        status="pending"
+        rawInput={{ task: "Task 5: UserDao case normalization" }}
+        sessionId="main1"
+      />,
+    );
+
+    // Shows 30k tokens with calculated 3% context window for Gemini (1M context) and cost
+    expect(screen.getByText("30k tok (3%)")).toBeTruthy();
+    expect(screen.getByText("$0.04")).toBeTruthy();
   });
 
   it("renders NO rows for entries whose parentSessionId does not match", () => {

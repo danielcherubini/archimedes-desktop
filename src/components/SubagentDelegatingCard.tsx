@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSubagents } from "../store/subagents";
 import { useSubagentSelection } from "../store/subagentSelection";
+import { useBridge } from "../store/bridge";
 import { useSessions, type Message, type ToolCallUiStatus } from "../store/sessions";
 import {
   cleanModelName,
@@ -9,6 +10,7 @@ import {
   formatDuration,
   formatThinkingIndicator,
   formatTokens,
+  getModelContextWindow,
   summarizeToolCall,
 } from "../lib/toolOutput";
 import { StatusIcon } from "./SubagentStatusIcon";
@@ -131,6 +133,27 @@ function extractTargetInfo(rawInput: unknown, rawOutput: unknown) {
     resultsList,
     details,
   };
+}
+
+function estimateTokensFromMessages(messages: Message[]): number {
+  let totalChars = 0;
+  for (const m of messages) {
+    if (m.kind === "user" || m.kind === "agent-text" || m.kind === "agent-thought") {
+      totalChars += m.text.length;
+    } else if (m.kind === "tool-call") {
+      if (typeof m.rawInput === "string") totalChars += m.rawInput.length;
+      else if (typeof m.rawInput === "object" && m.rawInput !== null) {
+        totalChars += JSON.stringify(m.rawInput).length;
+      }
+      if (typeof m.rawOutput === "string") totalChars += m.rawOutput.length;
+      else if (typeof m.rawOutput === "object" && m.rawOutput !== null) {
+        totalChars += JSON.stringify(m.rawOutput).length;
+      }
+    } else if (m.kind === "diff") {
+      totalChars += m.patch.length;
+    }
+  }
+  return Math.round(totalChars / 4);
 }
 
 interface ActivityInfo {
@@ -306,6 +329,7 @@ export default function SubagentDelegatingCard({
   const entries = useSubagents((s) => s.entries);
   const select = useSubagentSelection((s) => s.select);
   const allMessages = useSessions((s) => s.messages);
+  const allBridgeCost = useBridge((s) => s.cost);
   const [open, setOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
 
@@ -398,22 +422,62 @@ export default function SubagentDelegatingCard({
               : undefined) ??
             extractThinkingFromModel(model);
 
-          const tokens =
+          const bridgeCost = resolvedSessionId
+            ? (allBridgeCost[resolvedSessionId] as
+                | {
+                    inputTokens?: number;
+                    outputTokens?: number;
+                    tokens?: number;
+                    cost?: number;
+                    percent?: number;
+                    contextPercent?: number;
+                  }
+                | undefined)
+            : undefined;
+
+          const sessionMessages = resolvedSessionId ? allMessages[resolvedSessionId] : undefined;
+
+          const explicitTokens =
             progress?.tokens ??
+            (bridgeCost &&
+            (bridgeCost.inputTokens !== undefined || bridgeCost.outputTokens !== undefined || bridgeCost.tokens !== undefined)
+              ? (bridgeCost.tokens ?? (bridgeCost.inputTokens ?? 0) + (bridgeCost.outputTokens ?? 0))
+              : undefined) ??
             (result?.usage
               ? (result.usage.input ?? 0) + (result.usage.output ?? 0)
               : undefined) ??
             result?.progressSummary?.tokens ??
-            (storeEntry?.metrics
+            (storeEntry?.metrics &&
+            (storeEntry.metrics.inputTokens > 0 || storeEntry.metrics.outputTokens > 0)
               ? storeEntry.metrics.inputTokens + storeEntry.metrics.outputTokens
               : undefined);
 
-          const contextPercent = progress?.percent ?? progress?.contextPercent;
+          const estimatedTokens =
+            sessionMessages && sessionMessages.length > 0
+              ? estimateTokensFromMessages(sessionMessages)
+              : undefined;
+
+          const tokens =
+            (explicitTokens && explicitTokens > 0 ? explicitTokens : undefined) ??
+            estimatedTokens;
+
+          const modelContextWindow = getModelContextWindow(model);
+          const calculatedPct =
+            tokens && modelContextWindow > 0 ? (tokens / modelContextWindow) * 100 : undefined;
+
+          const contextPercent =
+            progress?.percent ??
+            progress?.contextPercent ??
+            bridgeCost?.percent ??
+            bridgeCost?.contextPercent ??
+            calculatedPct;
 
           const cost =
-            progress?.cost ?? result?.usage?.cost ?? storeEntry?.metrics?.cost;
+            progress?.cost ??
+            bridgeCost?.cost ??
+            result?.usage?.cost ??
+            storeEntry?.metrics?.cost;
 
-          const sessionMessages = resolvedSessionId ? allMessages[resolvedSessionId] : undefined;
           const sessionToolCount = sessionMessages
             ? sessionMessages.filter((m) => m.kind === "tool-call").length
             : undefined;
@@ -477,26 +541,67 @@ export default function SubagentDelegatingCard({
             progress?.toolCount ??
             result?.progressSummary?.toolCount;
 
+          const bridgeCost = storeEntry.sessionId
+            ? (allBridgeCost[storeEntry.sessionId] as
+                | {
+                    inputTokens?: number;
+                    outputTokens?: number;
+                    tokens?: number;
+                    cost?: number;
+                    percent?: number;
+                    contextPercent?: number;
+                  }
+                | undefined)
+            : undefined;
+
+          const explicitTokens =
+            progress?.tokens ??
+            (bridgeCost &&
+            (bridgeCost.inputTokens !== undefined || bridgeCost.outputTokens !== undefined || bridgeCost.tokens !== undefined)
+              ? (bridgeCost.tokens ?? (bridgeCost.inputTokens ?? 0) + (bridgeCost.outputTokens ?? 0))
+              : undefined) ??
+            (result?.usage
+              ? (result.usage.input ?? 0) + (result.usage.output ?? 0)
+              : undefined) ??
+            (storeEntry.metrics &&
+            (storeEntry.metrics.inputTokens > 0 || storeEntry.metrics.outputTokens > 0)
+              ? storeEntry.metrics.inputTokens + storeEntry.metrics.outputTokens
+              : undefined);
+
+          const estimatedTokens =
+            sessionMessages && sessionMessages.length > 0
+              ? estimateTokensFromMessages(sessionMessages)
+              : undefined;
+
+          const tokens =
+            (explicitTokens && explicitTokens > 0 ? explicitTokens : undefined) ??
+            estimatedTokens;
+
+          const rawModel = storeEntry.model ?? progress?.model ?? result?.model;
+          const modelContextWindow = getModelContextWindow(rawModel);
+          const calculatedPct =
+            tokens && modelContextWindow > 0 ? (tokens / modelContextWindow) * 100 : undefined;
+
+          const contextPercent =
+            progress?.percent ??
+            progress?.contextPercent ??
+            bridgeCost?.percent ??
+            bridgeCost?.contextPercent ??
+            calculatedPct;
+
           return {
             key: storeEntry.sessionId ?? `entry-${idx}`,
             sessionId: storeEntry.sessionId,
             agentName: storeEntry.agentName || "subagent",
             task: storeEntry.task,
             status: storeEntry.status,
-            model: cleanModelName(storeEntry.model ?? progress?.model ?? result?.model),
+            model: cleanModelName(rawModel),
             thinkingLevel:
               storeEntry.thinkingLevel ??
-              extractThinkingFromModel(storeEntry.model ?? progress?.model),
-            tokens:
-              progress?.tokens ??
-              (result?.usage
-                ? (result.usage.input ?? 0) + (result.usage.output ?? 0)
-                : undefined) ??
-              (storeEntry.metrics
-                ? storeEntry.metrics.inputTokens + storeEntry.metrics.outputTokens
-                : undefined),
-            contextPercent: progress?.percent ?? progress?.contextPercent,
-            cost: progress?.cost ?? result?.usage?.cost ?? storeEntry.metrics?.cost,
+              extractThinkingFromModel(rawModel),
+            tokens,
+            contextPercent,
+            cost: progress?.cost ?? bridgeCost?.cost ?? result?.usage?.cost ?? storeEntry.metrics?.cost,
             toolCount,
             durationMs,
             error: storeEntry.error ?? result?.error ?? progress?.error,
@@ -550,14 +655,18 @@ export default function SubagentDelegatingCard({
                 className: "text-accent",
               });
             }
-            if (row.contextPercent !== undefined && !Number.isNaN(row.contextPercent)) {
+            if (row.tokens !== undefined && row.tokens > 0) {
+              const pctStr =
+                row.contextPercent !== undefined && !Number.isNaN(row.contextPercent)
+                  ? ` (${row.contextPercent >= 1 ? `${Math.round(row.contextPercent)}%` : `${row.contextPercent.toFixed(1)}%`})`
+                  : "";
               metadataParts.push({
-                text: `${Math.round(row.contextPercent)}%`,
+                text: `${formatTokens(row.tokens)} tok${pctStr}`,
                 className: "text-foreground-subtle",
               });
-            } else if (row.tokens !== undefined && row.tokens > 0) {
+            } else if (row.contextPercent !== undefined && !Number.isNaN(row.contextPercent)) {
               metadataParts.push({
-                text: formatTokens(row.tokens),
+                text: `${Math.round(row.contextPercent)}%`,
                 className: "text-foreground-subtle",
               });
             }
@@ -578,7 +687,7 @@ export default function SubagentDelegatingCard({
               if (formattedCost) {
                 metadataParts.push({
                   text: formattedCost,
-                  className: "",
+                  className: "text-foreground-subtle",
                 });
               }
             }
