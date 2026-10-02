@@ -6,6 +6,7 @@ mod errors;
 mod fs_backend;
 pub mod gate;
 pub mod harness;
+pub mod mcp;
 mod permission;
 pub mod rpc;
 mod session;

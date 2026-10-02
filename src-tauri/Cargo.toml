@@ -52,6 +52,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # but no `.next()`, so the full `futures-util` is needed.
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+# OAuth 2.1 (the native `mcp` tool's HTTP-server auth, ADR 0018): `sha2`
+# (the PKCE S256 challenge) + `rand` (the PKCE verifier + the callback
+# `state` entropy).
+sha2 = "0.10"
+rand = "0.9"
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 # System-clipboard image read for the WebKitGTK paste fallback (Wayland
