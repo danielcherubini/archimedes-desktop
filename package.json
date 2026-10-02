@@ -9,6 +9,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "icon": "tauri icon && node -e \"require('fs').copyFileSync('app-icon.png','public/app-icon.png')\"",
     "test": "vitest run"
   },
   "dependencies": {
