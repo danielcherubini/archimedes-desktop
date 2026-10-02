@@ -188,8 +188,14 @@ function App() {
           the controls sit OUTSIDE it so a click on a button never starts a
           drag. */}
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-background pr-2 pl-3">
-        <div data-tauri-drag-region className="flex h-full flex-1 items-center">
-          <span className="text-ui-caption text-foreground-subtle">Archimedes</span>
+        <div data-tauri-drag-region className="flex h-full flex-1 items-center gap-2">
+          <img
+            src="/logo.png"
+            alt="Archimedes"
+            className="h-4 w-4 rounded-sm object-contain select-none pointer-events-none"
+            draggable={false}
+          />
+          <span className="text-ui-caption font-medium text-foreground-subtle">Archimedes</span>
         </div>
         <WindowControls />
       </div>
