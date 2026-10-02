@@ -313,12 +313,15 @@ main()
         }
     }
 
-    /// Detect whether `python3` is usable (the suite is the end-to-end
-    /// gate on dev machines, but a CI runner without python3 must not
-    /// hard-fail — the tests skip instead).
+    /// Detect whether `python3` is USABLE (can actually import the stdlib,
+    /// not merely respond to `--version` — `--version` succeeds even when
+    /// `PYTHONHOME` is misconfigured and the interpreter cannot run). The
+    /// suite is the end-to-end gate on dev machines, but a CI runner without
+    /// a usable python3 must not hard-fail — the tests skip instead.
     fn python3_available() -> bool {
         std::process::Command::new("python3")
-            .arg("--version")
+            .arg("-c")
+            .arg("import sys")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -339,7 +342,7 @@ main()
         arg: &str,
     ) -> Option<std::process::Child> {
         if !python3_available() {
-            eprintln!("bridge integration test: python3 not found on PATH — skipping");
+            eprintln!("bridge integration test: python3 not available or unusable — skipping");
             return None;
         }
         Some(
@@ -367,7 +370,7 @@ main()
         // below is the cleanup that a top-of-test skip would otherwise
         // skip).
         if !python3_available() {
-            eprintln!("bridge integration test: python3 not found on PATH — skipping");
+            eprintln!("bridge integration test: python3 not available or unusable — skipping");
             return;
         }
         let sink = Arc::new(CapturingSink::default());
@@ -448,7 +451,7 @@ main()
     async fn peer_verification_rejects_a_double_forked_orphan() {
         // python3 gate FIRST (before `start`) — see the happy-path test.
         if !python3_available() {
-            eprintln!("bridge integration test: python3 not found on PATH — skipping");
+            eprintln!("bridge integration test: python3 not available or unusable — skipping");
             return;
         }
         let sink = Arc::new(CapturingSink::default());
@@ -513,7 +516,7 @@ main()
     async fn push_frames_are_seq_deduped() {
         // python3 gate FIRST (before `start`) — see the happy-path test.
         if !python3_available() {
-            eprintln!("bridge integration test: python3 not found on PATH — skipping");
+            eprintln!("bridge integration test: python3 not available or unusable — skipping");
             return;
         }
         let sink = Arc::new(CapturingSink::default());
@@ -583,7 +586,7 @@ main()
     async fn a_timeout_writes_the_terminal_cancelled_frame() {
         // python3 gate FIRST (before `start`) — see the happy-path test.
         if !python3_available() {
-            eprintln!("bridge integration test: python3 not found on PATH — skipping");
+            eprintln!("bridge integration test: python3 not available or unusable — skipping");
             return;
         }
         let sink = Arc::new(CapturingSink::default());

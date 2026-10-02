@@ -12,12 +12,80 @@ done-when: The app window restores its previous size, position, and maximized st
 
 ---
 
+### Task 0: Fix the `bridge_integration` python3 availability gate (baseline / pre-existing CI failure)
+
+**Context:**
+The 4 tests in `tests/bridge_integration.rs` (Linux-only; they spawn a real Python stub over a Unix-socket bridge) were **falsely failing on a clean `main`** before this plan started. Root cause: the test's availability gate `python3_available()` (lines 319-329) checks `python3 --version`, which **succeeds even when the interpreter is broken** (e.g. `PYTHONHOME` points at a PyInstaller/flatpak mount dir that lacks `encodings`, so `python3 -c 'import sys'` dies with "Failed to import encodings"). The gate returns `true` → the test does not skip → it spawns the stub → the stub crashes (can't import stdlib) → writes nothing → the test **times out and fails**. The test's own doc comment states the intent: *"a CI runner without python3 must not hard-fail — the tests skip instead."* This task makes the detection match that intent so the tests **skip (pass vacuously) instead of falsely failing** when `python3` is not actually usable. This is a test-infrastructure robustness fix only — no app code changes. It is a prerequisite so the branch's `cargo test` baseline is green before the feature work.
+
+**Files:**
+- Modify: `src-tauri/tests/bridge_integration.rs`
+
+**What to implement:**
+
+1. In `src-tauri/tests/bridge_integration.rs`, change `python3_available()` (lines 319-329) so it checks actual interpreter capability instead of `--version`. Replace the `.arg("--version")` line with a probe that imports the stdlib:
+   ```rust
+   fn python3_available() -> bool {
+       std::process::Command::new("python3")
+           .arg("-c")
+           .arg("import sys")
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null())
+           .spawn()
+           .ok()
+           .and_then(|mut c| c.wait().ok())
+           .map(|s| s.success())
+           .unwrap_or(false)
+   }
+   ```
+   Rationale (verified): on a healthy machine `python3 -c 'import sys'` exits 0 → gate true → the real end-to-end tests run. On a machine where `python3` is present but broken (e.g. `PYTHONHOME` misconfigured), `python3 -c 'import sys'` exits non-zero → gate false → the 4 tests `return` early (pass vacuously) instead of timing out. `python3 --version` is the wrong probe because it is handled before stdlib import and succeeds even when the interpreter cannot run.
+2. Update the doc comment immediately above `python3_available()` (lines 316-318) to reflect the stronger detection. It currently reads:
+   ```rust
+   /// Detect whether `python3` is usable (the suite is the end-to-end
+   /// gate on dev machines, but a CI runner without python3 must not
+   /// hard-fail — the tests skip instead).
+   ```
+   Change it to:
+   ```rust
+   /// Detect whether `python3` is USABLE (can actually import the stdlib,
+   /// not merely respond to `--version` — `--version` succeeds even when
+   /// `PYTHONHOME` is misconfigured and the interpreter cannot run). The
+   /// suite is the end-to-end gate on dev machines, but a CI runner without
+   /// a usable python3 must not hard-fail — the tests skip instead.
+   ```
+
+**What NOT to change:**
+- Do not touch the 4 test bodies, the `STUB` constant, or any other helper in `bridge_integration.rs`.
+- Do not modify any application code in `src/` — this is test-infrastructure only.
+- Do not set/clear `PYTHONHOME` or any environment variable inside the test (that would be a hack and wouldn't help a real CI runner; correct detection is the fix).
+
+**Steps:**
+
+- [ ] Apply the two edits above (the `python3_available()` probe + the doc comment) in `src-tauri/tests/bridge_integration.rs`.
+- [ ] Run `cargo test --test bridge_integration` (from `src-tauri/`)
+  - On a machine with a healthy `python3`: the 4 tests should **run and pass** (real end-to-end). On a machine where `python3` is present-but-broken (like this sandbox, where `PYTHONHOME` is misconfigured): the 4 tests should **pass vacuously** (each `return`s early after printing "python3 ... skipping"), NOT time out and fail. Either outcome is a PASS for this task.
+- [ ] Run `cargo test` (full, from `src-tauri/`)
+  - Did all tests pass (424 unit + the 4 bridge_integration no longer failing)? If not, fix and re-run before continuing.
+- [ ] Run `cargo clippy --all-targets` (from `src-tauri/`)
+  - Did it succeed with 0 warnings? If not, fix and re-run before continuing.
+- [ ] Run `cargo fmt --check` (from `src-tauri/`)
+  - Did it succeed? If not, run `cargo fmt` and re-run `cargo fmt --check` before continuing.
+- [ ] Commit with message: `test: skip bridge_integration when python3 is unusable (not merely absent)`.
+
+**Acceptance criteria:**
+- [ ] `python3_available()` probes `python3 -c 'import sys'` (real interpreter capability), not `python3 --version`.
+- [ ] The doc comment above `python3_available()` explains the stronger detection.
+- [ ] `cargo test` (full) is green — the 4 `bridge_integration` tests no longer falsely fail (they either run-and-pass or skip-and-pass).
+- [ ] `cargo clippy --all-targets` is 0 warnings and `cargo fmt --check` is clean.
+- [ ] No application code (`src/`) and no other test file were modified.
+
+---
+
 ### Task 1: Register the `window-state` plugin and suppress the startup flash
 
 **Context:**
 The Client currently opens at a fixed 800×600 every launch because Tauri core has no window-state persistence — the size comes solely from `src-tauri/tauri.conf.json` and nothing observes or saves resize events. This single task wires in the official `tauri-plugin-window-state` so the window's full state (size + position + maximized + visible + decorations + fullscreen, i.e. `StateFlags::all()`) is restored on launch and saved on quit, and adds `visible: false` so the default size is not flashed before restore. This is the entire feature in one commit.
 
-Why `visible: false` is safe on first run (verified from the plugin source, `plugins/window-state/src/lib.rs`, v2 branch): in `restore_state`, `should_show` is initialized to `true` (line 196) and is only overwritten by the cached `state.visible` when saved state **exists** (line 244). On first run there is no cache entry, so `should_show` stays `true` and the plugin calls `self.show()?` + `self.set_focus()?` (lines 279-282). A `visible: false` window therefore cannot stay hidden forever on a fresh install.
+Why `visible: false` is safe on first run (verified from the plugin source, `plugins/window-state/src/lib.rs`, v2 branch): in `restore_state`, `should_show` is initialized to `true` (line 196) and is only overwritten by the cached `state.visible` when saved state **exists** (line 244). On first run there is no cache entry, so `should_show` stays `true` and the plugin calls `self.show()?` + `self.set_focus()?` (lines 279-282). A `visible: false` window therefore cannot stay hidden forever on a fresh install. On **subsequent** runs the plugin sets `should_show = state.visible` and shows the window only if the persisted `visible` is `true`; that value is re-derived from `is_visible()` at save time (the save fires on `CloseRequested`, while the window is still visible, so the normal quit path persists `visible: true` and the window re-shows). Residual low-probability risk: `restore_state` returns early (via `?`) if `set_position`/`set_size`/`maximize`/`set_fullscreen` errors before `show()`, which would leave a `visible: false` window hidden — this is gated by the acceptance test asserting the window APPEARS on relaunch (below).
 
 **Files:**
 - Modify: `src-tauri/Cargo.toml`
@@ -87,8 +155,8 @@ Why `visible: false` is safe on first run (verified from the plugin source, `plu
 - [ ] **Manual acceptance test** (run against a real `tauri dev` / packaged build, on the platform(s) available):
   1. Remove any existing state file (e.g. `rm -f ~/.local/share/codes.archimedes.desktop/.window-state.json` on Linux; the equivalent Tauri app-data dir on macOS/Windows) → launch → the window **appears at 800×600** (proves first-run show works — the window is NOT left invisible).
   2. Resize the window, move it, and maximize it; then quit normally (the custom close button → `close()`). Confirm the state file now exists in the Tauri app-data dir.
-  3. Relaunch → the window comes back at the same size/position/maximized, with **no visible flash** of 800×600.
-  4. (macOS Retina and/or Linux) Repeat steps 2–3 twice more; the size must be **stable** — it must not grow/double per launch (regression watch for plugin #3521 macOS doubling / #3553 Linux drift).
+  3. Relaunch → the window **appears** (becomes visible) AND comes back at the same size/position/maximized, with **no visible flash** of 800×600. (Assert visibility explicitly — not just geometry — since re-show depends on the persisted `visible` field.)
+  4. (all three shipped platforms: macOS Retina, Linux, and Windows — Windows is in `bundle.targets`) Repeat steps 2–3 twice more; the window must **appear** and the size must be **stable** — it must not grow/double per launch (regression watch for plugin #3521 macOS doubling / #3553 Linux drift).
   5. (Linux, WebKitGTK) Confirm the window reliably APPEARS on first run with `visible: false` + `transparent: true` + `decorations: false` (the three interact on WebKitGTK). If the window does NOT appear on some Linux configuration, the fallback is to remove `"visible": false` and accept the brief flash of 800×600 before restore — report this as a known platform limitation rather than shipping an invisible app.
 - [ ] Commit with message: `feat: remember window size/position/maximized across restarts (window-state plugin)` — stage `Cargo.toml`, `Cargo.lock` (the auto-updated lockfile MUST be in the commit), `src/lib.rs`, and `tauri.conf.json` together.
 
@@ -96,5 +164,5 @@ Why `visible: false` is safe on first run (verified from the plugin source, `plu
 - [ ] `cargo build`, `cargo clippy --all-targets` (0 warnings), `cargo fmt --check`, `cargo test` (from `src-tauri/`) and `pnpm test` + `pnpm build` (from repo root) are all green.
 - [ ] A fresh launch with no state file shows the window at 800×600 (not invisible).
 - [ ] After a normal quit, a state file exists in the Tauri app-data dir; the next launch restores the previous size/position/maximized with no flash of the default size.
-- [ ] Two consecutive relaunches on macOS (Retina) and/or Linux show a stable size (no per-launch growth/doubling).
+- [ ] Two consecutive relaunches on macOS (Retina), Linux, and Windows show the window appearing at a stable size (no per-launch growth/doubling).
 - [ ] No frontend files, no npm package, and no capability file were modified.
