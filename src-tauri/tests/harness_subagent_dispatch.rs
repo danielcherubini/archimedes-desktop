@@ -292,6 +292,7 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
     let _ = prompt_tx
         .send(Prompt {
             text: "go".to_string(),
+            images: Vec::new(),
         })
         .await;
 
@@ -421,6 +422,7 @@ async fn native_subagent_tool_without_a_manager_returns_an_error_result() {
     let _ = prompt_tx
         .send(Prompt {
             text: "go".to_string(),
+            images: Vec::new(),
         })
         .await;
 

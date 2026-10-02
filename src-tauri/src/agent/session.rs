@@ -48,6 +48,7 @@ use crate::agent::harness::{
 use crate::agent::permission::{self, PendingPermissions};
 use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
+use crate::agent::tools::ImageRef;
 use crate::commands::settings::{load_settings, write_settings};
 use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
@@ -394,10 +395,11 @@ impl NativeHandle {
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped,
     /// mirroring `AgentLoop::send_prompt`).
-    fn send_prompt(&self, text: &str) -> bool {
+    fn send_prompt(&self, text: &str, images: &[ImageRef]) -> bool {
         self.prompt_tx
             .try_send(Prompt {
                 text: text.to_string(),
+                images: images.to_vec(),
             })
             .is_ok()
     }
@@ -2646,9 +2648,9 @@ impl SessionManager {
         // Dispatch the prompt (the `SessionBackend` generalization, Task 7):
         // the EXTERNAL path is UNCHANGED (the pi `prompt` command — the text
         // message + the image content + a `get_state` steer check); the
-        // NATIVE path queues the text on the loop's prompt queue (the native
-        // `Prompt` is text-only in v1 — a full queue is a best-effort drop,
-        // mapped to the same error path as a pi refusal below).
+        // NATIVE path queues the text + the image attachments on the loop's
+        // prompt queue (a full queue is a best-effort drop, mapped to the
+        // same error path as a pi refusal below).
         let send_error = match &backend {
             SessionBackend::Pi(handle) => {
                 // Build the prompt command: the text message + the image
@@ -2682,7 +2684,17 @@ impl SessionManager {
                 handle.send(command).await.err()
             }
             SessionBackend::Native(handle) => {
-                if handle.send_prompt(&text) {
+                // The wire `ImagePayload` maps onto the loop's `ImageRef`
+                // (the `name` / `sizeBytes` are transcript-only — the
+                // model transcript carries the `data` + `mimeType`).
+                let image_refs: Vec<ImageRef> = images
+                    .iter()
+                    .map(|img| ImageRef {
+                        data: img.data.clone(),
+                        mime_type: img.mime_type.clone(),
+                    })
+                    .collect();
+                if handle.send_prompt(&text, &image_refs) {
                     None
                 } else {
                     Some(RpcError::Command {
@@ -3210,14 +3222,15 @@ fn resolve_native_model(
 /// The capability envelope for a NATIVE session (the item-1 shape minus the
 /// pi keys — there is NO `piSessionFile`: resume is from the
 /// `native_messages` table, so `loadSession` is `true` (the frontend's
-/// Resume button); `image` is fail-closed `false` — the native `Prompt` is
-/// text-only in v1).
+/// Resume button); `image` is `true` (the native `Prompt` carries image
+/// blocks — the provider's `to_wire` sends them as `image_url` parts;
+/// `audio` / `embeddedContext` stay fail-closed `false`).
 fn native_capabilities(model: &Model, thinking_level: Option<&str>) -> Value {
     let mut caps = json!({
         "native": true,
         "model": format!("{}/{}", model.provider, model.id),
         "loadSession": true,
-        "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+        "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
     });
     if let Some(level) = thinking_level {
         caps["thinkingLevel"] = Value::String(level.to_string());
@@ -5335,6 +5348,20 @@ mod session_tests {
             thinking_levels: Vec::new(),
             api: Some("openai-completions".to_string()),
         }
+    }
+
+    /// The NATIVE capability envelope advertises `image: true` (the native
+    /// `Prompt` carries image blocks — the frontend's `imageCapable` gate
+    /// opens the paste / attach path; `false` was the v1 text-only shape).
+    #[test]
+    fn native_capabilities_advertises_image() {
+        let caps = native_capabilities(&chain_test_model("fake", "m1"), None);
+        assert_eq!(caps["native"], true);
+        assert_eq!(caps["loadSession"], true);
+        assert_eq!(
+            caps["promptCapabilities"],
+            json!({ "image": true, "audio": false, "embeddedContext": false })
+        );
     }
 
     /// Write an `agents.json` with a single NATIVE entry whose harness

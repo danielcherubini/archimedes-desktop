@@ -49,6 +49,47 @@ pub enum MessageContent {
     Blocks(Vec<ContentBlock>),
 }
 
+impl MessageContent {
+    /// The OpenAI-compatible WIRE form of the content: `Text` → a plain
+    /// string (`{ "content": "..." }`); `Blocks` → an array of OpenAI
+    /// content parts (a text part `{ "type": "text", "text" }` — the
+    /// `ContentBlock::Text` wire shape verbatim — or an image part
+    /// `{ "type": "image_url", "image_url": { "url": "data:<mime>;base64,…"
+    /// } }`, the OpenAI data-URI shape).
+    ///
+    /// This is the ONLY serialization used on the request wire
+    /// (`request_body`); the `ContentBlock`'s own (pi-shaped) serialization
+    /// is the DB / transcript / tool-result shape, NOT the model request.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            MessageContent::Text(t) => Value::String(t.clone()),
+            MessageContent::Blocks(blocks) => {
+                let parts: Vec<Value> = blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => json!({
+                            "type": "text",
+                            "text": text,
+                        }),
+                        // The OpenAI image wire shape: a `data:` URI
+                        // (`data:<mime>;base64,<base64>`) in
+                        // `image_url.url`. The `ContentBlock::Image` field
+                        // is `data` (base64, NO `data:` prefix) + `mimeType`
+                        // (renamed from `mime_type`), so compose the URI here.
+                        ContentBlock::Image { image } => json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.mime_type, image.data),
+                            },
+                        }),
+                    })
+                    .collect();
+                Value::Array(parts)
+            }
+        }
+    }
+}
+
 /// A chat message's role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,18 +150,6 @@ struct WireToolCall<'a> {
 struct WireFunction<'a> {
     name: &'a str,
     arguments: &'a Value,
-}
-
-/// The REQUEST-wire shape of a chat message: the flat [`ChatMessage`]
-/// fields, but `tool_calls` in the OpenAI wire shape ([`WireToolCall`]).
-#[derive(Serialize)]
-struct WireChatMessage<'a> {
-    role: &'a ChatRole,
-    content: &'a MessageContent,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<WireToolCall<'a>>>,
 }
 
 impl Serialize for WireToolCall<'_> {
@@ -616,30 +645,50 @@ fn build_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::C
 
 /// Build the OpenAI-compatible request body from a [`ModelRequest`]
 /// (`stream: true` is always sent; `None` options are omitted). The
-/// messages go through the request-wire DTOs ([`WireChatMessage`]) so an
-/// assistant `tool_calls` is serialized in the OpenAI shape (`{ id,
-/// type: "function", function: { name, arguments: <string> } }`).
+/// message `content` goes through the OpenAI WIRE form
+/// ([`MessageContent::to_wire`]) — a plain string for `Text`, an array
+/// of OpenAI content parts (`text` / `image_url` data-URIs) for
+/// `Blocks` — and an assistant `tool_calls` is serialized in the
+/// OpenAI shape (`{ id, type: "function", function: { name, arguments:
+/// <string> } }`).
 fn request_body(req: &ModelRequest) -> Value {
     let messages: Vec<Value> = req
         .messages
         .iter()
         .map(|m| {
-            serde_json::to_value(WireChatMessage {
-                role: &m.role,
-                content: &m.content,
-                tool_call_id: m.tool_call_id.as_ref(),
-                tool_calls: m.tool_calls.as_ref().map(|calls| {
-                    calls
-                        .iter()
-                        .map(|tc| WireToolCall {
-                            id: &tc.id,
-                            name: &tc.name,
-                            arguments: &tc.arguments,
-                        })
-                        .collect()
-                }),
-            })
-            .expect("JSON serialization cannot fail")
+            // The content is the OpenAI WIRE form (`MessageContent::to_wire`
+            // — `Text` → a string, `Blocks` → an array of OpenAI content
+            // parts with `image_url` data-URIs), NOT the `ContentBlock`'s
+            // own pi-shaped serialization (the DB / transcript / tool-result
+            // shape). The remaining fields keep their wire shape.
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "role".to_string(),
+                serde_json::to_value(m.role).expect("role serialization cannot fail"),
+            );
+            obj.insert("content".to_string(), m.content.to_wire());
+            if let Some(id) = &m.tool_call_id {
+                obj.insert("tool_call_id".to_string(), Value::String(id.clone()));
+            }
+            if let Some(calls) = &m.tool_calls {
+                obj.insert(
+                    "tool_calls".to_string(),
+                    Value::Array(
+                        calls
+                            .iter()
+                            .map(|tc| {
+                                serde_json::to_value(WireToolCall {
+                                    id: &tc.id,
+                                    name: &tc.name,
+                                    arguments: &tc.arguments,
+                                })
+                                .expect("JSON serialization cannot fail")
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            Value::Object(obj)
         })
         .collect();
     let mut body = json!({
@@ -679,6 +728,7 @@ fn request_body(req: &ModelRequest) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::ImageRef;
 
     /// Build an `SseStream` over RAW byte chunks (the `&str` helper above
     /// cannot split a multi-byte codepoint mid-byte — `&str` is valid
@@ -1033,9 +1083,46 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
-        // `Blocks` content serializes as an array of blocks (the Task 1
-        // `ContentBlock` wire shape).
+        // `Blocks` content serializes as an array of OpenAI parts (the
+        // `to_wire` shape — `ContentBlock::Text` verbatim).
         assert_eq!(body["messages"][2]["content"][0]["type"], "text");
+    }
+
+    /// The model-request wire form is the OpenAI shape: `Text` → a plain
+    /// string; `Blocks` → an array of content parts — a `Text` block
+    /// verbatim, an `Image` block as an `image_url` **data-URI** (the
+    /// pi-shaped `data` (base64, no prefix) + `mimeType` fields composed
+    /// into `data:<mime>;base64,<data>` — the model never sees the
+    /// pi-shaped `image` block).
+    #[test]
+    fn to_wire_is_the_openai_request_shape() {
+        // `Text` → a plain string.
+        assert_eq!(
+            MessageContent::Text("hello".to_string()).to_wire(),
+            json!("hello")
+        );
+        // `Blocks` → an array of OpenAI content parts.
+        let blocks = MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "before".to_string(),
+            },
+            ContentBlock::Image {
+                image: ImageRef {
+                    data: "BASE64DATA".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            },
+        ]);
+        assert_eq!(
+            blocks.to_wire(),
+            json!([
+                { "type": "text", "text": "before" },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,BASE64DATA" }
+                }
+            ])
+        );
     }
 
     /// The assistant `tool_calls` go on the wire in the OpenAI shape:

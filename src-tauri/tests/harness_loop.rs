@@ -18,6 +18,7 @@ use archimedes_lib::agent::harness::{
     Prompt, Provider, ProviderError, ProviderEvent, RetryPolicy, SessionStore, SudoDeps, Usage,
 };
 use archimedes_lib::agent::rpc::RpcEvent;
+use archimedes_lib::agent::tools::ContentBlock;
 use archimedes_lib::agent::{EventSink, PendingPermissions, PermissionOutcome, TodoStore};
 use archimedes_lib::storage::Db;
 use async_trait::async_trait;
@@ -252,6 +253,7 @@ async fn text_response_emits_normalized_events_and_persists_transcript() {
     h.prompt_tx
         .send(Prompt {
             text: "hi".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();
@@ -351,6 +353,7 @@ async fn tool_call_gates_executes_loops_and_settles() {
     h.prompt_tx
         .send(Prompt {
             text: "run it".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();
@@ -436,13 +439,20 @@ async fn tool_call_gates_executes_loops_and_settles() {
     );
     assert_eq!(msgs[2].role, ChatRole::Tool);
     assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_1"));
-    let tool_text = match &msgs[2].content {
-        MessageContent::Text(t) => t.clone(),
-        other => panic!("the tool result is text, got {other:?}"),
+    // The `tool` message keeps the result's FULL `Blocks` (the pi shape —
+    // the provider's `to_wire` is the request-wire shape; a `bash` `hi`
+    // result is a single text block, but an image-only result would be
+    // an image block, NOT flattened text).
+    let tool_blocks = match &msgs[2].content {
+        MessageContent::Blocks(b) => b,
+        other => panic!("the tool result is the full blocks, got {other:?}"),
     };
     assert!(
-        tool_text.contains("hi"),
-        "the tool result, got {tool_text:?}"
+        tool_blocks.iter().any(|b| match b {
+            ContentBlock::Text { text } => text.contains("hi"),
+            _ => false,
+        }),
+        "the tool result's text block round-trips, got {tool_blocks:?}"
     );
     task.abort();
 }
@@ -467,6 +477,7 @@ async fn retryable_error_retries_then_succeeds() {
     h.prompt_tx
         .send(Prompt {
             text: "hi".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();
@@ -511,6 +522,7 @@ async fn load_messages_reconstructs_the_transcript_for_resume() {
     h.prompt_tx
         .send(Prompt {
             text: "hi".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();
@@ -577,6 +589,7 @@ async fn context_threshold_triggers_compaction() {
     h.prompt_tx
         .send(Prompt {
             text: "first".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();
@@ -584,6 +597,7 @@ async fn context_threshold_triggers_compaction() {
     h.prompt_tx
         .send(Prompt {
             text: "second".to_string(),
+            images: Vec::new(),
         })
         .await
         .unwrap();

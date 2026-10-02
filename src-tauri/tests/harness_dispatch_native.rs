@@ -1528,6 +1528,7 @@ async fn dispatch_subagent_a_parent_turn_cancel_propagates_to_the_hanging_child(
     prompt_tx
         .send(Prompt {
             text: "dispatch a child".to_string(),
+            images: Vec::new(),
         })
         .await
         .expect("the prompt was queued");
