@@ -192,7 +192,7 @@ function App() {
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-background pr-2 pl-3">
         <div data-tauri-drag-region className="flex h-full flex-1 items-center gap-2">
           <img
-            src="/logo.png"
+            src="/app-icon.png"
             alt="Archimedes"
             className="h-4 w-4 rounded-sm object-contain select-none pointer-events-none"
             draggable={false}
