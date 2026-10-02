@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 import {
   ArrowLeftIcon,
   EyeIcon,
@@ -58,6 +58,45 @@ function slugify(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+/** A slug de-duped against the taken ids (a `-2` / `-3` suffix). */
+function uniqueSlug(slug: string, taken: Set<string>): string {
+  let id = slug;
+  let n = 2;
+  while (taken.has(id)) {
+    id = `${slug}-${n}`;
+    n += 1;
+  }
+  return id;
+}
+
+/**
+ * Remap a settings-level model reference (the `defaultModel` composed key —
+ * `"<providerId>/<modelId>"`) from a provider's old id to its new one (a
+ * name commit re-identifies the provider — the reference must not orphan).
+ * A `null` / non-matching key is untouched.
+ */
+function remapModelRef(
+  key: string | null,
+  oldId: string,
+  newId: string,
+): string | null {
+  if (key === null || !key.startsWith(`${oldId}/`)) return key;
+  return `${newId}${key.slice(oldId.length)}`;
+}
+
+/** Remap the `defaultThinkingLevels` keys (the same `"<providerId>/<modelId>"` composed keys). */
+function remapModelRefs(
+  refs: Record<string, string>,
+  oldId: string,
+  newId: string,
+): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(refs)) {
+    next[remapModelRef(key, oldId, newId) as string] = value;
+  }
+  return next;
 }
 
 /**
@@ -158,12 +197,24 @@ function TextField({
   );
 }
 
+/** A labeled provider field (a small caption above a full-width `TextField`). */
+function Field({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <div>
+      <div className="mb-1 text-ui-sm text-foreground-subtle">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+
 /**
- * One provider row (the ZCode model-provider pattern): Name / Base URL /
- * API key (masked, an eye toggle) + the discovery status + a refresh + a
- * remove. The `id` is generated ONCE at add time and NEVER changes
- * afterwards (a later name commit must NOT regenerate it — `defaultModel`
- * references + the discovery cache entries would silently orphan).
+ * One provider row: a labeled 2×2 grid (Name / Base URL / API key (masked,
+ * an eye toggle) / the discovery status + a refresh + a remove) — the
+ * `SettingsRow`'s label+control shape can't host three text fields (they
+ * overflow the fixed 280px control column and get clipped by the card's
+ * `overflow-hidden`), so the row is a full-width `border-t` block (the
+ * `SettingsRow`'s `px-4 py-3` / `first:border-t-0` pattern).
  */
 function ProviderRow({
   provider,
@@ -198,32 +249,34 @@ function ProviderRow({
       ? `${modelCount} models`
       : "unreachable";
   return (
-    <SettingsRow
-      label={provider.name || "Unnamed provider"}
-      controlLayout="wide"
-      control={
-        <div className="flex items-center gap-2">
+    <div className="border-t border-border px-4 py-3 first:border-t-0">
+      <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+        <Field label="Name">
           <TextField
             value={provider.name}
             placeholder="Provider name"
             ariaLabel="Provider name"
-            className="w-40"
+            className="w-full"
             onCommit={(name) => onCommitField({ name })}
           />
+        </Field>
+        <Field label="Base URL">
           <TextField
             value={provider.baseUrl}
             placeholder="https://example.com/v1"
             ariaLabel="Base URL"
-            className="w-56"
+            className="w-full"
             onCommit={(baseUrl) => onCommitField({ baseUrl })}
           />
-          <div className="relative w-40">
+        </Field>
+        <Field label="API key">
+          <div className="relative">
             <TextField
               value={provider.apiKey}
               placeholder="No key (local gateway)"
               ariaLabel="API key"
               type={showKey ? "text" : "password"}
-              className="pr-8"
+              className="w-full pr-8"
               onCommit={(apiKey) => onCommitField({ apiKey })}
             />
             <Button
@@ -237,6 +290,8 @@ function ProviderRow({
               {showKey ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
             </Button>
           </div>
+        </Field>
+        <div className="flex items-center justify-end gap-2">
           <SettingsBadge>{status}</SettingsBadge>
           <Button
             type="button"
@@ -275,8 +330,8 @@ function ProviderRow({
             </AlertDialogContent>
           </AlertDialog>
         </div>
-      }
-    />
+      </div>
+    </div>
   );
 }
 
@@ -326,35 +381,64 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   /**
    * A provider field commit (immediate save): `update` + re-run the changed
    * provider's discovery (Task 2's `force_refresh` bypasses its cache).
+   * The id is derived from the name: a committed name (a non-blank slug)
+   * that differs from the current id re-identifies the provider — the
+   * settings-level model references (the `defaultModel` composed key + the
+   * `defaultThinkingLevels` keys, both `"<providerId>/<modelId>"`) are
+   * remapped old → new so they don't orphan (the in-memory discovery cache
+   * entries for the old id are simply unused — the new id gets a fresh
+   * discovery; a BLANK name keeps the current id).
    */
   const commitProviderField = (index: number, patch: Partial<ProviderConfig>) => {
     if (settings === null) return;
-    const providers = settings.providers.map((p, i) =>
-      i === index ? { ...p, ...patch } : p,
-    );
-    update({ providers });
-    void listModels(settings.providers[index].id).then(setModels).catch(() => {});
+    const current = settings.providers[index];
+    const next = { ...current, ...patch };
+    const slug = slugify(next.name);
+    let id = next.id;
+    if (slug !== "") {
+      const taken = new Set(
+        settings.providers
+          .map((p, i) => (i === index ? null : p.id))
+          .filter((v): v is string => v !== null),
+      );
+      id = uniqueSlug(slug, taken);
+    }
+    const nextSettings: Partial<AppSettings> = {
+      providers: settings.providers.map((p, i) =>
+        i === index ? { ...next, id } : p,
+      ),
+    };
+    if (id !== current.id) {
+      nextSettings.defaultModel = remapModelRef(
+        settings.defaultModel,
+        current.id,
+        id,
+      );
+      nextSettings.defaultThinkingLevels = remapModelRefs(
+        settings.defaultThinkingLevels,
+        current.id,
+        id,
+      );
+    }
+    update(nextSettings);
+    void listModels(id).then(setModels).catch(() => {});
   };
 
   /**
-   * Add provider: append an empty editable row whose `id` is generated
-   * ONCE at add time and NEVER changes afterwards (`slug(name)` when a
-   * name is already known at add time, else `provider-N`; de-duped with a
-   * `-2` / `-3` suffix).
+   * Add provider: append an empty editable row with a placeholder id
+   * (`provider-N` — a name commit derives the real id from the name,
+   * de-duped with a `-2` / `-3` suffix).
    */
   const addProvider = (name = "") => {
     if (settings === null) return;
     const slug = slugify(name);
     const base = slug !== "" ? slug : `provider-${settings.providers.length + 1}`;
     const existing = new Set(settings.providers.map((p) => p.id));
-    let id = base;
-    let n = 2;
-    while (existing.has(id)) {
-      id = `${base}-${n}`;
-      n += 1;
-    }
     update({
-      providers: [...settings.providers, { id, name: "", baseUrl: "", apiKey: "" }],
+      providers: [
+        ...settings.providers,
+        { id: uniqueSlug(base, existing), name: "", baseUrl: "", apiKey: "" },
+      ],
     });
   };
 
@@ -553,6 +637,7 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
       <Button onClick={() => addProvider()}>Add provider</Button>
     </div>
   );
+
 
   return (
     <div className="grid h-full grid-cols-[268px_minmax(0,1fr)]">

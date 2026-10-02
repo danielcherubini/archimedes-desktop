@@ -142,39 +142,102 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     await go("Providers");
     const nameInput = await screen.findByDisplayValue("Tama");
     fireEvent.change(nameInput, { target: { value: "Tama2" } });
-    // Commit on blur: save the updated provider + re-run its discovery
-    // (the `listModels` force-refresh bypasses Task 2's cache).
+    // Commit on blur: the id is derived from the name (`Tama` → `Tama2`
+    // re-identifies the provider `tama` → `tama2`) + re-run the discovery
+    // under the NEW id (the `listModels` force-refresh bypasses the cache).
     fireEvent.blur(nameInput);
     await waitFor(() => expect(saveSettings).toHaveBeenCalled());
     const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
     expect(saved.providers[0].name).toBe("Tama2");
-    expect(listModels).toHaveBeenCalledWith("tama");
+    expect(saved.providers[0].id).toBe("tama2");
+    expect(listModels).toHaveBeenCalledWith("tama2");
   });
 
-  it("add_provider_appends_a_row_with_a_generated_id", async () => {
+  it("add_provider_appends_a_row_and_the_name_commit_derives_the_id", async () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Providers");
     // The existing provider row is loaded (one "Provider name" input).
     await screen.findByDisplayValue("Tama");
     fireEvent.click(screen.getByRole("button", { name: "Add provider" }));
-    // The new empty row: a second "Provider name" input, empty, editable.
+    // The new empty row: a second "Provider name" input, empty, editable
+    // (a placeholder id until a name is committed).
     const nameInputs = screen.getAllByPlaceholderText("Provider name");
     expect(nameInputs).toHaveLength(2);
     const newInput = nameInputs[1] as HTMLInputElement;
     expect(newInput.value).toBe("");
     // Type the SAME name as the existing provider + commit: the id is
-    // generated ONCE at add time (`provider-2`) and a name commit must NOT
-    // regenerate it (the `defaultModel` refs + discovery cache would orphan).
-    // The ADD already saved the document (immediate save — call 0, name
-    // `""`); the blur commit is call 1.
+    // derived from the name (the slug `tama`) and de-duped against the
+    // existing provider's id (`tama` → `tama-2`). The ADD already saved
+    // the document (immediate save — call 0, name `""`); the blur commit
+    // is call 1.
     fireEvent.change(newInput, { target: { value: "Tama" } });
     fireEvent.blur(newInput);
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
     const saved = vi.mocked(saveSettings).mock.calls[1][0] as AppSettings;
     expect(saved.providers).toHaveLength(2);
     expect(saved.providers[1].name).toBe("Tama");
-    expect(saved.providers[1].id).toBe("provider-2");
+    expect(saved.providers[1].id).toBe("tama-2");
+  });
+
+  it("a_name_commit_reidentifies_the_provider_and_remaps_the_model_refs", async () => {
+    // The loaded document: the default model + a remembered thinking level
+    // reference the provider by its CURRENT id (`tama/Qwen3.8`).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultModel: "tama/Qwen3.8",
+      defaultThinkingLevels: { "tama/Qwen3.8": "xhigh" },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const nameInput = await screen.findByDisplayValue("Tama");
+    // Rename: `Tama` → `Another Name` → the id is the slug (`another-name`).
+    fireEvent.change(nameInput, { target: { value: "Another Name" } });
+    fireEvent.blur(nameInput);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.providers[0].name).toBe("Another Name");
+    expect(saved.providers[0].id).toBe("another-name");
+    // The settings-level references ride along re-mapped (old id → new id —
+    // they must NOT orphan).
+    expect(saved.defaultModel).toBe("another-name/Qwen3.8");
+    expect(saved.defaultThinkingLevels).toEqual({
+      "another-name/Qwen3.8": "xhigh",
+    });
+    // The discovery re-runs under the new id.
+    expect(listModels).toHaveBeenCalledWith("another-name");
+  });
+
+  it("a_blank_name_keeps_the_provider_id", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const nameInput = await screen.findByDisplayValue("Tama");
+    fireEvent.change(nameInput, { target: { value: "" } });
+    fireEvent.blur(nameInput);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.providers[0].name).toBe("");
+    expect(saved.providers[0].id).toBe("tama");
+  });
+
+  it("the_provider_row_shows_all_its_fields", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    // The labeled fields (the fix for the clipped single-line layout —
+    // the Name / Base URL / API key fields are all visible, not
+    // overflowed out of the 280px control column).
+    expect(screen.getByText("Name")).toBeTruthy();
+    expect(screen.getByText("Base URL")).toBeTruthy();
+    expect(screen.getByText("API key")).toBeTruthy();
+    expect(
+      await screen.findByDisplayValue("https://tama.wizards.town/v1"),
+    ).toBeTruthy();
+    // The status + the refresh + the remove remain in the row.
+    expect(screen.getByRole("button", { name: "Refresh models" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove provider" })).toBeTruthy();
   });
 
   it("remove_provider_confirms_then_saves", async () => {

@@ -23,8 +23,10 @@ use crate::agent::SessionManager;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
-    /// Stable slug (internal — generated ONCE at add time, never changes
-    /// afterwards).
+    /// The provider's id: the slug of its name (the desktop's Settings page
+    /// derives it from the name — a name commit re-identifies the provider,
+    /// remapping the `default_model` / `default_thinking_levels` references
+    /// old → new; a blank name keeps the current id).
     pub id: String,
     pub name: String,
     /// Normalized base URL (…/v1).
