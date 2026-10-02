@@ -93,6 +93,7 @@ pub fn run() {
             commands::settings::save_settings,
             commands::settings::list_models,
             commands::settings::test_mcp_server,
+            commands::settings::auth_mcp_server,
             commands::spaces::list_agents,
             commands::spaces::list_spaces,
             commands::spaces::delete_space,

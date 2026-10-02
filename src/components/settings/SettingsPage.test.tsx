@@ -2,6 +2,7 @@ import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import SettingsPage from "./SettingsPage";
 import {
+  authMcpServer,
   getSettings,
   listModels,
   saveSettings,
@@ -67,6 +68,7 @@ vi.mock("../../lib/tauri", async () => {
     // The one-shot MCP test (ADR 0019): 0 tools by default (the tests
     // override per case).
     testMcpServer: vi.fn().mockResolvedValue(0),
+    authMcpServer: vi.fn().mockResolvedValue("authenticated"),
   };
 });
 
@@ -456,7 +458,7 @@ describe("SettingsPage (the MCP section — ADR 0019)", () => {
     );
     // The one-shot test (the entry as saved) + the result badge.
     expect(await screen.findByText("3 tools")).toBeTruthy();
-    expect(testMcpServer).toHaveBeenCalledWith({ url: "https://tama/mcp" });
+    expect(testMcpServer).toHaveBeenCalledWith({ url: "https://tama/mcp" }, "tama");
   });
 
   it("test_mcp_server_surfaces_the_error", async () => {
@@ -471,5 +473,33 @@ describe("SettingsPage (the MCP section — ADR 0019)", () => {
     // The error badge (the message in the tooltip).
     const badge = await screen.findByText("error");
     expect(badge).toBeTruthy();
+  });
+
+  it("auth_mcp_server_runs_the_interactive_flow_and_retests", async () => {
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      mcpServers: {
+        oauth_srv: { url: "https://auth.example/mcp", auth: "oauth" },
+      },
+    });
+    vi.mocked(authMcpServer).mockResolvedValueOnce("oauth_srv: authenticated");
+    vi.mocked(testMcpServer).mockResolvedValueOnce(5);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    await screen.findByText("oauth_srv");
+    const authBtn = screen.getByRole("button", {
+      name: "Authenticate MCP server oauth_srv",
+    });
+    fireEvent.click(authBtn);
+    expect(await screen.findByText("5 tools")).toBeTruthy();
+    expect(authMcpServer).toHaveBeenCalledWith("oauth_srv", {
+      url: "https://auth.example/mcp",
+      auth: "oauth",
+    });
+    expect(testMcpServer).toHaveBeenCalledWith(
+      { url: "https://auth.example/mcp", auth: "oauth" },
+      "oauth_srv",
+    );
   });
 });

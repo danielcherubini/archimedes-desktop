@@ -4,6 +4,7 @@ import {
   ArrowLeftIcon,
   EyeIcon,
   EyeOffIcon,
+  KeyIcon,
   PackageIcon,
   PaletteIcon,
   PencilIcon,
@@ -16,6 +17,7 @@ import {
 
 import { applySettingsToDocument, MAX_FONT_PX, MIN_FONT_PX } from "@/lib/settings";
 import {
+  authMcpServer,
   getSettings,
   listAgents,
   listModels,
@@ -239,20 +241,23 @@ function McpRow({
   onRemove: () => void;
 }): ReactElement {
   const [testing, setTesting] = useState(false);
+  const [authenticating, setAuthenticating] = useState(false);
   const [result, setResult] = useState<
     { count: number } | { error: string } | null
   >(null);
   const isHttp = entry.url !== undefined;
+  const isOAuth = entry.auth !== undefined;
   const kind = isHttp ? "HTTP" : "stdio";
   const summary = isHttp
     ? entry.url
     : [entry.command ?? "", ...(entry.args ?? [])].join(" ").trim();
+
   const runTest = async () => {
-    if (testing) return;
+    if (testing || authenticating) return;
     setTesting(true);
     setResult(null);
     try {
-      const count = await testMcpServer(entry);
+      const count = await testMcpServer(entry, name);
       setResult({ count });
     } catch (e) {
       setResult({ error: e instanceof Error ? e.message : String(e) });
@@ -260,6 +265,25 @@ function McpRow({
       setTesting(false);
     }
   };
+
+  const runAuth = async () => {
+    if (testing || authenticating) return;
+    setAuthenticating(true);
+    setResult(null);
+    try {
+      await authMcpServer(name, entry);
+      const count = await testMcpServer(entry, name);
+      setResult({ count });
+    } catch (e) {
+      setResult({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setAuthenticating(false);
+    }
+  };
+
+  const needsAuth =
+    result !== null && "error" in result && result.error.includes("needs-auth");
+
   return (
     <div className="border-t border-border px-4 py-3 first:border-t-0">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
@@ -269,23 +293,42 @@ function McpRow({
               {name}
             </span>
             <SettingsBadge>{kind}</SettingsBadge>
+            {isOAuth && <SettingsBadge>OAuth</SettingsBadge>}
           </div>
           <div className="truncate text-ui-sm text-foreground-subtle">{summary}</div>
         </div>
-        {testing ? (
+        {authenticating ? (
+          <SettingsBadge>signing in…</SettingsBadge>
+        ) : testing ? (
           <SettingsBadge>testing…</SettingsBadge>
         ) : result !== null ? (
           "count" in result ? (
             <SettingsBadge>{`${result.count} tools`}</SettingsBadge>
+          ) : needsAuth ? (
+            <SettingsBadge title={result.error}>needs auth</SettingsBadge>
           ) : (
             <SettingsBadge title={result.error}>error</SettingsBadge>
           )
         ) : null}
+        {(isOAuth || needsAuth) && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Authenticate MCP server ${name}`}
+            title="Sign in with OAuth"
+            disabled={testing || authenticating}
+            onClick={() => void runAuth()}
+          >
+            <KeyIcon className="size-3.5" />
+          </Button>
+        )}
         <Button
           type="button"
           variant="ghost"
           size="icon-sm"
           aria-label={`Test MCP server ${name}`}
+          disabled={testing || authenticating}
           onClick={() => void runTest()}
         >
           <PlayIcon className="size-3.5" />

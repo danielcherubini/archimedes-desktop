@@ -504,8 +504,13 @@ export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
 }
 
 /** Test ONE MCP server entry (the Settings page's Test action, ADR 0019): a one-shot bounded connect + `tools/list`. Resolves the tool count; rejects with the error text (a `needs-auth` / a network failure). */
-export async function testMcpServer(entry: McpServerEntry): Promise<number> {
-  return invoke("test_mcp_server", { entry });
+export async function testMcpServer(entry: McpServerEntry, name?: string): Promise<number> {
+  return invoke("test_mcp_server", { name: name ?? null, entry });
+}
+
+/** Run interactive OAuth authentication for an MCP server (the Settings page's Sign in action). */
+export async function authMcpServer(name: string, entry: McpServerEntry): Promise<string> {
+  return invoke("auth_mcp_server", { name, entry });
 }
 
 // ---------------------------------------------------------------------------

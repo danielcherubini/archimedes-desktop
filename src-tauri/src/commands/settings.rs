@@ -247,13 +247,21 @@ impl From<&Model> for ModelDto {
 /// `needs-auth` / a network failure). The entry is the `settings.json`
 /// `mcpServers` entry VERBATIM (pi's shape — classified, not re-shaped).
 #[tauri::command]
-pub async fn test_mcp_server(entry: Value) -> Result<u32, String> {
+pub async fn test_mcp_server(name: Option<String>, entry: Value) -> Result<u32, String> {
     let def = crate::agent::mcp::types::classify_server(&entry)
         .ok_or_else(|| "invalid MCP server entry (need a `url` or a `command`)".to_string())?;
     let timeout = std::time::Duration::from_secs(10);
-    crate::agent::mcp::manager::test_server(&def, Path::new("."), timeout)
+    crate::agent::mcp::manager::test_server(name.as_deref(), &def, Path::new("."), timeout)
         .await
         .map(|n| n as u32)
+}
+
+/// Run interactive OAuth authentication for an MCP server (Settings UI).
+#[tauri::command]
+pub async fn auth_mcp_server(name: String, entry: Value) -> Result<String, String> {
+    let def = crate::agent::mcp::types::classify_server(&entry)
+        .ok_or_else(|| "invalid MCP server entry (need a `url` or a `command`)".to_string())?;
+    crate::agent::mcp::manager::authenticate_server(&name, &def).await
 }
 
 #[cfg(test)]
@@ -296,6 +304,7 @@ mod tests {
             .expect("runtime");
         let result = rt
             .block_on(test_mcp_server(
+                None,
                 serde_json::json!({ "headers": { "a": "b" } }),
             ))
             .expect_err("a malformed entry is an error");
@@ -313,9 +322,12 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/target/debug/fake_mcp_stdio"
         ));
-        let count = test_mcp_server(serde_json::json!({ "command": bin.display().to_string() }))
-            .await
-            .expect("the fake server answers");
+        let count = test_mcp_server(
+            None,
+            serde_json::json!({ "command": bin.display().to_string() }),
+        )
+        .await
+        .expect("the fake server answers");
         assert_eq!(count, 3);
     }
 
