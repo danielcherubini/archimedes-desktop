@@ -221,6 +221,11 @@ pub fn user_message_payload(text: &str, images: &[ImagePayload]) -> Value {
     }
 }
 
+/// Mint a fresh unique session ID with the `arch_` prefix.
+pub fn mint_session_id() -> String {
+    format!("arch_{}", uuid::Uuid::new_v4())
+}
+
 /// A fully established session, ready to accept prompts.
 ///
 /// `Serialize` so it can cross the IPC boundary as a command return value.
@@ -2006,7 +2011,7 @@ impl SessionManager {
         let (session_id, model, stored_level) = match resume {
             Some((id, model, level)) => (id.to_string(), model.clone(), level),
             None => (
-                uuid::Uuid::new_v4().to_string(),
+                mint_session_id(),
                 resolve_native_model(&catalog, &harness.default_model, &settings.default_model)?,
                 None,
             ),
@@ -2235,7 +2240,7 @@ impl SessionManager {
         // starts the peer-verified listener before the spawn returns. For a
         // NEW session the client session id is a fresh UUID (the pi
         // `sessionId` does not exist until the session is established).
-        let client_session_id = uuid::Uuid::new_v4().to_string();
+        let client_session_id = mint_session_id();
         let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id) {
             Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
             None => (entry.env.clone(), None),
@@ -4696,6 +4701,18 @@ mod session_tests {
     use futures_util::StreamExt;
     use std::path::Path;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn mint_session_id_format() {
+        let sid = mint_session_id();
+        assert!(
+            sid.starts_with("arch_"),
+            "session id must start with arch_, got {sid}"
+        );
+        let suffix = &sid["arch_".len()..];
+        let parsed = uuid::Uuid::parse_str(suffix).expect("suffix must be valid UUID");
+        assert_eq!(parsed.get_version_num(), 4, "suffix must be UUID v4");
+    }
 
     pub struct TestSink {
         tx: mpsc::UnboundedSender<Value>,
