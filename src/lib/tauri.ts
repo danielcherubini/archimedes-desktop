@@ -283,6 +283,9 @@ export interface SubagentSessionStartedPayload {
   parentSessionId: string;
   agentName: string;
   task: string;
+  model?: string;
+  thinkingLevel?: string;
+  enabledTools?: string[];
 }
 
 /**

@@ -117,12 +117,54 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
  * A human duration for a millisecond span (`<60s` → `Ns`, `<60m` → `Nm`,
  * else `Nh`) — the live tool duration in the subagent activity line.
  */
-function formatDuration(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
+export function formatDuration(ms: number): string {
+  if (ms < 100) return "<0.1s";
+  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`;
+  const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  return `${Math.floor(m / 60)}h`;
+  const rem = s % 60;
+  return `${m}m${rem > 0 ? `${rem}s` : ""}`;
+}
+
+export function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(n);
+}
+
+export function formatCost(cost: number): string {
+  if (!cost || cost <= 0) return "";
+  if (cost < 0.01) return "$" + cost.toFixed(4);
+  return "$" + cost.toFixed(2);
+}
+
+export const THINKING_GLYPHS: Record<string, string> = {
+  off: "○",
+  minimal: "○",
+  low: "◔",
+  medium: "◑",
+  high: "◕",
+  xhigh: "●",
+  max: "●",
+};
+
+export function formatThinkingIndicator(level?: string): string | undefined {
+  if (!level) return undefined;
+  const glyph = THINKING_GLYPHS[level.toLowerCase()] ?? "◑";
+  return `${glyph} ${level}`;
+}
+
+export function cleanModelName(model?: string): string | undefined {
+  if (!model) return undefined;
+  const withoutThinking = model.includes(":") ? model.split(":")[0] : model;
+  return withoutThinking;
+}
+
+export function extractThinkingFromModel(model?: string): string | undefined {
+  if (!model || !model.includes(":")) return undefined;
+  const parts = model.split(":");
+  return parts[parts.length - 1];
 }
 
 /**
@@ -132,7 +174,10 @@ function formatDuration(ms: number): string {
  * subagent's streamed output (the "what is it working on" line), or
  * `Starting...`. `undefined` when there is nothing to show.
  */
-function subagentActivityLine(e: Record<string, unknown>): string | undefined {
+export function subagentActivityLine(
+  e: Record<string, unknown>,
+  now = Date.now(),
+): string | undefined {
   if (typeof e.error === "string" && e.error !== "") return truncate(e.error, 80);
   const status = typeof e.status === "string" ? e.status : undefined;
   if (status === "completed") return "Done";
@@ -144,8 +189,21 @@ function subagentActivityLine(e: Record<string, unknown>): string | undefined {
       const startedAt =
         typeof e.currentToolStartedAt === "number" ? e.currentToolStartedAt : undefined;
       const duration =
-        startedAt !== undefined ? ` · ${formatDuration(Date.now() - startedAt)}` : "";
+        startedAt !== undefined ? ` · ${formatDuration(now - startedAt)}` : "";
       return (args !== "" ? `${tool}: ${truncate(args, 60)}` : tool) + duration;
+    }
+    if (Array.isArray(e.toolCalls) && e.toolCalls.length > 0) {
+      const lastCall = e.toolCalls[e.toolCalls.length - 1] as
+        | { name?: string; argsPreview?: string; error?: boolean }
+        | string;
+      if (typeof lastCall === "string") {
+        return truncate(lastCall, 60);
+      }
+      if (lastCall && typeof lastCall.name === "string") {
+        const glyph = lastCall.error ? "✗" : "✓";
+        const suffix = lastCall.argsPreview ? `: ${truncate(lastCall.argsPreview, 60)}` : "";
+        return `${glyph} ${lastCall.name}${suffix}`;
+      }
     }
     // The last non-empty line of the subagent's streamed output (the
     // "what is it working on" line the user asked for).
@@ -168,6 +226,9 @@ function subagentActivityLine(e: Record<string, unknown>): string | undefined {
   // line the user asked for), or `Done` / `Failed` when there is none.
   const exitCode = typeof e.exitCode === "number" ? e.exitCode : undefined;
   if (exitCode !== undefined) {
+    if (exitCode !== 0 && typeof e.error === "string" && e.error !== "") {
+      return truncate(e.error, 80);
+    }
     const final = typeof e.finalOutput === "string" ? e.finalOutput : "";
     const lines = final.split("\n").filter((l) => l.trim() !== "");
     if (lines.length > 0) return truncate(lines[lines.length - 1], 80);

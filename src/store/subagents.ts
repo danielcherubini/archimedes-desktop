@@ -59,6 +59,9 @@ export interface SubagentEntry {
    * the only one `dismissSession` never touches.
    */
   metrics?: SubagentMetrics;
+  model?: string;
+  thinkingLevel?: string;
+  enabledTools?: string[];
 }
 
 interface SubagentState {

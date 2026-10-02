@@ -113,6 +113,8 @@ function App() {
           agentName: p.agentName,
           task: p.task,
           status: "running",
+          model: p.model,
+          thinkingLevel: p.thinkingLevel,
         }),
       ),
     );

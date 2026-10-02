@@ -10,6 +10,13 @@ import {
   summarizeSubagentFor,
   summarizeToolCall,
   subagentActivityFor,
+  cleanModelName,
+  extractThinkingFromModel,
+  formatCost,
+  formatDuration,
+  formatThinkingIndicator,
+  formatTokens,
+  subagentActivityLine,
 } from "./toolOutput";
 import {
   SquareTerminalIcon,
@@ -470,3 +477,67 @@ describe("summarizeToolCall (mcp — the server name on the side)", () => {
     expect(summarizeToolCall("mcp", {})).toBeUndefined();
   });
 });
+
+describe("subagent metadata and activity formatting helpers", () => {
+  it("formats tokens into human-readable strings", () => {
+    expect(formatTokens(450)).toBe("450");
+    expect(formatTokens(12400)).toBe("12.4k");
+    expect(formatTokens(12000)).toBe("12k");
+    expect(formatTokens(1500000)).toBe("1.5M");
+  });
+
+  it("formats durations into human-readable spans", () => {
+    expect(formatDuration(50)).toBe("<0.1s");
+    expect(formatDuration(800)).toBe("0.8s");
+    expect(formatDuration(4000)).toBe("4s");
+    expect(formatDuration(75000)).toBe("1m15s");
+    expect(formatDuration(120000)).toBe("2m");
+  });
+
+  it("formats costs into clean dollar strings", () => {
+    expect(formatCost(0)).toBe("");
+    expect(formatCost(0.0042)).toBe("$0.0042");
+    expect(formatCost(0.15)).toBe("$0.15");
+  });
+
+  it("formats thinking indicators with glyphs", () => {
+    expect(formatThinkingIndicator("high")).toBe("◕ high");
+    expect(formatThinkingIndicator("medium")).toBe("◑ medium");
+    expect(formatThinkingIndicator("low")).toBe("◔ low");
+    expect(formatThinkingIndicator("off")).toBe("○ off");
+    expect(formatThinkingIndicator("minimal")).toBe("○ minimal");
+    expect(formatThinkingIndicator("xhigh")).toBe("● xhigh");
+    expect(formatThinkingIndicator("max")).toBe("● max");
+    expect(formatThinkingIndicator(undefined)).toBeUndefined();
+  });
+
+  it("cleans model names and extracts thinking suffix", () => {
+    expect(cleanModelName("claude-3-7-sonnet")).toBe("claude-3-7-sonnet");
+    expect(cleanModelName("anthropic/claude-3-7-sonnet:high")).toBe("anthropic/claude-3-7-sonnet");
+    expect(cleanModelName(undefined)).toBeUndefined();
+
+    expect(extractThinkingFromModel("claude-3-7-sonnet:high")).toBe("high");
+    expect(extractThinkingFromModel("claude-3-7-sonnet")).toBeUndefined();
+  });
+
+  it("subagentActivityLine formats recent tool calls when no active tool is running", () => {
+    const out = subagentActivityLine({
+      status: "running",
+      toolCalls: [
+        { name: "read", argsPreview: "src/dao.rs", error: false },
+      ],
+    });
+    expect(out).toBe("✓ read: src/dao.rs");
+  });
+
+  it("subagentActivityLine formats failed tool calls", () => {
+    const out = subagentActivityLine({
+      status: "running",
+      toolCalls: [
+        { name: "bash", argsPreview: "cargo test", error: true },
+      ],
+    });
+    expect(out).toBe("✗ bash: cargo test");
+  });
+});
+
