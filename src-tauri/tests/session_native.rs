@@ -17,7 +17,7 @@ use archimedes_lib::agent::harness::{
     ChatMessage, ChatRole, CompactionConfig, FinishReason, MessageContent, Model, ModelCatalog,
     Provider, ProviderError, ProviderEvent,
 };
-use archimedes_lib::agent::{EventSink, SessionManager, StopReason};
+use archimedes_lib::agent::{EventSink, SessionInfo, SessionManager, StopReason};
 use archimedes_lib::config::{AgentKind, Registry};
 use archimedes_lib::storage::Db;
 use async_trait::async_trait;
@@ -260,6 +260,11 @@ async fn native_session_end_to_end() {
         .start_session("archimedes", dir.clone(), &sink)
         .await
         .expect("the native session starts (in-process, no subprocess)");
+    assert!(
+        info.session_id.starts_with("arch_"),
+        "a fresh native session ID starts with arch_, got {}",
+        info.session_id
+    );
     let sid = info.session_id.clone();
 
     // (1) The capability envelope: NO `piSessionFile` (resume is from the
@@ -398,5 +403,69 @@ async fn native_session_end_to_end() {
     );
 
     let _ = manager.close_session(&sid).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A legacy session whose stored ID is a bare UUID (no `arch_` prefix)
+/// retains its exact ID when resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resuming_legacy_bare_uuid_session_preserves_id() {
+    let dir = temp_config_dir_pi_only();
+    let (manager, _recorded, sink, mut sink_rx) = build_manager(&dir).await;
+
+    let legacy_id = uuid::Uuid::new_v4().to_string();
+    assert!(
+        !legacy_id.starts_with("arch_"),
+        "legacy id has no arch_ prefix: {legacy_id}"
+    );
+
+    // Seed the DB with a legacy session record and a system prompt in native_messages.
+    let db = Db::open(&dir.join("archimedes.db")).unwrap();
+    let info = SessionInfo {
+        session_id: legacy_id.clone(),
+        agent_id: "archimedes".to_string(),
+        cwd: dir.clone(),
+        capabilities: json!({
+            "model": "test/m1",
+            "loadSession": true,
+        }),
+        config_options: None,
+        archived: false,
+    };
+    db.record_session(&info).unwrap();
+    let sys_msg = ChatMessage {
+        role: ChatRole::System,
+        content: MessageContent::Text("legacy system prompt".to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+    };
+    db.insert_native_message(
+        &legacy_id,
+        0,
+        "system",
+        &serde_json::to_string(&sys_msg).unwrap(),
+    )
+    .unwrap();
+
+    let resumed = manager
+        .resume_session("archimedes", &legacy_id, dir.clone(), &sink)
+        .await
+        .expect("legacy session resumes");
+
+    assert_eq!(
+        resumed.session_id, legacy_id,
+        "the resumed session preserves its exact legacy bare-UUID ID"
+    );
+
+    // Send a turn to ensure the session operates normally under the legacy ID.
+    let reason = manager
+        .send_prompt(&legacy_id, "hello legacy".to_string())
+        .await
+        .expect("turn completes");
+    assert_eq!(reason, StopReason::EndTurn);
+    let chunk = wait_for_update(&mut sink_rx, "agent_message_chunk").await;
+    assert_eq!(chunk["content"]["text"], "Hello");
+
+    let _ = manager.close_session(&legacy_id).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
