@@ -1254,6 +1254,7 @@ impl AgentLoop {
                 reasoning_effort: None,
                 stream: true,
             },
+            session_id: None,
         };
         let mut stream = tokio::select! {
             s = self.provider.complete(&req) => s?,
@@ -1325,6 +1326,7 @@ impl AgentLoop {
                 reasoning_effort: self.thinking_level.clone(),
                 stream: true,
             },
+            session_id: None,
         }
     }
 

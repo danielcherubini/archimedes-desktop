@@ -7,7 +7,7 @@ use archimedes_lib::agent::harness::{
     OpenAiCompatibleProvider, Provider, ProviderError, ProviderEvent,
 };
 use futures_util::StreamExt;
-use wiremock::matchers::method;
+use wiremock::matchers::{header, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A provider pointed at the mock server.
@@ -35,6 +35,7 @@ fn request() -> ModelRequest {
             reasoning_effort: None,
             stream: true,
         },
+        session_id: None,
     }
 }
 
@@ -212,5 +213,74 @@ async fn http_401_is_auth() {
     assert!(
         matches!(err, ProviderError::Auth(_)),
         "a 401 is an auth error, got {err:?}"
+    );
+}
+
+// ── (f) session_id present → x-litellm-session-id & x-request-id headers ──
+
+#[tokio::test]
+async fn openai_provider_sends_session_id_headers_when_present() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-litellm-session-id", "sess-xyz-123"))
+        .and(header("x-request-id", "sess-xyz-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                 data: [DONE]\n\n",
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut req = request();
+    req.session_id = Some("sess-xyz-123".to_string());
+
+    let events = collect(&provider(&server), &req).await;
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ],
+    );
+}
+
+// ── (g) session_id absent → omit headers ─────────────────────────────────
+
+#[tokio::test]
+async fn openai_provider_omits_session_id_headers_when_absent() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .await;
+
+    let req = request();
+    let events = collect(&provider(&server), &req).await;
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ],
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    let sent_headers = &requests[0].headers;
+    assert!(
+        !sent_headers.contains_key(wiremock::http::HeaderName::from_static(
+            "x-litellm-session-id"
+        )),
+        "x-litellm-session-id header should not be present"
+    );
+    assert!(
+        !sent_headers.contains_key(wiremock::http::HeaderName::from_static("x-request-id")),
+        "x-request-id header should not be present"
     );
 }
