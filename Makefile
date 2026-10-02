@@ -32,12 +32,28 @@ NO_STRIP ?= $(shell grep -q '^ID=fedora' /etc/os-release 2>/dev/null && echo 1)
 
 # ── Setup / dev ───────────────────────────────────────────────────────
 
+.PHONY: install-desktop
+install-desktop: ## Install desktop entry and icons to ~/.local/share (Linux only)
+	@if [ "$$(uname -s)" = "Linux" ]; then \
+		mkdir -p ~/.local/share/icons/hicolor/32x32/apps ~/.local/share/icons/hicolor/64x64/apps ~/.local/share/icons/hicolor/128x128/apps ~/.local/share/icons/hicolor/256x256/apps ~/.local/share/icons/hicolor/512x512/apps ~/.local/share/applications; \
+		cp $(RUST_DIR)/icons/32x32.png ~/.local/share/icons/hicolor/32x32/apps/archimedes.png 2>/dev/null || true; \
+		cp $(RUST_DIR)/icons/64x64.png ~/.local/share/icons/hicolor/64x64/apps/archimedes.png 2>/dev/null || true; \
+		cp $(RUST_DIR)/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/archimedes.png 2>/dev/null || true; \
+		cp $(RUST_DIR)/icons/128x128@2x.png ~/.local/share/icons/hicolor/256x256/apps/archimedes.png 2>/dev/null || true; \
+		cp $(RUST_DIR)/icons/icon.png ~/.local/share/icons/hicolor/512x512/apps/archimedes.png 2>/dev/null || true; \
+		cp $(RUST_DIR)/icons/icon.png ~/.local/share/icons/hicolor/512x512/apps/codes.archimedes.desktop.png 2>/dev/null || true; \
+		printf '[Desktop Entry]\nName=Archimedes\nComment=Archimedes Desktop Coding Agent\nExec=archimedes %%U\nTerminal=false\nType=Application\nIcon=archimedes\nCategories=Development;\nStartupWMClass=archimedes\n' > ~/.local/share/applications/archimedes.desktop; \
+		printf '[Desktop Entry]\nName=Archimedes\nComment=Archimedes Desktop Coding Agent\nExec=archimedes %%U\nTerminal=false\nType=Application\nIcon=archimedes\nCategories=Development;\nStartupWMClass=codes.archimedes.desktop\n' > ~/.local/share/applications/codes.archimedes.desktop.desktop; \
+		update-desktop-database ~/.local/share/applications 2>/dev/null || true; \
+		gtk-update-icon-cache -f ~/.local/share/icons/hicolor 2>/dev/null || true; \
+	fi
+
 .PHONY: setup
-setup: ## Install JS dependencies (one-time; system deps are manual)
+setup: install-desktop ## Install JS dependencies (one-time; system deps are manual)
 	$(PNPM) install
 
 .PHONY: dev
-dev: ## Run the app in the Tauri shell (Vite HMR + cargo build)
+dev: install-desktop ## Run the app in the Tauri shell (Vite HMR + cargo build)
 	$(PNPM) tauri dev
 
 .PHONY: dev-web

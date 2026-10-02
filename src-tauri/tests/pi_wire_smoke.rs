@@ -302,8 +302,10 @@ async fn real_pi_gate_and_resume_smoke() {
                     .expect("the extension_ui_response should be accepted");
             }
             maybe_ev = tokio::time::timeout(Duration::from_secs(5), ev_events.recv()) => {
-                let Some(ev) = maybe_ev.ok().flatten() else {
-                    panic!("the event stream ended before the turn settled");
+                let ev = match maybe_ev {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => panic!("the event stream ended before the turn settled"),
+                    Err(_) => continue,
                 };
                 if matches!(ev, RpcEvent::agent_settled) {
                     break;
