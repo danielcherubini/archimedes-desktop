@@ -321,6 +321,29 @@ export interface ProviderConfig {
   apiKey: string;
 }
 
+/**
+ * An MCP server entry (the `settings.json` `mcpServers` value — ADR 0019):
+ * pi's `mcpServers` entry shape VERBATIM, so an entry copy-pastes between
+ * the desktop's `settings.json` and pi's `mcp.json` files. An entry is an
+ * HTTP server (`url` + optional `headers` / `auth` / `bearerTokenEnv`) or
+ * a stdio server (`command` + optional `args` / `env` / `cwd`).
+ */
+export interface McpServerEntry {
+  // HTTP:
+  url?: string;
+  headers?: Record<string, string>;
+  /** `"oauth"` (the interactive flow) or the OAuth config object's fields. */
+  auth?: string | Record<string, string>;
+  bearerTokenEnv?: string;
+  // stdio:
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  // common:
+  disabled?: boolean;
+}
+
 /** The font settings (the settings UI's size slider + optional family overrides). */
 export interface FontSettings {
   sizePx: number;
@@ -341,6 +364,8 @@ export interface AppSettings {
   defaultTrustNewSpaces: boolean;
   defaultModel: string | null;
   providers: ProviderConfig[];
+  /** (ADR 0019) The user-managed MCP servers: `name → entry` (pi's entry shape). */
+  mcpServers: Record<string, McpServerEntry>;
   font: FontSettings;
   /** Per-model remembered thinking level (ADR 0015): `"<provider>/<id>"` → the last level the user set for that model. */
   defaultThinkingLevels: Record<string, string>;
@@ -476,6 +501,11 @@ export async function saveSettings(settings: AppSettings): Promise<void> {
 /** The effective catalog's models (the Default-model select + provider discovery status). `forceRefresh` = a provider id whose discovery cache is bypassed. */
 export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
   return invoke("list_models", { forceRefresh: forceRefresh ?? null });
+}
+
+/** Test ONE MCP server entry (the Settings page's Test action, ADR 0019): a one-shot bounded connect + `tools/list`. Resolves the tool count; rejects with the error text (a `needs-auth` / a network failure). */
+export async function testMcpServer(entry: McpServerEntry): Promise<number> {
+  return invoke("test_mcp_server", { entry });
 }
 
 // ---------------------------------------------------------------------------

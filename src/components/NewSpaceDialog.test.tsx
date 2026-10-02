@@ -13,6 +13,7 @@ const baseSettings: AppSettings = {
   defaultTrustNewSpaces: false,
   defaultModel: null,
   providers: [],
+  mcpServers: {},
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
   defaultThinkingLevels: {},
 };

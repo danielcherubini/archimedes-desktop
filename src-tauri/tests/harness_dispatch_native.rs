@@ -135,6 +135,7 @@ fn make_manager_with_trust(
         sudo: SudoDeps::default(),
         settle_timeout,
         trust_db,
+        config_dir: None,
     });
     manager
 }
@@ -1093,6 +1094,7 @@ fn agent_loop_getters_and_prepend_system() {
         None,
         SudoDeps::default(),
         RetryPolicy::new(),
+        None, // config_dir (no desktop MCP layer in the test)
     );
     // The getters (before configuration — the defaults).
     assert!(loop_.enabled_tools().is_none(), "None = all (the default)");
@@ -1520,6 +1522,7 @@ async fn dispatch_subagent_a_parent_turn_cancel_propagates_to_the_hanging_child(
         Some(manager),
         SudoDeps::default(),
         RetryPolicy::new(),
+        None, // config_dir (no desktop MCP layer in the test)
     );
     let _handle = tokio::spawn(loop_.run());
 

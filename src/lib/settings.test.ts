@@ -103,6 +103,7 @@ describe("loadAndApplySettings", () => {
       defaultTrustNewSpaces: false,
       defaultModel: null,
       providers: [],
+      mcpServers: {},
       font: { sizePx: 16, uiFamily: "Inter", codeFamily: null },
       defaultThinkingLevels: {},
     });

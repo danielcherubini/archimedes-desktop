@@ -6,7 +6,10 @@ import {
   EyeOffIcon,
   PackageIcon,
   PaletteIcon,
+  PencilIcon,
+  PlayIcon,
   RefreshCwIcon,
+  ServerIcon,
   Settings2Icon,
   TrashIcon,
 } from "lucide-react";
@@ -17,8 +20,10 @@ import {
   listAgents,
   listModels,
   saveSettings,
+  testMcpServer,
   type AgentEntryDto,
   type AppSettings,
+  type McpServerEntry,
   type ModelDto,
   type ProviderConfig,
 } from "@/lib/tauri";
@@ -34,7 +39,16 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -50,7 +64,7 @@ import {
   SettingsSidebarButton,
 } from "./primitives";
 
-type Section = "general" | "appearance" | "providers";
+type Section = "general" | "appearance" | "providers" | "mcp";
 
 /** A ZCode-style slug: lowercase alphanumeric + `-`. */
 function slugify(name: string): string {
@@ -207,6 +221,330 @@ function Field({ label, children }: { label: string; children: ReactNode }): Rea
   );
 }
 
+/**
+ * One MCP server row (ADR 0019 — the desktop's OWN entries only): the name
+ * + a type badge (HTTP / stdio) + a one-line summary (the url, or
+ * `command` + args) + the on-demand Test status + edit / remove. (pi's
+ * `mcp.json` entries stay in their own files — not listed here.)
+ */
+function McpRow({
+  name,
+  entry,
+  onEdit,
+  onRemove,
+}: {
+  name: string;
+  entry: McpServerEntry;
+  onEdit: () => void;
+  onRemove: () => void;
+}): ReactElement {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<
+    { count: number } | { error: string } | null
+  >(null);
+  const isHttp = entry.url !== undefined;
+  const kind = isHttp ? "HTTP" : "stdio";
+  const summary = isHttp
+    ? entry.url
+    : [entry.command ?? "", ...(entry.args ?? [])].join(" ").trim();
+  const runTest = async () => {
+    if (testing) return;
+    setTesting(true);
+    setResult(null);
+    try {
+      const count = await testMcpServer(entry);
+      setResult({ count });
+    } catch (e) {
+      setResult({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+  return (
+    <div className="border-t border-border px-4 py-3 first:border-t-0">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-ui-base font-medium text-foreground">
+              {name}
+            </span>
+            <SettingsBadge>{kind}</SettingsBadge>
+          </div>
+          <div className="truncate text-ui-sm text-foreground-subtle">{summary}</div>
+        </div>
+        {testing ? (
+          <SettingsBadge>testing…</SettingsBadge>
+        ) : result !== null ? (
+          "count" in result ? (
+            <SettingsBadge>{`${result.count} tools`}</SettingsBadge>
+          ) : (
+            <SettingsBadge title={result.error}>error</SettingsBadge>
+          )
+        ) : null}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Test MCP server ${name}`}
+          onClick={() => void runTest()}
+        >
+          <PlayIcon className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Edit MCP server ${name}`}
+          onClick={onEdit}
+        >
+          <PencilIcon className="size-3.5" />
+        </Button>
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={`Remove MCP server ${name}`}
+            >
+              <TrashIcon className="size-3.5" />
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Remove MCP server {name}?</AlertDialogTitle>
+              <AlertDialogDescription>
+                The server leaves the harness's `mcp` tool (its tools are no
+                longer callable). Existing sessions are unaffected.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={onRemove}>Remove</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
+    </div>
+  );
+}
+
+/** The add/edit form draft (the `McpDialog`'s local state — one field per input). */
+interface McpDraft {
+  name: string;
+  kind: "http" | "stdio";
+  url: string;
+  headers: string; // `KEY=VALUE` lines
+  bearerTokenEnv: string;
+  useOAuth: boolean;
+  command: string;
+  args: string; // one arg per line
+  env: string; // `KEY=VALUE` lines
+  cwd: string;
+}
+
+/** The `mcpServers` entry → draft (the form's pre-fill for the EDIT case). */
+function entryToDraft(name: string, entry: McpServerEntry): McpDraft {
+  const mapToLines = (m?: Record<string, string>): string =>
+    m ? Object.entries(m).map(([k, v]) => `${k}=${v}`).join("\n") : "";
+  return {
+    name,
+    kind: entry.url !== undefined ? "http" : "stdio",
+    url: entry.url ?? "",
+    headers: mapToLines(entry.headers),
+    bearerTokenEnv: entry.bearerTokenEnv ?? "",
+    useOAuth: entry.auth !== undefined,
+    command: entry.command ?? "",
+    args: (entry.args ?? []).join("\n"),
+    env: mapToLines(entry.env),
+    cwd: entry.cwd ?? "",
+  };
+}
+
+/** `KEY=VALUE` lines → a string map (`undefined` when empty; a line without
+ * a `=` is skipped — the form is best-effort, not a linter). */
+function linesToMap(lines: string): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  for (const line of lines.split("\n")) {
+    const idx = line.indexOf("=");
+    if (idx > 0) out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** draft → the `mcpServers` entry (the empty fields are OMITTED — a clean entry). */
+function draftToEntry(d: McpDraft): McpServerEntry {
+  const entry: McpServerEntry = {};
+  if (d.kind === "http") {
+    if (d.url.trim() !== "") entry.url = d.url.trim();
+    const headers = linesToMap(d.headers);
+    if (headers) entry.headers = headers;
+    if (d.bearerTokenEnv.trim() !== "")
+      entry.bearerTokenEnv = d.bearerTokenEnv.trim();
+    if (d.useOAuth) entry.auth = "oauth";
+  } else {
+    if (d.command.trim() !== "") entry.command = d.command.trim();
+    const args = d.args.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    if (args.length > 0) entry.args = args;
+    const env = linesToMap(d.env);
+    if (env) entry.env = env;
+    if (d.cwd.trim() !== "") entry.cwd = d.cwd.trim();
+  }
+  return entry;
+}
+
+/**
+ * The add/edit form (ADR 0019 — a structured form, no raw JSON): Name + a
+ * kind toggle (HTTP / stdio) + the kind's fields. Save = the immediate
+ * `saveSettings` (the provider pattern); the entry is pi's shape VERBATIM.
+ */
+function McpDialog({
+  initial,
+  onSave,
+  onClose,
+}: {
+  initial: McpDraft;
+  onSave: (name: string, entry: McpServerEntry) => void;
+  onClose: () => void;
+}): ReactElement {
+  const [draft, setDraft] = useState(initial);
+  const set = (patch: Partial<McpDraft>) =>
+    setDraft((d) => ({ ...d, ...patch }));
+  const valid =
+    draft.name.trim() !== "" &&
+    (draft.kind === "http"
+      ? draft.url.trim() !== ""
+      : draft.command.trim() !== "");
+  return (
+    <Dialog open onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            {initial.name === ""
+              ? "Add MCP server"
+              : `Edit MCP server ${initial.name}`}
+          </DialogTitle>
+          <DialogDescription>
+            Stored in the desktop's settings.json (pi's entry shape — it
+            copy-pastes to a mcp.json). Merged with pi's mcp.json files at
+            global precedence (project &gt; desktop &gt; pi-global).
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <Field label="Name">
+            <Input
+              value={draft.name}
+              placeholder="Server name"
+              aria-label="Server name"
+              onChange={(e) => set({ name: e.currentTarget.value })}
+            />
+          </Field>
+          <Field label="Type">
+            <Select
+              value={draft.kind}
+              onValueChange={(v) => set({ kind: v as McpDraft["kind"] })}
+            >
+              <SelectTrigger aria-label="Type" className="w-56">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="http">HTTP (streamable)</SelectItem>
+                <SelectItem value="stdio">stdio (a spawned process)</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          {draft.kind === "http" ? (
+            <>
+              <Field label="URL">
+                <Input
+                  value={draft.url}
+                  placeholder="https://example.com/mcp"
+                  aria-label="URL"
+                  onChange={(e) => set({ url: e.currentTarget.value })}
+                />
+              </Field>
+              <Field label="Headers (one KEY=VALUE per line)">
+                <Textarea
+                  value={draft.headers}
+                  placeholder="Authorization=Bearer $TOKEN"
+                  aria-label="Headers"
+                  rows={2}
+                  onChange={(e) => set({ headers: e.currentTarget.value })}
+                />
+              </Field>
+              <Field label="Bearer token env var">
+                <Input
+                  value={draft.bearerTokenEnv}
+                  placeholder="MY_TOKEN"
+                  aria-label="Bearer token env var"
+                  onChange={(e) => set({ bearerTokenEnv: e.currentTarget.value })}
+                />
+              </Field>
+              <div>
+                <div className="mb-1 text-ui-sm text-foreground-subtle">
+                  OAuth (interactive flow)
+                </div>
+                <Switch
+                  checked={draft.useOAuth}
+                  aria-label="OAuth (interactive flow)"
+                  onCheckedChange={(c) => set({ useOAuth: c })}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <Field label="Command">
+                <Input
+                  value={draft.command}
+                  placeholder="npx"
+                  aria-label="Command"
+                  onChange={(e) => set({ command: e.currentTarget.value })}
+                />
+              </Field>
+              <Field label="Args (one per line)">
+                <Textarea
+                  value={draft.args}
+                  placeholder={"-y\nexample-mcp"}
+                  aria-label="Args"
+                  rows={2}
+                  onChange={(e) => set({ args: e.currentTarget.value })}
+                />
+              </Field>
+              <Field label="Env (one KEY=VALUE per line)">
+                <Textarea
+                  value={draft.env}
+                  placeholder="KEY=value"
+                  aria-label="Env"
+                  rows={2}
+                  onChange={(e) => set({ env: e.currentTarget.value })}
+                />
+              </Field>
+              <Field label="Working dir">
+                <Input
+                  value={draft.cwd}
+                  placeholder="/home/user/project"
+                  aria-label="Working dir"
+                  onChange={(e) => set({ cwd: e.currentTarget.value })}
+                />
+              </Field>
+            </>
+          )}
+        </div>
+        <DialogFooter>
+        <Button variant="ghost" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button
+          disabled={!valid}
+          onClick={() => onSave(draft.name.trim(), draftToEntry(draft))}
+        >
+          Save
+        </Button>
+      </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 /**
  * One provider row: a labeled 2×2 grid (Name / Base URL / API key (masked,
@@ -338,7 +676,7 @@ function ProviderRow({
 /**
  * The settings page (the approved ZCode-parity design, spec §1/§4): a full
  * content-area view — a 268px section sidebar (back button + General /
- * Appearance / Providers) + the active section's content. Immediate save:
+ * Appearance / Providers / MCP) + the active section's content. Immediate save:
  * a control change → `saveSettings` with the COMPLETE document (text
  * fields commit on blur/Enter; no save button, no dirty state).
  */
@@ -347,6 +685,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const [section, setSection] = useState<Section>("general");
   const [agents, setAgents] = useState<AgentEntryDto[]>([]);
   const [models, setModels] = useState<ModelDto[]>([]);
+  // The MCP add/edit dialog draft (`null` = closed — a fresh draft per open
+  // so a Cancel never leaks the draft into the next open).
+  const [mcpDialog, setMcpDialog] = useState<McpDraft | null>(null);
   // The theme cleanup is HELD IN A REF and replaced on each apply —
   // discarding it would leak a `matchMedia` listener per control change
   // (`applySettingsToDocument` subscribes one for "system" themes).
@@ -445,6 +786,20 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const removeProvider = (id: string) => {
     if (settings === null) return;
     update({ providers: settings.providers.filter((p) => p.id !== id) });
+  };
+
+  /** Save an MCP server (the dialog's Save — immediate save, the provider pattern). */
+  const saveMcpServer = (name: string, entry: McpServerEntry) => {
+    if (settings === null) return;
+    update({ mcpServers: { ...settings.mcpServers, [name]: entry } });
+    setMcpDialog(null);
+  };
+
+  const removeMcpServer = (name: string) => {
+    if (settings === null) return;
+    const mcpServers = { ...settings.mcpServers };
+    delete mcpServers[name];
+    update({ mcpServers });
   };
 
   const refreshProvider = (id: string): Promise<void> =>
@@ -638,6 +993,54 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     </div>
   );
 
+  // (ADR 0019) The MCP section: the desktop's OWN `mcpServers` entries
+  // (pi's `mcp.json` entries stay in their own files — not listed here).
+  const mcpSection = settings === null ? null : (
+    <div className="space-y-3">
+      <SettingsGroupCard>
+        {Object.keys(settings.mcpServers).length === 0 ? (
+          <div className="px-4 py-3 text-ui-base text-foreground-subtle">
+            No MCP servers yet — add one to connect an MCP server.
+          </div>
+        ) : (
+          Object.entries(settings.mcpServers).map(([name, entry]) => (
+            <McpRow
+              key={name}
+              name={name}
+              entry={entry}
+              onEdit={() => setMcpDialog(entryToDraft(name, entry))}
+              onRemove={() => removeMcpServer(name)}
+            />
+          ))
+        )}
+      </SettingsGroupCard>
+      <Button
+        onClick={() =>
+          setMcpDialog({
+            name: "",
+            kind: "http",
+            url: "",
+            headers: "",
+            bearerTokenEnv: "",
+            useOAuth: false,
+            command: "",
+            args: "",
+            env: "",
+            cwd: "",
+          })
+        }
+      >
+        Add server
+      </Button>
+      {mcpDialog !== null && (
+        <McpDialog
+          initial={mcpDialog}
+          onSave={saveMcpServer}
+          onClose={() => setMcpDialog(null)}
+        />
+      )}
+    </div>
+  );
 
   return (
     <div className="grid h-full grid-cols-[268px_minmax(0,1fr)]">
@@ -676,6 +1079,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
                 active={section === "providers"}
                 onClick={() => setSection("providers")}
               />
+              <SettingsSidebarButton
+                icon={ServerIcon}
+                label="MCP"
+                active={section === "mcp"}
+                onClick={() => setSection("mcp")}
+              />
             </div>
           </nav>
         </div>
@@ -686,7 +1095,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
             ? generalSection
             : section === "appearance"
               ? appearanceSection
-              : providersSection}
+              : section === "providers"
+                ? providersSection
+                : mcpSection}
         </div>
       </section>
     </div>

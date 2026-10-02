@@ -184,6 +184,7 @@ async fn build_harness(
         None, // subagent (not exercised)
         SudoDeps::default(),
         retry,
+        None, // config_dir (no desktop MCP layer in the test)
     );
     let task = tokio::spawn(loop_.run());
     (

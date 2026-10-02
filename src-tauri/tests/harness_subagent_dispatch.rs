@@ -115,6 +115,7 @@ fn make_manager(
         sudo: SudoDeps::default(),
         settle_timeout,
         trust_db: None,
+        config_dir: None,
     });
     manager
 }
@@ -175,6 +176,7 @@ async fn build_harness(
         subagent_manager,
         SudoDeps::default(),
         RetryPolicy::default(),
+        None, // config_dir (no desktop MCP layer in the test)
     );
     let task = tokio::spawn(loop_.run());
     // Reap the task on drop (the tests don't await it — the `events`

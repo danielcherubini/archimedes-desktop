@@ -80,6 +80,13 @@ pub struct Settings {
     /// User-managed providers (default `[]`).
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// (ADR 0019) The user-managed MCP servers: `name → entry` in pi's
+    /// `mcpServers` entry shape VERBATIM (an entry copy-pastes between the
+    /// two files). Merged into the harness's effective set at global
+    /// precedence (project > desktop > pi-global). `#[serde(default)]` —
+    /// a pre-feature file parses to `{}` (no migration).
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, Value>,
     /// Font settings.
     #[serde(default)]
     pub font: FontSettings,
@@ -99,6 +106,7 @@ impl Default for Settings {
             default_trust_new_spaces: false,
             default_model: None,
             providers: Vec::new(),
+            mcp_servers: HashMap::new(),
             font: FontSettings::default(),
             default_thinking_levels: HashMap::new(),
         }
@@ -233,6 +241,21 @@ impl From<&Model> for ModelDto {
     }
 }
 
+/// Test ONE MCP server definition (the Settings page's Test action, ADR
+/// 0019): a one-shot bounded connect + `tools/list`. `Ok` = the tool
+/// count; `Err` = the error text (surfaced verbatim in the row — a
+/// `needs-auth` / a network failure). The entry is the `settings.json`
+/// `mcpServers` entry VERBATIM (pi's shape — classified, not re-shaped).
+#[tauri::command]
+pub async fn test_mcp_server(entry: Value) -> Result<u32, String> {
+    let def = crate::agent::mcp::types::classify_server(&entry)
+        .ok_or_else(|| "invalid MCP server entry (need a `url` or a `command`)".to_string())?;
+    let timeout = std::time::Duration::from_secs(10);
+    crate::agent::mcp::manager::test_server(&def, Path::new("."), timeout)
+        .await
+        .map(|n| n as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +282,65 @@ mod tests {
         assert!(!settings.default_trust_new_spaces);
         assert_eq!(settings.default_model, None);
         assert!(settings.providers.is_empty());
+        assert!(settings.mcp_servers.is_empty());
         assert_eq!(settings.font, FontSettings::default());
+    }
+
+    #[test]
+    fn test_mcp_server_an_invalid_entry_is_an_error() {
+        // (ADR 0019) The Test action on a malformed entry (neither a `url`
+        // nor a `command`) is an error, not a connect attempt.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = rt
+            .block_on(test_mcp_server(
+                serde_json::json!({ "headers": { "a": "b" } }),
+            ))
+            .expect_err("a malformed entry is an error");
+        assert!(
+            result.contains("invalid"),
+            "the error names the problem: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_mcp_server_a_valid_stdio_entry_reports_the_tool_count() {
+        // (ADR 0019) A valid stdio entry (the fake binary — three canned
+        // tools) round-trips the count through the command.
+        let bin = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_mcp_stdio"
+        ));
+        let count = test_mcp_server(serde_json::json!({ "command": bin.display().to_string() }))
+            .await
+            .expect("the fake server answers");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn mcp_servers_round_trips_in_camel_case() {
+        // (ADR 0019) The `mcpServers` field round-trips the pi entry shape
+        // VERBATIM (a `Value` — the shape is pi's, not a desktop struct).
+        let file = r#"{ "theme": "dark", "mcpServers": { "tama": { "url": "https://tama/mcp", "headers": { "Authorization": "Bearer k" } }, "local": { "command": "npx", "args": ["-y", "x-mcp"] } } }"#;
+        let settings: Settings = serde_json::from_str(file).unwrap();
+        assert_eq!(settings.mcp_servers.len(), 2);
+        assert_eq!(
+            settings.mcp_servers["tama"],
+            serde_json::json!({ "url": "https://tama/mcp", "headers": { "Authorization": "Bearer k" } })
+        );
+        assert_eq!(
+            settings.mcp_servers["local"],
+            serde_json::json!({ "command": "npx", "args": ["-y", "x-mcp"] })
+        );
+        // camelCase on the wire (a populated map serializes the field).
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"mcpServers\""), "camelCase key: {json}");
+        assert!(
+            json.contains("https://tama/mcp"),
+            "the entry round-trips: {json}"
+        );
     }
 
     #[test]
@@ -317,6 +398,16 @@ mod tests {
                 ui_family: Some("Inter".to_string()),
                 code_family: Some("JetBrains Mono".to_string()),
             },
+            mcp_servers: std::collections::HashMap::from([
+                (
+                    "tama".to_string(),
+                    serde_json::json!({ "url": "https://tama/mcp" }),
+                ),
+                (
+                    "local".to_string(),
+                    serde_json::json!({ "command": "npx", "args": ["-y", "x-mcp"] }),
+                ),
+            ]),
             default_thinking_levels: std::collections::HashMap::from([(
                 "a/b".to_string(),
                 "xhigh".to_string(),
@@ -328,6 +419,7 @@ mod tests {
             "\"defaultTrustNewSpaces\"",
             "\"defaultModel\"",
             "\"providers\"",
+            "\"mcpServers\"",
             "\"font\"",
             "\"sizePx\"",
             "\"defaultThinkingLevels\"",

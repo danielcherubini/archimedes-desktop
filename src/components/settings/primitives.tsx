@@ -70,10 +70,20 @@ export function SettingsRow({
   );
 }
 
-/** A subtle inline badge (the ZCode `SettingsBadge` port). */
-export function SettingsBadge({ children }: { children: ReactNode }): ReactElement {
+/** A subtle inline badge (the ZCode `SettingsBadge` port; an optional
+ * `title` for the error tooltips). */
+export function SettingsBadge({
+  children,
+  title,
+}: {
+  children: ReactNode;
+  title?: string;
+}): ReactElement {
   return (
-    <span className="rounded-md bg-surface px-2.5 py-1 text-ui-base font-medium text-foreground-subtle">
+    <span
+      title={title}
+      className="rounded-md bg-surface px-2.5 py-1 text-ui-base font-medium text-foreground-subtle"
+    >
       {children}
     </span>
   );

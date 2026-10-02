@@ -1810,6 +1810,7 @@ impl SessionManager {
                 },
                 settle_timeout: self.driver.settle_timeout,
                 trust_db: self.driver.trust_db.clone(),
+                config_dir: Some(self.config_dir.clone()),
             });
         }
     }
@@ -2085,6 +2086,7 @@ impl SessionManager {
                 sudo_password: self.driver.sudo_password.clone(),
             },
             RetryPolicy::new(),
+            Some(self.config_dir.clone()),
         );
         // The harness config's `enabled_tools` (`[]` = all — finding
         // 13b: a disabled tool is a tool-result error, NOT executed).

@@ -5,11 +5,13 @@ import {
   getSettings,
   listModels,
   saveSettings,
+  testMcpServer,
   type AppSettings,
 } from "@/lib/tauri";
 
 // The page's single source of truth (the `getSettings` fixture): a full
-// `AppSettings` document — dark theme, font defaults, one provider.
+// `AppSettings` document — dark theme, font defaults, one provider, one
+// MCP server.
 const baseSettings: AppSettings = {
   theme: "dark",
   paneLayout: {},
@@ -19,6 +21,9 @@ const baseSettings: AppSettings = {
   providers: [
     { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
   ],
+  mcpServers: {
+    tama: { url: "https://tama/mcp" },
+  },
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
   defaultThinkingLevels: {},
 };
@@ -38,6 +43,9 @@ vi.mock("../../lib/tauri", async () => {
       providers: [
         { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
       ],
+      mcpServers: {
+        tama: { url: "https://tama/mcp" },
+      },
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
     }),
@@ -56,6 +64,9 @@ vi.mock("../../lib/tauri", async () => {
       },
     ]),
     saveSettings: vi.fn().mockResolvedValue(undefined),
+    // The one-shot MCP test (ADR 0019): 0 tools by default (the tests
+    // override per case).
+    testMcpServer: vi.fn().mockResolvedValue(0),
   };
 });
 
@@ -89,11 +100,13 @@ async function loaded(): Promise<void> {
 }
 
 /** Navigate to a section (click its sidebar button) and wait for it. */
-async function go(section: "Appearance" | "Providers"): Promise<void> {
+async function go(section: "Appearance" | "Providers" | "MCP"): Promise<void> {
   fireEvent.click(screen.getByRole("button", { name: section }));
   if (section === "Appearance") await screen.findByText("Theme");
-  // The "Add provider" button is always in the Providers section (below the card).
-  else await screen.findByRole("button", { name: "Add provider" });
+  else if (section === "Providers")
+    await screen.findByRole("button", { name: "Add provider" });
+  // The "Add server" button is always in the MCP section (below the card).
+  else await screen.findByRole("button", { name: "Add server" });
 }
 
 describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
@@ -301,5 +314,162 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     // The `{ ...settings, ...patch }` round-trip loses no field — the
     // per-model memory rides along untouched (no new UI, ADR 0015).
     expect(saved.defaultThinkingLevels).toEqual({ "tama/Qwen3.8": "xhigh" });
+  });
+});
+
+describe("SettingsPage (the MCP section — ADR 0019)", () => {
+  it("the_mcp_section_lists_the_servers_with_their_actions", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    // The server row: the name + a type badge (HTTP) + a one-line summary
+    // (the url) + the on-demand Test / Edit / Remove actions.
+    expect(await screen.findByText("tama")).toBeTruthy();
+    expect(screen.getByText("HTTP")).toBeTruthy();
+    expect(screen.getByText("https://tama/mcp")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add server" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Test MCP server tama" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Edit MCP server tama" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove MCP server tama" }),
+    ).toBeTruthy();
+  });
+
+  it("add_mcp_http_server_saves_the_entry_in_pi_shape", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    // The structured form (HTTP is the default kind).
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    const nameInput = screen.getByPlaceholderText("Server name");
+    fireEvent.change(nameInput, { target: { value: "My Gateway" } });
+    const urlInput = screen.getByPlaceholderText("https://example.com/mcp");
+    fireEvent.change(urlInput, { target: { value: "https://gw.example.com/mcp" } });
+    const headers = screen.getByPlaceholderText("Authorization=Bearer $TOKEN");
+    fireEvent.change(headers, { target: { value: "Authorization=Bearer k" } });
+    const bearer = screen.getByPlaceholderText("MY_TOKEN");
+    fireEvent.change(bearer, { target: { value: "GW_TOKEN" } });
+    fireEvent.click(
+      screen.getByRole("switch", { name: "OAuth (interactive flow)" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    // The entry is pi's shape VERBATIM (an entry copy-pastes to mcp.json).
+    expect(saved.mcpServers["My Gateway"]).toEqual({
+      url: "https://gw.example.com/mcp",
+      headers: { Authorization: "Bearer k" },
+      bearerTokenEnv: "GW_TOKEN",
+      auth: "oauth",
+    });
+    // The new row appears + the dialog closed.
+    expect(await screen.findByText("My Gateway")).toBeTruthy();
+  });
+
+  it("add_mcp_stdio_server_saves_the_entry", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    await screen.findByRole("dialog");
+    // Switch to stdio (the command / args / env / cwd fields appear).
+    const kindTrigger = screen.getByRole("combobox", { name: "Type" });
+    fireEvent.click(kindTrigger);
+    fireEvent.click(
+      await screen.findByRole("option", { name: "stdio (a spawned process)" }),
+    );
+    const nameInput = screen.getByPlaceholderText("Server name");
+    fireEvent.change(nameInput, { target: { value: "Local" } });
+    const command = screen.getByPlaceholderText("npx");
+    fireEvent.change(command, { target: { value: "npx" } });
+    // The args placeholder is multi-line (one arg per line) — the query is
+    // the NORMALIZED form (a space; `getByPlaceholderText` normalizes the
+    // element's text but not the query).
+    const args = screen.getByPlaceholderText("-y example-mcp");
+    fireEvent.change(args, { target: { value: "-y\nexample-mcp" } });
+    const env = screen.getByPlaceholderText("KEY=value");
+    fireEvent.change(env, { target: { value: "MY_VAR=1" } });
+    const cwd = screen.getByPlaceholderText("/home/user/project");
+    fireEvent.change(cwd, { target: { value: "/tmp/proj" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.mcpServers["Local"]).toEqual({
+      command: "npx",
+      args: ["-y", "example-mcp"],
+      env: { MY_VAR: "1" },
+      cwd: "/tmp/proj",
+    });
+  });
+
+  it("edit_mcp_server_pre_fills_the_form_and_updates_the_entry", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    await screen.findByText("tama");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit MCP server tama" }),
+    );
+    // The form is pre-filled (the entry's values).
+    expect(await screen.findByDisplayValue("https://tama/mcp")).toBeTruthy();
+    fireEvent.change(screen.getByDisplayValue("https://tama/mcp"), {
+      target: { value: "https://tama2/mcp" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.mcpServers["tama"]).toEqual({ url: "https://tama2/mcp" });
+  });
+
+  it("remove_mcp_server_confirms_then_saves", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    await screen.findByText("tama");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove MCP server tama" }),
+    );
+    // The confirm dialog (the server name in the copy).
+    expect(await screen.findByRole("alertdialog")).toBeTruthy();
+    expect(screen.getByText("Remove MCP server tama?")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ mcpServers: {} }),
+      ),
+    );
+  });
+
+  it("test_mcp_server_runs_the_one_shot_test_and_reports_the_count", async () => {
+    vi.mocked(testMcpServer).mockResolvedValueOnce(3);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    await screen.findByText("tama");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Test MCP server tama" }),
+    );
+    // The one-shot test (the entry as saved) + the result badge.
+    expect(await screen.findByText("3 tools")).toBeTruthy();
+    expect(testMcpServer).toHaveBeenCalledWith({ url: "https://tama/mcp" });
+  });
+
+  it("test_mcp_server_surfaces_the_error", async () => {
+    vi.mocked(testMcpServer).mockRejectedValueOnce("connect timed out");
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("MCP");
+    await screen.findByText("tama");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Test MCP server tama" }),
+    );
+    // The error badge (the message in the tooltip).
+    const badge = await screen.findByText("error");
+    expect(badge).toBeTruthy();
   });
 });
