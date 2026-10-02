@@ -40,6 +40,10 @@ _Avoid_: Worker, delegated task, child session, background session
 A user-authored markdown file (flat, in a standard agents dir) with YAML frontmatter (`name`, `description`, `model`, `thinking`, `tools`) + a system-prompt body — discovered by the desktop like a **Skill** (space-level `.agents/agents` + `.pi/agents` walked to the repo root; user-level `~/.agents/agents` + `~/.pi/agent/agents`). Selectable in a **Subagent session** via the `subagent` tool's `agentName` (layered under explicit params — ADR 0020); advertised by the `list_agents` tool. Distinct from **Agent** (the conversation partner) — an Agent definition is a user-authored prompt + config, not a runtime.
 _Avoid_: Agent config, agent preset, subagent preset
 
+**Subagent model override**:
+A per-agent model override in the app's settings (`settings.json` `subagentModels`: agent name → model key) — layered between the explicit `subagent` tool `model` param and the **Agent definition**'s frontmatter (explicit > override > frontmatter > parent model — ADR 0023); a stale override degrades to the frontmatter layer (never fails the dispatch); the agent's markdown file is never modified.
+_Avoid_: Agent config, model preset, subagent default model
+
 **Permission prompt**:
 The Client's UI response to the native harness's in-process **permission gate** (the `permission-request` event before every mutating tool — ADR 0010) — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
