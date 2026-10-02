@@ -37,7 +37,7 @@ A stored **Session** hidden from its **Space** group by an explicit user action 
 _Avoid_: Paused session, closed session, hidden session
 
 **Subagent session**:
-A **Session** the desktop spawns to run a task delegated by the main agent — either a pi RPC session (bridge mode) or an in-process native **AgentLoop** child (native-native: the parent's model/tools minus `subagent`, plus optional `launch` overrides; its `agentName` is a free-form UI label only, ADR 0017). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. In bridge mode the subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime._
+A **Session** the desktop spawns to run a task delegated by the main agent — either a pi RPC session (bridge mode) or an in-process native **AgentLoop** child (native-native: the parent's model/tools minus `subagent` and `list_agents`, plus optional `launch` overrides; its `agentName` resolves against discovered **Agent definitions** — ADR 0020; an unknown/omitted name is a config-less label-only dispatch). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. In bridge mode the subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime._
 _Avoid_: Worker, delegated task, child session, background session
 
 **Suite tool**:
@@ -47,6 +47,10 @@ _Avoid_: Agent tool, delegated tool, built-in tool
 **Agent registry**:
 The Client's list of known agents — each entry is a spawn command (program + args) plus metadata (name, capabilities, defaults). v1 ships with pi only.
 _Avoid_: Agent list, agent config, agent profile
+
+**Agent definition**:
+A user-authored markdown file (flat, in a standard agents dir) with YAML frontmatter (`name`, `description`, `model`, `thinking`, `tools`) + a system-prompt body — discovered by the desktop like a **Skill** (space-level `.agents/agents` + `.pi/agents` walked to the repo root; user-level `~/.agents/agents` + `~/.pi/agent/agents`). Selectable in a **Subagent session** via the `subagent` tool's `agentName` (layered under explicit params — ADR 0020); advertised by the `list_agents` tool. Distinct from **Agent** (the conversation partner) and **Agent registry** (the Client's spawn-command list).
+_Avoid_: Agent config, agent preset, subagent preset
 
 **Permission prompt**:
 The Client's UI response to a tool-call permission gate from an agent (the bundled gate extension's `tool_call` hook → `ctx.ui.confirm` → the RPC `extension_ui_request` subprotocol, ADR 0009) — the user approves or denies a tool call.

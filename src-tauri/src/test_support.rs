@@ -5,6 +5,19 @@
 use crate::agent::RpcError;
 use std::time::Duration;
 
+/// The shared lock serializing the HOME-mutating tests (the parallel test
+/// harness runs all module tests concurrently; a `HOME` read by one test
+/// mid-mutation by another would see the wrong value).
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the env-mutation lock (poison-tolerant — a sibling test
+/// panicking while holding it must not turn this test's failure into an
+/// opaque `PoisonError` panic; see the `ENV_LOCK` docs).
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    std::sync::Mutex::lock(&ENV_LOCK).unwrap_or_else(|p| p.into_inner())
+}
+
 /// A helper to run an async attempt function with retries on spawn-class
 /// errors.
 ///

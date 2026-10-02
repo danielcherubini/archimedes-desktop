@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-01
-superseded-by:
+superseded-by: 0020-native-subagent-agent-definitions.md
 ---
 
 # The desktop authors the native session's system prompt; subagents are nameless
