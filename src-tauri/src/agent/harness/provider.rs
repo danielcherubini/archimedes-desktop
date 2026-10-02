@@ -635,10 +635,25 @@ impl Provider for OpenAiCompatibleProvider {
 /// BYTES on the body — a stalled provider errors `Retryable`, a healthy slow
 /// stream that dribbles bytes keeps flowing). Extracted so the tests can
 /// inject a short `read_timeout` (the production 5 min is too slow to test).
+///
+/// The client also identifies itself: a `User-Agent` header ([`USER_AGENT`])
+/// so the provider's logs can attribute the traffic to the app.
+/// The `User-Agent` the model calls identify with (`archimedes/<version>` —
+/// the harness is the desktop's own OpenAI-compatible client; `reqwest` sends
+/// NO `User-Agent` by default, so without this the traffic is unattributable
+/// in the provider's logs).
+pub const USER_AGENT: &str = concat!("archimedes/", env!("CARGO_PKG_VERSION"));
+
 fn build_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
+        .default_headers(headers)
         .build()
         .expect("the reqwest client builds (fixed connect + read timeouts)")
 }
@@ -1354,5 +1369,66 @@ mod tests {
             "the silent stream errors — the `read_timeout` fired"
         );
         server.abort(); // the server holds the connection open (the sleep)
+    }
+
+    /// The client identifies itself: the request carries a `User-Agent`
+    /// header (`archimedes/<version>`) so the provider's logs can
+    /// attribute the traffic to the app (the harness is the desktop's own
+    /// OpenAI-compatible client — `reqwest` sends NO `User-Agent` by
+    /// default, so without this the traffic is unattributable).
+    #[tokio::test]
+    async fn the_request_sends_a_user_agent_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A raw server that CAPTURES the request headers (the `reqwest`
+        // response is complete — `data: [DONE]` — so the client closes
+        // the connection; the captured bytes go to the test via the
+        // channel).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            let _ = tx.send(data).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: [DONE]\r\n\r\n",
+                )
+                .await;
+            // Hold the socket open until the test is done (the response
+            // body is complete — the client closes the connection).
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = build_client(Duration::from_secs(30), Duration::from_millis(200));
+        let _resp = client
+            .post(format!("http://{addr}/chat/completions"))
+            .send()
+            .await
+            .expect("the request sends");
+        let raw = rx.recv().await.expect("the server captured the request");
+        let request = String::from_utf8(raw).expect("the request is valid UTF-8");
+        let header = request
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("user-agent:"))
+            .expect("the request carries a User-Agent header")
+            .to_lowercase();
+        assert_eq!(
+            header,
+            format!("user-agent: archimedes/{}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
