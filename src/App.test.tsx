@@ -17,28 +17,28 @@ vi.mock("./lib/tauri", async () => {
     listSessions: vi.fn().mockResolvedValue([]),
     listSpaces: vi.fn().mockResolvedValue([]),
     listSkills: vi.fn().mockResolvedValue([]),
-    // `SettingsPage`'s data deps: the settings document + the agent/model
-    // catalogs.
+    // `SettingsPage`'s data deps: the settings document + the model catalog.
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",
       paneLayout: {},
-      defaultAgent: null,
       defaultTrustNewSpaces: false,
       defaultModel: null,
+      defaultThinkingLevel: null,
+      enabledTools: [],
       providers: [],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
-    listAgents: vi.fn().mockResolvedValue([]),
     listModels: vi.fn().mockResolvedValue([]),
+    listTools: vi.fn().mockResolvedValue([]),
     // Every `listen*` registration resolves a no-op unlisten.
     listenSessionUpdate: vi.fn().mockResolvedValue(() => {}),
     listenSessionClosed: vi.fn().mockResolvedValue(() => {}),
     listenPermissionRequest: vi.fn().mockResolvedValue(() => {}),
-    listenBridgeRequest: vi.fn().mockResolvedValue(() => {}),
-    listenBridgeRequestClose: vi.fn().mockResolvedValue(() => {}),
-    listenBridgeEvent: vi.fn().mockResolvedValue(() => {}),
+    listenInteractiveRequest: vi.fn().mockResolvedValue(() => {}),
+    listenInteractiveRequestClose: vi.fn().mockResolvedValue(() => {}),
+    listenInteractiveEvent: vi.fn().mockResolvedValue(() => {}),
     listenSubagentSessionStarted: vi.fn().mockResolvedValue(() => {}),
     listenSubagentClosed: vi.fn().mockResolvedValue(() => {}),
   };

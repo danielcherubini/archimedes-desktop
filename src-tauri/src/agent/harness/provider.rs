@@ -582,7 +582,7 @@ impl Provider for OpenAiCompatibleProvider {
         // finished" — it kills HEALTHY slow streams too (a legitimately
         // long streaming call — e.g. a 4k-token compaction summary at
         // 5-10 tok/s on a slow local OpenAI-compatible endpoint, the
-        // harness's target deployment per ADR 0012 ≈ 7-14 min — is cut
+        // harness's target deployment per ADR 0014 ≈ 7-14 min — is cut
         // mid-stream → `Retryable` → re-issued from scratch up to 5× →
         // compaction/turn permanently fails). Instead:
         // - `connect_timeout`: a generous CONNECT bound (the TCP connect +

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import {
-  listenBridgeEvent,
-  listenBridgeRequest,
-  listenBridgeRequestClose,
+  listenInteractiveEvent,
+  listenInteractiveRequest,
+  listenInteractiveRequestClose,
   listenPermissionRequest,
   listenSessionClosed,
   listenSessionUpdate,
@@ -14,7 +14,7 @@ import {
 import { createBatchedSessionUpdate } from "./lib/batchSessionUpdates";
 import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
-import { useBridge } from "./store/bridge";
+import { useInteractive } from "./store/interactive";
 import { useSubagents } from "./store/subagents";
 import SpacesList from "./components/SpacesList";
 import ChatStream from "./components/ChatStream";
@@ -48,9 +48,9 @@ function App() {
     );
     unlistenPromises.push(
       listenSessionClosed((payload) => {
-        // Dismiss the session's bridge state (its pending prompts are
+        // Dismiss the session's interactive state (its pending prompts are
         // drained as cancelled server-side; the password is never kept).
-        useBridge.getState().dismissSession(payload.sessionId);
+        useInteractive.getState().dismissSession(payload.sessionId);
         useSessions
           .getState()
           .handleSessionClosed(payload.sessionId, payload.reason);
@@ -68,23 +68,25 @@ function App() {
       ),
     );
     unlistenPromises.push(
-      listenBridgeRequest((payload) =>
-        useBridge.getState().addRequest(payload.sessionId, payload),
+      listenInteractiveRequest((payload) =>
+        useInteractive.getState().addRequest(payload.sessionId, payload),
       ),
     );
     // A DROPPED `sudo_exec` sub-prompt (a turn cancel skips the flow's
     // exit-path cleanup) closes its modal (the Rust `SudoPromptCleanup`
-    // drop guard emits `bridge-request-close` — pre-fix the modal stayed
-    // open with no pending response, and a late answer got `Ok(true)` with
-    // the send silently failing).
+    // drop guard emits `interactive-request-close` — pre-fix the modal
+    // stayed open with no pending response, and a late answer got
+    // `Ok(true)` with the send silently failing).
     unlistenPromises.push(
-      listenBridgeRequestClose((payload) =>
-        useBridge.getState().removeRequest(payload.sessionId, payload.requestId),
+      listenInteractiveRequestClose((payload) =>
+        useInteractive
+          .getState()
+          .removeRequest(payload.sessionId, payload.requestId),
       ),
     );
     unlistenPromises.push(
-      listenBridgeEvent((payload) => {
-        const s = useBridge.getState();
+      listenInteractiveEvent((payload) => {
+        const s = useInteractive.getState();
         // Wire names: the bus `COST_UPDATE` maps to `cost_update` (the
         // `archimedes:`-prefix-strip lookup), NOT `cost`.
         if (payload.event === "todos_update") {
@@ -103,7 +105,7 @@ function App() {
     // Subagent sessions (Task 4): the `subagent-session-started` /
     // `subagent-closed` events feed the subagents store (the panel's
     // authority for subagent STATUS + the metrics SNAPSHOT — the existing
-    // `listenSessionClosed` handler above stays as-is; its bridge-store
+    // `listenSessionClosed` handler above stays as-is; its interactive-store
     // deletion is exactly why the metrics live in the snapshot).
     unlistenPromises.push(
       listenSubagentSessionStarted((p) =>

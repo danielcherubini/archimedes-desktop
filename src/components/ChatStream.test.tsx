@@ -11,7 +11,7 @@ import {
 } from "../lib/tauri";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import { useSessions } from "../store/sessions";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSubagents } from "../store/subagents";
 import { getSidePaneCollapsed, setSidePaneCollapsed } from "../lib/sidePaneState";
@@ -52,10 +52,8 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    listAgents: vi.fn().mockResolvedValue([{ id: "a1", name: "Agent" }]),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "s2",
-      agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: {},
       archived: false,
@@ -64,13 +62,12 @@ vi.mock("../lib/tauri", async () => {
     sendPrompt: vi.fn().mockResolvedValue("end_turn"),
     resumeSession: vi.fn().mockResolvedValue({
       sessionId: "s1",
-      agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true, promptCapabilities: { image: true } },
       archived: false,
     }),
     respondPermission: vi.fn().mockResolvedValue(undefined),
-    respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
     readClipboardImage: vi.fn().mockResolvedValue(null),
     cancelSession: vi.fn().mockResolvedValue(undefined),
@@ -103,7 +100,7 @@ function seedLiveSession(): void {
   useSessions.setState({
     activeSessionId: "s1",
     sessions: [
-      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
+      { sessionId: "s1", cwd: "/home/u/proj", capabilities: {}, archived: false },
     ],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [],
@@ -128,7 +125,7 @@ function seedStoredSession(
     sessions: [],
     spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [
-      { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities, archived: false },
+      { sessionId: "s1", cwd: "/home/u/proj", capabilities, archived: false },
     ],
     messages: { s1: [] },
     inTurn: {},
@@ -152,7 +149,7 @@ function seedArchivedSession(
     spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
     historySessions: [],
     archivedSessions: [
-      { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities, archived: true },
+      { sessionId: "s9", cwd: "/home/u/arch", capabilities, archived: true },
     ],
     messages: { s9: [] },
     inTurn: {},
@@ -172,7 +169,6 @@ function seedLiveSessionWithImages(): void {
     sessions: [
       {
         sessionId: "s1",
-        agentId: "a1",
         cwd: "/home/u/proj",
         capabilities: { promptCapabilities: { image: true } },
         archived: false,
@@ -221,9 +217,9 @@ function dropOnComposer(files: File[]): void {
 }
 
 /**
- * Flush the microtask queue (the mocked `listAgents` promise resolves after
- * `render` — its `setAgents` re-render must land BEFORE the assertions,
- * wrapped in `act` so React applies it to the DOM).
+ * Flush the microtask queue (the mocked IPC promises resolve after
+ * `render` — their state updates must land BEFORE the assertions,
+ * wrapped in `act` so React applies them to the DOM).
  */
 async function flush(): Promise<void> {
   await act(async () => {
@@ -274,12 +270,12 @@ beforeEach(() => {
     closeReasons: {},
     configOptions: {},
   });
-  useBridge.getState().dismissSession("s1");
+  useInteractive.getState().dismissSession("s1");
   usePermissions.getState().dismissSessionPrompts("s1");
   for (const id of Object.keys(useSubagents.getState().entries)) {
     useSubagents.getState().dismiss(id);
   }
-  useBridge.getState().dismissSession("sub1");
+  useInteractive.getState().dismissSession("sub1");
   usePermissions.getState().dismissSessionPrompts("sub1");
 });
 
@@ -328,7 +324,7 @@ describe("ChatStream", () => {
     expect(screen.getByText(long)).toBeTruthy();
   });
 
-  it("renders the working indicator (BrailleLoader) when inTurn with no bridge state", () => {
+  it("renders the working indicator (BrailleLoader) when inTurn with no interactive state", () => {
     seedLiveSession();
     useSessions.getState().addUserMessage("s1", "hi");
     useSessions.getState().beginTurn("s1");
@@ -369,19 +365,19 @@ describe("ChatStream", () => {
     expect(screen.getByText("Thought")).toBeTruthy();
   });
 
-  it("renders the working indicator from the bridge agentState alone (no inTurn)", async () => {
+  it("renders the working indicator from the interactive agentState alone (no inTurn)", async () => {
     seedLiveSession();
     useSessions.getState().addUserMessage("s1", "hi");
-    useBridge.getState().applyState("s1", { state: "working" });
+    useInteractive.getState().applyState("s1", { state: "working" });
     render(<ChatStream />);
     await flush();
     expect(screen.getByRole("status")).toBeTruthy();
   });
 
-  it("renders 'Waiting for your input…' when the bridge agentState is blocked", async () => {
+  it("renders 'Waiting for your input…' when the interactive agentState is blocked", async () => {
     seedLiveSession();
     useSessions.getState().addUserMessage("s1", "hi");
-    useBridge.getState().applyState("s1", { state: "blocked" });
+    useInteractive.getState().applyState("s1", { state: "blocked" });
     render(<ChatStream />);
     await flush();
     expect(screen.getByText("Waiting for your input…")).toBeTruthy();
@@ -552,7 +548,6 @@ describe("ChatStream", () => {
     // Tauri `resume_session` command, mocked above)…
     await waitFor(() =>
       expect(resumeSession).toHaveBeenCalledWith(
-        "a1",
         "s1",
         "/home/u/proj",
       ),
@@ -622,12 +617,12 @@ describe("ChatStream", () => {
     useSessions.setState({
       activeSessionId: "s9",
       sessions: [
-        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
+        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
       ],
       spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
       historySessions: [],
       archivedSessions: [
-        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
+        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
       ],
       messages: { s9: [] },
       inTurn: {},
@@ -647,7 +642,7 @@ describe("ChatStream", () => {
   });
 
   it("labels a sticky-archived live session 'Live' when the space holds a second (more recent) live session", () => {
-    // Multi-live space (the one-live cap is lifted, ADR 0002): the sticky
+    // Multi-live space (the one-live cap is lifted): the sticky
     // session (s9) is live — in BOTH `sessions` and `archivedSessions` —
     // but is NOT `view.liveSessionId` because the OTHER live session (s1)
     // is more recent (last in `sessions`). Its selector entry must be
@@ -655,13 +650,13 @@ describe("ChatStream", () => {
     useSessions.setState({
       activeSessionId: "s9",
       sessions: [
-        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
-        { sessionId: "s1", agentId: "a1", cwd: "/home/u/arch", capabilities: {}, archived: false },
+        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
+        { sessionId: "s1", cwd: "/home/u/arch", capabilities: {}, archived: false },
       ],
       spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
       historySessions: [],
       archivedSessions: [
-        { sessionId: "s9", agentId: "a1", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
+        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
       ],
       messages: { s9: [], s1: [] },
       inTurn: {},
@@ -704,7 +699,6 @@ describe("ChatStream", () => {
     // The first send auto-resumes the archived session…
     await waitFor(() =>
       expect(resumeSession).toHaveBeenCalledWith(
-        "a1",
         "s9",
         "/home/u/arch",
       ),
@@ -776,11 +770,11 @@ describe("ChatStream", () => {
     expect(screen.queryByText("Send a prompt to start")).toBeNull();
   });
 
-  it("renders a stacked bridge ask on an empty transcript (no fresh-session hint)", () => {
+  it("renders a stacked interactive ask on an empty transcript (no fresh-session hint)", () => {
     seedLiveSession();
     // No `toolCallId` → the card is NOT queued (it renders immediately,
     // unanchored).
-    useBridge.getState().addRequest("s1", {
+    useInteractive.getState().addRequest("s1", {
       requestId: "req-ask",
       method: "ask",
       source: "main",
@@ -803,7 +797,7 @@ describe("ChatStream", () => {
     seedLiveSession();
     // No `toolCallId` (absent for `password`) → the modal renders
     // immediately (unanchored).
-    useBridge.getState().addRequest("s1", {
+    useInteractive.getState().addRequest("s1", {
       requestId: "req-pw",
       method: "password",
       source: "main",
@@ -814,9 +808,9 @@ describe("ChatStream", () => {
     expect(screen.queryByText("Send a prompt to start")).toBeNull();
   });
 
-  it("renders 'Waiting for your input…' on an empty transcript when the bridge agentState is blocked", async () => {
+  it("renders 'Waiting for your input…' on an empty transcript when the interactive agentState is blocked", async () => {
     seedLiveSession();
-    useBridge.getState().applyState("s1", { state: "blocked" });
+    useInteractive.getState().applyState("s1", { state: "blocked" });
     render(<ChatStream />);
     await flush();
     expect(screen.getByText("Waiting for your input…")).toBeTruthy();
@@ -825,7 +819,7 @@ describe("ChatStream", () => {
 
   // --- Composer mismatch states (ONE predicate: `workingOrInTurn`). ---
 
-  it("disables the send button and no-ops send() when the bridge agentState is working (no inTurn)", async () => {
+  it("disables the send button and no-ops send() when the interactive agentState is working (no inTurn)", async () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
@@ -833,11 +827,11 @@ describe("ChatStream", () => {
     // Idle → enabled (sanity).
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
-    // The bridge says working (the `state` push races `turnCompleted`, or
+    // The interactive agentState says working (the `state` push races `turnCompleted`, or
     // the state latches after a turn) → the composer is dead: button AND
     // textarea disabled, Enter no-ops.
     await act(async () => {
-      useBridge.getState().applyState("s1", { state: "working" });
+      useInteractive.getState().applyState("s1", { state: "working" });
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
     expect(textarea.hasAttribute("disabled")).toBe(true);
@@ -848,7 +842,7 @@ describe("ChatStream", () => {
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
-  it("disables the send button, the textarea, and no-ops Enter while the bridge agentState is blocked (mid-turn awaiting a request response)", async () => {
+  it("disables the send button, the textarea, and no-ops Enter while the interactive agentState is blocked (mid-turn awaiting a request response)", async () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
@@ -859,12 +853,12 @@ describe("ChatStream", () => {
     expect(textarea.hasAttribute("disabled")).toBe(false);
     // `inTurn` is true (a `blocked` agent is mid-turn — it is awaiting a
     // request response, so `inTurn` alone used to lock the composer) +
-    // the bridge says blocked → the composer is dead for the whole
+    // the interactive agentState says blocked → the composer is dead for the whole
     // wait: button AND textarea disabled, Enter no-ops (no
     // double-send, no clobbered turn bookkeeping).
     await act(async () => {
       useSessions.getState().beginTurn("s1");
-      useBridge.getState().applyState("s1", { state: "blocked" });
+      useInteractive.getState().applyState("s1", { state: "blocked" });
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
     expect(textarea.hasAttribute("disabled")).toBe(true);
@@ -882,7 +876,7 @@ describe("ChatStream", () => {
       task: "review the diff",
       status: "running",
     });
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "ask",
       source: "subagent:reviewer",
@@ -909,10 +903,10 @@ describe("ChatStream", () => {
     expect(toggle.querySelector(".bg-warning")).toBeNull();
   });
 
-  it("keeps the composer LOCKED when the bridge is idle but the store is inTurn", () => {
+  it("keeps the composer LOCKED when the interactive agentState is idle but the store is inTurn", () => {
     seedLiveSession();
     useSessions.getState().beginTurn("s1");
-    useBridge.getState().applyState("s1", { state: "idle" });
+    useInteractive.getState().applyState("s1", { state: "idle" });
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
     // A stale `idle` from the previous turn must not unlock the composer
@@ -931,7 +925,7 @@ describe("ChatStream", () => {
   it("prefers the 'Waiting for your input…' line over the braille loader when blocked AND inTurn", () => {
     seedLiveSession();
     useSessions.getState().beginTurn("s1");
-    useBridge.getState().applyState("s1", { state: "blocked" });
+    useInteractive.getState().applyState("s1", { state: "blocked" });
     render(<ChatStream />);
     // `blocked` + `inTurn` → `workingOrInTurn` is true, but the blocked
     // line takes precedence: the waiting line renders and the braille
@@ -1016,8 +1010,8 @@ describe("ChatStream", () => {
     useSessions.setState({
       activeSessionId: "s1",
       sessions: [
-        { sessionId: "s1", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
-        { sessionId: "s2", agentId: "a1", cwd: "/home/u/proj", capabilities: {}, archived: false },
+        { sessionId: "s1", cwd: "/home/u/proj", capabilities: {}, archived: false },
+        { sessionId: "s2", cwd: "/home/u/proj", capabilities: {}, archived: false },
       ],
       spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
       historySessions: [],
@@ -1336,7 +1330,6 @@ describe("ChatStream", () => {
         sessions: [
           {
             sessionId: "s2",
-            agentId: "a1",
             cwd: "/home/u/proj",
             capabilities: {},
             archived: false,
@@ -1532,7 +1525,6 @@ describe("ChatStream", () => {
         sessions: [
           {
             sessionId: "s2",
-            agentId: "a1",
             cwd: "/home/u/proj",
             capabilities: {},
             archived: false,
@@ -1687,14 +1679,12 @@ describe("ChatStream", () => {
       sessions: [
         {
           sessionId: "s1",
-          agentId: "a1",
           cwd: "/home/u/proj",
           capabilities: { promptCapabilities: { image: true } },
           archived: false,
         },
         {
           sessionId: "s2",
-          agentId: "a1",
           cwd: "/home/u/proj",
           capabilities: { promptCapabilities: { image: true } },
           archived: false,
@@ -1731,7 +1721,7 @@ describe("ChatStream", () => {
     // A pending agent question (no `toolCallId` → not queued; unanchored →
     // the card takes focus on mount, so its root div is the focusable
     // element an Esc keypress lands on).
-    useBridge.getState().addRequest("s1", {
+    useInteractive.getState().addRequest("s1", {
       requestId: "req-ask",
       method: "ask",
       source: "main",
@@ -1762,7 +1752,7 @@ describe("ChatStream", () => {
     });
     // The card's own Esc handler dismissed the request (cancelled)…
     await waitFor(() =>
-      expect(useBridge.getState().requests["s1"]).toHaveLength(0),
+      expect(useInteractive.getState().requests["s1"]).toHaveLength(0),
     );
     // …and the window listener did NOT fire (no `session/cancel`).
     expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
@@ -1770,7 +1760,7 @@ describe("ChatStream", () => {
 
   it("Esc on the sudo password modal's input dismisses the modal WITHOUT cancelling the turn", async () => {
     seedLiveSession();
-    useBridge.getState().addRequest("s1", {
+    useInteractive.getState().addRequest("s1", {
       requestId: "req-pw",
       method: "password",
       source: "main",
@@ -1786,7 +1776,7 @@ describe("ChatStream", () => {
     });
     // The modal's Esc handler dismissed the request (cancelled)…
     await waitFor(() =>
-      expect(useBridge.getState().requests["s1"]).toHaveLength(0),
+      expect(useInteractive.getState().requests["s1"]).toHaveLength(0),
     );
     // …and the window listener did NOT fire (no `session/cancel`).
     expect(vi.mocked(cancelSession)).not.toHaveBeenCalled();
@@ -1799,7 +1789,6 @@ describe("ChatStream", () => {
     // The FRESH agent (the resume result) does NOT advertise images.
     vi.mocked(resumeSession).mockResolvedValueOnce({
       sessionId: "s1",
-      agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true },
       archived: false,
@@ -1814,7 +1803,7 @@ describe("ChatStream", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() =>
-      expect(resumeSession).toHaveBeenCalledWith("a1", "s1", "/home/u/proj"),
+      expect(resumeSession).toHaveBeenCalledWith("s1", "/home/u/proj"),
     );
     // Fail-closed: the fresh agent can't take images → 2-arg send, the
     // image is NOT attached (and not sent a second time).
@@ -1828,7 +1817,6 @@ describe("ChatStream", () => {
     seedStoredSession({ loadSession: true, promptCapabilities: { image: true } });
     vi.mocked(resumeSession).mockResolvedValueOnce({
       sessionId: "s1",
-      agentId: "a1",
       cwd: "/home/u/proj",
       capabilities: { loadSession: true },
       archived: false,
@@ -1840,7 +1828,7 @@ describe("ChatStream", () => {
     // No text — an image-only send (enabled by the SAVED capability).
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() =>
-      expect(resumeSession).toHaveBeenCalledWith("a1", "s1", "/home/u/proj"),
+      expect(resumeSession).toHaveBeenCalledWith("s1", "/home/u/proj"),
     );
     // Blocked: no prompt is sent (an empty prompt + unsent images is
     // meaningless — the same fail-closed posture as `!imageCapable`).

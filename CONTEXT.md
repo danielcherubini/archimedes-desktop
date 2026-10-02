@@ -1,75 +1,59 @@
 # Archimedes Desktop
 
-A cross-platform (Windows/macOS/Linux) desktop app, built with Tauri 2, that connects to coding agents. The Rust core speaks pi's RPC mode natively (`pi --mode rpc` — JSONL over stdio, ADR 0009). Pi is the first-class agent in v1.
+A cross-platform (Windows/macOS/Linux) desktop app, built with Tauri 2, that runs coding agents in-process — the desktop's own Rust runtime is the only **Agent harness** (a **Native session** — ADR 0022).
 
 ## Language
 
 **Client**:
-The Archimedes Desktop application itself — the RPC *client* role: it spawns agent processes (`pi --mode rpc`), renders the conversation, and provides file/terminal/permission backends.
+The Archimedes Desktop application itself — the **Client** role: it runs the in-process **Agent harness** (a **Native session** — ADR 0022; the spawned-agent-process / RPC-client framing is gone), renders the conversation, and provides file/terminal/permission backends.
 _Avoid_: App, frontend, IDE
 
 **Agent**:
-The conversation *partner* — the thing that produces the assistant's responses. Embodied either as a spawned external process (pi, which speaks pi's RPC mode `--mode rpc` over stdio JSONL, one JSON object per line, both directions) or in the desktop's in-process harness (a **Native session** — no external process). _Generalized 2026-10-06: a native session has no subprocess; the partner is embodied in the desktop's own runtime._
+The conversation *partner* — the thing that produces the assistant's responses. Always embodied in the desktop's in-process harness (a **Native session** — no external process, ADR 0022). _Generalized 2026-10-06: a native session has no subprocess; the partner is embodied in the desktop's own runtime. 2026-10-02: the external (pi) embodiment is removed — the harness is the desktop's own runtime, full stop._
 _Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated session — see its entry below.)
 
 **Agent harness**:
-The machinery that runs an agent conversation end-to-end — the model loop (model call → tool dispatch → retry/compaction) + the tool registry + session persistence + provider integration. A harness is a *runtime*, not a model: pi is one harness (an external Node process, its `agent-core`); the desktop's native runtime is another (in-process Rust). The harness owns the conversation's *control flow*; the model only produces tokens, the tools only act on the world.
+The machinery that runs an agent conversation end-to-end — the model loop (model call → tool dispatch → retry/compaction) + the tool registry + session persistence + provider integration. A harness is a *runtime*, not a model: the desktop's in-process Rust runtime is the **only** harness (ADR 0022 — the external pi harness embodiment is removed). The harness owns the conversation's *control flow*; the model only produces tokens, the tools only act on the world.
 _Avoid_: Agent (that's the conversation *partner*; a harness *runs* it), loop, brain, runtime (too generic)
 
 **Space**:
-A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: one active conversation per Space — its most recent live **Session** (multiple live Sessions may coexist app-wide: the one-live policy was lifted 2026-09-22, ADR 0002 superseded); stored conversations of a Space survive.
+A single on-disk folder the Client can open — the workspace in which a conversation and its file access happen. Identified by the folder's canonical path, not a user-supplied name; the display label is the folder's base name. v1: one active conversation per Space — its most recent live **Session** (multiple live Sessions may coexist app-wide: the one-live policy was lifted 2026-09-22); stored conversations of a Space survive.
 _Avoid_: Project, workspace, folder, directory, environment
 
 **Session**:
-One live conversation, backed by exactly one **Agent harness** — either a spawned external process (an **External session**) or the desktop's in-process runtime (a **Native session**). The unit of lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session. _Generalized 2026-10-06: a native session has no subprocess; embodiment is a harness, not a process._
+One live conversation, backed by the desktop's in-process **Agent harness** (a **Native session** — ADR 0022; the external embodiment is removed). The unit of lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session. _Generalized 2026-10-06: a native session has no subprocess; embodiment is a harness, not a process._
 _Avoid_: Conversation, chat, thread, run
 
 **Native session**:
-A **Session** whose **Agent harness** is the desktop's in-process Rust runtime — no spawned agent process, no bridge, no pi. Driven by the desktop's own AgentLoop (a tokio task) that calls the model directly (an OpenAI-compatible provider), executes tools in-process (Rust executors), and persists to SQLite.
+A **Session** — the desktop's in-process Rust runtime is the **only** **Agent harness** (ADR 0022): no spawned agent process. Driven by the desktop's own AgentLoop (a tokio task) that calls the model directly (an OpenAI-compatible provider), executes tools in-process (Rust executors), and persists to SQLite.
 _Avoid_: In-process session, local session, built-in session
-
-**External session**:
-A **Session** whose **Agent harness** is a spawned external agent process (today: pi, `pi --mode rpc`). The desktop is the RPC client; tools execute in the child (pre-tool-move) or are delegated to the desktop (tool-move+).
-_Avoid_: pi session, child session, remote session
 
 **Archived session**:
 A stored **Session** hidden from its **Space** group by an explicit user action (the `archived` flag on the `sessions` row) — listed in the sidebar's **Archived** section instead of its Space group. Archiving is a *view* property, not a lifecycle one: the transcript stays in the desktop's storage, the session is still openable and resumable (first send resumes it, as for any stored session), and the flag is **sticky** — it survives resume/pause and changes only via explicit archive/unarchive. Delete is offered only from the Archived section (ADR 0016).
 _Avoid_: Paused session, closed session, hidden session
 
 **Subagent session**:
-A **Session** the desktop spawns to run a task delegated by the main agent — either a pi RPC session (bridge mode) or an in-process native **AgentLoop** child (native-native: the parent's model/tools minus `subagent` and `list_agents`, plus optional `launch` overrides; its `agentName` resolves against discovered **Agent definitions** — ADR 0020; an unknown/omitted name is a config-less label-only dispatch). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same RPC pipeline as a Session. In bridge mode the subagent's suite runs in bridge mode, so its interactive tools (ask, sudo_exec) go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime._
+A **Session** the desktop spawns to run a task delegated by the main agent — an in-process native **AgentLoop** child (the parent's model/tools minus `subagent` and `list_agents`, plus optional `launch` overrides; its `agentName` resolves against discovered **Agent definitions** — ADR 0020; an unknown/omitted name is a config-less label-only dispatch). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same event pipeline as a Session. The subagent's interactive tools (ask, sudo_exec) run in the desktop's in-process **interactive** channel, so their prompts go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime. 2026-10-02: the bridge-mode embodiment is removed (ADR 0022) — a subagent session is always an in-process native child._
 _Avoid_: Worker, delegated task, child session, background session
 
-**Suite tool**:
-One of the pi-archimedes suite's interactive tools — `ask` / `sudo_exec` / `manage_todo_list`. In Phase 2 these EXECUTE IN THE DESKTOP (the Client), not the agent: the desktop injects a `tools.ts` override (ADR 0009) that re-registers them with the same name + schema but `execute()` = a bridge round-trip, so the agent's copies are thin delegates and the desktop owns the confirmation / execution / todo store. `subagent` is already desktop-executed (not overridden); pi's BUILT-IN tools (`bash` / `edit` / `write` / `read` / `find` / `grep`) still run in the agent.
-_Avoid_: Agent tool, delegated tool, built-in tool
-
-**Agent registry**:
-The Client's list of known agents — each entry is a spawn command (program + args) plus metadata (name, capabilities, defaults). v1 ships with pi only.
-_Avoid_: Agent list, agent config, agent profile
-
 **Agent definition**:
-A user-authored markdown file (flat, in a standard agents dir) with YAML frontmatter (`name`, `description`, `model`, `thinking`, `tools`) + a system-prompt body — discovered by the desktop like a **Skill** (space-level `.agents/agents` + `.pi/agents` walked to the repo root; user-level `~/.agents/agents` + `~/.pi/agent/agents`). Selectable in a **Subagent session** via the `subagent` tool's `agentName` (layered under explicit params — ADR 0020); advertised by the `list_agents` tool. Distinct from **Agent** (the conversation partner) and **Agent registry** (the Client's spawn-command list).
+A user-authored markdown file (flat, in a standard agents dir) with YAML frontmatter (`name`, `description`, `model`, `thinking`, `tools`) + a system-prompt body — discovered by the desktop like a **Skill** (space-level `.agents/agents` + `.pi/agents` walked to the repo root; user-level `~/.agents/agents` + `~/.pi/agent/agents`). Selectable in a **Subagent session** via the `subagent` tool's `agentName` (layered under explicit params — ADR 0020); advertised by the `list_agents` tool. Distinct from **Agent** (the conversation partner) — an Agent definition is a user-authored prompt + config, not a runtime.
 _Avoid_: Agent config, agent preset, subagent preset
 
 **Permission prompt**:
-The Client's UI response to a tool-call permission gate from an agent (the bundled gate extension's `tool_call` hook → `ctx.ui.confirm` → the RPC `extension_ui_request` subprotocol, ADR 0009) — the user approves or denies a tool call.
+The Client's UI response to the native harness's in-process **permission gate** (the `permission-request` event before every mutating tool — ADR 0010) — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
 
 **Trusted Space**:
-A Space flagged as trusted — its Sessions (including Subagent sessions) skip the **Permission prompt** for the gated tools (`bash`/`edit`/`write`), which the Client auto-approves. `sudo_exec` (its own confirm + password modal) and `ask` (a `select` request, not a confirm) are unaffected. Trust is stored per-Space, defaults to off, and is enforced desktop-side — the gate extension is unchanged (ADR 0010).
+A Space flagged as trusted — its Sessions (including Subagent sessions) skip the **Permission prompt** for the gated tools (`bash`/`edit`/`write`), which the Client auto-approves. `sudo_exec` (its own confirm + password modal) and `ask` (a `select` request, not a confirm) are unaffected. Trust is stored per-Space, defaults to off, and is enforced in the native harness's in-process permission gate (ADR 0010).
 _Avoid_: Auto-approve mode, trust mode, yolo mode
 
-**Bridge**:
-The mechanism by which the archimedes suite (running inside an Agent process managed by the Client) routes its interactive UI primitives (ask picker, confirmations, masked password input) and ambient state (todos, cost, subagent streams, agent state) to the Client over a local channel. Gated by process spawn: the Client sets the bridge env vars on the Agent it spawns; the suite is inert when they are absent. See the pi-archimedes glossary for the suite-side view.
-_Avoid_: Side channel, socket bridge, client mode, host mode
-
 **Config option**:
-A per-session selector the agent advertises over the RPC `get_state` response (e.g. model, thinking level) — a `select` (or `boolean`) with a current value and choices. Updated via the RPC's config-option events, and set by the Client via `set_model` / `set_thinking_level` commands. The agent is the source of truth: the Client does not persist config options; a resume re-fetches fresh state from the agent.
+A per-session selector the harness re-synthesizes in-process from the `ModelCatalog` (the model / thinking-level selectors — the `synthesize_catalog_config_options` shape) and the Client updates via the `set_session_config_option` command. The harness is the source of truth: the Client does not persist config options; a resume re-synthesizes fresh state from the stored model + the catalog.
 _Avoid_: Model list, model picker, settings, preferences
 
 **Thinking block**:
-The collapsible UI unit that shows the agent's streamed internal reasoning (the RPC's `thinking_start` / `thinking_delta` / `thinking_end` events) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
+The collapsible UI unit that shows the agent's streamed internal reasoning (the harness's streamed thinking events) — one per contiguous thinking run, collapsed by default with a live one-line summary while streaming. In the transcript data model it is a message of kind `agent-thought`.
 _Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZCode's term; the Client's UI says "Thinking…"/"Thought")
 
 **Attachment**:

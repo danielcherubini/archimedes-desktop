@@ -1,8 +1,8 @@
 # AGENTS.md
 
 Archimedes Desktop — a cross-platform (Windows / macOS / Linux) Tauri 2 app
-that connects to coding agents. The Rust core speaks pi's RPC mode natively
-(`pi --mode rpc` — JSONL over stdio; ADR 0009). Rust backend (`src-tauri/`)
+that runs coding agents in-process — the desktop's own Rust runtime is the
+only Agent harness (a native session, ADR 0022). Rust backend (`src-tauri/`)
 + React 19 / TypeScript frontend (`src/`). See `CONTEXT.md` for terminology
 and `docs/decisions/` for ADRs.
 
@@ -30,6 +30,4 @@ is validated with `pnpm test` + `pnpm -r exec -- tsc --noEmit` from its root.
 - **Docs**: durable design decisions live in `docs/decisions/NNNN-slug.md`
   (ADR format); in-flight plans live in `docs/roadmap/<feature>.md` and are
   deleted on ship.
-- The desktop is the **Client** of the bridge channel; `pi-archimedes` is the
-  **Agent** side. The bridge is env-gated and inert without the
-  `PI_ARCHIMEDES_BRIDGE_*` env vars (see `docs/decisions/0003-bridge-client.md`).
+

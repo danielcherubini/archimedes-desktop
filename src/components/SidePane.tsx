@@ -60,7 +60,7 @@ function initialWidth(): number {
  *   ~60/s sync writes). The handle captures the pointer on `pointerdown`
  *   (released on `pointerup`/`pointercancel`) so a release outside the
  *   webview still ends the drag; a `blur` listener is the fallback.
- * - **`SubagentModals`:** the bridge sudo modals for the subagent
+ * - **`SubagentModals`:** the interactive sudo modals for the subagent
  *   entries, rendered at the frame ROOT (a `fixed` overlay, NOT inside
  *   the scrollable content — see the component doc in
  *   `SubagentModals`).
@@ -200,7 +200,7 @@ export default function SidePane() {
           <TodoBoardPanel sessionId={activeSessionId} />
         </div>
       </div>
-      {/* The bridge sudo modals for the entries (at the frame ROOT —
+      {/* The interactive sudo modals for the entries (at the frame ROOT —
           `fixed` overlays, NOT inside the scrollable content: a collapsed
           pane never hides a pending modal). */}
       <SubagentModals />

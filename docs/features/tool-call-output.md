@@ -18,7 +18,10 @@ A tool-call card in the transcript shows what happened, in two places:
   call with empty stdout), a bare string as-is, or compact JSON; scrollable
   (`max-h-80`), capped at 20k chars with a truncation note. `(no output)` only when
   there is genuinely nothing (empty text items count as nothing for a successful call).
-  A `content`-derived diff (the ACP path) keeps priority when present.
+  A `content`-derived diff (the first-generation ACP diff channel — removed,
+  ADR 0022: the native tool frames emit no `content`, but the frontend's
+  `extractDiffs` / `diffMessages` handling is kept forward-compat) keeps priority
+  when present.
 
 ## Data source (why no agent-side work was needed)
 

@@ -20,11 +20,6 @@ use crate::storage::{Db, MessageRow};
 /// argument): `false` (the default) hides archived sessions; `true`
 /// returns them with the `archived` flag set (the frontend splits the
 /// boot list client-side).
-///
-/// The stored `capabilities_json` is NORMALIZED on the way out (item 6b of
-/// the swap plan): a pre-swap ACP row (or an unparseable blob) becomes
-/// `{ "loadSession": false }` — the frontend's resume path then stays
-/// hidden and the history-only banner is the honest view.
 #[tauri::command]
 pub async fn list_sessions(
     state: State<'_, Arc<Db>>,
@@ -37,7 +32,6 @@ pub async fn list_sessions(
         .into_iter()
         .map(|row| SessionInfo {
             session_id: row.id,
-            agent_id: row.agent_id,
             cwd: PathBuf::from(row.cwd),
             capabilities: normalize_capabilities(&row.capabilities_json),
             config_options: None,

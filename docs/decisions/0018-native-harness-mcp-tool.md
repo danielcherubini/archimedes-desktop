@@ -11,8 +11,8 @@ A native-harness session (ADR 0011) has NO access to the user's MCP servers: the
 **Considered Options**
 
 - **Expose each MCP server's tools as DIRECT tools** (`mcp__server__tool`, the suite's `directTools` mode + `toolPrefix` strategies): rejected for v1 — the proxy tool is the model's single entry point (one advertised spec instead of N×M), matches the suite's primary interface, and keeps the harness's tool list stable; direct exposure (with prefix/filter settings) is a later extension.
-- **Reuse pi's built-in MCP by running a pi sidecar just for MCP**: rejected — a second process + an inference protocol (the ADR 0011/0012 rejection rationale) for what is a plain JSON-RPC client; the desktop is the harness (ADR 0011) and speaks the wire itself.
-- **A desktop-owned MCP config surface** (its own settings + UI): rejected for v1 — the ADR 0012 contract: the desktop is a read-only CONSUMER of the user's existing pi setup (best-effort: a missing/unparseable `mcp.json` degrades to "no MCP servers", never a crash). A desktop MCP settings surface is a later feature (it needs the UI panel work the suite's TUI panels had).
+- **Reuse pi's built-in MCP by running a pi sidecar just for MCP**: rejected — a second process + an inference protocol (the ADR 0011 rejection rationale) for what is a plain JSON-RPC client; the desktop is the harness (ADR 0011) and speaks the wire itself.
+- **A desktop-owned MCP config surface** (its own settings + UI): rejected for v1 — the first-generation contract: the desktop is a read-only CONSUMER of the user's existing pi setup (best-effort: a missing/unparseable `mcp.json` degrades to "no MCP servers", never a crash). A desktop MCP settings surface is a later feature (it needs the UI panel work the suite's TUI panels had).
 - **OS-keyring credential storage** (the suite's `auth-storage.ts`): rejected — a new system dependency (keyring backends differ per platform); the credentials live in `~/.local/share/archimedes/mcp-auth.json` (the desktop's existing `dirs` app-data root, `0600`) — the user's own home dir.
 
 **Consequences**

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { SubagentTranscript } from "./SubagentTranscript";
 import { useSubagents } from "../store/subagents";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
 
@@ -11,7 +11,7 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     respondPermission: vi.fn().mockResolvedValue(undefined),
   };
 });
@@ -28,9 +28,9 @@ beforeEach(() => {
   for (const id of Object.keys(useSubagents.getState().entries)) {
     useSubagents.getState().dismiss(id);
   }
-  useBridge.getState().dismissSession("sub1");
-  useBridge.getState().dismissSession("sub2");
-  useBridge.getState().dismissSession("main1");
+  useInteractive.getState().dismissSession("sub1");
+  useInteractive.getState().dismissSession("sub2");
+  useInteractive.getState().dismissSession("main1");
   usePermissions.getState().dismissSessionPrompts("sub1");
   usePermissions.getState().dismissSessionPrompts("sub2");
   usePermissions.getState().dismissSessionPrompts("main1");
@@ -72,7 +72,7 @@ describe("SubagentTranscript (the read-only session transcript, expanded inline 
     expect(screen.getByText(/100 ms/)).toBeTruthy();
   });
 
-  it("renders a closed entry's metrics line from useSubagents (surviving useBridge.dismissSession)", () => {
+  it("renders a closed entry's metrics line from useSubagents (surviving useInteractive.dismissSession)", () => {
     useSubagents.getState().addSession(entry);
     useSubagents.getState().markClosed("sub1", "completed", undefined, {
       inputTokens: 0,
@@ -84,12 +84,12 @@ describe("SubagentTranscript (the read-only session transcript, expanded inline 
     // The metrics line (the status word lives in the DIRECTORY row — the
     // transcript's header was dropped: the row IS the header).
     expect(screen.getByText(/1234 ms/)).toBeTruthy();
-    // The race: the driver teardown's `session-closed` fires the bridge's
-    // `dismissSession` for the same id (DELETING `cost`/`agentState`). The
-    // metrics line is read from the `subagent-closed` SNAPSHOT in
-    // `useSubagents` — it must survive the bridge-store deletion.
+    // The race: the driver teardown's `session-closed` fires the interactive
+    // store's `dismissSession` for the same id (DELETING `cost`/`agentState`).
+    // The metrics line is read from the `subagent-closed` SNAPSHOT in
+    // `useSubagents` — it must survive the interactive-store deletion.
     act(() => {
-      useBridge.getState().dismissSession("sub1");
+      useInteractive.getState().dismissSession("sub1");
     });
     expect(screen.getByText(/1234 ms/)).toBeTruthy();
   });
@@ -106,7 +106,7 @@ describe("SubagentTranscript (the read-only session transcript, expanded inline 
     useSubagents.getState().addSession(entry);
     // The subagent's OWN `ask` carries `source: "main"` (keyed by the
     // subagent's own session id) — the header provides the name.
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "ask",
       source: "main",

@@ -18,47 +18,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use archimedes_lib::agent::bridge::PendingBridge;
+use archimedes_lib::agent::events::RpcEvent;
 use archimedes_lib::agent::harness::{
     FinishReason, Model, ModelCatalog, ModelRequest, Prompt, Provider, ProviderError,
     ProviderEvent, RetryPolicy, SessionStore, SudoDeps, ToolCall,
 };
-use archimedes_lib::agent::rpc::RpcEvent;
+use archimedes_lib::agent::interactive::PendingInteractive;
 use archimedes_lib::agent::subagent::{NativeDeps, SubagentSessionManager};
-use archimedes_lib::agent::{EventSink, PendingPermissions, ProviderFactory, TodoStore};
+use archimedes_lib::agent::{
+    EffectiveCatalog, EventSink, PendingPermissions, ProviderFactory, TodoStore,
+};
 use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
-
-/// Write an `agents.json` with ONE `pi` entry: `command` = a NONEXISTENT
-/// path (`/nonexistent/fake_pi`), `args` = `[]`, `bridge: true`. The
-/// `pi` entry must exist (a MISSING `agents.json` makes `Registry::load`
-/// fall back to `default_registry()` — a `pi` entry pointing at the REAL
-/// `pi` binary, which the pre-fix `dispatch` (which looks up `"pi"`) would
-/// then SPAWN); the nonexistent `command` makes the pre-fix spawn fail
-/// deterministically (a red step) while staying inert (no real `pi`
-/// process).
-fn write_pi_agents_json(dir: &std::path::Path) {
-    let json = json!({
-        "agents": [
-            {
-                "id": "pi",
-                "name": "Fake Pi",
-                "command": "/nonexistent/fake_pi",
-                "args": [],
-                "bridge": true
-            }
-        ]
-    });
-    std::fs::write(
-        dir.join("agents.json"),
-        serde_json::to_string_pretty(&json).unwrap(),
-    )
-    .unwrap();
-}
 
 /// The parent's `Model` (the `build_harness` model — the `dispatch_native`
 /// driver resolves the CHILD's model from the catalog by this key, so the
@@ -102,15 +77,16 @@ fn make_manager(
     provider: Arc<dyn Provider>,
     settle_timeout: Duration,
 ) -> Arc<SubagentSessionManager> {
-    let manager = Arc::new(
-        SubagentSessionManager::new(config_dir.to_path_buf(), None)
-            .expect("subagent manager should build"),
-    );
+    let manager = Arc::new(SubagentSessionManager::new(None));
     let factory: ProviderFactory =
         Arc::new(move |_m: &Model| Box::new(BoxedProvider(provider.clone())));
     manager.set_native_deps(NativeDeps {
         provider_factory: factory,
-        catalog,
+        catalog: EffectiveCatalog {
+            config_dir: config_dir.to_path_buf(),
+            cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            base: catalog,
+        },
         todo_store: Arc::new(TodoStore::new()),
         sudo: SudoDeps::default(),
         settle_timeout,
@@ -136,7 +112,6 @@ async fn build_harness(
     let db = Arc::new(Db::open(&dir.join("db.sqlite")).unwrap());
     db.record_session(&archimedes_lib::agent::SessionInfo {
         session_id: "ns1".to_string(),
-        agent_id: "native".to_string(),
         cwd: PathBuf::from("/tmp"),
         capabilities: json!({}),
         config_options: None,
@@ -149,7 +124,7 @@ async fn build_harness(
     let (events_tx, events_rx) = mpsc::channel(256);
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
     let pending: PendingPermissions = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let pending_bridge: PendingBridge = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let pending_bridge: PendingInteractive = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let cancel = CancellationToken::new();
     let turn_cancel: Arc<StdMutex<CancellationToken>> =
         Arc::new(StdMutex::new(CancellationToken::new()));
@@ -242,12 +217,11 @@ fn extract_result_text(result: &Value) -> String {
 /// `fake_pi` "Hello", NOT an error).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the_result() {
-    // The config dir (a `pi` registry entry → a NONEXISTENT `command`
-    // — the pre-fix `dispatch` looks up `pi` + fails to spawn it).
+    // The config dir (the `settings.json` home — the effective catalog
+    // reads the `providers` entries from here; empty = the base catalog).
     let config_dir =
         std::env::temp_dir().join(format!("harness-subagent-cfg-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&config_dir).unwrap();
-    write_pi_agents_json(&config_dir);
 
     // The subagent manager (wired with `NativeDeps` — a mock
     // `provider_factory`; the child is an IN-PROCESS `AgentLoop`). The

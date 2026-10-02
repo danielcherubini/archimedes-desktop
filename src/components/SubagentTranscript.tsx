@@ -1,5 +1,5 @@
 import { useSubagents } from "../store/subagents";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
@@ -43,7 +43,7 @@ const EMPTY: never[] = [];
  *   for subagent-session requests; the transcript is ALWAYS MOUNTED —
  *   the row's `hidden` attribute hides it visually, never unmounts it).
  * - The metrics line on close: the `subagent-closed` SNAPSHOT from
- *   `useSubagents` — NEVER `useBridge.cost[sessionId]` (the
+ *   `useSubagents` — NEVER `useInteractive.cost[sessionId]` (the
  *   `session-closed` handler's `dismissSession` deletes it, and the two
  *   events are concurrent).
  */
@@ -60,7 +60,7 @@ export function SubagentTranscript({ sessionId }: { sessionId: string }) {
   // `undefined` is a stable reference too — the shared `EMPTY` fallback
   // is never minted per render (a `?? []` selector defeats slice
   // equality).
-  const requests = useBridge((s) => s.requests[entry.sessionId]);
+  const requests = useInteractive((s) => s.requests[entry.sessionId]);
   const prompts = usePermissions((s) => s.prompts[entry.sessionId]);
   const messages = useSessions((s) => s.messages[entry.sessionId]);
   // The parent's `subagent` tool-call `details` (the progress envelope) —
@@ -148,7 +148,7 @@ export function SubagentTranscript({ sessionId }: { sessionId: string }) {
       {/* The prompt cards render in the transcript (the component is
           session-id-keyed and already generic; the transcript is ALWAYS
           MOUNTED, so a request is never unrendered — an unrendered
-          request would hang until the bridge timeout). */}
+          request would hang until the interactive timeout). */}
       {promptList.map((p) => (
         <PermissionPrompt
           key={p.requestId}

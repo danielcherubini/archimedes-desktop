@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
-use crate::agent::harness::Model;
+use crate::agent::harness::{tool_specs, Model};
 use crate::agent::SessionManager;
 
 /// A user-managed LLM provider.
@@ -68,15 +68,23 @@ pub struct Settings {
     /// Free-form pane layout state (owned by the frontend).
     #[serde(default)]
     pub pane_layout: Value,
-    /// Registry id of the default agent; `None` = agents[0].
-    #[serde(default)]
-    pub default_agent: Option<String>,
     /// Whether to trust new Spaces by default.
     #[serde(default)]
     pub default_trust_new_spaces: bool,
     /// `"provider/id"`; `None` = system default.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// The per-app thinking-level seed (the native session start's last
+    /// rung: remembered > stored > this > `None`); `None` = the model's
+    /// own default. `#[serde(default)]` — a pre-feature file parses to
+    /// `None` (no migration needed).
+    #[serde(default)]
+    pub default_thinking_level: Option<String>,
+    /// The harness-level tool filter: `[]` = all tools enabled (the native
+    /// `AgentLoop` maps an empty list to `None` = all). `#[serde(default)]`
+    /// — a pre-feature file parses to `[]` (no migration needed).
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
     /// User-managed providers (default `[]`).
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
@@ -102,9 +110,10 @@ impl Default for Settings {
         Self {
             theme: "dark".to_string(),
             pane_layout: Value::Object(Default::default()),
-            default_agent: None,
             default_trust_new_spaces: false,
             default_model: None,
+            default_thinking_level: None,
+            enabled_tools: Vec::new(),
             providers: Vec::new(),
             mcp_servers: HashMap::new(),
             font: FontSettings::default(),
@@ -161,7 +170,14 @@ pub fn load_settings(config_dir: &Path) -> Settings {
         }
     };
     match serde_json::from_str::<Settings>(&raw) {
-        Ok(settings) => settings,
+        Ok(mut settings) => {
+            // A hand-edited file may carry a blank level (the frontend never
+            // SAVES `""`): a blank level is "no level" — the same as `null`.
+            if settings.default_thinking_level.as_deref() == Some("") {
+                settings.default_thinking_level = None;
+            }
+            settings
+        }
         Err(e) => {
             eprintln!("settings: corrupt {path:?}: {e}; using defaults");
             Settings::default()
@@ -241,6 +257,16 @@ impl From<&Model> for ModelDto {
     }
 }
 
+/// The native harness's tool names, sorted (the Settings page's
+/// enabled-tools checkbox list). STATELESS (no `tauri::State` param — the
+/// command needs no state: `tool_specs()` is a free function).
+#[tauri::command]
+pub async fn list_tools() -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = tool_specs().iter().map(|t| t.name.clone()).collect();
+    names.sort(); // deterministic UI order
+    Ok(names)
+}
+
 /// Test ONE MCP server definition (the Settings page's Test action, ADR
 /// 0019): a one-shot bounded connect + `tools/list`. `Ok` = the tool
 /// count; `Err` = the error text (surfaced verbatim in the row — a
@@ -268,12 +294,32 @@ pub async fn auth_mcp_server(name: String, entry: Value) -> Result<String, Strin
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn list_tools_returns_a_sorted_list_of_the_native_harness_tools() {
+        // The command is stateless (no `tauri::State` param — it cannot be
+        // constructed in a unit test, and it needs no state: `tool_specs()`
+        // is a free function), so it is called directly.
+        let names = list_tools().await.expect("the tool specs build");
+        // Sorted (deterministic UI order).
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        // The built-in harness tools.
+        for name in ["bash", "read", "edit", "write", "subagent"] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "missing {name} in {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn default_settings_are_dark_with_empty_layout() {
         let settings = Settings::default();
         assert_eq!(settings.theme, "dark");
         assert!(settings.pane_layout.is_object());
-        assert_eq!(settings.default_agent, None);
+        assert_eq!(settings.default_thinking_level, None);
+        assert!(settings.enabled_tools.is_empty());
         assert!(!settings.default_trust_new_spaces);
         assert_eq!(settings.default_model, None);
         assert!(settings.providers.is_empty());
@@ -286,7 +332,8 @@ mod tests {
         // new fields `#[serde(default)]`) rather than be treated as corrupt.
         let settings: Settings =
             serde_json::from_str(r#"{ "theme": "dark", "paneLayout": {} }"#).unwrap();
-        assert_eq!(settings.default_agent, None);
+        assert_eq!(settings.default_thinking_level, None);
+        assert!(settings.enabled_tools.is_empty());
         assert!(!settings.default_trust_new_spaces);
         assert_eq!(settings.default_model, None);
         assert!(settings.providers.is_empty());
@@ -396,7 +443,8 @@ mod tests {
         let settings = Settings {
             theme: "system".to_string(),
             pane_layout: serde_json::json!({ "chatWidth": 480 }),
-            default_agent: Some("claude-code".to_string()),
+            default_thinking_level: Some("high".to_string()),
+            enabled_tools: vec!["read".to_string()],
             default_trust_new_spaces: true,
             default_model: Some("anthropic/claude-opus-4".to_string()),
             providers: vec![ProviderConfig {
@@ -427,7 +475,8 @@ mod tests {
         };
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
-            "\"defaultAgent\"",
+            "\"defaultThinkingLevel\"",
+            "\"enabledTools\"",
             "\"defaultTrustNewSpaces\"",
             "\"defaultModel\"",
             "\"providers\"",
@@ -440,6 +489,23 @@ mod tests {
         }
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn load_settings_normalizes_a_blank_default_thinking_level_to_none() {
+        // A hand-edited file may carry `"defaultThinkingLevel": ""` (the
+        // frontend never SAVES `""`, but the `Option<String>` accepts it):
+        // a blank level is "no level" — the same as a missing field (`null`).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{ "theme": "dark", "defaultThinkingLevel": "" }"#,
+        )
+        .unwrap();
+        let settings = load_settings(dir.path());
+        assert_eq!(settings.default_thinking_level, None);
+        // The other fields still parse (the file is not corrupt).
+        assert_eq!(settings.theme, "dark");
     }
 
     #[test]

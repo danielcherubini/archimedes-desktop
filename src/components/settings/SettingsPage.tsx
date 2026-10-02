@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import {
   ArrowLeftIcon,
@@ -19,11 +19,10 @@ import { applySettingsToDocument, MAX_FONT_PX, MIN_FONT_PX } from "@/lib/setting
 import {
   authMcpServer,
   getSettings,
-  listAgents,
   listModels,
+  listTools,
   saveSettings,
   testMcpServer,
-  type AgentEntryDto,
   type AppSettings,
   type McpServerEntry,
   type ModelDto,
@@ -726,8 +725,9 @@ function ProviderRow({
 export default function SettingsPage({ onBack }: { onBack: () => void }): ReactElement {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [section, setSection] = useState<Section>("general");
-  const [agents, setAgents] = useState<AgentEntryDto[]>([]);
   const [models, setModels] = useState<ModelDto[]>([]);
+  // The native harness's tool names (the enabled-tools checkbox list).
+  const [tools, setTools] = useState<string[]>([]);
   // The MCP add/edit dialog draft (`null` = closed — a fresh draft per open
   // so a Cancel never leaks the draft into the next open).
   const [mcpDialog, setMcpDialog] = useState<McpDraft | null>(null);
@@ -741,16 +741,51 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     getSettings()
       .then(setSettings)
       .catch(() => {});
-    listAgents()
-      .then(setAgents)
-      .catch(() => {});
     listModels()
       .then(setModels)
+      .catch(() => {});
+    listTools()
+      .then(setTools)
       .catch(() => {});
     return () => {
       themeCleanupRef.current?.();
     };
   }, []);
+
+  /**
+   * The Default-thinking-level select's options (the union of the
+   * `thinkingLevels` arrays across the `listModels` results, deduped in
+   * FIRST-SEEN order — each model's advertised order, consistent with the
+   * in-session thinking-level picker; a `Set` preserves insertion order,
+   * so no `.sort()`): a model's live `thinkingLevels` is the source of
+   * truth — a level no model advertises is not offered.
+   */
+  const thinkingLevelUnion = useMemo(() => {
+    const levels = new Set<string>();
+    for (const model of models) {
+      for (const level of model.thinkingLevels) levels.add(level);
+    }
+    return [...levels];
+  }, [models]);
+
+  /**
+   * The stored `defaultThinkingLevel` when it is NON-NULL, NON-BLANK and NOT
+   * in the union (a provider removed it / the level sets changed): offered
+   * as its own raw option — otherwise Radix's `SelectValue` falls back to the
+   * placeholder and the UI DISPLAYS "Model default" while sessions still
+   * start with the stored level (a false representation of the saved state).
+   * A blank stored value (a hand-edited file — the frontend never SAVES
+   * `""`) is treated as absent: `""` is the `value` of the "Model default"
+   * option, so offering it again would give Radix two items with the same
+   * value.
+   */
+  const storedLevel = settings?.defaultThinkingLevel ?? null;
+  const storedLevelOutsideUnion =
+    storedLevel !== null &&
+    storedLevel !== "" &&
+    !thinkingLevelUnion.includes(storedLevel)
+      ? storedLevel
+      : null;
 
   /** The immediate-save pattern (one helper, used by every control). */
   const update = (patch: Partial<AppSettings>) => {
@@ -831,6 +866,17 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     update({ providers: settings.providers.filter((p) => p.id !== id) });
   };
 
+  /** Toggle one tool in the enabled-tools list (immediate save — the CHECKED
+   * names are the saved list; `[]` = all tools). */
+  const toggleTool = (name: string) => {
+    if (settings === null) return;
+    const current = settings.enabledTools;
+    const next = current.includes(name)
+      ? current.filter((n) => n !== name)
+      : [...current, name];
+    update({ enabledTools: next });
+  };
+
   /** Save an MCP server (the dialog's Save — immediate save, the provider pattern). */
   const saveMcpServer = (name: string, entry: McpServerEntry) => {
     if (settings === null) return;
@@ -851,30 +897,6 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const generalSection = settings === null ? null : (
     <SettingsGroupCard>
       <SettingsRow
-        label="Default agent"
-        description="The agent new sessions start with"
-        control={
-          <Select
-            value={settings.defaultAgent ?? ""}
-            onValueChange={(value) =>
-              update({ defaultAgent: value === "" ? null : value })
-            }
-          >
-            <SelectTrigger aria-label="Default agent" className="w-48">
-              <SelectValue placeholder="Select an agent…" />
-            </SelectTrigger>
-            <SelectContent>
-              {agents.map((agent) => (
-                <SelectItem key={agent.id} value={agent.id}>
-                  {agent.name}
-                </SelectItem>
-              ))}
-              <SelectItem value="">Default (first in the list)</SelectItem>
-            </SelectContent>
-          </Select>
-        }
-      />
-      <SettingsRow
         label="Trust new Spaces by default"
         description="New Spaces start trusted (skip permission prompts for bash/edit/write); existing Spaces are unaffected"
         control={
@@ -889,7 +911,7 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
       />
       <SettingsRow
         label="Default model"
-        description="The model new sessions start with (both native and external sessions)"
+        description="The model new sessions start with (the system default when unset)"
         control={
           <Select
             value={settings.defaultModel ?? ""}
@@ -914,6 +936,67 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
           </Select>
         }
       />
+      <SettingsRow
+        label="Default thinking level"
+        description="The thinking level new sessions start with (the model's own default when unset)"
+        control={
+          <Select
+            value={settings.defaultThinkingLevel ?? ""}
+            onValueChange={(value) =>
+              update({ defaultThinkingLevel: value === "" ? null : value })
+            }
+          >
+            <SelectTrigger aria-label="Default thinking level" className="w-48">
+              <SelectValue placeholder="Model default" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="">Model default</SelectItem>
+              {thinkingLevelUnion.map((level) => (
+                <SelectItem key={level} value={level}>
+                  {level}
+                </SelectItem>
+              ))}
+              {storedLevelOutsideUnion !== null && (
+                <SelectItem value={storedLevelOutsideUnion}>
+                  {storedLevelOutsideUnion}
+                </SelectItem>
+              )}
+            </SelectContent>
+          </Select>
+        }
+      />
+      {/* The enabled-tools list (the harness-level tool filter — `[]` = all
+          tools: "none checked" is a valid, meaningful state, it means all). */}
+      <div className="border-t border-border px-4 py-3">
+        <div className="text-ui-base font-medium text-foreground">
+          Enabled tools
+        </div>
+        <div className="mt-1 text-ui-base leading-6 text-foreground-subtle">
+          The harness tools new sessions start with — empty = all tools
+        </div>
+        {tools.length === 0 ? (
+          <div className="mt-2 text-ui-sm text-foreground-subtlest">
+            Loading…
+          </div>
+        ) : (
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-2">
+            {tools.map((name) => (
+              <label
+                key={name}
+                className="flex items-center gap-2 text-ui-base text-foreground"
+              >
+                <input
+                  type="checkbox"
+                  checked={settings.enabledTools.includes(name)}
+                  aria-label={`Enable tool ${name}`}
+                  onChange={() => toggleTool(name)}
+                />
+                {name}
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
     </SettingsGroupCard>
   );
 

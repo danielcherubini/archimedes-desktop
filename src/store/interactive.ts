@@ -1,26 +1,24 @@
 import { create } from "zustand";
 
 /**
- * The bridge store — the desktop's delegated interactive UI (Task 5).
+ * The interactive store — the desktop's delegated interactive UI (Task 5).
  * Mirrors `permissions.ts` (pending prompts keyed by session id).
  *
  * **Password hygiene:** the `password` method's secret lives ONLY in the
- * modal's local `useState` — it is sent via `respondBridgeRequest` and is
- * NEVER stored here (0010 / ADR 0003 invariant), so there is no
+ * modal's local `useState` — it is sent via `respondInteractiveRequest` and
+ * is NEVER stored here (0010 / ADR 0022 invariant), so there is no
  * `markAnswered` step: a settled request is removed outright.
  *
- * **Session-id identity (B3):** the `sessionId` in every `bridge-request` /
- * `bridge-event` payload is the ACP `session_id` (the desktop calls
- * `handle.set_session_id(&acp_id)` once the ACP id is known; bridge requests
- * only occur mid-turn, after establish, so they always carry the ACP id).
- * The store keys by this ACP id, which is the same id the frontend's
- * `activeSessionId` holds (from `startSession`'s return) — so the keys line
- * up. (Pre-establish pushes carry the client-side placeholder UUID, but they
- * are wired-not-rendered in v1.)
+ * **Session-id identity (B3):** the `sessionId` in every
+ * `interactive-request` / `interactive-event` payload is the ACP session id
+ * (the native `AgentLoop` is constructed with it, so the events always
+ * carry it). The store keys by this ACP id, which is the same id the
+ * frontend's `activeSessionId` holds (from `startSession`'s return) — so
+ * the keys line up.
  */
 
-/** A pending bridge request (a `bridge-request` event, keyed by `requestId`). */
-export interface BridgeRequestData {
+/** A pending interactive request (an `interactive-request` event, keyed by `requestId`). */
+export interface InteractiveRequestData {
   /** The frame UUID (the correlation key — never the bare `toolCallId`). */
   requestId: string;
   method: "ask" | "confirm" | "password";
@@ -65,9 +63,9 @@ export interface CostUpdatePayload {
   source?: string;
 }
 
-interface BridgeState {
+interface InteractiveState {
   /** Pending interactive requests, keyed by the ACP session id. */
-  requests: Record<string, BridgeRequestData[]>;
+  requests: Record<string, InteractiveRequestData[]>;
   /** Todo board columns, keyed by the ACP session id. */
   todos: Record<string, TodoColumn>;
   /** The agent state machine (`working`/`idle`/`blocked`) — wired, not rendered in v1. */
@@ -78,7 +76,7 @@ interface BridgeState {
   session: Record<string, unknown>;
 
   /** Add a request (dedup by `requestId` — a re-delivered frame replaces). */
-  addRequest: (sessionId: string, data: BridgeRequestData) => void;
+  addRequest: (sessionId: string, data: InteractiveRequestData) => void;
   /** Remove a settled request. */
   removeRequest: (sessionId: string, requestId: string) => void;
   /** A `todos_update` push: set `main` for `source === "main"`, else `subagents[source]`. */
@@ -95,7 +93,7 @@ interface BridgeState {
   dismissSession: (sessionId: string) => void;
 }
 
-export const useBridge = create<BridgeState>((set) => ({
+export const useInteractive = create<InteractiveState>((set) => ({
   requests: {},
   todos: {},
   agentState: {},

@@ -18,7 +18,6 @@ fn temp_db_path() -> PathBuf {
 fn sample_session() -> SessionInfo {
     SessionInfo {
         session_id: "sess-1".to_string(),
-        agent_id: "fake".to_string(),
         cwd: PathBuf::from("/tmp/proj"),
         capabilities: serde_json::json!({
             "piSessionId": "sess-1",
@@ -66,7 +65,6 @@ fn records_sessions_and_messages_with_upsert_semantics() {
         .expect("list_sessions should succeed");
     assert_eq!(sessions.len(), 1, "exactly one session should be stored");
     assert_eq!(sessions[0].id, "sess-1");
-    assert_eq!(sessions[0].agent_id, "fake");
     assert_eq!(sessions[0].cwd, "/tmp/proj");
     assert!(sessions[0].capabilities_json.starts_with("{"));
 
@@ -196,7 +194,7 @@ fn native_messages_fk_migrated_on_preexisting_databases() {
         .expect("old-schema tables");
         conn.execute(
             "INSERT INTO sessions (id, agent_id, cwd, created_at, capabilities_json)
-             VALUES ('sess-1', 'native', '/tmp', 1, '{}');",
+             VALUES ('sess-1', 'archimedes', '/tmp', 1, '{}');",
             [],
         )
         .expect("session row");
@@ -374,7 +372,6 @@ fn open_backfills_space_rows_from_existing_sessions() {
 
     let mk_session = |id: &str, cwd: std::path::PathBuf| SessionInfo {
         session_id: id.to_string(),
-        agent_id: "fake".to_string(),
         cwd,
         capabilities: serde_json::json!({
             "piSessionId": id,

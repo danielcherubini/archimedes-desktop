@@ -1,6 +1,6 @@
 import { useState, type ChangeEvent } from "react";
-import { respondBridgeRequest } from "../lib/tauri";
-import { useBridge } from "../store/bridge";
+import { respondInteractiveRequest } from "../lib/tauri";
+import { useInteractive } from "../store/interactive";
 import {
   Dialog,
   DialogContent,
@@ -12,15 +12,15 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 
 /**
- * Modal for a bridge `password` request (the `sudo_exec` credential gate):
+ * Modal for an interactive `password` request (the `sudo_exec` credential gate):
  * displays the `command` + `reason` **verbatim** (so even a direct
  * `password` call — which skips the confirm gate — shows the user what the
  * password is for) plus a masked `•` field (the TUI `maskLine` behavior:
  * one `•` per char, the raw value never rendered). Enter confirms / Esc
- * cancels / Backspace deletes. Confirm → `respondBridgeRequest(…, {
+ * cancels / Backspace deletes. Confirm → `respondInteractiveRequest(…, {
  * password })`; Esc/empty → `{ password: "" }` (cancel); then
  * `removeRequest` (the password lives only in this modal's `useState` —
- * it is never stored in the bridge store).
+ * it is never stored in the interactive store).
  */
 export default function SudoPasswordModal({
   sessionId,
@@ -29,12 +29,12 @@ export default function SudoPasswordModal({
   sessionId: string;
   requestId: string;
 }) {
-  const request = useBridge((state) =>
+  const request = useInteractive((state) =>
     (state.requests[sessionId] ?? []).find((r) => r.requestId === requestId),
   );
-  const removeRequest = useBridge((state) => state.removeRequest);
+  const removeRequest = useInteractive((state) => state.removeRequest);
   // The raw value lives in state only — it is NEVER rendered (the input
-  // shows the mask: one `•` per char) and never stored in the bridge
+  // shows the mask: one `•` per char) and never stored in the interactive
   // store.
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
@@ -50,7 +50,7 @@ export default function SudoPasswordModal({
     setError(null);
     const password = cancelled ? "" : secret;
     try {
-      await respondBridgeRequest(sessionId, requestId, { password });
+      await respondInteractiveRequest(sessionId, requestId, { password });
       // The password was in `useState` only — removing the request
       // settles the card; it never persisted in store state.
       removeRequest(sessionId, requestId);

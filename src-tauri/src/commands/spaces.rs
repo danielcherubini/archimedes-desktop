@@ -1,37 +1,11 @@
-//! Tauri commands for the space and agent registries (read-only views plus
-//! the dialog's folder check). See `docs/roadmap/spaces.md` Task 4.
+//! Tauri commands for the space registry (read-only views plus the
+//! dialog's folder check). See `docs/roadmap/spaces.md` Task 4.
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
 
-use crate::agent::SessionManager;
 use crate::storage::Db;
-
-/// A registry entry (camelCase over IPC) — the agent dropdown's data.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentEntryDto {
-    pub id: String,
-    pub name: String,
-}
-
-/// `list_agents` — every configured agent (v1 default registry: single
-/// `pi` entry). Powers the dialog dropdown; default selection is
-/// `agents[0]` (a decision in the frontend: `pi` first, no `fake` default).
-#[tauri::command]
-pub async fn list_agents(
-    state: State<'_, Arc<SessionManager>>,
-) -> Result<Vec<AgentEntryDto>, String> {
-    Ok(state
-        .agents()
-        .iter()
-        .map(|e| AgentEntryDto {
-            id: e.id.clone(),
-            name: e.name.clone(),
-        })
-        .collect())
-}
 
 /// The folder check + canonicalizer for the new-space dialog.
 ///

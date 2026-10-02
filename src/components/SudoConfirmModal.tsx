@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { respondBridgeRequest } from "../lib/tauri";
-import { useBridge } from "../store/bridge";
+import { respondInteractiveRequest } from "../lib/tauri";
+import { useInteractive } from "../store/interactive";
 import {
   Dialog,
   DialogContent,
@@ -11,9 +11,9 @@ import {
 import { Button } from "./ui/button";
 
 /**
- * Modal for a bridge `confirm` request (the `sudo_exec` confirm gate):
+ * Modal for an interactive `confirm` request (the `sudo_exec` confirm gate):
  * shows the `command` + `reason` verbatim with Run/Cancel. Run →
- * `respondBridgeRequest(…, { confirmed: true })`; Cancel →
+ * `respondInteractiveRequest(…, { confirmed: true })`; Cancel →
  * `{ confirmed: false }`; then `removeRequest` (the request is settled
  * and removed outright — there is no `markAnswered` step).
  */
@@ -24,10 +24,10 @@ export default function SudoConfirmModal({
   sessionId: string;
   requestId: string;
 }) {
-  const request = useBridge((state) =>
+  const request = useInteractive((state) =>
     (state.requests[sessionId] ?? []).find((r) => r.requestId === requestId),
   );
-  const removeRequest = useBridge((state) => state.removeRequest);
+  const removeRequest = useInteractive((state) => state.removeRequest);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,7 +38,7 @@ export default function SudoConfirmModal({
     setBusy(true);
     setError(null);
     try {
-      await respondBridgeRequest(sessionId, requestId, { confirmed });
+      await respondInteractiveRequest(sessionId, requestId, { confirmed });
       removeRequest(sessionId, requestId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

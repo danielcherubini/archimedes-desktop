@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Check } from "lucide-react";
 import { Progress } from "./ui/progress";
-import { useBridge, type TodoItem } from "../store/bridge";
+import { useInteractive, type TodoItem } from "../store/interactive";
 import { useSessions } from "../store/sessions";
 
 /**
@@ -9,15 +9,15 @@ import { useSessions } from "../store/sessions";
  * count badge and the panel's checklist consume the SAME derivation and
  * can never disagree):
  *
- * - Bridge todos (`todos_update`/`todos_clear` columns) win.
- * - `rawInput` fallback for non-bridge agents: when the bridge delivered
- *   no column, the latest `manage_todo_list` `rawInput` (from the ACP
+ * - Interactive todos (`todos_update`/`todos_clear` columns) win.
+ * - `rawInput` fallback for non-interactive agents: when the interactive
+ *   channel delivered no column, the latest `manage_todo_list` `rawInput` (from the ACP
  *   `tool_call` frame, via the `sessions` store) seeds the board. The
  *   `title` is the reliable discriminator (the `name` field is unstable in
  *   ACP 1.7).
  */
 export function useMainTodoItems(sessionId: string | null): TodoItem[] {
-  const column = useBridge((state) =>
+  const column = useInteractive((state) =>
     sessionId ? state.todos[sessionId] : undefined,
   );
   const messages = useSessions((state) =>
@@ -57,8 +57,8 @@ export function useMainTodoItems(sessionId: string | null): TodoItem[] {
     return undefined;
   }, [messages]);
 
-  // Bridge todos win; the `rawInput` seeds the board only when the bridge
-  // delivered no column for this session.
+  // Interactive todos win; the `rawInput` seeds the board only when the
+  // interactive channel delivered no column for this session.
   return column?.main ?? rawTodos ?? [];
 }
 
@@ -145,12 +145,12 @@ function TodoItems({ items }: { items: TodoItem[] }) {
  *   `text-foreground-subtlest`) — the main section renders only when an
  *   OPEN main todo exists (a fully-completed main list is hidden even
  *   while a subagent column is still open).
- * - Subagent todo columns (`subagents[source]`, fed by the same bridge
+ * - Subagent todo columns (`subagents[source]`, fed by the same interactive
  *   events — a unique `source` per child, cleared on child exit) as
  *   indented sub-rows (`pl-6`, `text-ui-sm`), one block per source with a
  *   `text-ui-xs text-foreground-subtlest` header — a column renders only
  *   while it has an OPEN item (an all-completed column is hidden).
- * - `rawInput` fallback for non-bridge agents (via `useMainTodoItems`).
+ * - `rawInput` fallback for non-interactive agents (via `useMainTodoItems`).
  * - The `SidePane` frame owns the auto open/close (the board no longer
  *   auto-collapses on its own — the frame's auto open/close does it).
  */
@@ -160,7 +160,7 @@ export default function TodoBoardPanel({
   sessionId: string | null;
 }) {
   const mainItems = useMainTodoItems(sessionId);
-  const subagents = useBridge((state) =>
+  const subagents = useInteractive((state) =>
     sessionId ? state.todos[sessionId]?.subagents : undefined,
   ) ?? {};
   // The visibility filter (the SAME open-item rule the badge's count uses

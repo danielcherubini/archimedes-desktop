@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use archimedes_lib::agent::bridge::PendingBridge;
+use archimedes_lib::agent::events::RpcEvent;
 use archimedes_lib::agent::harness::{
     ChatMessage, ChatRole, CompactionConfig, FinishReason, MessageContent, Model, ModelCatalog,
     Prompt, Provider, ProviderError, ProviderEvent, RetryPolicy, SessionStore, SudoDeps, Usage,
 };
-use archimedes_lib::agent::rpc::RpcEvent;
+use archimedes_lib::agent::interactive::PendingInteractive;
 use archimedes_lib::agent::tools::ContentBlock;
 use archimedes_lib::agent::{EventSink, PendingPermissions, PermissionOutcome, TodoStore};
 use archimedes_lib::storage::Db;
@@ -139,7 +139,6 @@ async fn build_harness(
     // so transcript inserts (and the `run_compaction` rewrite) are valid.
     db.record_session(&archimedes_lib::agent::SessionInfo {
         session_id: "ns1".to_string(),
-        agent_id: "native".to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: serde_json::json!({}),
         config_options: None,
@@ -152,7 +151,8 @@ async fn build_harness(
     let (events_tx, events_rx) = mpsc::channel(256);
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
     let pending: PendingPermissions = Arc::new(TokioMutex::new(std::collections::HashMap::new()));
-    let pending_bridge: PendingBridge = Arc::new(TokioMutex::new(std::collections::HashMap::new()));
+    let pending_bridge: PendingInteractive =
+        Arc::new(TokioMutex::new(std::collections::HashMap::new()));
     let cancel = CancellationToken::new();
     // The turn cancel (finding 8c — shared with the handle in production;
     // the tests cancel it directly) + the settle watch (finding 3 — the

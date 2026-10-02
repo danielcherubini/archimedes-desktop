@@ -35,7 +35,6 @@ pub enum DbError {
 pub struct SessionRow {
     /// The ACP session id (primary key).
     pub id: String,
-    pub agent_id: String,
     pub cwd: String,
     /// Unix milliseconds.
     pub created_at: i64,
@@ -96,6 +95,30 @@ impl Db {
         let conn = Connection::open(path)?;
         // Enforce the ON DELETE CASCADE on messages.
         conn.pragma_update(None, "foreign_keys", true)?;
+        // One-way migration for pre-rip-out databases (the desktop is
+        // native-only now): drop the `sessions.agent_id` column. The
+        // `messages` table STAYS (the native display transcript) — but ALL
+        // external `sessions` rows (`agent_id <> 'archimedes'`: the built-in
+        // `pi` + any user-configured external entries) are deleted first;
+        // their `messages` rows cascade via the FK (the `foreign_keys`
+        // pragma above is live). Gated on a `PRAGMA table_info` probe — a
+        // fresh or already-migrated database skips it, so the migration is
+        // idempotent by construction. ONE transaction (SQLite DDL is
+        // transactional — a crash mid-batch cannot leave a half-migrated
+        // schema behind; the `DELETE` + `ALTER` are atomic together).
+        let has_agent_id: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'agent_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_agent_id > 0 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "DELETE FROM sessions WHERE agent_id <> 'archimedes';
+                ALTER TABLE sessions DROP COLUMN agent_id;",
+            )?;
+            tx.commit()?;
+        }
         // (finding 5) A legacy crash state: a crash under the pre-fix
         // autocommit code between `DROP TABLE native_messages` and the
         // `RENAME` leaves `native_messages` GONE with the rows living in
@@ -242,20 +265,17 @@ impl Db {
     /// Record (or refresh) a session.
     ///
     /// Upserts by session id: `created_at` and `title` are preserved on a
-    /// re-record (e.g. a resume), while agent_id / cwd / capabilities are
-    /// refreshed.
+    /// re-record (e.g. a resume), while cwd / capabilities are refreshed.
     pub fn record_session(&self, info: &SessionInfo) -> Result<(), DbError> {
         let capabilities = serde_json::to_string(&info.capabilities)?;
         self.conn.lock().expect("db mutex poisoned").execute(
-            "INSERT INTO sessions (id, agent_id, cwd, created_at, title, capabilities_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO sessions (id, cwd, created_at, title, capabilities_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
-               agent_id = excluded.agent_id,
                cwd = excluded.cwd,
                capabilities_json = excluded.capabilities_json",
             params![
                 info.session_id.to_string(),
-                info.agent_id,
                 info.cwd.display().to_string(),
                 now_ms(),
                 Option::<String>::None,
@@ -289,24 +309,23 @@ impl Db {
     }
 
     /// One stored session by id (`None` when absent) — the resume path
-    /// reads the stored `capabilities_json` (the `piSessionFile` is the
-    /// `--session` argument of the resume spawn).
+    /// reads the stored `capabilities_json` (the `loadSession` flag is the
+    /// pre-check for a native resume).
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived \
+            "SELECT id, cwd, created_at, title, capabilities_json, archived \
              FROM sessions WHERE id = ?1",
         )?;
         let row = stmt
             .query_map(params![id], |row| {
                 Ok(SessionRow {
                     id: row.get(0)?,
-                    agent_id: row.get(1)?,
-                    cwd: row.get(2)?,
-                    created_at: row.get(3)?,
-                    title: row.get(4)?,
-                    capabilities_json: row.get(5)?,
-                    archived: row.get::<_, i64>(6)? != 0,
+                    cwd: row.get(1)?,
+                    created_at: row.get(2)?,
+                    title: row.get(3)?,
+                    capabilities_json: row.get(4)?,
+                    archived: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .next()
@@ -322,11 +341,11 @@ impl Db {
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let sql = if include_archived {
-            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived
+            "SELECT id, cwd, created_at, title, capabilities_json, archived
              FROM sessions
              ORDER BY created_at DESC, id DESC"
         } else {
-            "SELECT id, agent_id, cwd, created_at, title, capabilities_json, archived
+            "SELECT id, cwd, created_at, title, capabilities_json, archived
              FROM sessions
              WHERE archived = 0
              ORDER BY created_at DESC, id DESC"
@@ -336,12 +355,11 @@ impl Db {
             .query_map([], |row| {
                 Ok(SessionRow {
                     id: row.get(0)?,
-                    agent_id: row.get(1)?,
-                    cwd: row.get(2)?,
-                    created_at: row.get(3)?,
-                    title: row.get(4)?,
-                    capabilities_json: row.get(5)?,
-                    archived: row.get::<_, i64>(6)? != 0,
+                    cwd: row.get(1)?,
+                    created_at: row.get(2)?,
+                    title: row.get(3)?,
+                    capabilities_json: row.get(4)?,
+                    archived: row.get::<_, i64>(5)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -383,24 +401,6 @@ impl Db {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    /// Delete a session's messages.
-    ///
-    /// `resume_session` calls this before `session/load`: the agent's
-    /// restored replay is treated as the authoritative history, so a
-    /// replay that reuses (or changes) a `messageId` replaces the stored
-    /// transcript instead of corrupting or duplicating it.
-    ///
-    /// `native_messages` is NOT touched (the native `AgentLoop`'s
-    /// transcript has its OWN clear — `SessionStore::clear_messages` —
-    /// and the native resume path must NOT clear before `load_messages`).
-    pub fn clear_messages_for(&self, session_id: &str) -> Result<(), DbError> {
-        self.conn.lock().expect("db mutex poisoned").execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        Ok(())
     }
 
     /// Insert or refresh one native transcript message (the native
@@ -623,7 +623,6 @@ fn space_key(path: impl AsRef<std::path::Path>) -> Option<String> {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     title TEXT,
@@ -746,7 +745,7 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 UNIQUE(session_id, seq)
             );
-            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');
+            INSERT INTO sessions VALUES ('s1', 'archimedes', '/tmp', 1, NULL, '{}');
             INSERT INTO native_messages VALUES ('s1', 0, 'user', '{}', 1);",
         )
         .unwrap();
@@ -832,7 +831,7 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 UNIQUE(session_id, seq)
             );
-            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');
+            INSERT INTO sessions VALUES ('s1', 'archimedes', '/tmp', 1, NULL, '{}');
             INSERT INTO native_messages_migrated VALUES ('s1', 0, 'user', '{}', 1);",
         )
         .unwrap();
@@ -912,7 +911,7 @@ mod tests {
                 created_at INTEGER NOT NULL,
                 last_opened_at INTEGER NOT NULL
             );
-            INSERT INTO sessions VALUES ('s1', 'native', '/tmp', 1, NULL, '{}');",
+            INSERT INTO sessions VALUES ('s1', 'archimedes', '/tmp', 1, NULL, '{}');",
         )
         .unwrap();
         drop(conn);
@@ -961,6 +960,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (native-only rip-out) A pre-rip-out database (`sessions` WITH the
+    /// `agent_id` column) must open CLEANLY on `Db::open`: the one-way
+    /// migration deletes ALL external `sessions` rows (`agent_id <> 'archimedes'`
+    /// — the built-in `pi` + any user-configured external entries; their
+    /// `messages` rows cascade via the FK) and drops the `agent_id` column.
+    /// The `messages` table STAYS (the native display transcript) and the
+    /// `archimedes` row + its `messages` / `native_messages` rows are intact.
+    /// Idempotent: a SECOND `Db::open` on the same file is a clean no-op
+    /// (the `PRAGMA table_info` probe is the guard).
+    #[test]
+    fn opening_a_pre_rip_out_database_migrates_it() {
+        let dir = std::env::temp_dir().join(format!("db-riput-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // A pre-rip-out database: the CURRENT schema with the `agent_id`
+        // column still on `sessions` (the pre-feature shape).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                message_key TEXT,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, kind, message_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+            CREATE TABLE native_messages (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            CREATE TABLE spaces (
+                path TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_opened_at INTEGER NOT NULL,
+                trusted INTEGER NOT NULL DEFAULT 0
+            );
+            -- (a) the built-in `pi` external entry + a display row.
+            INSERT INTO sessions VALUES ('s-pi', 'pi', '/tmp', 1, NULL, '{}', 0);
+            INSERT INTO messages VALUES (1, 's-pi', 'agent-text', 'm1', '{}', 1);
+            -- (b) a user-configured external entry + a display row.
+            INSERT INTO sessions VALUES ('s-cc', 'claude-code', '/tmp', 2, NULL, '{}', 0);
+            INSERT INTO messages VALUES (2, 's-cc', 'agent-text', 'm2', '{}', 2);
+            -- (c) the native entry + display + provider transcript rows.
+            INSERT INTO sessions VALUES ('s-native', 'archimedes', '/tmp', 3, NULL, '{}', 0);
+            INSERT INTO messages VALUES (3, 's-native', 'agent-text', 'm3', '{}', 3);
+            INSERT INTO native_messages VALUES ('s-native', 0, 'user', '{}', 3);",
+        )
+        .unwrap();
+        drop(conn);
+        // `Db::open` must SUCCEED (the migration is one-way + idempotent).
+        let db = Db::open(&path).expect("the pre-rip-out migration must not brick startup");
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        // The `messages` table STILL EXISTS (the native display transcript).
+        let messages_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            messages_exists, 1,
+            "the messages table survives the migration (the native display transcript)"
+        );
+        // `sessions` has NO `agent_id` column (the migration dropped it).
+        let has_agent_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_agent_id, 0,
+            "the agent_id column is gone after the migration"
+        );
+        // The external rows are GONE with their `messages` rows (the FK cascade).
+        let external_sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id IN ('s-pi', 's-cc')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            external_sessions, 0,
+            "the pi + claude-code session rows are deleted"
+        );
+        let external_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id IN ('s-pi', 's-cc')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            external_messages, 0,
+            "the external messages rows cascaded away"
+        );
+        // The `archimedes` row SURVIVES with its `messages` + `native_messages`
+        // rows intact.
+        let native_sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 's-native'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_sessions, 1, "the archimedes session row survived");
+        let native_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 's-native'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_messages, 1, "the native messages row survived");
+        let native_transcript: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM native_messages WHERE session_id = 's-native'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_transcript, 1, "the native transcript row survived");
+        // A SECOND `Db::open` on the same file is a clean no-op (idempotency —
+        // the `PRAGMA table_info` probe is the guard): the rows are intact.
+        drop(conn);
+        drop(db);
+        let db = Db::open(&path).expect("a re-open of the migrated db must succeed");
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        let has_agent_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_agent_id, 0,
+            "the re-open is a no-op (the column stays dropped)"
+        );
+        let native_sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 's-native'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_sessions, 1, "the native row survived the re-open");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (ADR 0016) `list_sessions(false)` never returns archived rows;
     /// `list_sessions(true)` returns them with the flag set. Mixed-list
     /// parity: with a mix of archived and non-archived rows, the default
@@ -974,7 +1141,6 @@ mod tests {
         let db = Db::open(&path).expect("db should open");
         let mk = |id: &str| SessionInfo {
             session_id: id.to_string(),
-            agent_id: "fake".to_string(),
             cwd: std::path::PathBuf::from("/tmp/proj"),
             capabilities: serde_json::json!({
                 "piSessionId": id,
@@ -1050,7 +1216,6 @@ mod tests {
         let db = Db::open(&path).expect("db should open");
         let session = SessionInfo {
             session_id: "sess-1".to_string(),
-            agent_id: "fake".to_string(),
             cwd: std::path::PathBuf::from("/tmp/proj"),
             capabilities: serde_json::json!({
                 "piSessionId": "sess-1",

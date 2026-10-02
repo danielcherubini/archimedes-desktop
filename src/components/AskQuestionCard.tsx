@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  respondBridgeRequest,
+  respondInteractiveRequest,
   type AskQuestionDto,
   type AskResponsePayload,
 } from "../lib/tauri";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useSessions } from "../store/sessions";
 import { Button } from "./ui/button";
 
@@ -59,7 +59,7 @@ function draftHasAnswer(draft: QuestionDraft): boolean {
 }
 
 /**
- * Inline card for a bridge `ask` request — the ask UI ported from the TUI
+ * Inline card for an interactive `ask` request — the ask UI ported from the TUI
  * (accent separator, circular radio list — filled amber dot = selected;
  * `Other (type your own)` free-text; checkboxes for `multi`;
  * `(Recommended)` suffix; a per-option note field; footer hints; a final
@@ -74,7 +74,7 @@ function draftHasAnswer(draft: QuestionDraft): boolean {
  * `tool_call` frame, the card renders queued (bounded ~1.5 s) then
  * unanchored/labeled.
  *
- * Submit → `respondBridgeRequest` with the `AskResponsePayload` +
+ * Submit → `respondInteractiveRequest` with the `AskResponsePayload` +
  * `removeRequest` (the card collapses on settle). The card takes focus on
  * mount when UNANCHORED (a standalone card — no focus steal from the
  * message stream) so the advertised Enter/Esc shortcuts work immediately.
@@ -87,10 +87,10 @@ export default function AskQuestionCard({
   sessionId: string;
   requestId: string;
 }) {
-  const request = useBridge((state) =>
+  const request = useInteractive((state) =>
     (state.requests[sessionId] ?? []).find((r) => r.requestId === requestId),
   );
-  const removeRequest = useBridge((state) => state.removeRequest);
+  const removeRequest = useInteractive((state) => state.removeRequest);
   // The card takes focus on mount when unanchored (see the component doc
   // above) so the Enter/Esc `onKeyDown` — which only fires with focus
   // INSIDE the card — works immediately for a standalone card.
@@ -190,7 +190,7 @@ export default function AskQuestionCard({
           }),
         };
     try {
-      await respondBridgeRequest(sessionId, requestId, payload);
+      await respondInteractiveRequest(sessionId, requestId, payload);
       removeRequest(sessionId, requestId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

@@ -1,69 +1,62 @@
-//! The bridge listener: a per-spawn, peer-verified local channel the agent's
-//! archimedes suite uses to reach the desktop (the Client) — ADR 0003.
+//! The in-process interactive channel: the ask / sudo / todo cores the
+//! native `AgentLoop` calls in-process (NOT over a socket) — the
+//! user-paced oneshots (`PendingInteractive` / `PendingSudo`), the sudo
+//! run flow (`SudoRunner` / `RealSudoRunner`), the todo apply, and the
+//! `SudoPromptCleanup` modal-close guard.
 //!
-//! The agent opens a **new connection per message** and destroys it on the
-//! first data (one frame per connection — see the suite's `channel.ts`), so
-//! [`handle_connection`] reads exactly ONE frame (a line) and dispatches:
+//! The `ask` / `confirm` / `password` (interactive request), `todo_update`,
+//! and `sudo_exec` flows the native `AgentLoop`'s `ToolRegistry` calls
+//! directly (the desktop is the Client of the interactive channel, ADR
+//! 0022 — the desktop is native-only, so there is no external socket:
+//! the cores are called in-process, and the desktop answers the prompts
+//! itself).
 //!
-//! - **request frame** → register a oneshot in `pending_bridge` (keyed
-//!   `"{session_id}/{request_id}"`, the `permission` convention) **before**
-//!   emitting the `bridge-request` event (the UI's `respond_bridge_request`
-//!   may race the emission and must find the entry), then spawn a **waiter
-//!   that owns the stream** (330 s cap; the agent sends nothing while
-//!   waiting, so EOF on the stream — the agent's close — is the
-//!   immediate-cancel signal).
-//! - **push frame** → `seq` drop (keep `last_seq` per listener; drop
-//!   `seq <= last_seq`), emit a `bridge-event`, write an ack line, close.
+//! **The request flow** (the `ask` / `confirm` / `password` core, ADR 0022):
+//! register a oneshot in `pending_bridge` (keyed `"{session_id}/{request_id}"`,
+//! the `permission` convention) **before** emitting the `interactive-request`
+//! event (the UI's `respond_interactive_request` may race the emission and
+//! must find the entry), then await the answer (330 s cap; a session close —
+//! the `cancel` token — is the immediate-cancel signal).
 //!
-//! **Peer verification (fail-closed):** a connection is accepted only if the
-//! connecting process is a **descendant of the desktop itself** — the anchor
-//! is the desktop's own pid (`std::process::id()`, always alive). The
-//! topology is desktop (D) → `pi` (A, a direct child of D — the desktop
-//! spawns `pi --mode rpc` directly; the subagent dispatch spawns the same
-//! binary with the `ARCHIMEDES_SUBAGENT=1` env); the peer connecting to the
-//! desktop's socket is `pi` (A). On
-//! Linux the peer's pid comes from `SO_PEERCRED` and the parent chain is
-//! walked via `/proc/<pid>/status` (bounded ≤8 hops). On **macOS** (no
-//! `SO_PEERCRED`/`ucred`) the listener is **not started** (fail-closed — the
-//! bridge is unavailable, a documented v1 limitation).
+//! **The `sudo_exec` core** (Phase 2): the same flow, but the desktop
+//! ANSWERS the `confirm` / `password` sub-prompts itself (the `pending_sudo`
+//! oneshots, the per-session `sudo_password` credential cache — the suite's
+//! `credentialCache`: in-memory only, keyed by session id, cleared at every
+//! session boundary) and runs `sudo -S` through the `SudoRunner` seam (the
+//! production `RealSudoRunner`; tests inject a fake).
 
 use std::collections::HashMap;
 use std::future::Future;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::session::{CostAccumulator, EventSink, SubagentSpawn};
+use crate::agent::session::EventSink;
 use crate::agent::subagent::LaunchConfig;
-use crate::agent::subagent::{SubagentMetrics, SubagentOutcome};
 use crate::agent::todo::{TodoItem, TodoStatus, TodoStore};
-use crate::agent::tools::exec::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+use crate::agent::tools::exec::{ContentBlock, ToolResult};
 
-/// The manager's map of pending bridge-request senders.
+/// The manager's map of pending interactive-request senders.
 ///
 /// Keyed by `"{session_id}/{request_id}"` so the driver-task cleanup can
 /// drain all entries for a closing session at once (dropping the senders
 /// cancels the spawned waiters). The oneshot carries the response **`result`
 /// `Value` verbatim** — no wrapper (for `password`, `{password}`; for
 /// `confirm`, `{confirmed}`; for `ask`, the `AskResponsePayload`).
-pub type PendingBridge = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
+pub type PendingInteractive = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
 
-/// Build the compound key for a pending bridge request.
-pub fn bridge_key(session_id: &str, request_id: &str) -> String {
+/// Build the compound key for a pending interactive request.
+pub fn interactive_key(session_id: &str, request_id: &str) -> String {
     format!("{session_id}/{request_id}")
 }
 
-/// The key prefix of all pending-bridge keys that belong to `session_id`.
+/// The key prefix of all pending-interactive keys that belong to `session_id`.
 /// Keys are `"{session_id}/{request_id}"`, so the prefix carries the trailing
 /// slash: a session id that is a plain prefix of another ("s1" vs "s10")
 /// must not drain the other session's requests.
@@ -75,8 +68,8 @@ pub fn session_key_prefix(session_id: &str) -> String {
 ///
 /// One entry per sub-prompt, keyed `"{session_id}/{request_id}:confirm"` /
 /// `"{session_id}/{request_id}:password"` (the `requestId` the modals echo
-/// VERBATIM into `respond_bridge_request`). Each oneshot carries the raw
-/// `respond_bridge_request` `result` `Value` (for `:confirm`, `{confirmed}`;
+/// VERBATIM into `respond_interactive_request`). Each oneshot carries the raw
+/// `respond_interactive_request` `result` `Value` (for `:confirm`, `{confirmed}`;
 /// for `:password`, `{password}` — an empty `""` is a cancel).
 ///
 /// The driver-task cleanup drains all entries for a closing session at once
@@ -123,12 +116,12 @@ pub struct SudoRun {
 /// The `sudo_exec` execution seam (mirrors the suite's `SudoSpawner` seam,
 /// `packages/sudo/src/tool.ts` `createSudoExecTool({spawner})`): the desktop
 /// runs `sudo -S` on the host through this trait, so the tests use a fake
-/// runner (no real `sudo` in `cargo test`) and the real runner enters
-/// through `start_listener` → `ConnCtx` → the handler.
+/// runner (no real `sudo` in `cargo test`) and the real runner is the
+/// production `SessionDriver` default.
 ///
-/// MUST be dyn-compatible (`Arc<dyn SudoRunner>` is the `start_listener`
-/// parameter type) — a plain `async fn` in a trait is NOT dyn-compatible,
-/// hence the boxed-future return (the boxed-future pattern).
+/// MUST be dyn-compatible (`Arc<dyn SudoRunner>`) — a plain `async fn` in a
+/// trait is NOT dyn-compatible, hence the boxed-future return (the
+/// boxed-future pattern).
 pub trait SudoRunner: Send + Sync {
     /// Run `sudo -S <argv>` (the full argv from [`build_sudo_argv`] — no
     /// `-p`), writing `password` to stdin (never argv/env), bounded by
@@ -232,8 +225,8 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // password exceeds the pipe buffer (~64 KiB), `write_all` would block
     // unboundedly (no timeout, no close-guard) — a 5 s cap maps a stuck
     // write to a process-level failure (kill + reap + `error: Some(…)`).
-    // It is NOT an auth failure: the cached credential is kept (`
-    // handle_sudo_exec` maps `error: Some(…)` to a clean tool failure and
+    // It is NOT an auth failure: the cached credential is kept (the
+    // `sudo_run_flow` maps `error: Some(…)` to a clean tool failure and
     // never clears the cache on it).
     if let Some(mut stdin) = child.stdin.take() {
         let bytes = format!("{password}\n").into_bytes();
@@ -406,13 +399,13 @@ impl Drop for SudoGroupGuard {
 /// A drop guard that cleans up a `sudo_run_flow`'s `pending_sudo` entry
 /// (finding 3 — a DROPPED flow: the `dispatch_tool` `select!`'s turn-cancel
 /// arm drops the `sudo_run_flow` future, skipping its exit-path cleanup, so
-/// the `:confirm` / `:password` oneshot entry leaked + the `bridge-request`
+/// the `:confirm` / `:password` oneshot entry leaked + the `interactive-request`
 /// modal stayed open with no pending response). On `Drop` it (a) emits a
-/// `bridge-request-close` event (the UI closes the modal) and (b) removes the
+/// `interactive-request-close` event (the UI closes the modal) and (b) removes the
 /// tracked key(s) (best-effort — a dropped runtime skips the removal). The
 /// keys are tracked as they are inserted; a normal exit UNTRACKS them (the
 /// entry is removed + the key is untracked — the guard's removal is then a
-/// no-op, so it is idempotent), so `bridge-request-close` is emitted ONLY for
+/// no-op, so it is idempotent), so `interactive-request-close` is emitted ONLY for
 /// a genuinely dropped flow (the entry NOT removed — a completed flow, after
 /// the user answered both sub-prompts, does NOT emit a stale close).
 struct SudoPromptCleanup {
@@ -436,7 +429,7 @@ impl SudoPromptCleanup {
         self.keys.push(key.to_string());
     }
     /// Untrack a `pending_sudo` key (called when the entry is removed on a
-    /// normal exit — the `bridge-request-close` is then NOT emitted for it, so
+    /// normal exit — the `interactive-request-close` is then NOT emitted for it, so
     /// a completed flow does not emit a stale close for an already-answered
     /// sub-prompt; only a genuinely dropped flow (the entry NOT removed) emits
     /// the close).
@@ -450,16 +443,16 @@ impl Drop for SudoPromptCleanup {
         if self.keys.is_empty() {
             return;
         }
-        // (a) Close the modal(s) (a `bridge-request` was emitted for each
+        // (a) Close the modal(s) (a `interactive-request` was emitted for each
         // sub-prompt; a drop must close it — pre-fix the modal stayed open
         // with no pending response, and a late answer got `Ok(true)` with
         // the send silently failing). The `requestId` is the key's suffix
-        // after `"{session_id}/"` (`bridge_key` is `"{session_id}/{id}"`).
+        // after `"{session_id}/"` (`interactive_key` is `"{session_id}/{id}"`).
         let prefix = format!("{}/", self.session_id);
         for key in &self.keys {
             if let Some(request_id) = key.strip_prefix(&prefix) {
                 self.sink.emit(
-                    "bridge-request-close",
+                    "interactive-request-close",
                     json!({
                         "sessionId": self.session_id,
                         "requestId": request_id,
@@ -654,707 +647,11 @@ pub fn is_sudo_auth_failure(stderr: &str) -> bool {
     lower.contains("[sudo] password for") && lower.contains("incorrect password")
 }
 
-/// How long a bridge request stays open before it auto-cancels (the agent's
-/// 5-minute timeout + a 30 s margin, so the agent's cancel deterministically
-/// wins).
-pub const DEFAULT_BRIDGE_TIMEOUT: Duration = Duration::from_secs(330);
+/// How long an interactive request stays open before it auto-cancels (the
+/// agent's 5-minute timeout + a 30 s margin, so the agent's cancel
+/// deterministically wins).
+pub const DEFAULT_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(330);
 
-/// A started bridge listener (or a no-op on platforms where the bridge is
-/// unavailable — fail-closed, ADR 0003).
-#[derive(Clone)]
-pub struct BridgeHandle {
-    /// Flipping this to `true` stops the accept loop.
-    stop_tx: watch::Sender<bool>,
-    /// The bound socket path (Unix; `None` on Windows/macOS — Windows pipes
-    /// vanish when the last handle closes, so there is nothing to unlink).
-    socket_path: Option<PathBuf>,
-    /// The session id carried in `bridge-request`/`bridge-event` payloads:
-    /// the client-side placeholder until the ACP `session_id` is known
-    /// (then updated by [`BridgeHandle::set_session_id`]).
-    session_id: Arc<Mutex<String>>,
-}
-
-impl BridgeHandle {
-    /// Update the session id carried in bridge payloads (called by the
-    /// driver task once the ACP `session_id` is known).
-    pub async fn set_session_id(&self, id: &str) {
-        let mut sid = self.session_id.lock().await;
-        *sid = id.to_string();
-    }
-}
-
-/// Tear a bridge listener down (idempotent; a `None` handle is a no-op):
-/// stop the accept loop and unlink the socket (Unix; Windows pipes vanish
-/// when the last handle closes — no unlink API).
-pub fn teardown(handle: Option<BridgeHandle>) {
-    if let Some(h) = handle {
-        let _ = h.stop_tx.send(true);
-        if let Some(path) = h.socket_path {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Whether the bridge is available on this platform (Linux/Windows).
-///
-/// On **macOS** the bridge is unavailable (no `SO_PEERCRED`/`ucred`) — the
-/// listener is not started (fail-closed, a documented v1 limitation).
-pub fn available() -> bool {
-    #[cfg(any(target_os = "linux", windows))]
-    {
-        true
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        false
-    }
-}
-
-/// Start the bridge listener on `socket_path` (the per-spawn randomized
-/// socket, see `session.rs`).
-///
-/// `anchor_pid` is the **desktop's own pid** (`std::process::id()`) — the
-/// peer-verification anchor (ADR 0003). `close_tx` is the driver task's
-/// close flag; the per-request waiters subscribe it so a session close
-/// cancels every in-flight request. `timeout` caps each request (default
-/// [`DEFAULT_BRIDGE_TIMEOUT`]; a test injects a short value).
-///
-/// `subagent` (main only — `Some`) is the subagent dispatch handle; the
-/// `dispatch_subagent` method (method-aware: NO timeout) is serviced by it.
-/// `cost_capture` (subagents only — `Some`) accumulates the `cost_update`
-/// payloads (the v1 metrics source).
-///
-/// `todo_store` / `pending_sudo` / `sudo_password` / `runner` (Phase 2,
-/// Task 1) service the method-aware `todo_update` / `sudo_exec` handlers:
-/// the shared todo store, the sudo sub-prompt oneshots, the per-session
-/// sudo credential cache, and the `sudo -S` execution seam. `cwd`
-/// (native-agent-harness Task 2) is the session's `cwd` — the sandbox root
-/// the method-aware `tool_exec` handler runs the delegated built-in tools
-/// in.
-///
-/// **Platform policy:** on **macOS** (and other platforms) the listener is
-/// NOT started — a no-op handle is returned (fail-closed, ADR 0003).
-#[allow(clippy::too_many_arguments)]
-pub async fn start_listener(
-    placeholder_session_id: String,
-    socket_path: &Path,
-    anchor_pid: u32,
-    cwd: &Path,
-    sink: Arc<dyn EventSink>,
-    pending_bridge: PendingBridge,
-    close_tx: &watch::Sender<bool>,
-    timeout: Duration,
-    subagent: Option<SubagentSpawn>,
-    cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
-    todo_store: Arc<TodoStore>,
-    pending_sudo: PendingSudo,
-    sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>>,
-    runner: Arc<dyn SudoRunner>,
-) -> Result<BridgeHandle, String> {
-    #[cfg(target_os = "linux")]
-    {
-        let listener = tokio::net::UnixListener::bind(socket_path).map_err(|e| e.to_string())?;
-        let (stop_tx, mut stop_rx) = watch::channel(false);
-        let session_id = Arc::new(Mutex::new(placeholder_session_id));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let cwd = Arc::new(cwd.to_path_buf());
-        // Owned (and `'static`) so the spawned accept loop + per-connection
-        // waiters can hold it; `watch::Sender::clone` shares the same channel.
-        let close_tx: Arc<watch::Sender<bool>> = Arc::new(close_tx.clone());
-        let session_id_for_loop = session_id.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop_rx.changed() => break,
-                    accepted = listener.accept() => {
-                        let (stream, _addr) = match accepted {
-                            Ok(s) => s,
-                            Err(e) => {
-                                // A transient accept error (ECONNABORTED —
-                                // the peer aborted before the accept;
-                                // EMFILE/ENFILE — fd exhaustion) does NOT
-                                // mean the listener is dead: log it and
-                                // keep accepting. Anything else (e.g.
-                                // EBADF — the listener is closed) is
-                                // fatal: log it and stop the loop.
-                                let fatal = !matches!(
-                                    e.raw_os_error(),
-                                    Some(
-                                        libc::ECONNABORTED
-                                        | libc::EMFILE
-                                        | libc::ENFILE,
-                                    ),
-                                );
-                                eprintln!(
-                                    "bridge: accept failed ({e}) — {}",
-                                    if fatal {
-                                        "listener is closing, stopping the accept loop"
-                                    } else {
-                                        "transient error, continuing to accept"
-                                    }
-                                );
-                                if fatal {
-                                    break;
-                                }
-                                // EMFILE/ENFILE: `accept()` fails
-                                // IMMEDIATELY while fds are exhausted, so
-                                // without a backoff the loop would hot-spin
-                                // (syscall → log → retry) at 100% CPU for as
-                                // long as the exhaustion persists.
-                                if matches!(
-                                    e.raw_os_error(),
-                                    Some(libc::EMFILE | libc::ENFILE),
-                                ) {
-                                    tokio::time::sleep(Duration::from_millis(100))
-                                        .await;
-                                }
-                                continue;
-                            }
-                        };
-                        // Peer verification (fail-closed): accept only if
-                        // the connecting process is a descendant of the
-                        // desktop. A rejection is LOGGED (pid + anchor)
-                        // — a silent drop would make a false rejection
-                        // look like "the bridge just doesn't work".
-                        match peer_pid(&stream) {
-                            Some(pid) if pid != 0 => {
-                                match is_descendant(pid, anchor_pid, &ProcfsReader) {
-                                    DescendantCheck::Accepted(_) => {
-                                        let ctx = ConnCtx {
-                                            session_id: session_id_for_loop.clone(),
-                                            sink: sink.clone(),
-                                            pending_bridge: pending_bridge.clone(),
-                                            last_seq: last_seq.clone(),
-                                            close_tx: close_tx.clone(),
-                                            timeout,
-                                            cwd: cwd.clone(),
-                                            subagent: subagent.clone(),
-                                            cost_capture: cost_capture.clone(),
-                                            todo_store: todo_store.clone(),
-                                            pending_sudo: pending_sudo.clone(),
-                                            sudo_password: sudo_password.clone(),
-                                            runner: runner.clone(),
-                                        };
-                                        tokio::spawn(handle_connection(
-                                            stream,
-                                            ctx,
-                                        ));
-                                    }
-                                    DescendantCheck::Rejected(hops) => eprintln!(
-                                        "bridge: rejecting peer {pid} (parent chain did not reach the desktop (anchor {anchor_pid}) after {hops} hops) — connection dropped"
-                                    ),
-                                }
-                            }
-                            _ => eprintln!(
-                                "bridge: rejecting a peer with no verifiable pid (SO_PEERCRED unavailable; anchor {anchor_pid}) — connection dropped"
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-        Ok(BridgeHandle {
-            stop_tx,
-            socket_path: Some(socket_path.to_path_buf()),
-            session_id,
-        })
-    }
-    #[cfg(windows)]
-    {
-        // The stub consumes the (unused-on-Windows) parameters so the
-        // no-op build is warning-free; a real implementation uses all of
-        // them.
-        let _ = (
-            socket_path,
-            anchor_pid,
-            cwd,
-            sink,
-            pending_bridge,
-            close_tx,
-            timeout,
-            subagent,
-            cost_capture,
-            todo_store,
-            pending_sudo,
-            sudo_password,
-            runner,
-        );
-        // TODO(windows): minimal named-pipe listener — create a
-        // `\\.\pipe\<name>` instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`
-        // (pre-squat detection), wait for a connection, verify the client
-        // pid via `GetNamedPipeClientProcessId` (the `is_descendant`
-        // Toolhelp walk is a v1 limitation), and hand the handle to
-        // `handle_connection`. v1 ships a no-op so the cross-platform build
-        // compiles; the bridge is effectively unavailable on Windows until
-        // this is implemented.
-        let (stop_tx, _stop_rx) = watch::channel(true);
-        Ok(BridgeHandle {
-            stop_tx,
-            socket_path: None,
-            session_id: Arc::new(Mutex::new(placeholder_session_id)),
-        })
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        // The stub consumes the (unused-on-macOS) parameters so the
-        // no-op build is warning-free; a real implementation uses all of
-        // them.
-        let _ = (
-            socket_path,
-            anchor_pid,
-            cwd,
-            sink,
-            pending_bridge,
-            close_tx,
-            timeout,
-            subagent,
-            cost_capture,
-            todo_store,
-            pending_sudo,
-            sudo_password,
-            runner,
-        );
-        // macOS (and other platforms): the bridge is unavailable —
-        // fail-closed (ADR 0003). Return a no-op handle so the caller's
-        // lifecycle code is uniform; `available()` is `false`.
-        let (stop_tx, _stop_rx) = watch::channel(true);
-        Ok(BridgeHandle {
-            stop_tx,
-            socket_path: None,
-            session_id: Arc::new(Mutex::new(placeholder_session_id)),
-        })
-    }
-}
-
-/// Read the peer's pid from a connected Unix socket (`SO_PEERCRED`).
-#[cfg(target_os = "linux")]
-fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
-    let fd = stream.as_raw_fd();
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc == 0 {
-        Some(cred.pid as u32)
-    } else {
-        None
-    }
-}
-
-/// Read a process's parent pid (the `PPid` line of `/proc/<pid>/status`).
-/// `None` when the process is gone (or the entry is unreadable).
-///
-/// This is the `#[cfg(test)]` seam: the real reader is [`ProcfsReader`]; a
-/// test injects a reader backed by an explicit `pid -> parent` map so it
-/// can fabricate the parent chain (a "foreign process" case is real without
-/// a double-fork — any test-spawned process is a descendant of the test
-/// process and would be accepted).
-pub trait ProcReader: Send {
-    fn parent_pid(&self, pid: u32) -> Option<u32>;
-}
-
-/// The real `/proc` reader.
-pub struct ProcfsReader;
-
-impl ProcReader for ProcfsReader {
-    fn parent_pid(&self, pid: u32) -> Option<u32> {
-        let content = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        content.lines().find_map(|line| {
-            line.strip_prefix("PPid:")
-                .and_then(|rest| rest.trim().parse::<u32>().ok())
-        })
-    }
-}
-
-/// The outcome of the parent-chain walk: `Accepted(hops)` when the chain
-/// reached `anchor`, `Rejected(hops)` otherwise (the `hops` is the number
-/// of parent-chain advances before the verdict — logged on rejection).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescendantCheck {
-    /// The chain reached `anchor` after `hops` parent-chain advances.
-    Accepted(u32),
-    /// The chain rejected (a dead end, a missing process, or a chain that
-    /// never reached `anchor`) after `hops` parent-chain advances.
-    Rejected(u32),
-}
-
-/// Walk the parent chain from `peer` up to `anchor` (bounded ≤8 hops).
-///
-/// The 8-hop bound assumes the bridge topology is shallow (desktop →
-/// `pi` is 2 levels); a chain deeper than 8 is rejected
-/// (fail-closed). The bound is also the CYCLE GUARD: a cycle in the chain
-/// (42 → 7 → 42 → …) cannot loop forever.
-///
-/// A dead end, a missing process, or a chain that never reaches `anchor`
-/// rejects (fail-closed).
-pub fn is_descendant<R: ProcReader>(peer: u32, anchor: u32, reader: &R) -> DescendantCheck {
-    let mut pid = peer;
-    let mut hops = 0;
-    for _ in 0..8 {
-        if pid == anchor {
-            return DescendantCheck::Accepted(hops);
-        }
-        match reader.parent_pid(pid) {
-            // `parent == anchor` is allowed even when `parent == 1` (init):
-            // when the desktop runs as PID 1 (a container), the anchor IS
-            // init, and the walk must be allowed to reach it. A `parent`
-            // of 1 that is NOT the anchor is a dead end — a reparented
-            // orphan — and rejects.
-            Some(parent) if parent > 1 || parent == anchor => {
-                pid = parent;
-                hops += 1;
-            }
-            _ => return DescendantCheck::Rejected(hops),
-        }
-    }
-    DescendantCheck::Rejected(hops)
-}
-
-/// Per-connection context for [`handle_connection`]: the listener's shared
-/// state, cloned once per accepted connection (the `Arc`s are cheap; this
-/// bundles what would otherwise be six positional arguments).
-#[derive(Clone)]
-struct ConnCtx {
-    session_id: Arc<Mutex<String>>,
-    sink: Arc<dyn EventSink>,
-    pending_bridge: PendingBridge,
-    last_seq: Arc<AtomicU64>,
-    close_tx: Arc<watch::Sender<bool>>,
-    timeout: Duration,
-    /// The session's `cwd` (the `tool_exec` sandbox root — the `ToolCtx`
-    /// for the desktop's own tool execution; native-agent-harness Task 2).
-    cwd: Arc<PathBuf>,
-    /// The subagent dispatch handle (main only — `Some`); `None` for tests /
-    /// non-bridge setups (a `dispatch_subagent` frame on such a listener gets
-    /// the unknown-method `error` response).
-    subagent: Option<SubagentSpawn>,
-    /// Accumulated `cost_update` usage (subagents only; `None` for main).
-    cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
-    /// The shared todo store (the `todo_update` handler — Phase 2).
-    todo_store: Arc<TodoStore>,
-    /// The pending `sudo_exec` sub-prompt oneshots (Phase 2).
-    pending_sudo: PendingSudo,
-    /// The per-session sudo credential cache (Phase 2; keyed by session id,
-    /// cleared in the driver-task teardown alongside the `pending_bridge`
-    /// prefix drain — mirroring the suite's `credentialCache` cleared at
-    /// every session boundary).
-    sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>>,
-    /// The `sudo -S` execution seam (Phase 2 — the real runner in
-    /// production, a fake in tests).
-    runner: Arc<dyn SudoRunner>,
-}
-
-/// Handle one bridge connection: read exactly ONE frame (a line — the agent
-/// opens a connection per message and destroys it on the first data), then
-/// dispatch.
-///
-/// A **request frame** becomes:
-///
-/// - a oneshot in `pending_bridge` (registered BEFORE the event is emitted
-///   — see (a)), a `bridge-request` event, and a waiter that owns the
-///   stream (the agent sends nothing while waiting, so EOF on the stream is
-///   the immediate-cancel signal); the waiter writes the response frame —
-///   the `result` verbatim — or the terminal `error:"cancelled"` frame,
-///   then closes.
-///
-/// A **push frame** becomes a `seq` drop (drop `seq <= last_seq`), a
-/// `bridge-event` event, an ack line, and a close.
-async fn handle_connection<S>(mut stream: S, ctx: ConnCtx)
-where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    // Read exactly ONE frame (a line) with a hard cap: `read_line` has no
-    // length cap of its own — a peer that streams bytes without a newline
-    // would make it allocate without bound (blast radius: the entire desktop
-    // process). A frame exceeding the cap is dropped (fail-closed, the same
-    // posture as an unparseable frame) — and LOGGED: a silent drop is the
-    // "the bridge just doesn't work" failure mode.
-    const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
-    let line = match read_capped_line(&mut stream, MAX_FRAME_BYTES).await {
-        CappedRead::Line(l) if l.trim().is_empty() => return, // an empty frame is a no-frame
-        CappedRead::Line(l) => l,
-        CappedRead::Eof => return, // closed before a frame
-        CappedRead::ExceededCap(len) => {
-            eprintln!("bridge: dropping a {len}-byte frame over the {MAX_FRAME_BYTES}-byte cap");
-            return;
-        }
-    };
-    let frame: Value = match serde_json::from_str(line.trim()) {
-        Ok(v) => v,
-        Err(_) => {
-            // A frame that fails JSON parse (or is non-UTF-8 via
-            // `from_utf8_lossy`) — log it: a silent drop is the "the bridge
-            // just doesn't work" failure mode (the same posture as the
-            // `ExceededCap` arm above).
-            eprintln!("bridge: dropping an unparseable frame");
-            return;
-        }
-    };
-    let ConnCtx {
-        session_id,
-        sink,
-        pending_bridge,
-        last_seq,
-        close_tx,
-        timeout,
-        // The session's `cwd` (the `tool_exec` sandbox root).
-        cwd,
-        // The subagent dispatch handle (main only — `Some`); the
-        // `dispatch_subagent` method is method-aware (NO timeout).
-        subagent,
-        cost_capture,
-        // The Phase 2 method-aware handler state (`todo_update` /
-        // `sudo_exec` — the desktop answers these itself).
-        todo_store,
-        pending_sudo,
-        sudo_password,
-        runner,
-    } = ctx;
-    match frame.get("type").and_then(Value::as_str) {
-        Some("request") => {
-            let id = frame
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let sid = session_id.lock().await.clone();
-            let method = frame
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-
-            // `dispatch_subagent` is method-aware: NO `pending_bridge`
-            // entry (the desktop answers it itself — not the user), NO
-            // `bridge-request` UI event (the panel is fed by
-            // `subagent-session-started`), NO timeout arm (a subagent task
-            // may run minutes; cancellation is the parent close / the
-            // agent's EOF). All OTHER methods keep the existing 330 s
-            // behavior below.
-            if method == "dispatch_subagent" {
-                handle_dispatch_subagent(
-                    stream,
-                    id,
-                    sid,
-                    frame.get("params"),
-                    sink,
-                    subagent,
-                    close_tx,
-                )
-                .await;
-                return;
-            }
-
-            // `todo_update` / `sudo_exec` are method-aware too (Phase 2,
-            // Task 1): NO `pending_bridge` entry for the OUTER request
-            // (the desktop answers it itself), NO `bridge-request` event
-            // for the outer request, NO 330 s timeout arm for it. The
-            // `sudo_exec` sub-prompts (`:confirm` / `:password`) reuse the
-            // EXISTING modals via `pending_sudo` + `bridge-request` events
-            // (the user answers them via the existing
-            // `respond_bridge_request`). `todo_update` is fast (no user
-            // interaction); `sudo_exec` is long-running (user-paced
-            // sub-prompts).
-            let source = frame
-                .get("source")
-                .and_then(Value::as_str)
-                .unwrap_or("main");
-            if method == "todo_update" {
-                handle_todo_update(
-                    &mut stream,
-                    &id,
-                    &sid,
-                    source,
-                    frame.get("params"),
-                    &todo_store,
-                    &sink,
-                    &close_tx,
-                )
-                .await;
-                return;
-            }
-            if method == "sudo_exec" {
-                handle_sudo_exec(
-                    &mut stream,
-                    &id,
-                    &sid,
-                    source,
-                    frame.get("params"),
-                    &sink,
-                    &runner,
-                    &pending_sudo,
-                    &sudo_password,
-                    &close_tx,
-                )
-                .await;
-                return;
-            }
-
-            // `tool_exec` is method-aware too (native-agent-harness Task 2):
-            // NO `pending_bridge` entry (the desktop executes the delegated
-            // built-in tool itself — not the user), NO `bridge-request`
-            // event, NO 330 s timeout arm (the run is bounded by the
-            // per-method timeout instead; cancellation is the agent's EOF /
-            // the session close).
-            if method == "tool_exec" {
-                handle_tool_exec(&mut stream, &id, frame.get("params"), &cwd, &close_tx).await;
-                return;
-            }
-
-            // (a) Register the oneshot the user's answer flows through —
-            // BEFORE the event is emitted. The UI (and the acp_flow test)
-            // calls `respond_bridge_request` the instant it sees the
-            // `bridge-request` event; if the entry were not in the map yet,
-            // that call would miss and be a no-op, and the request would
-            // wait out the full timeout (the agent gets
-            // `error:"cancelled"`). Registering first makes the lookup
-            // total: by the time the event is observed, the entry is already
-            // there. (The same race class `b3c920a` fixed in `permission.rs`.)
-            let key = bridge_key(&sid, &id);
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut map = pending_bridge.lock().await;
-                map.insert(key.clone(), tx);
-            }
-
-            // (b) Tell the UI about the request — now that the answer path
-            // is in place, so a `respond_bridge_request` racing the emission
-            // always finds the entry. The `session_id` is the CURRENT value
-            // — the ACP id after `set_session_id`, the placeholder before.
-            let payload = json!({
-                "sessionId": sid,
-                "requestId": id,
-                "method": frame.get("method"),
-                "source": frame.get("source"),
-                "toolCallId": frame.get("toolCallId"),
-                "params": frame.get("params"),
-            });
-            sink.emit("bridge-request", payload);
-
-            // (c) The waiter owns the stream: the agent sends NOTHING while
-            // waiting for the response, so EOF on the stream is the
-            // immediate-cancel signal.
-            #[derive(Debug)]
-            enum WaitResult {
-                /// The user answered (the oneshot resolved with the `result`).
-                Answered(Value),
-                /// Timeout / session close / the agent's close (EOF) / a
-                /// drained oneshot — the request is cancelled.
-                Cancelled,
-            }
-            let mut close_rx = close_tx.subscribe();
-            let close_already = *close_rx.borrow();
-            let outcome = if close_already {
-                WaitResult::Cancelled
-            } else {
-                tokio::select! {
-                    r = rx => match r {
-                        Ok(result) => WaitResult::Answered(result),
-                        Err(_) => WaitResult::Cancelled,
-                    },
-                    _ = tokio::time::sleep(timeout) => WaitResult::Cancelled,
-                    _ = close_rx.changed() => WaitResult::Cancelled,
-                    // EOF drain: read until EOF, DISCARDING bytes in 4 KiB
-                    // chunks (no `read_to_end` into a growing Vec — a peer
-                    // that streams bytes without closing can't make this
-                    // allocate without bound).
-                    _ = drain_until_eof(&mut stream) => WaitResult::Cancelled,
-                }
-            };
-            let response = match outcome {
-                WaitResult::Answered(result) => {
-                    json!({ "v": 1, "type": "response", "id": id, "result": result })
-                }
-                WaitResult::Cancelled => {
-                    json!({ "v": 1, "type": "response", "id": id, "error": "cancelled" })
-                }
-            };
-            let data = response.to_string() + "\n";
-            let _ = stream.write_all(data.as_bytes()).await;
-            let _ = stream.flush().await;
-            // Drop the stream → close the connection.
-            {
-                let mut map = pending_bridge.lock().await;
-                map.remove(&key);
-            }
-        }
-        Some("push") => {
-            let seq = frame.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            // `seq` dedupe: drop frames with `seq <= last_seq` (per
-            // listener; `seq` starts at 1). `fetch_max` returns the
-            // previous value — delivered iff the previous was lower.
-            //
-            // In-order assumption: the desktop accepts one connection at a
-            // time (the accept loop is single-threaded, and the agent's
-            // channel protocol is one connection per message, acked before
-            // the next), so two pushes can't be accepted out of order —
-            // the drop is correct for re-delivery (a re-delivered `seq` is
-            // a duplicate).
-            let delivered = seq == 0 || last_seq.fetch_max(seq, Ordering::Relaxed) < seq;
-            if delivered {
-                let sid = session_id.lock().await.clone();
-                // (b) Accumulate the `cost_update` payload (subagents only;
-                // `None` for main) — the v1 metrics source. The lock is
-                // TOLERANT of a poisoned mutex (`into_inner` — a poisoned
-                // capture degrades to its last good state, not a panic: a
-                // panic here would chain into the driver task, and on a
-                // subagent dispatch into a dropped oneshot — a crash
-                // silently reported as a "cancelled" dispatch).
-                if frame.get("event").and_then(Value::as_str) == Some("cost_update") {
-                    if let Some(cc) = &cost_capture {
-                        if let Some(p) = frame.get("payload") {
-                            cc.lock().unwrap_or_else(|p| p.into_inner()).add_payload(p);
-                        }
-                    }
-                }
-                let payload = json!({
-                    "sessionId": sid,
-                    "seq": seq,
-                    "event": frame.get("event"),
-                    "payload": frame.get("payload"),
-                });
-                sink.emit("bridge-event", payload);
-            }
-            // Ack + close (the agent destroys on the first data). A dropped
-            // duplicate is still acked.
-            let _ = stream.write_all(b"ack\n").await;
-            let _ = stream.flush().await;
-        }
-        _ => {
-            // Unknown frame type: close (the agent sees the close as a
-            // failure and retries / gives up per its own policy).
-        }
-    }
-}
-
-/// The outcome of the `dispatch_subagent` waiter.
-#[derive(Debug)]
-enum DispatchWait {
-    /// The dispatch completed (the output + the metrics, verbatim in the
-    /// response's `result`).
-    Completed {
-        output: String,
-        metrics: SubagentMetrics,
-    },
-    /// The dispatch failed (the error, verbatim in the response's `error`).
-    Failed { error: String },
-    /// The parent closed / the agent's EOF / a dropped oneshot — the
-    /// dispatch is cancelled (the terminal `error:"cancelled"` frame).
-    Cancelled,
-}
-
-/// Parse + validate the `dispatch_subagent` frame's `params` →
-/// `(task, LaunchConfig)`. `None` when the `task` is missing or empty (the
-/// caller responds `error: "invalid params"` — a missing `task` must NOT
-/// dispatch an empty-prompt subagent session). `tools: []` is treated as
-/// `None` (an empty allowlist is malformed, not an allowlist — it would
-/// produce `--tools ''`).
 /// Parse + validate the `dispatch_subagent` params: `task` (required,
 /// non-empty) + the optional `launch` config (`model` / `systemPrompt` /
 /// `tools` — `tools: []` is treated as `None`). `pub(crate)` so the native
@@ -1396,165 +693,15 @@ pub(crate) fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> 
     ))
 }
 
-/// The `dispatch_subagent` request branch (method-aware — see the
-/// `handle_connection` request arm): spawn the subagent dispatch on the
-/// worker runtime (the oneshot is the only handoff — the caller never
-/// blocks on the worker runtime) and wait for it. The waiter `select!`s on
-/// `dispatch_rx` (→ the response frame), the parent close (the `close_tx`
-/// flag — a subagent's own listener carries the external close here, so a
-/// cancel also cancels its in-flight `ask` waiters), and the agent's EOF
-/// (→ `cancel.cancel()` + the terminal `error:"cancelled"` frame). NO
-/// timeout arm for this method (the `timeout` is ignored; all other
-/// methods keep the existing 330 s behavior).
-async fn handle_dispatch_subagent<S>(
-    mut stream: S,
-    id: String,
-    parent_session_id: String,
-    params: Option<&Value>,
-    sink: Arc<dyn EventSink>,
-    subagent: Option<SubagentSpawn>,
-    close_tx: Arc<watch::Sender<bool>>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    // A `dispatch_subagent` frame on a listener without a subagent manager
-    // (tests, non-bridge setups) gets the unknown-method `error` response.
-    let Some(spawn) = subagent else {
-        let response = json!({ "v": 1, "type": "response", "id": id, "error": "unknown method" });
-        let data = response.to_string() + "\n";
-        let _ = stream.write_all(data.as_bytes()).await;
-        let _ = stream.flush().await;
-        return;
-    };
-
-    // Validation (BEFORE the spawn): a missing / empty `task` is rejected
-    // (`error: "invalid params"`, no dispatch — an empty-prompt subagent
-    // session would be a wasted process burning tokens on nothing);
-    // `tools: []` is treated as `None` (it would produce `--tools ''`).
-    let params = params.cloned().unwrap_or(Value::Null);
-    let (task, launch) = match dispatch_params(&params) {
-        Some(p) => p,
-        None => {
-            let response =
-                json!({ "v": 1, "type": "response", "id": id, "error": "invalid params" });
-            let data = response.to_string() + "\n";
-            let _ = stream.write_all(data.as_bytes()).await;
-            let _ = stream.flush().await;
-            return;
-        }
-    };
-    // `agentName` is the dispatch's agent name (the `subagent-session-
-    // started` payload) — NOT part of the launch config.
-    let agent_name = params
-        .get("agentName")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    // Pre-check (BEFORE the spawn): a parent that is ALREADY closing must
-    // NOT spawn a subagent at all — the dispatch would be ORPHANED (no
-    // code path could close it: `SubagentCancel` has no `Drop`, and the
-    // sender stays alive via `LiveSession.close_tx`): it would run until
-    // its own prompt settles / app exit — a live agent process burning
-    // tokens whose result nobody consumes. (The post-spawn
-    // `close_rx.changed()` arm below is the belt-and-braces race guard for
-    // a flag that flips AFTER the check — it cancels the spawned dispatch.)
-    let mut close_rx = close_tx.subscribe();
-    let close_already = *close_rx.borrow();
-    let outcome = if close_already {
-        DispatchWait::Cancelled
-    } else {
-        // The desktop spawns the dispatch (the whole lifecycle runs on the
-        // worker runtime; `parent_session_id` is the parent's ACP id — the
-        // `ConnCtx` session-id state after the parent's `set_session_id`).
-        let (dispatch_rx, cancel) = spawn.manager.dispatch(
-            &parent_session_id,
-            &spawn.parent_cwd,
-            &spawn.parent_agent_id,
-            agent_name,
-            launch,
-            task,
-            &sink,
-        );
-        tokio::select! {
-            r = dispatch_rx => match r {
-                Ok(SubagentOutcome::Completed { output, metrics }) => {
-                    DispatchWait::Completed { output, metrics }
-                }
-                Ok(SubagentOutcome::Failed { error }) => DispatchWait::Failed { error },
-                // The worker task vanished without resolving (app exit —
-                // a panicked task is logged by the worker runtime,
-                // unwind profiles only; release builds abort the process
-                // on a panic by design): the dispatch is gone — cancel.
-                Err(_) => DispatchWait::Cancelled,
-            },
-            // The parent closed AFTER the pre-check passed (the race the
-            // pre-check can't cover — the flag flipped between the check
-            // and here): cancel the spawned dispatch (it would otherwise
-            // be orphaned — no code path could close it).
-            _ = close_rx.changed() => {
-                cancel.cancel();
-                DispatchWait::Cancelled
-            },
-            // EOF drain: read until EOF, DISCARDING bytes in 4 KiB chunks
-            // (no `read_to_end` into a growing Vec — a peer that streams
-            // bytes without closing can't make this allocate without
-            // bound).
-            _ = drain_until_eof(&mut stream) => {
-                cancel.cancel();
-                DispatchWait::Cancelled
-            }
-        }
-    };
-    let response = match outcome {
-        DispatchWait::Completed { output, metrics } => {
-            json!({
-                "v": 1, "type": "response", "id": id,
-                "result": {
-                    "output": output,
-                    "metrics": {
-                        "inputTokens": metrics.input_tokens,
-                        "outputTokens": metrics.output_tokens,
-                        "cost": metrics.cost,
-                        "durationMs": metrics.duration_ms,
-                    }
-                }
-            })
-        }
-        DispatchWait::Failed { error } => {
-            json!({ "v": 1, "type": "response", "id": id, "error": error })
-        }
-        DispatchWait::Cancelled => {
-            json!({ "v": 1, "type": "response", "id": id, "error": "cancelled" })
-        }
-    };
-    let data = response.to_string() + "\n";
-    let _ = stream.write_all(data.as_bytes()).await;
-    let _ = stream.flush().await;
-    // Drop the stream → close the connection.
-}
-
-/// The `todo_update` request branch (method-aware — the desktop answers
-/// it itself; see the `handle_connection` request arm): parse the suite's
-/// `ManageTodoListParams` (`{operation: "write"|"read", todoList?: [...]}`),
-/// serve it from the shared [`TodoStore`], and — on a `write` — emit the
-/// `todos_update` push the EXISTING `useBridge.applyTodoUpdate` /
-/// `TodoBoardPanel` consume (the `BridgeEventPayload` shape — `sessionId`
-/// is MANDATORY: `App.tsx` calls `applyTodoUpdate(payload.sessionId,
-/// payload.payload)`, so a missing `sessionId` would land the todos under
-/// `todos[undefined]` and the board (keyed by `activeSessionId`) would
-/// never update). The result shapes/text mirror the suite's
-/// `packages/todo/src/tool.ts` VERBATIM.
-///
-/// The FRAME-FREE CORE (native-agent-harness Task 6, reviewer-corrected
-/// Major #15): apply the suite's `manage_todo_list` params to the shared
-/// [`TodoStore`], and — on a `write` — emit the `todos_update` push the
-/// EXISTING `useBridge.applyTodoUpdate` / `TodoBoardPanel` consume (the
-/// `BridgeEventPayload` shape — `sessionId` is MANDATORY), returning the
-/// result (the text + details mirror the suite's `tool.ts` VERBATIM). Both
-/// the `todo_update` frame handler AND the native `AgentLoop`'s
-/// `ToolRegistry` call it (the native `AgentLoop` passes its `cancel`
-/// token; the frame handler passes a token bridged from the close flag).
+/// The `todo_update` core (method-aware — the desktop answers it itself,
+/// in-process): apply the `write` / `replace` / `toggle` / `clear` /
+/// `add` / `remove` operations to the shared `TodoStore` (the `todos`
+/// table) and emit a `interactive-event` (`todo_update` — the EXISTING
+/// `useInteractive.applyTodoUpdate` / `TodoBoardPanel` consume the
+/// `InteractiveEventPayload` shape, `sessionId` MANDATORY). A cancelled session
+/// aborts the core (BEFORE the store write / the push emit); the `cancel`
+/// token is the session's teardown token (the native `AgentLoop` passes
+/// its `cancel`; a session close cancels the in-flight core).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn todo_apply(
     store: &TodoStore,
@@ -1681,12 +828,12 @@ pub(crate) async fn todo_apply(
             } else {
                 let stored = store.set(sid, items.clone());
                 // Emit the `todos_update` push via the EXISTING
-                // `bridge-event` sink path (the `BridgeEventPayload` shape
-                // — the EXISTING `useBridge.applyTodoUpdate` +
+                // `interactive-event` sink path (the `InteractiveEventPayload`
+                // shape — the EXISTING `useInteractive.applyTodoUpdate` +
                 // `TodoBoardPanel` consume it; do NOT invent a new
                 // `todo-update` event).
                 sink.emit(
-                    "bridge-event",
+                    "interactive-event",
                     json!({
                         "sessionId": sid,
                         "seq": 0,
@@ -1720,153 +867,16 @@ pub(crate) async fn todo_apply(
     }
 }
 
-/// The `todo_update` request branch (method-aware — the desktop answers
-/// it itself; see the `handle_connection` request arm): the frame wrapper
-/// around the frame-free [`todo_apply`] core (Task 6) — a cancelled
-/// session aborts the handler (BEFORE the store write / the push emit),
-/// and the response write races the close flag (a write to a closed
-/// stream fails silently). `drain_until_eof` is NOT a separate arm: it and
-/// the write would both need `&mut stream` in the same `select!` (a
-/// double mutable borrow) — the close flag is the driver's cancel path
-/// and the write itself is bounded (it cannot block on a dead stream:
-/// `write_all` on a closed stream errors immediately).
-#[allow(clippy::too_many_arguments)]
-async fn handle_todo_update<S>(
-    stream: &mut S,
-    id: &str,
-    sid: &str,
-    source: &str,
-    params: Option<&Value>,
-    todo_store: &Arc<TodoStore>,
-    sink: &Arc<dyn EventSink>,
-    close_tx: &Arc<watch::Sender<bool>>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    let params = params.cloned().unwrap_or(Value::Null);
-
-    // A cancelled session aborts the handler (BEFORE the store write / the
-    // push emit — a cancelled session's agent is gone). The core's own
-    // `cancel.is_cancelled()` check sees the SAME snapshot (the token is
-    // built from the flag state at call time — the todo work is fast, so a
-    // flag that flips MID-CALL is caught by the response write race below,
-    // exactly as before).
-    let mut close_rx = close_tx.subscribe();
-    if *close_rx.borrow() {
-        return;
-    }
-    let cancel = close_flag_token(close_tx);
-    let result = todo_apply(todo_store, sid, source, &params, sink, &cancel).await;
-    let response = json!({
-        "v": 1, "type": "response", "id": id,
-        "result": tool_result_response_value(&result),
-    });
-
-    // Write the response, racing the close flag (a cancelled session
-    // aborts the write — the agent is gone; a write to a closed stream
-    // fails silently).
-    let data = response.to_string() + "\n";
-    tokio::select! {
-        _ = close_rx.changed() => {}
-        _ = async {
-            let _ = stream.write_all(data.as_bytes()).await;
-            let _ = stream.flush().await;
-        } => {}
-    }
-}
-
-/// The `todo_update` / `sudo_exec` response's `result` value (the LEGACY
-/// wire contract, byte-compatible with the pre-refactor handlers — the
-/// existing bridge tests freeze it): `content` + `details` (omitted when
-/// absent) + `isError` — present **ONLY on a failure** (`true`); a
-/// success omits it. (The `tool_exec` method deliberately keeps the full
-/// `ToolResult` serialization — its wire contract carries `isError: false`
-/// on a success.)
-fn tool_result_response_value(result: &ToolResult) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "content".into(),
-        serde_json::to_value(&result.content).unwrap_or(Value::Array(Vec::new())),
-    );
-    if let Some(details) = &result.details {
-        obj.insert("details".into(), details.clone());
-    }
-    if result.is_error {
-        obj.insert("isError".into(), Value::Bool(true));
-    }
-    Value::Object(obj)
-}
-
-/// A `CancellationToken` bridged from the session's close flag: a
-/// `close_tx` whose flag is ALREADY set yields an already-cancelled token;
-/// otherwise a forwarder task cancels the token when the flag flips (the
-/// `sudo_exec` core awaits user-paced oneshots for up to 330 s — a
-/// MID-CALL close must cancel them; the todo core only needs the
-/// snapshot, but the bridge serves both).
-///
-/// KNOWN MINOR (not blocking): one forwarder task is spawned per
-/// `todo_update` / `sudo_exec` call and lives until the session closes —
-/// a long-lived session with many calls accumulates them (each is a
-/// trivial `rx.changed().await` waiter, but the count grows unboundedly
-/// for the session's lifetime). A per-session cached forwarder (keyed
-/// off the close flag's first flip) would bound this, but the current
-/// shape is safe (the tasks exit as soon as the flag flips).
-fn close_flag_token(close_tx: &Arc<watch::Sender<bool>>) -> CancellationToken {
-    let token = CancellationToken::new();
-    let mut rx = close_tx.subscribe();
-    if *rx.borrow() {
-        token.cancel();
-        return token;
-    }
-    let token_task = token.clone();
-    tokio::spawn(async move {
-        if rx.changed().await.is_ok() {
-            token_task.cancel();
-        }
-    });
-    token
-}
-
-/// The `sudo_exec` request branch (method-aware — the desktop orchestrates
-/// the confirm → password → run-sudo flow; the user answers the sub-prompts
-/// via the EXISTING `respond_bridge_request`). Ports the suite's policy
-/// VERBATIM (`packages/sudo/src/{tool,cache,config,guard}.ts`):
-///
-/// - **Confirm sub-prompt** (reuses the existing `SudoConfirmModal`): a
-///   oneshot in `pending_sudo` keyed `"{sid}/{id}:confirm"` (REGISTERED
-///   BEFORE the `bridge-request` event — the modals echo the `requestId`
-///   VERBATIM into `respondBridgeRequest`, which composes
-///   `bridge_key(sid, requestId)` = `"{sid}/{id}:confirm"`), a 330 s cap
-///   (user-paced), and the suite's "not confirmed" result on a cancel /
-///   timeout / session close (NO password prompt, NO execution).
-/// - **Password sub-prompt — CACHE-HIT FIRST** (the suite's
-///   `credentialCache.get()`, `tool.ts:442-456`): a valid entry (TTL 15
-///   min, `config.ts`) skips the prompt entirely; on expiry the entry is
-///   dropped and the `SudoPasswordModal` prompt fires (an EMPTY `""`
-///   password is a cancel — the `BridgeResponseDto` convention).
-/// - **Run** via the INJECTABLE [`SudoRunner`] (the suite's `SudoSpawner`
-///   seam — tests use a fake runner, no real `sudo` in `cargo test`):
-///   `buildSudoArgv` (quoted-arg split, leading-`sudo` strip, NO `-p`),
-///   the password on stdin, the timeout from `params.timeoutMs` (absent =
-///   the 120 s default — the RUN is NOT under the 330 s sub-prompt cap).
-/// - **Auth-failure handling** (`tool.ts:225-228`): the EXACT two-condition
-///   signature (`[sudo] password for` AND `incorrect password`, both
-///   case-insensitive) clears the cached password (a mistyped password
-///   must not stick for the TTL). SCOPED OUT (fast path only): the
-///   two-strike ambiguous-failure rule with the `sudo -n -v` `authProbe`
-///   and `failStreak`, and the `exitCode` conventions (-1/124/130/137
-///   exclusions — a future task can add the `authProbe`).
-/// - **Secret scrubbing** (the suite's `scrubSecret`, applied PER STREAM):
-///   the password must not appear in the captured output that is persisted
-///   in tool results).
-///
-/// The FRAME-FREE CORE (native-agent-harness Task 6, reviewer-corrected
-/// Major #15) is [`sudo_run_flow`] — the same flow WITHOUT the stream:
-/// it owns the `"{sid}/{id}:confirm"` / `"{sid}/{id}:password"` oneshot
-/// registration in `pending_sudo` + the `bridge-request` events via
-/// `sink`, and calls the `SudoRunner` (the production `RealSudoRunner`;
-/// tests inject a fake). Both the `sudo_exec` frame handler AND the
-/// native `AgentLoop`'s `ToolRegistry` call it.
+/// The `sudo_exec` core (method-aware — the desktop answers it itself,
+/// in-process): the `confirm` / `password` sub-prompts (the `pending_sudo`
+/// oneshots, the `interactive-request` events via `sink`), the per-session
+/// `sudo_password` credential cache (the suite's `credentialCache` —
+/// in-memory only, cleared at every session boundary), and the `sudo -S`
+/// execution through the `SudoRunner` seam (the production
+/// `RealSudoRunner`; tests inject a fake). A cancelled session aborts the
+/// core (the `cancel` token — the native `AgentLoop`'s session teardown
+/// token); the `SudoPromptCleanup` guard emits the terminal
+/// `interactive-request-close` on a DROPPED (unanswered) prompt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn sudo_run_flow(
     sid: &str,
@@ -1918,8 +928,8 @@ pub(crate) async fn sudo_run_flow(
     // the instant it sees the event — the same race class the generic path
     // guards, `b3c920a`). The `requestId` is the DERIVED `"{id}:confirm"`
     // (NOT the bare frame `id` — a bare id would miss the
-    // `respond_bridge_request` lookup and silently time out at 330 s).
-    let confirm_key = bridge_key(sid, &format!("{request_id}:confirm"));
+    // `respond_interactive_request` lookup and silently time out at 330 s).
+    let confirm_key = interactive_key(sid, &format!("{request_id}:confirm"));
     let (confirm_tx, confirm_rx) = oneshot::channel();
     {
         let mut map = pending_sudo.lock().await;
@@ -1927,7 +937,7 @@ pub(crate) async fn sudo_run_flow(
     }
     cleanup.track(&confirm_key);
     sink.emit(
-        "bridge-request",
+        "interactive-request",
         json!({
             "sessionId": sid,
             "requestId": format!("{request_id}:confirm"),
@@ -1939,7 +949,7 @@ pub(crate) async fn sudo_run_flow(
     );
     let r: Result<Value, ()> = tokio::select! {
         r = confirm_rx => r.map_err(|_| ()),
-        _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
+        _ = tokio::time::sleep(DEFAULT_INTERACTIVE_TIMEOUT) => Err(()),
         _ = cancel.cancelled() => Err(()),
     };
     // EVERY exit path (answered, timeout, cancel — the entry was inserted
@@ -1947,7 +957,7 @@ pub(crate) async fn sudo_run_flow(
     // entry (no leaked dead-receiver entries — mirrors the `pending_bridge`
     // remove in the generic path). A cancel resolves to `false` (a
     // missing/`false` `confirmed` is a cancel). The key is UNTRACKED too
-    // (the `SudoPromptCleanup` guard's `bridge-request-close` is then a
+    // (the `SudoPromptCleanup` guard's `interactive-request-close` is then a
     // no-op — a completed flow, after the user answered, must not emit a
     // stale close; only a genuinely dropped flow — the entry NOT removed —
     // emits the close).
@@ -1992,7 +1002,7 @@ pub(crate) async fn sudo_run_flow(
     let mut prompted = false;
     let mut prompted_value: Option<Value> = None;
     if cached.is_none() {
-        let password_key = bridge_key(sid, &format!("{request_id}:password"));
+        let password_key = interactive_key(sid, &format!("{request_id}:password"));
         let (pw_tx, pw_rx) = oneshot::channel();
         {
             let mut map = pending_sudo.lock().await;
@@ -2000,7 +1010,7 @@ pub(crate) async fn sudo_run_flow(
         }
         cleanup.track(&password_key);
         sink.emit(
-            "bridge-request",
+            "interactive-request",
             json!({
                 "sessionId": sid,
                 "requestId": format!("{request_id}:password"),
@@ -2012,11 +1022,11 @@ pub(crate) async fn sudo_run_flow(
         );
         let r: Result<Value, ()> = tokio::select! {
             r = pw_rx => r.map_err(|_| ()),
-            _ = tokio::time::sleep(DEFAULT_BRIDGE_TIMEOUT) => Err(()),
+            _ = tokio::time::sleep(DEFAULT_INTERACTIVE_TIMEOUT) => Err(()),
             _ = cancel.cancelled() => Err(()),
         };
         pending_sudo.lock().await.remove(&password_key);
-        // Untrack the key (the `SudoPromptCleanup` guard's `bridge-request-close`
+        // Untrack the key (the `SudoPromptCleanup` guard's `interactive-request-close`
         // is then a no-op — a completed flow, after the user answered, must
         // not emit a stale close; only a genuinely dropped flow emits it).
         cleanup.untrack(&password_key);
@@ -2150,265 +1160,13 @@ pub(crate) async fn sudo_run_flow(
     }
 }
 
-/// The `sudo_exec` request branch (method-aware — the desktop orchestrates
-/// the confirm → password → run-sudo flow; the user answers the sub-prompts
-/// via the EXISTING `respond_bridge_request`): the frame wrapper around the
-/// frame-free [`sudo_run_flow`] core (Task 6) — a cancelled session aborts
-/// the handler (the token is bridged from the close flag; a MID-CALL close
-/// cancels the user-paced oneshots), and the response write races the close
-/// flag. `drain_until_eof` is a SEPARATE arm (unlike `todo_update`): the
-/// core does NOT own the stream, so an EOF (the agent hung up — it holds
-/// the connection open while waiting, so EOF is the immediate-cancel
-/// signal) drops the core (a dropped oneshot entry is drained by the
-/// driver-task teardown) and skips the write (the connection is dead —
-/// the pre-refactor behavior wrote a cancel response that failed on the
-/// dead stream, a net no-op).
-#[allow(clippy::too_many_arguments)]
-async fn handle_sudo_exec<S>(
-    stream: &mut S,
-    id: &str,
-    sid: &str,
-    source: &str,
-    params: Option<&Value>,
-    sink: &Arc<dyn EventSink>,
-    runner: &Arc<dyn SudoRunner>,
-    pending_sudo: &PendingSudo,
-    sudo_password: &Arc<Mutex<HashMap<String, CachedPassword>>>,
-    close_tx: &Arc<watch::Sender<bool>>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    let params = params.cloned().unwrap_or(Value::Null);
-
-    // A cancelled session aborts the handler (BEFORE any sub-prompt — the
-    // token is bridged from the close flag: a flag that flips MID-CALL
-    // cancels the user-paced oneshots via the core's `cancel.cancelled()`
-    // arms).
-    let mut close_rx = close_tx.subscribe();
-    if *close_rx.borrow() {
-        return;
-    }
-    let cancel = close_flag_token(close_tx);
-    let result = tokio::select! {
-        r = sudo_run_flow(sid, id, source, &params, sink, runner, pending_sudo, sudo_password, &cancel) => r,
-        // EOF drain: the agent hung up — drop the core + skip the write
-        // (the connection is dead).
-        _ = drain_until_eof(stream) => return,
-    };
-    let response = json!({
-        "v": 1, "type": "response", "id": id,
-        "result": tool_result_response_value(&result),
-    });
-    write_sudo_response(stream, &response, &mut close_rx).await;
-}
-
-/// The `tool_exec` request branch (method-aware — the desktop executes the
-/// delegated built-in tool itself and answers the frame; native-agent-harness
-/// Task 2): parse `{ tool, params }` (the inner `params` is the tool's own
-/// params), run [`execute_tool`] (Task 1) with a `ToolCtx` built from the
-/// session's `cwd` (the sandbox root) + a fresh cancellation token, and
-/// write back the `ToolResult`.
-///
-/// **Response shape (byte-compatible with the other handlers):** a
-/// successful dispatch — including a tool that returned `isError: true`
-/// (a clean tool failure the LLM sees) — is a `result` frame with **NO
-/// `error` key** (the agent-side client treats `error !== undefined` as a
-/// failure, so an `error: null` frame would fail every round-trip); a hard
-/// failure (a timeout) is an `error` frame with **NO `result` key**.
-///
-/// **Abort:** a `tokio::select!` over the execution, the agent's EOF
-/// (drain), the session close, and the per-method timeout; every
-/// non-completion arm cancels the token (the `bash` child is killed — the
-/// select dropping the execution future would kill it via `kill_on_drop`
-/// too; the explicit cancel is the documented seam). A dead-but-open peer
-/// with a full buffer must not park the handler (the response write races
-/// the close flag — the `write_sudo_response` posture).
-///
-/// **Timeout:** fast tools are capped at [`TOOL_EXEC_FAST_TIMEOUT`] (30 s);
-/// `bash` is capped by its `timeout_ms` param (absent = the 5-min default,
-/// [`TOOL_EXEC_BASH_DEFAULT_TIMEOUT`] — the run is bounded by the caller's
-/// `timeout_ms`, mirroring the `sudo_exec` run cap).
-async fn handle_tool_exec<S>(
-    stream: &mut S,
-    id: &str,
-    params: Option<&Value>,
-    cwd: &Arc<PathBuf>,
-    close_tx: &Arc<watch::Sender<bool>>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    let params = params.cloned().unwrap_or(Value::Null);
-    let tool = params
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    // The inner `params` is the tool's own params (a missing one is a
-    // `Null` — the executors validate their own params and return a clean
-    // `isError: true` result).
-    let inner = params.get("params").cloned().unwrap_or(Value::Null);
-
-    // The per-method timeout (see the doc above).
-    let timeout = if tool == "bash" {
-        inner
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .filter(|ms| *ms > 0)
-            .map(Duration::from_millis)
-            .unwrap_or(TOOL_EXEC_BASH_DEFAULT_TIMEOUT)
-    } else {
-        TOOL_EXEC_FAST_TIMEOUT
-    };
-
-    let mut close_rx = close_tx.subscribe();
-    let cancel = CancellationToken::new();
-    let ctx = ToolCtx {
-        cwd: cwd.as_path().to_path_buf(),
-        cancel: cancel.clone(),
-    };
-
-    // `Result<_, &str>`: the cancel arms (close / EOF) and the timeout arm
-    // all map to an `error` frame; a tool that returns `isError: true` is
-    // STILL a successful response (the `result` carries the flag — the LLM
-    // sees the clean tool failure). A session that is ALREADY closing
-    // skips the select entirely (the `close_already` pre-check — a
-    // `changed()` on a fresh receiver would never fire when the flag was
-    // set at subscribe time; the write below is skipped by the same check).
-    let close_already = *close_rx.borrow();
-    let outcome: Result<ToolResult, &str> = if close_already {
-        Err("cancelled")
-    } else {
-        tokio::select! {
-            r = execute_tool(&ctx, &tool, &inner) => Ok(r),
-            _ = tokio::time::sleep(timeout) => {
-                cancel.cancel();
-                Err("timeout")
-            }
-            // The session closed AFTER the pre-check passed (the flag
-            // flipped between the check and here): cancel the tool.
-            _ = close_rx.changed() => {
-                cancel.cancel();
-                Err("cancelled")
-            }
-            // EOF drain: the agent hung up — cancel the tool (the agent
-            // holds the connection open while waiting, so EOF is the
-            // immediate-cancel signal, exactly like the other handlers).
-            _ = drain_until_eof(stream) => {
-                cancel.cancel();
-                Err("cancelled")
-            }
-        }
-    };
-    let response = match outcome {
-        Ok(result) => {
-            json!({
-                "v": 1, "type": "response", "id": id,
-                "result": serde_json::to_value(&result).unwrap_or(Value::Null)
-            })
-        }
-        Err(reason) => {
-            json!({ "v": 1, "type": "response", "id": id, "error": reason })
-        }
-    };
-    // The close-raced write (the `write_sudo_response` posture): a
-    // dead-but-open peer with a full buffer must not park the handler —
-    // a write to a closed stream fails silently (the agent is gone).
-    write_sudo_response(stream, &response, &mut close_rx).await;
-}
-
-/// Write a `sudo_exec` response frame, racing the write against the close
-/// flag (the SAME posture as `handle_todo_update`): a dead-but-open peer
-/// with a full socket buffer would otherwise park the `handle_sudo_exec`
-/// task on the write past session close. A write to a closed stream fails
-/// silently (the agent is gone). `drain_until_eof` is NOT a separate arm:
-/// it and the write would both need `&mut stream` in the same `select!`
-/// (a double mutable borrow) — the close flag is the driver's cancel path.
-async fn write_sudo_response<S>(
-    stream: &mut S,
-    response: &Value,
-    close_rx: &mut watch::Receiver<bool>,
-) where
-    S: AsyncWrite + Unpin,
-{
-    // The flag was ALREADY set at subscribe time: a `changed()` on a fresh
-    // receiver would never fire (the value has not changed since the
-    // subscribe), so skip the write — the agent is gone.
-    if *close_rx.borrow() {
-        return;
-    }
-    let data = response.to_string() + "\n";
-    tokio::select! {
-        _ = close_rx.changed() => {}
-        _ = async {
-            let _ = stream.write_all(data.as_bytes()).await;
-            let _ = stream.flush().await;
-        } => {}
-    }
-}
-
-/// The outcome of a capped frame read. The enum makes the cap-exceeded
-/// case UNREPRESENTABLE as a silent `None` — every caller must
-/// acknowledge the truncation case (and log it).
-#[derive(Debug, PartialEq)]
-enum CappedRead {
-    /// A complete frame (a line, `\n`-terminated).
-    Line(String),
-    /// The connection closed before a complete frame.
-    Eof,
-    /// The frame exceeded the cap (dropped — `len` is the byte count at
-    /// the point the cap was tripped).
-    ExceededCap(usize),
-}
-
-/// Read one frame (a line) with a hard byte cap (the frame read is bounded
-/// — a peer that streams bytes without a newline can't make this allocate
-/// without bound). `Eof` when the connection closed before a complete
-/// frame; `ExceededCap` when the frame exceeded the cap (fail-closed, the
-/// same posture as an unparseable frame — but distinguishable, so the drop
-/// is logged rather than silent).
-async fn read_capped_line<S: AsyncRead + Unpin>(stream: &mut S, cap: usize) -> CappedRead {
-    let mut frame: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = match stream.read(&mut chunk).await {
-            Ok(n) => n,
-            Err(_) => return CappedRead::Eof,
-        };
-        if n == 0 {
-            return CappedRead::Eof; // closed before a complete frame
-        }
-        frame.extend_from_slice(&chunk[..n]);
-        if frame.len() > cap {
-            return CappedRead::ExceededCap(frame.len()); // the frame exceeded the cap — fail closed
-        }
-        if frame.ends_with(b"\n") {
-            return CappedRead::Line(String::from_utf8_lossy(&frame).into_owned());
-        }
-    }
-}
-
-/// Read until EOF, discarding bytes in 4 KiB chunks (a bounded drain — no
-/// `read_to_end` into a growing `Vec`).
-async fn drain_until_eof<R: AsyncRead + Unpin>(r: &mut R) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io;
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
-    use std::task::{Context, Poll};
-    use tokio::io::AsyncBufReadExt;
-    use tokio::io::ReadBuf;
+    use tokio::sync::watch;
 
     /// An `EventSink` that captures emissions (the test double for
     /// `TauriSink`).
@@ -2433,443 +1191,25 @@ mod tests {
         }
     }
 
-    /// A `ProcReader` backed by an explicit `pid -> parent` map (the
-    /// `#[cfg(test)]` seam — fabricates the parent chain, so the "foreign
-    /// process" case is real without a double-fork).
-    struct MapReader(StdMutex<HashMap<u32, u32>>);
-
-    impl MapReader {
-        fn new(pairs: &[(u32, u32)]) -> Self {
-            Self(StdMutex::new(pairs.iter().cloned().collect()))
-        }
-    }
-
-    impl ProcReader for MapReader {
-        fn parent_pid(&self, pid: u32) -> Option<u32> {
-            self.0.lock().unwrap().get(&pid).copied()
-        }
-    }
-
     #[test]
-    fn bridge_key_carries_the_trailing_slash_prefix() {
-        assert_eq!(bridge_key("s1", "r1"), "s1/r1");
+    fn interactive_key_carries_the_trailing_slash_prefix() {
+        assert_eq!(interactive_key("s1", "r1"), "s1/r1");
         assert_eq!(session_key_prefix("s1"), "s1/");
         // Closing "s1" must not drain "s10"'s pending entry (the same
         // trailing-slash-prefix invariant as `permission`).
         let mut map: HashMap<String, oneshot::Sender<Value>> = HashMap::new();
         let (tx_s1, _rx_s1) = oneshot::channel();
         let (tx_s10, _rx_s10) = oneshot::channel();
-        map.insert(bridge_key("s1", "r1"), tx_s1);
-        map.insert(bridge_key("s10", "r1"), tx_s10);
+        map.insert(interactive_key("s1", "r1"), tx_s1);
+        map.insert(interactive_key("s10", "r1"), tx_s10);
         map.retain(|key, _| !key.starts_with(&session_key_prefix("s1")));
         assert!(
-            map.contains_key(&bridge_key("s10", "r1")),
+            map.contains_key(&interactive_key("s10", "r1")),
             "closing s1 must not drain s10's pending entry"
         );
         assert!(
-            !map.contains_key(&bridge_key("s1", "r1")),
+            !map.contains_key(&interactive_key("s1", "r1")),
             "s1's own pending entry must be drained"
-        );
-    }
-
-    #[test]
-    fn is_descendant_accepts_a_chain_that_reaches_the_anchor() {
-        // peer 42 → 7 → anchor 1000 (two `/proc` reads).
-        let reader = MapReader::new(&[(42, 7), (7, 1000)]);
-        assert_eq!(
-            is_descendant(42, 1000, &reader),
-            DescendantCheck::Accepted(2)
-        );
-    }
-
-    #[test]
-    fn is_descendant_reaches_an_anchor_that_is_init() {
-        // The desktop runs as PID 1 (a container): the anchor IS init,
-        // so the walk must be allowed to reach pid 1 (42 → 7 → 1).
-        let reader = MapReader::new(&[(42, 7), (7, 1)]);
-        assert_eq!(is_descendant(42, 1, &reader), DescendantCheck::Accepted(2));
-    }
-
-    #[test]
-    fn is_descendant_rejects_a_chain_that_never_reaches_the_anchor() {
-        // A double-forked orphan: reparented to init — its chain
-        // (400 → 2 → 1) never reaches the anchor (which is NOT init):
-        // one `/proc` read (400 → 2), then `parent == 1` is a dead end.
-        let reader = MapReader::new(&[(400, 2), (2, 1)]);
-        assert_eq!(
-            is_descendant(400, 1000, &reader),
-            DescendantCheck::Rejected(1)
-        );
-    }
-
-    #[test]
-    fn is_descendant_rejects_a_cycle_bounded_by_eight_hops() {
-        // A cycle (42 → 7 → 42 → …) must terminate (≤8 hops) and reject
-        // (eight `/proc` reads, no verdict).
-        let reader = MapReader::new(&[(42, 7), (7, 42)]);
-        assert_eq!(
-            is_descendant(42, 1000, &reader),
-            DescendantCheck::Rejected(8)
-        );
-    }
-
-    /// A `tokio` `AsyncRead` that returns a fixed byte buffer once, then
-    /// EOF (a closed connection) — the test double for a peer that sends
-    /// a bounded amount of data and hangs up.
-    struct ByteStream(Vec<u8>);
-
-    impl AsyncRead for ByteStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<Result<(), io::Error>> {
-            let n = self.0.len().min(buf.capacity());
-            if n == 0 {
-                return Poll::Ready(Ok(())); // EOF
-            }
-            buf.put_slice(&self.0[..n]);
-            self.0.drain(..n);
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn read_capped_line_returns_the_line_when_under_the_cap() {
-        let mut stream = ByteStream(b"hello\n".to_vec());
-        assert_eq!(
-            read_capped_line(&mut stream, 1024).await,
-            CappedRead::Line("hello\n".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn read_capped_line_returns_eof_when_the_peer_closes_before_a_frame() {
-        let mut stream = ByteStream(Vec::new()); // immediate EOF
-        assert_eq!(read_capped_line(&mut stream, 1024).await, CappedRead::Eof);
-    }
-
-    #[tokio::test]
-    async fn read_capped_line_returns_exceeded_cap_when_the_frame_exceeds_it() {
-        // A frame larger than the cap, with NO newline: the cap is tripped
-        // (distinguishable from an EOF — the drop is representable, so the
-        // caller must log it rather than fail silently).
-        let big = vec![b'x'; 1024 + 4096];
-        let mut stream = ByteStream(big);
-        match read_capped_line(&mut stream, 1024).await {
-            CappedRead::ExceededCap(len) => assert!(len > 1024),
-            other => panic!("expected ExceededCap, got {other:?}"),
-        }
-    }
-
-    /// Bind a unique Unix socket, spawn `handle_connection` as the server
-    /// (the agent opens a new connection per message and destroys it on the
-    /// first data — one frame per connection), and return the path + the
-    /// server task. A tokio-native `UnixListener`/`UnixStream::connect` is
-    /// used (NOT `UnixStream::from_std` on a blocking fd, which tokio 1.53
-    /// refuses to register). `subagent` (the `dispatch_subagent` dispatch
-    /// handle) is `None` for the non-dispatch tests.
-    async fn spawn_server(
-        session_id: String,
-        sink: Arc<CapturingSink>,
-        pending: PendingBridge,
-        last_seq: Arc<AtomicU64>,
-        close_tx: Arc<watch::Sender<bool>>,
-        timeout: Duration,
-        subagent: Option<crate::agent::session::SubagentSpawn>,
-    ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "archimedes-bridge-test-{}-{}.sock",
-            std::process::id(),
-            n
-        ));
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let ctx = ConnCtx {
-                session_id: Arc::new(Mutex::new(session_id)),
-                sink,
-                pending_bridge: pending,
-                last_seq,
-                close_tx,
-                timeout,
-                cwd: Arc::new(std::env::temp_dir()),
-                subagent,
-                cost_capture: None,
-                todo_store: Arc::new(TodoStore::new()),
-                pending_sudo: Arc::new(Mutex::new(HashMap::new())),
-                sudo_password: Arc::new(Mutex::new(HashMap::new())),
-                runner: Arc::new(FakeRunner::default()),
-            };
-            handle_connection(stream, ctx).await
-        });
-        (path, server_task)
-    }
-
-    /// Connect a client to `path` (tokio-native — no `from_std` on a
-    /// blocking fd).
-    async fn connect_client(
-        path: &std::path::Path,
-    ) -> tokio::io::BufReader<tokio::net::UnixStream> {
-        let inner = tokio::net::UnixStream::connect(path)
-            .await
-            .expect("connect");
-        tokio::io::BufReader::new(inner)
-    }
-
-    #[tokio::test]
-    async fn push_frames_are_seq_deduped() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-
-        let frame = json!({ "v": 1, "type": "push", "seq": 1, "event": "session", "payload": {} });
-
-        // First connection: push `seq: 1` → delivered.
-        let (path, server_task) = spawn_server(
-            "sess".to_string(),
-            sink.clone(),
-            pending.clone(),
-            last_seq.clone(),
-            close_tx.clone(),
-            Duration::from_secs(30),
-            None,
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-        let mut ack = String::new();
-        let _ = client.read_line(&mut ack).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(ack, "ack\n", "a delivered push is acked");
-        assert_eq!(
-            sink.events_named("bridge-event").len(),
-            1,
-            "a delivered push emits one bridge-event"
-        );
-
-        // Second connection (one frame per connection): the same `seq: 1`
-        // → dropped (`seq <= last_seq`), but still acked.
-        let (path, server_task) = spawn_server(
-            "sess".to_string(),
-            sink.clone(),
-            pending.clone(),
-            last_seq.clone(),
-            close_tx.clone(),
-            Duration::from_secs(30),
-            None,
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-        let mut ack = String::new();
-        let _ = client.read_line(&mut ack).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(ack, "ack\n", "a dropped duplicate is still acked");
-        assert_eq!(
-            sink.events_named("bridge-event").len(),
-            1,
-            "a duplicate seq emits no second bridge-event"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_request_frame_round_trips_the_response_verbatim() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-
-        let (path, server_task) = spawn_server(
-            "sess-1".to_string(),
-            sink.clone(),
-            pending.clone(),
-            last_seq,
-            close_tx,
-            Duration::from_secs(30),
-            None,
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        let frame = json!({
-            "v": 1, "type": "request", "id": "r-1", "method": "confirm",
-            "source": "main", "params": { "command": "ls", "reason": "test" }
-        });
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-
-        // Wait for the pending entry to be registered.
-        let mut interval = tokio::time::interval(Duration::from_millis(5));
-        loop {
-            interval.tick().await;
-            if pending
-                .lock()
-                .await
-                .contains_key(&bridge_key("sess-1", "r-1"))
-            {
-                break;
-            }
-        }
-
-        // The user answers — the oneshot carries the `result` verbatim.
-        let result = json!({ "confirmed": true });
-        let sender = pending
-            .lock()
-            .await
-            .remove(&bridge_key("sess-1", "r-1"))
-            .expect("pending entry");
-        let _ = sender.send(result);
-
-        // The client reads the response frame (one frame per connection —
-        // the agent destroys on the first data).
-        let mut response_line = String::new();
-        let _ = client.read_line(&mut response_line).await;
-        server_task.await.expect("server task");
-
-        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
-        assert_eq!(
-            response.get("type").and_then(Value::as_str),
-            Some("response")
-        );
-        assert_eq!(response.get("id").and_then(Value::as_str), Some("r-1"));
-        // The `result` verbatim — no wrapper, no double-nesting.
-        assert_eq!(response.get("result"), Some(&json!({ "confirmed": true })));
-        assert!(response.get("error").is_none());
-        let _ = std::fs::remove_file(&path);
-
-        // The `bridge-request` event carries the session id.
-        let requests = sink.events_named("bridge-request");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].get("sessionId").and_then(Value::as_str),
-            Some("sess-1")
-        );
-        assert_eq!(
-            requests[0].get("requestId").and_then(Value::as_str),
-            Some("r-1")
-        );
-        assert_eq!(
-            requests[0].get("method").and_then(Value::as_str),
-            Some("confirm")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_timeout_writes_the_terminal_cancelled_frame() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-
-        let (path, server_task) = spawn_server(
-            "sess-1".to_string(),
-            sink.clone(),
-            pending.clone(),
-            last_seq,
-            close_tx,
-            // The injectable timeout (the `Duration` parameter — Task 6 shrinks
-            // it to 50 ms; here 200 ms).
-            Duration::from_millis(200),
-            None,
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        let frame = json!({ "v": 1, "type": "request", "id": "r-2", "method": "ask", "source": "main", "params": {} });
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-        // Do NOT answer — the waiter times out and writes the explicit
-        // terminal frame, then closes.
-        let mut response_line = String::new();
-        let _ = client.read_line(&mut response_line).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-
-        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
-        assert_eq!(
-            response.get("type").and_then(Value::as_str),
-            Some("response")
-        );
-        assert_eq!(response.get("id").and_then(Value::as_str), Some("r-2"));
-        assert_eq!(
-            response.get("error").and_then(Value::as_str),
-            Some("cancelled"),
-            "a timeout writes the terminal error:\"cancelled\" frame"
-        );
-        assert!(response.get("result").is_none());
-    }
-
-    #[tokio::test]
-    async fn a_session_close_cancels_the_request() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-
-        let (path, server_task) = spawn_server(
-            "sess-1".to_string(),
-            sink.clone(),
-            pending.clone(),
-            last_seq,
-            close_tx.clone(),
-            Duration::from_secs(30),
-            None,
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        let frame = json!({ "v": 1, "type": "request", "id": "r-3", "method": "password", "source": "main", "params": {} });
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-
-        // Wait for the pending entry, then close the session — the waiter
-        // observes the close flag and cancels.
-        let mut interval = tokio::time::interval(Duration::from_millis(5));
-        loop {
-            interval.tick().await;
-            if pending
-                .lock()
-                .await
-                .contains_key(&bridge_key("sess-1", "r-3"))
-            {
-                break;
-            }
-        }
-        close_tx.send(true).expect("close flag");
-        let mut response_line = String::new();
-        let _ = client.read_line(&mut response_line).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-
-        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
-        assert_eq!(
-            response.get("error").and_then(Value::as_str),
-            Some("cancelled"),
-            "a session close writes the terminal error:\"cancelled\" frame"
         );
     }
 
@@ -2914,143 +1254,11 @@ mod tests {
         assert!(launch.tools.is_none());
     }
 
-    /// A `dispatch_subagent` frame with NO `task` gets `error: "invalid
-    /// params"` (and NO dispatch is spawned — no `subagent-session-started`
-    /// event). The server carries a real subagent manager (so the method is
-    /// reachable — a `None` manager would get the unknown-method response
-    /// instead).
-    #[tokio::test]
-    async fn a_dispatch_subagent_frame_without_a_task_gets_invalid_params() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-        // A real subagent manager (an empty config dir — no agents; the
-        // validation happens BEFORE any dispatch, so nothing is spawned).
-        let dir =
-            std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone(), None)
-            .expect("subagent manager should build");
-        let spawn = crate::agent::session::SubagentSpawn {
-            manager: Arc::new(manager),
-            parent_cwd: dir.clone(),
-            parent_agent_id: "fake".to_string(),
-        };
-
-        let (path, server_task) = spawn_server(
-            "sess-1".to_string(),
-            sink.clone(),
-            pending,
-            last_seq,
-            close_tx,
-            Duration::from_secs(30),
-            Some(spawn),
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        // A `dispatch_subagent` frame with NO `task` (the other params are
-        // present — only `task` is missing/invalid).
-        let frame = json!({
-            "v": 1, "type": "request", "id": "r-dispatch", "method": "dispatch_subagent",
-            "source": "main", "params": { "agentName": "fake", "model": null }
-        });
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-        let mut response_line = String::new();
-        let _ = client.read_line(&mut response_line).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
-        assert_eq!(
-            response.get("type").and_then(Value::as_str),
-            Some("response")
-        );
-        assert_eq!(
-            response.get("id").and_then(Value::as_str),
-            Some("r-dispatch")
-        );
-        assert_eq!(
-            response.get("error").and_then(Value::as_str),
-            Some("invalid params"),
-            "a missing `task` is rejected with `error: \"invalid params\"`"
-        );
-        // NO dispatch was spawned (no `subagent-session-started` event).
-        assert!(
-            sink.events_named("subagent-session-started").is_empty(),
-            "a rejected frame must not spawn a subagent dispatch"
-        );
-    }
-
-    /// A `dispatch_subagent` frame with an EMPTY `task` gets `error:
-    /// "invalid params"` (same rejection as a missing `task`).
-    #[tokio::test]
-    async fn a_dispatch_subagent_frame_with_an_empty_task_gets_invalid_params() {
-        let sink = Arc::new(CapturingSink::default());
-        let pending: PendingBridge = Arc::new(Mutex::new(HashMap::new()));
-        let last_seq = Arc::new(AtomicU64::new(0));
-        let (close_tx, _close_rx) = watch::channel(false);
-        let close_tx = Arc::new(close_tx);
-        let dir =
-            std::env::temp_dir().join(format!("bridge-dispatch-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let manager = crate::agent::subagent::SubagentSessionManager::new(dir.clone(), None)
-            .expect("subagent manager should build");
-        let spawn = crate::agent::session::SubagentSpawn {
-            manager: Arc::new(manager),
-            parent_cwd: dir.clone(),
-            parent_agent_id: "fake".to_string(),
-        };
-
-        let (path, server_task) = spawn_server(
-            "sess-1".to_string(),
-            sink.clone(),
-            pending,
-            last_seq,
-            close_tx,
-            Duration::from_secs(30),
-            Some(spawn),
-        )
-        .await;
-        let mut client = connect_client(&path).await;
-        let frame = json!({
-            "v": 1, "type": "request", "id": "r-dispatch-2", "method": "dispatch_subagent",
-            "source": "main", "params": { "agentName": "fake", "task": "" }
-        });
-        client
-            .write_all((frame.to_string() + "\n").as_bytes())
-            .await
-            .expect("write frame");
-        let _ = client.flush().await;
-        let mut response_line = String::new();
-        let _ = client.read_line(&mut response_line).await;
-        server_task.await.expect("server task");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let response: Value = serde_json::from_str(response_line.trim()).expect("response frame");
-        assert_eq!(
-            response.get("error").and_then(Value::as_str),
-            Some("invalid params"),
-            "an empty `task` is rejected with `error: \"invalid params\"`"
-        );
-        assert!(
-            sink.events_named("subagent-session-started").is_empty(),
-            "a rejected frame must not spawn a subagent dispatch"
-        );
-    }
-
     // -------------------------------------------------------------------
     // `todo_update` / `sudo_exec` (Phase 2, Task 1): the desktop-side
     // handlers (method-aware — the desktop answers them itself; the user
     // answers the `sudo_exec` sub-prompts via the existing
-    // `respond_bridge_request`). Driven through a fake `SudoRunner` (no
+    // `respond_interactive_request`). Driven through a fake `SudoRunner` (no
     // real `sudo` in `cargo test`).
     // -------------------------------------------------------------------
 
@@ -3104,44 +1312,6 @@ mod tests {
         }
     }
 
-    /// A stream that never delivers bytes, never EOFs, and records what
-    /// was written (the handler writes the response frame to it).
-    struct TestStream {
-        written: StdMutex<Vec<u8>>,
-    }
-
-    impl AsyncRead for TestStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<Result<(), io::Error>> {
-            // Never ready, never EOF: the sub-prompt waiters block until
-            // the test resolves the oneshot (or flips the close flag).
-            Poll::Pending
-        }
-    }
-
-    impl AsyncWrite for TestStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            self.written.lock().unwrap().extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
     /// Wait (up to ~2 s) until `key` appears in `pending_sudo`.
     async fn wait_for_sudo_key(pending: &PendingSudo, key: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3155,9 +1325,9 @@ mod tests {
     }
 
     /// Resolve a pending sudo sub-prompt (mirrors the manager's
-    /// `respond_bridge_request` lookup — the key is `"{sid}/{id}:{phase}"`).
+    /// `respond_interactive_request` lookup — the key is `"{sid}/{id}:{phase}"`).
     async fn respond_sudo(pending: &PendingSudo, id: &str, phase: &str, value: Value) -> bool {
-        let key = bridge_key("sid1", &format!("{id}:{phase}"));
+        let key = interactive_key("sid1", &format!("{id}:{phase}"));
         pending
             .lock()
             .await
@@ -3166,32 +1336,46 @@ mod tests {
             .is_some()
     }
 
-    /// Run `handle_todo_update` inline (it is fast — no user
-    /// interaction) and return the response frame it wrote.
-    async fn run_todo(params: Value, store: Arc<TodoStore>, sink: Arc<dyn EventSink>) -> Value {
-        let mut stream = TestStream {
-            written: StdMutex::new(Vec::new()),
-        };
-        let (close_tx, _close_rx) = watch::channel(false);
-        handle_todo_update(
-            &mut stream,
-            "id-t",
-            "sid1",
-            "main",
-            Some(&params),
-            &store,
-            &sink,
-            &Arc::new(close_tx),
-        )
-        .await;
-        let data = String::from_utf8(stream.written.lock().unwrap().clone()).unwrap();
-        serde_json::from_str(data.lines().next().expect("a response frame was written")).unwrap()
+    /// Serialize a `ToolResult` the way the interactive response envelope
+    /// does (`content` + `details` (omitted when absent) + `isError` —
+    /// present ONLY on a failure; a success omits it) — the test
+    /// helpers build the response envelope around this.
+    fn tool_result_response_value(result: &ToolResult) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "content".into(),
+            serde_json::to_value(&result.content).unwrap_or(Value::Array(Vec::new())),
+        );
+        if let Some(details) = &result.details {
+            obj.insert("details".into(), details.clone());
+        }
+        if result.is_error {
+            obj.insert("isError".into(), Value::Bool(true));
+        }
+        Value::Object(obj)
     }
 
-    /// Run `handle_sudo_exec` on a worker task (the handler may block on
-    /// a user sub-prompt) and return the response frame it wrote (a
-    /// `Value::Null` sentinel when NO frame was written — e.g. the write
-    /// was skipped because the session closed first).
+    /// Run the `todo_apply` core inline (it is fast — no user
+    /// interaction) and return the response envelope it would write
+    /// (`{type, id, result}` — the `ToolResult` serialized through
+    /// [`tool_result_response_value`]).
+    async fn run_todo(params: Value, store: Arc<TodoStore>, sink: Arc<dyn EventSink>) -> Value {
+        let cancel = CancellationToken::new();
+        let result = todo_apply(&store, "sid1", "main", &params, &sink, &cancel).await;
+        json!({
+            "type": "response",
+            "id": "id-t",
+            "result": tool_result_response_value(&result),
+        })
+    }
+
+    /// Run the `sudo_run_flow` core on a worker task (the core may block on
+    /// a user sub-prompt) and return the response envelope it would write
+    /// (a `Value::Null` sentinel when the session close wins the race —
+    /// the core is dropped, the write is skipped). The close flag is
+    /// wired into the core's `cancel` token (a session close cancels the
+    /// in-flight core — the native `AgentLoop` passes its `cancel` token
+    /// directly).
     async fn run_sudo(
         id: &str,
         params: Value,
@@ -3203,29 +1387,35 @@ mod tests {
     ) -> tokio::task::JoinHandle<Value> {
         let id = id.to_string();
         tokio::spawn(async move {
-            let mut stream = TestStream {
-                written: StdMutex::new(Vec::new()),
-            };
-            handle_sudo_exec(
-                &mut stream,
-                &id,
+            let cancel = CancellationToken::new();
+            let core = sudo_run_flow(
                 "sid1",
+                &id,
                 "main",
-                Some(&params),
+                &params,
                 &sink,
                 &runner,
                 &pending_sudo,
                 &sudo_password,
-                &close_tx,
-            )
-            .await;
-            let data = String::from_utf8(stream.written.lock().unwrap().clone()).unwrap();
-            // No frame (the write was SKIPPED — the session closed before
-            // the response, the agent is gone) → a `Value::Null` sentinel.
-            data.lines()
-                .next()
-                .map(|l| serde_json::from_str(l).expect("a valid response frame"))
-                .unwrap_or(Value::Null)
+                &cancel,
+            );
+            let mut close_rx = close_tx.subscribe();
+            tokio::select! {
+                result = core => {
+                    json!({
+                        "type": "response",
+                        "id": id,
+                        "result": tool_result_response_value(&result),
+                    })
+                }
+                _ = close_rx.wait_for(|v| *v) => {
+                    // A session close wins the race — the core is dropped
+                    // (its `SudoPromptCleanup` guard removes the in-flight
+                    // sub-prompt entries) and NO response is written.
+                    cancel.cancel();
+                    Value::Null
+                }
+            }
         })
     }
 
@@ -3275,9 +1465,9 @@ mod tests {
         assert!(result.get("isError").is_none());
         assert_eq!(store.get("sid1").len(), 3);
 
-        // The `todos_update` push (the EXISTING `useBridge.applyTodoUpdate`
+        // The `todos_update` push (the EXISTING `useInteractive.applyTodoUpdate`
         // shape — `sessionId` MANDATORY, `payload.{source,todos}`).
-        let events = sink.events_named("bridge-event");
+        let events = sink.events_named("interactive-event");
         assert_eq!(events.len(), 1, "one todos_update push");
         assert_eq!(events[0]["sessionId"], "sid1");
         assert_eq!(events[0]["event"], "todos_update");
@@ -3314,7 +1504,7 @@ mod tests {
         assert_eq!(result["details"]["todos"][0]["content"], "cur");
         assert_eq!(result["isError"], true);
         assert!(
-            sink.events_named("bridge-event").is_empty(),
+            sink.events_named("interactive-event").is_empty(),
             "no push on a failed write"
         );
     }
@@ -3417,7 +1607,7 @@ mod tests {
         assert_eq!(result["isError"], true);
         assert_eq!(runner.call_count(), 0, "no runner call");
         assert!(
-            sink.events_named("bridge-request").is_empty(),
+            sink.events_named("interactive-request").is_empty(),
             "no sub-prompt was emitted"
         );
         assert!(pending_sudo.lock().await.is_empty());
@@ -3470,8 +1660,8 @@ mod tests {
         );
         // The confirm event carries the FULL modal payload (`SudoConfirmModal`
         // reads `request.method` + `params.{command,reason}` and echoes the
-        // `requestId` VERBATIM into `respondBridgeRequest`).
-        let reqs = sink.events_named("bridge-request");
+        // `requestId` VERBATIM into `respondInteractiveRequest`).
+        let reqs = sink.events_named("interactive-request");
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0]["sessionId"], "sid1");
         assert_eq!(reqs[0]["requestId"], "id1:confirm");
@@ -3582,7 +1772,7 @@ mod tests {
             .await
         );
         assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:password").await);
-        // An EMPTY password is a cancel (the `BridgeResponseDto` convention).
+        // An EMPTY password is a cancel (the `InteractiveResponseDto` convention).
         assert!(respond_sudo(&pending_sudo, "id1", "password", json!({ "password": "" })).await);
         let response = task.await.unwrap();
         let result = &response["result"];
@@ -3618,9 +1808,9 @@ mod tests {
         close_tx.send(true).expect("close flag");
         let response = task.await.unwrap();
         // A session close maps to a cancel — and the response write is
-        // SKIPPED (the agent is gone: the write races the close flag, the
-        // `handle_todo_update` posture): no frame is written (the
-        // `Value::Null` sentinel). No run, no password prompt, no leak.
+        // SKIPPED (the agent is gone: the close flag wins the race in the
+        // `run_sudo` helper): no frame is written (the `Value::Null`
+        // sentinel). No run, no password prompt, no leak.
         assert!(response.is_null(), "no response frame on a closed session");
         assert_eq!(runner.call_count(), 0, "no runner call");
         assert!(
@@ -3767,7 +1957,7 @@ mod tests {
         assert_eq!(runner.call_count(), 2);
         let (_, pw, _) = runner.last_call().unwrap();
         assert_eq!(pw, "pw1", "the cached password was reused");
-        let reqs = sink.events_named("bridge-request");
+        let reqs = sink.events_named("interactive-request");
         // Run 1 emitted confirm + password (the cache was empty); run 2
         // emitted ONLY the confirm (the cache hit skipped the prompt).
         assert_eq!(
@@ -4001,77 +2191,6 @@ mod tests {
         assert_eq!(scrub_secret("a\nhunter2\nc", "hunter2"), "a\n[redacted]\nc");
         assert_eq!(scrub_secret("a\nhunter2", ""), "a\nhunter2");
         assert_eq!(scrub_secret("clean", "hunter2"), "clean");
-    }
-
-    /// A write that parks (returns `Pending`) until the close flag flips —
-    /// the test double for a dead-but-open peer with a full socket buffer
-    /// (`write_all` parks until the write errors or the session close
-    /// aborts it).
-    struct ParkingStream {
-        close: watch::Receiver<bool>,
-    }
-
-    impl AsyncWrite for ParkingStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            if *self.close.borrow() {
-                Poll::Ready(Ok(buf.len()))
-            } else {
-                Poll::Pending
-            }
-        }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn write_sudo_response_races_the_write_against_the_close_flag() {
-        let (close_tx, _close_rx) = watch::channel(false);
-        let mut stream = ParkingStream {
-            close: close_tx.subscribe(),
-        };
-        let mut rx = close_tx.subscribe();
-        // The write parks (a dead-but-open peer with a full buffer): without
-        // the close race, `write_sudo_response` would block FOREVER.
-        let task = tokio::spawn(async move {
-            write_sudo_response(&mut stream, &json!({ "v": 1 }), &mut rx).await
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        close_tx.send(true).expect("close flag");
-        let done = tokio::time::timeout(Duration::from_millis(2000), task).await;
-        assert!(
-            done.is_ok(),
-            "the close flag aborts the parked write (a bare write would park forever)"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_sudo_response_skips_the_write_when_the_session_is_already_closed() {
-        let (close_tx, _close_rx) = watch::channel(true);
-        let mut stream = ParkingStream {
-            close: close_tx.subscribe(),
-        };
-        let mut rx = close_tx.subscribe();
-        // The flag is ALREADY `true` at subscribe time: a `changed()` on a
-        // fresh receiver would never fire (the value has not changed since
-        // the subscribe) — the pre-check must skip the write, or the parked
-        // write would block forever.
-        let done = tokio::time::timeout(
-            Duration::from_millis(500),
-            write_sudo_response(&mut stream, &json!({ "v": 1 }), &mut rx),
-        )
-        .await;
-        assert!(done.is_ok(), "an already-closed session skips the write");
     }
 
     #[tokio::test]
@@ -4451,7 +2570,7 @@ mod tests {
     /// (finding 3) A `sudo_run_flow` future DROPPED while blocked on its
     /// confirm sub-prompt (the `dispatch_tool` `select!`'s turn-cancel arm)
     /// must clean up: the `pending_sudo` `:confirm` entry is removed (no
-    /// leaked dead-oneshot entry) AND a `bridge-request-close` event is
+    /// leaked dead-oneshot entry) AND a `interactive-request-close` event is
     /// emitted (the UI closes the modal — pre-fix the modal stayed open
     /// with no pending response, and a late answer got `Ok(true)` with the
     /// send silently failing). The `SudoPromptCleanup` drop guard does it.
@@ -4465,7 +2584,7 @@ mod tests {
         let cancel = CancellationToken::new(); // the SESSION teardown token (NOT cancelled)
         let params = json!({ "command": "echo hi", "reason": "test" });
         // SPAWN the flow (it inserts the `:confirm` entry + emits
-        // `bridge-request`, then blocks on the confirm sub-prompt — never
+        // `interactive-request`, then blocks on the confirm sub-prompt — never
         // answered in the test). A `Box::pin` would not poll the future, so
         // the spawn is what actually runs it. The `Arc`s are CLONED for the
         // closure (the originals are kept for the assertions below).
@@ -4503,10 +2622,10 @@ mod tests {
         // The modal-closing event is emitted SYNCHRONOUSLY by the guard's
         // `Drop` (assert after a short poll — the abort is a request).
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let close_events = capturing.events_named("bridge-request-close");
+        let close_events = capturing.events_named("interactive-request-close");
         assert!(
             close_events.iter().any(|p| p["requestId"] == "r1:confirm"),
-            "the bridge-request-close event was emitted (the modal closes)"
+            "the interactive-request-close event was emitted (the modal closes)"
         );
         // The entry is removed (the guard's spawned cleanup task) — wait for
         // it to run.
@@ -4521,8 +2640,8 @@ mod tests {
     }
 
     /// (finding 3) A COMPLETED (answered) `sudo_run_flow` must NOT emit a
-    /// `bridge-request-close` (the `SudoPromptCleanup` guard's
-    /// `bridge-request-close` is only for a genuinely DROPPED flow — the user
+    /// `interactive-request-close` (the `SudoPromptCleanup` guard's
+    /// `interactive-request-close` is only for a genuinely DROPPED flow — the user
     /// already answered both sub-prompts, so a stale close would promise
     /// "close this open modal" for a modal that is already closed). The mirror
     /// of `a_dropped_sudo_flow_cleans_up_its_pending_entry_and_closes_the_modal`
@@ -4578,13 +2697,13 @@ mod tests {
             "the flow completed (a success result), got {result:?}"
         );
         // The flow completed — the `SudoPromptCleanup` guard's `Drop` must NOT
-        // emit a `bridge-request-close` (the user already answered both
+        // emit a `interactive-request-close` (the user already answered both
         // sub-prompts; a stale close would promise "close this open modal" for
         // a modal that is already closed).
-        let close_events = sink.events_named("bridge-request-close");
+        let close_events = sink.events_named("interactive-request-close");
         assert!(
             close_events.is_empty(),
-            "a COMPLETED sudo flow must NOT emit a bridge-request-close (the user already answered both sub-prompts), got {close_events:?}"
+            "a COMPLETED sudo flow must NOT emit a interactive-request-close (the user already answered both sub-prompts), got {close_events:?}"
         );
         // The `pending_sudo` map is empty (the entries were removed on the
         // normal exit — no leaked dead-oneshot entries).

@@ -29,7 +29,9 @@ use archimedes_lib::agent::harness::{
 use archimedes_lib::agent::subagent::{
     LaunchConfig, NativeDeps, SubagentOutcome, SubagentSessionManager,
 };
-use archimedes_lib::agent::{EventSink, ProviderFactory, RpcEvent, SessionInfo, TodoStore};
+use archimedes_lib::agent::{
+    EffectiveCatalog, EventSink, ProviderFactory, RpcEvent, SessionInfo, TodoStore,
+};
 use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -39,23 +41,11 @@ use tokio::sync::mpsc;
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
-const FAKE_PI: &str = env!("CARGO_BIN_EXE_fake_pi");
-
-/// A config dir with ONE `fake` registry entry (the `dispatch_native`
-/// driver never spawns it — the registry just has to load).
+/// A config dir (the `dispatch_native` driver never spawns a pi process —
+/// the dir is just a valid path for the effective-catalog `config_dir`).
 fn temp_config_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("native-dispatch-cfg-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("agents.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "agents": [
-                { "id": "fake", "name": "Fake", "command": FAKE_PI, "args": [] }
-            ]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
     dir
 }
 
@@ -122,15 +112,16 @@ fn make_manager_with_trust(
     settle_timeout: Duration,
     trust_db: Option<Arc<Db>>,
 ) -> Arc<SubagentSessionManager> {
-    let manager = Arc::new(
-        SubagentSessionManager::new(config_dir.to_path_buf(), None)
-            .expect("subagent manager should build"),
-    );
+    let manager = Arc::new(SubagentSessionManager::new(None));
     let factory: ProviderFactory =
         Arc::new(move |_m: &Model| Box::new(BoxedProvider(provider.clone())));
     manager.set_native_deps(NativeDeps {
         provider_factory: factory,
-        catalog,
+        catalog: EffectiveCatalog {
+            config_dir: config_dir.to_path_buf(),
+            cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
+            base: catalog,
+        },
         todo_store: Arc::new(TodoStore::new()),
         sudo: SudoDeps::default(),
         settle_timeout,
@@ -359,10 +350,7 @@ async fn dispatch_native_runs_the_child_and_streams_frames_exactly_once() {
 #[test]
 fn dispatch_native_without_native_deps_fails_immediately() {
     let config_dir = temp_config_dir();
-    let manager = Arc::new(
-        SubagentSessionManager::new(config_dir.clone(), None)
-            .expect("subagent manager should build"),
-    );
+    let manager = Arc::new(SubagentSessionManager::new(None));
     let (parent_model, _) = test_catalog();
     let (sink, _rx) = rec_sink();
     let (mut dispatch_rx, _cancel) = manager.dispatch_native(
@@ -1063,7 +1051,6 @@ fn agent_loop_getters_and_prepend_system() {
     let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
     db.record_session(&archimedes_lib::agent::SessionInfo {
         session_id: "s1".to_string(),
-        agent_id: "native".to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: serde_json::json!({}),
         config_options: None,
@@ -1480,7 +1467,6 @@ async fn dispatch_subagent_a_parent_turn_cancel_propagates_to_the_hanging_child(
     let db = Arc::new(Db::open(&parent_dir.join("t.db")).expect("db should open"));
     db.record_session(&SessionInfo {
         session_id: "parent-1".to_string(),
-        agent_id: "native".to_string(),
         cwd: parent_dir.clone(),
         capabilities: serde_json::json!({}),
         config_options: None,
@@ -1622,7 +1608,6 @@ fn trusted_space_db() -> (Arc<Db>, PathBuf) {
     let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
     db.record_session(&SessionInfo {
         session_id: "s1".to_string(),
-        agent_id: "native".to_string(),
         cwd: space.clone(),
         capabilities: serde_json::json!({}),
         config_options: None,

@@ -28,7 +28,6 @@ fn temp_db() -> (Arc<Db>, std::path::PathBuf) {
 fn record_session(db: &Db, id: &str) {
     db.record_session(&SessionInfo {
         session_id: id.to_string(),
-        agent_id: "native".to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         capabilities: json!({}),
         config_options: None,

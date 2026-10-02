@@ -25,7 +25,6 @@ vi.mock("../lib/tauri", async () => {
     ...actual,
     resumeSession: vi.fn().mockResolvedValue({
       sessionId: "s1",
-      agentId: "a1",
       cwd: "/x",
       capabilities: {},
       archived: false,
@@ -47,7 +46,6 @@ vi.mock("../lib/tauri", async () => {
  */
 const info = (sessionId: string, cwd: string): SessionInfo => ({
   sessionId,
-  agentId: "clack-1.0",
   cwd,
   capabilities: {},
   archived: false,
@@ -552,11 +550,11 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
     });
   });
 
-  // The one-live cap is LIFTED (ADR 0002): a space may hold MORE than one
+  // The one-live cap is LIFTED: a space may hold MORE than one
   // live session. `sessions` is in insertion order (newest appended by
   // `addSession` / `resumeSession`), so the space row points at the
   // MOST-RECENTLY-STARTED one.
-  it("a space with TWO coexisting live sessions points at the most-recently-started one (ADR 0002 lift)", () => {
+  it("a space with TWO coexisting live sessions points at the most-recently-started one (the one-live cap lift)", () => {
     const twoLive = [
       info("first", "/workspaces/alpha"),
       info("second", "/workspaces/alpha"),
@@ -566,7 +564,7 @@ describe("spaceViewFor (per-space grouping, pure)", () => {
     expect(view.storedSessionIds).toEqual(["stored-alpha"]);
   });
 
-  it("autoSelectActive prefers the most-recently-started live session in the space (ADR 0002 lift)", () => {
+  it("autoSelectActive prefers the most-recently-started live session in the space (the one-live cap lift)", () => {
     const twoLive = [
       info("first", "/workspaces/alpha"),
       info("second", "/workspaces/alpha"),
@@ -947,7 +945,6 @@ describe("configOptions state", () => {
   it("seeds configOptions from a started session's SessionInfo (and not when absent)", () => {
     useSessions.getState().addSession({
       sessionId: "s1",
-      agentId: "a1",
       cwd: "/x",
       capabilities: {},
       archived: false,
@@ -959,7 +956,6 @@ describe("configOptions state", () => {
 
     useSessions.getState().addSession({
       sessionId: "s2",
-      agentId: "a2",
       cwd: "/x",
       capabilities: {},
       archived: false,
@@ -970,7 +966,7 @@ describe("configOptions state", () => {
   it("seeds configOptions from a resumed session's SessionInfo", async () => {
     useSessions.setState({
       historySessions: [
-        { sessionId: "s1", agentId: "a1", cwd: "/x", capabilities: {}, archived: false },
+        { sessionId: "s1", cwd: "/x", capabilities: {}, archived: false },
       ],
     });
     await useSessions.getState().resumeSession("s1");
@@ -1147,7 +1143,6 @@ describe("resumeSession (history reload race)", () => {
       historySessions: [
         {
           sessionId: "s1",
-          agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
           archived: false,
@@ -1209,7 +1204,6 @@ describe("resumeSession (history reload race)", () => {
       historySessions: [
         {
           sessionId: "s1",
-          agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
           archived: false,
@@ -1279,7 +1273,6 @@ describe("resumeSession (history reload race)", () => {
       historySessions: [
         {
           sessionId: "s1",
-          agentId: "a1",
           cwd: "/x",
           capabilities: { loadSession: true },
           archived: false,

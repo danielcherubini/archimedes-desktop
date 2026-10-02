@@ -15,8 +15,8 @@ pub mod retry;
 pub mod store;
 
 pub use catalog::{
-    discover_models, merge_catalog, seed_from_pi_config, CompactionConfig, DiscoveredMeta, Model,
-    ModelCatalog, ProviderDiscovery, DEFAULT_CONTEXT_WINDOW,
+    discover_models, merge_catalog, CompactionConfig, DiscoveredMeta, Model, ModelCatalog,
+    ProviderDiscovery, DEFAULT_CONTEXT_WINDOW,
 };
 pub use compact::{split_for_compaction, Compactor};
 pub use prompt::{

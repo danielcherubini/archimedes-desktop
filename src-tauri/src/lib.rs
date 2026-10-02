@@ -1,7 +1,6 @@
 pub mod agent;
 pub mod agents;
 pub mod commands;
-pub mod config;
 pub mod skills;
 pub mod storage;
 #[doc(hidden)]
@@ -15,8 +14,8 @@ use tauri::Manager;
 use crate::agent::{EventSink, SessionManager, SubagentSessionManager};
 use crate::storage::Db;
 
-/// The shared app setup: agent registry from `config_dir`, persistence
-/// database in `app_data_dir/archimedes.db`.
+/// The shared app setup: the session manager (settings-driven native
+/// sessions) + the persistence database in `app_data_dir/archimedes.db`.
 ///
 /// Factored out of [`run`] so the real command surface can be exercised in
 /// tests without a GUI (see `tests/ipc.rs`).
@@ -25,27 +24,26 @@ pub fn setup_dirs<R: tauri::Runtime>(
     config_dir: PathBuf,
     app_data_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The agent registry lives in the app's config directory.
-    let mut manager = SessionManager::new(config_dir.clone())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    // The session manager is settings-driven (the config dir is the
+    // `settings.json` home — the desktop is native-only: there is no agent
+    // registry and no pi config seeding).
+    let mut manager = SessionManager::new(config_dir.clone());
     // The persistence database lives in the app data directory.
     let db = Arc::new(
         Db::open(&app_data_dir.join("archimedes.db"))
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     );
     manager.attach_db(db.clone());
-    // The subagent manager (its own `SessionDriver` + a dedicated
-    // `WorkerRuntime`, built in `new()` — two idle threads, negligible).
-    // Injected into the main manager (the main session's bridge listener
-    // services `dispatch_subagent` frames); the injection order breaks the
-    // apparent cycle: the subagent manager needs nothing from the main
-    // manager; only the main manager's `SessionDriver.subagent` field points
-    // at it.
+    // The subagent manager (its own `SessionDriver`, built in `new()` —
+    // one idle thread, negligible). Injected into the main manager (the
+    // main session's `task` tool dispatches through it); the injection
+    // order breaks the apparent cycle: the subagent manager needs nothing
+    // from the main manager; only the main manager's `SessionDriver`
+    // `subagent` field points at it.
     let subagent_manager = Arc::new(
         // The trust db is threaded (ADR 0010 — subagent Sessions inherit
         // Space trust; the subagent's driver `db` stays `None` — ephemeral).
-        SubagentSessionManager::new(config_dir, Some(db.clone()))
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        SubagentSessionManager::new(Some(db.clone())),
     );
     manager.set_subagent_manager(subagent_manager.clone());
     // The event sink (TauriSink) is managed state so commands — and the
@@ -63,9 +61,9 @@ pub fn setup_dirs<R: tauri::Runtime>(
     // The manager is `Sync` (its mutable state is `Arc<Mutex<…>>`
     // internally), so it is shared directly without an outer lock.
     app.manage(Arc::new(manager));
-    // The subagent manager is `Send + Sync` (same reasoning — the
-    // `WorkerRuntime` fields are `Send` + `Sync`), so it is managed
-    // directly too (the `respond_*` commands resolve it as state).
+    // The subagent manager is `Send + Sync` (same reasoning — its mutable
+    // state is `Arc<Mutex<…>>` internally), so it is managed directly too
+    // (the `respond_*` commands resolve it as state).
     app.manage(subagent_manager);
     app.manage(db);
     Ok(())
@@ -83,7 +81,7 @@ pub fn run() {
             commands::sessions::send_prompt,
             commands::sessions::close_session,
             commands::sessions::respond_permission,
-            commands::sessions::respond_bridge_request,
+            commands::sessions::respond_interactive_request,
             commands::sessions::resume_session,
             commands::sessions::set_session_config_option,
             commands::sessions::cancel_session,
@@ -94,9 +92,9 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::list_models,
+            commands::settings::list_tools,
             commands::settings::test_mcp_server,
             commands::settings::auth_mcp_server,
-            commands::spaces::list_agents,
             commands::spaces::list_spaces,
             commands::spaces::delete_space,
             commands::spaces::space_for_path,

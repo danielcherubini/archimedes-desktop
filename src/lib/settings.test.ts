@@ -99,9 +99,10 @@ describe("loadAndApplySettings", () => {
     vi.mocked(getSettings).mockResolvedValue({
       theme: "system",
       paneLayout: {},
-      defaultAgent: null,
       defaultTrustNewSpaces: false,
       defaultModel: null,
+      defaultThinkingLevel: null,
+      enabledTools: [],
       providers: [],
       mcpServers: {},
       font: { sizePx: 16, uiFamily: "Inter", codeFamily: null },

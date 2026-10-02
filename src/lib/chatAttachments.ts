@@ -129,7 +129,7 @@ export function addImageAttachments(
  * `promptCapabilities.image === true` in its initialize response.
  * `capabilities` is the raw camelCase wire record from `SessionInfo`
  * (`src/lib/tauri.ts`) — a missing field or missing `promptCapabilities`
- * means "not supported" (same posture as the bridge's macOS fail-closed).
+ * means "not supported" (same posture as the suite's macOS fail-closed).
  */
 export function agentSupportsImages(
   capabilities: Record<string, unknown> | undefined,

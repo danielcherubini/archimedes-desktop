@@ -28,7 +28,7 @@ import {
 import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
 import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
@@ -121,15 +121,15 @@ export default function ChatStream() {
     usePermissions((s) =>
       activeSessionId ? s.prompts[activeSessionId] : undefined,
     ) ?? [];
-  // Bridge surfaces for the ACTIVE session (B3): the store is keyed by the
+  // Interactive surfaces for the ACTIVE session (B3): the store is keyed by the
   // ACP session id, which matches `activeSessionId`.
-  const bridgeRequests =
-    useBridge((s) =>
+  const interactiveRequests =
+    useInteractive((s) =>
       activeSessionId ? s.requests[activeSessionId] : undefined,
     ) ?? [];
-  const askRequests = bridgeRequests.filter((r) => r.method === "ask");
-  const confirmRequests = bridgeRequests.filter((r) => r.method === "confirm");
-  const passwordRequests = bridgeRequests.filter(
+  const askRequests = interactiveRequests.filter((r) => r.method === "ask");
+  const confirmRequests = interactiveRequests.filter((r) => r.method === "confirm");
+  const passwordRequests = interactiveRequests.filter(
     (r) => r.method === "password",
   );
   // An `ask` request is ANCHORED when a `tool-call` message with its
@@ -155,18 +155,18 @@ export default function ChatStream() {
   const turnCompleted = useSessions((s) => s.turnCompleted);
   const resumeSession = useSessions((s) => s.resumeSession);
 
-  // The bridge agent state for the active session. `inTurn` is the
+  // The interactive agent state for the active session. `inTurn` is the
   // ground truth for "a turn is in flight" (set by `beginTurn`, cleared
   // by `turnCompleted`) — a STALE `idle` from the previous turn must
   // not unlock the composer or hide the working indicator, so `inTurn`
   // wins alongside `working` (the store does not reset `agentState` on
-  // `turnCompleted` — a store follow-up; a bridge agent that hasn't
+  // `turnCompleted` — a store follow-up; an agent that hasn't
   // pushed yet is covered the same way: its turn IS in flight).
-  const agentState = useBridge((s) =>
+  const agentState = useInteractive((s) =>
     activeSessionId ? s.agentState[activeSessionId] : undefined,
   );
   const workingOrInTurn = agentState === "working" || inTurn;
-  // A `blocked` bridge agent is mid-turn AWAITING a request response
+  // A `blocked` agent is mid-turn AWAITING a request response
   // (`inTurn` is true) — the composer must stay locked for the whole
   // wait (pre-branch, `main`'s composer locked on `inTurn`): sending
   // concurrently would double-send and clobber the turn bookkeeping.
@@ -457,12 +457,12 @@ export default function ChatStream() {
             v.archivedSessionIds.includes(activeSessionId),
         );
 
-  // `New session` in this space (the extracted hook): `agentId =
-  // live ?? storedMostRecent ?? firstAgentId (registry default)`,
-  // `spacePath = view.path` (the active session's `cwd` by the match
-  // above; the backend canonicalizes). With the one-live cap lifted
-  // (ADR 0002) a new conversation does NOT displace a live one — they
-  // coexist. `view === undefined` → the hook no-ops (the `New Session`
+  // `New session` in this space (the extracted hook): `spacePath =
+  // view.path` (the active session's `cwd` by the match above; the
+  // backend canonicalizes) — a native session (one harness — no agent
+  // to choose). With the one-live cap lifted, a new
+  // conversation does NOT displace a live one — they coexist.
+  // `view === undefined` → the hook no-ops (the `New Session`
   // sidebar button routes that case to the Open Space dialog instead).
   const { startNewConversation, error: newConversationError } =
     useStartNewConversation(view);
@@ -676,7 +676,7 @@ export default function ChatStream() {
     // (once as `Live`, once as `Archived` — two `SelectItem`s with the
     // same `key`/`value`). Label it `Live` when it IS live (in `sessions`
     // — a multi-live space where a second, more recent live session is
-    // `view.liveSessionId`, ADR 0002); `Archived` only when it isn't.
+    // `view.liveSessionId`); `Archived` only when it isn't.
     if (
       activeSessionId !== view.liveSessionId &&
       !view.storedSessionIds.includes(activeSessionId) &&
@@ -734,16 +734,16 @@ export default function ChatStream() {
   // `width: 0` + `overflow: hidden` when collapsed): it counts the
   // ACTIVE session's requests PLUS pending subagent requests (subagent
   // session ids are never active, so the active-session count alone
-  // would strand a pending subagent request until the bridge timeout).
+  // would strand a pending subagent request until the interactive timeout).
   const hasPendingRequest =
     prompts.length > 0 ||
-    bridgeRequests.some(
+    interactiveRequests.some(
       (r) =>
         r.method === "ask" || r.method === "confirm" || r.method === "password",
     ) ||
     pendingSubagentRequests > 0;
   // The "Send a prompt to start" hint is hidden when a pending request
-  // (permission prompt or bridge `ask`/`confirm`/`password` — the cards
+  // (permission prompt or interactive `ask`/`confirm`/`password` — the cards
   // render in the stream regardless of the transcript's length) or a
   // working/blocked line is present — otherwise the card would be
   // swallowed by the hint.
@@ -967,7 +967,7 @@ export default function ChatStream() {
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
         {/* The request cards and the working/blocked/stop-reason lines
             render UNCONDITIONALLY (regardless of the transcript's
-            length — a bridge agent that asks at session start, or the
+            length — a native agent that asks at session start, or the
             window between `openSession` and `loadHistory` hydration,
             must not have its request swallowed by the hint). */}
         {messages.length === 0 &&
@@ -1031,7 +1031,7 @@ export default function ChatStream() {
             requestId={prompt.requestId}
           />
         ))}
-        {/* Stacked bridge `ask` cards (one per pending request, arrival
+        {/* Stacked interactive `ask` cards (one per pending request, arrival
             order — concurrent asks stack vertically in the stream). */}
         {stackedAskRequests.map((r) => (
           <AskQuestionCard
@@ -1232,10 +1232,7 @@ export default function ChatStream() {
           disabled={!composerEnabled || composerLocked}
           className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
         />
-        <div className="mt-1 flex items-center justify-between gap-2">
-          <span className="text-ui-xs text-foreground-subtlest">
-            {liveSession?.agentId ?? historySession?.agentId}
-          </span>
+        <div className="mt-1 flex items-center justify-end gap-2">
           {/* ZCode's composer carries the config controls in its toolbar
               (left of the send button) — the header does not. */}
           <div className="flex flex-wrap items-center gap-2">
@@ -1261,7 +1258,7 @@ export default function ChatStream() {
           </div>
         </div>
       </div>
-      {/* Bridge modals (rendered at the `ChatStream` root — `fixed`
+      {/* Interactive modals (rendered at the `ChatStream` root — `fixed`
           overlays, NOT inside the scroll region). */}
       {confirmRequests.map((r) => (
         <SudoConfirmModal

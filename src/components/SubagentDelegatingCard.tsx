@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSubagents } from "../store/subagents";
 import { useSubagentSelection } from "../store/subagentSelection";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useSessions, type Message, type ToolCallUiStatus } from "../store/sessions";
 import {
   cleanModelName,
@@ -329,7 +329,7 @@ export default function SubagentDelegatingCard({
   const entries = useSubagents((s) => s.entries);
   const select = useSubagentSelection((s) => s.select);
   const allMessages = useSessions((s) => s.messages);
-  const allBridgeCost = useBridge((s) => s.cost);
+  const allInteractiveCost = useInteractive((s) => s.cost);
   const [open, setOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
 
@@ -422,8 +422,8 @@ export default function SubagentDelegatingCard({
               : undefined) ??
             extractThinkingFromModel(model);
 
-          const bridgeCost = resolvedSessionId
-            ? (allBridgeCost[resolvedSessionId] as
+          const interactiveCost = resolvedSessionId
+            ? (allInteractiveCost[resolvedSessionId] as
                 | {
                     inputTokens?: number;
                     outputTokens?: number;
@@ -439,9 +439,9 @@ export default function SubagentDelegatingCard({
 
           const explicitTokens =
             progress?.tokens ??
-            (bridgeCost &&
-            (bridgeCost.inputTokens !== undefined || bridgeCost.outputTokens !== undefined || bridgeCost.tokens !== undefined)
-              ? (bridgeCost.tokens ?? (bridgeCost.inputTokens ?? 0) + (bridgeCost.outputTokens ?? 0))
+            (interactiveCost &&
+            (interactiveCost.inputTokens !== undefined || interactiveCost.outputTokens !== undefined || interactiveCost.tokens !== undefined)
+              ? (interactiveCost.tokens ?? (interactiveCost.inputTokens ?? 0) + (interactiveCost.outputTokens ?? 0))
               : undefined) ??
             (result?.usage
               ? (result.usage.input ?? 0) + (result.usage.output ?? 0)
@@ -468,13 +468,13 @@ export default function SubagentDelegatingCard({
           const contextPercent =
             progress?.percent ??
             progress?.contextPercent ??
-            bridgeCost?.percent ??
-            bridgeCost?.contextPercent ??
+            interactiveCost?.percent ??
+            interactiveCost?.contextPercent ??
             calculatedPct;
 
           const cost =
             progress?.cost ??
-            bridgeCost?.cost ??
+            interactiveCost?.cost ??
             result?.usage?.cost ??
             storeEntry?.metrics?.cost;
 
@@ -541,8 +541,8 @@ export default function SubagentDelegatingCard({
             progress?.toolCount ??
             result?.progressSummary?.toolCount;
 
-          const bridgeCost = storeEntry.sessionId
-            ? (allBridgeCost[storeEntry.sessionId] as
+          const interactiveCost = storeEntry.sessionId
+            ? (allInteractiveCost[storeEntry.sessionId] as
                 | {
                     inputTokens?: number;
                     outputTokens?: number;
@@ -556,9 +556,9 @@ export default function SubagentDelegatingCard({
 
           const explicitTokens =
             progress?.tokens ??
-            (bridgeCost &&
-            (bridgeCost.inputTokens !== undefined || bridgeCost.outputTokens !== undefined || bridgeCost.tokens !== undefined)
-              ? (bridgeCost.tokens ?? (bridgeCost.inputTokens ?? 0) + (bridgeCost.outputTokens ?? 0))
+            (interactiveCost &&
+            (interactiveCost.inputTokens !== undefined || interactiveCost.outputTokens !== undefined || interactiveCost.tokens !== undefined)
+              ? (interactiveCost.tokens ?? (interactiveCost.inputTokens ?? 0) + (interactiveCost.outputTokens ?? 0))
               : undefined) ??
             (result?.usage
               ? (result.usage.input ?? 0) + (result.usage.output ?? 0)
@@ -585,8 +585,8 @@ export default function SubagentDelegatingCard({
           const contextPercent =
             progress?.percent ??
             progress?.contextPercent ??
-            bridgeCost?.percent ??
-            bridgeCost?.contextPercent ??
+            interactiveCost?.percent ??
+            interactiveCost?.contextPercent ??
             calculatedPct;
 
           return {
@@ -601,7 +601,7 @@ export default function SubagentDelegatingCard({
               extractThinkingFromModel(rawModel),
             tokens,
             contextPercent,
-            cost: progress?.cost ?? bridgeCost?.cost ?? result?.usage?.cost ?? storeEntry.metrics?.cost,
+            cost: progress?.cost ?? interactiveCost?.cost ?? result?.usage?.cost ?? storeEntry.metrics?.cost,
             toolCount,
             durationMs,
             error: storeEntry.error ?? result?.error ?? progress?.error,

@@ -52,8 +52,8 @@ export interface SubagentEntry {
   error?: string;
   /**
    * Snapshot from the `subagent-closed` payload. The metrics line MUST read
-   * THIS (never `useBridge.cost[sessionId]`): the `session-closed` handler
-   * calls `useBridge.dismissSession`, which DELETES `cost`/`agentState` for
+   * THIS (never `useInteractive.cost[sessionId]`): the `session-closed` handler
+   * calls `useInteractive.dismissSession`, which DELETES `cost`/`agentState` for
    * the id — and `session-closed` (driver teardown) and `subagent-closed`
    * (worker task) are CONCURRENT, so the ordering is racy. This store is
    * the only one `dismissSession` never touches.

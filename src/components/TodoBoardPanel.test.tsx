@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, renderHook, screen } from "@testing-library/react";
 import TodoBoardPanel, { useMainTodoItems, useMainOpenTodoCount } from "./TodoBoardPanel";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useSessions } from "../store/sessions";
 
 // Mock the Tauri IPC layer; everything else (stores) is the real code.
@@ -9,20 +9,20 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     respondPermission: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 beforeEach(() => {
-  useBridge.getState().dismissSession("main1");
+  useInteractive.getState().dismissSession("main1");
   useSessions.setState({ messages: {}, activeSessionId: null });
 });
 
 describe("TodoBoardPanel", () => {
   it("renders the section header (the Todos label + N/M) with a progress indicator for a main column", () => {
     // 1 done / 3 total.
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "done item", status: "completed" },
@@ -48,7 +48,7 @@ describe("TodoBoardPanel", () => {
   });
 
   it("renders the three-state indicators (done / in-progress / pending)", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "done item", status: "completed" },
@@ -79,7 +79,7 @@ describe("TodoBoardPanel", () => {
   });
 
   it("renders NOTHING when ALL main todos are completed (the board hides once the list is done)", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "done one", status: "completed" },
@@ -98,14 +98,14 @@ describe("TodoBoardPanel", () => {
   });
 
   it("hides a subagent todo column when ALL of its todos are completed (open columns still render)", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "subagent:done-agent",
       todos: [
         { content: "sub done one", status: "completed" },
         { content: "sub done two", status: "completed" },
       ],
     });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "subagent:busy-agent",
       todos: [
         { content: "sub open one", status: "in_progress" },
@@ -123,11 +123,11 @@ describe("TodoBoardPanel", () => {
   });
 
   it("shows the subagent column(s) when the main list is fully completed but a subagent column is still open", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [{ content: "main done", status: "completed" }],
     });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "subagent:busy-agent",
       todos: [{ content: "sub open", status: "pending" }],
     });
@@ -140,11 +140,11 @@ describe("TodoBoardPanel", () => {
   });
 
   it("renders subagent todo columns as indented sub-rows", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [{ content: "main item", status: "pending" }],
     });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "subagent:explorer",
       todos: [
         { content: "sub task one", status: "in_progress" },
@@ -165,7 +165,7 @@ describe("TodoBoardPanel", () => {
   });
 
   it("useMainOpenTodoCount returns the OPEN (non-completed) main todo count (zero when fully completed)", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "a", status: "pending" },
@@ -179,7 +179,7 @@ describe("TodoBoardPanel", () => {
     // A fully-completed list counts as ZERO (the badge and the panel's
     // visibility share this derivation — they can never disagree).
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [
           { content: "a", status: "completed" },
@@ -191,8 +191,8 @@ describe("TodoBoardPanel", () => {
     expect(result.current).toBe(0);
   });
 
-  it("useMainTodoItems returns the rawInput fallback when the bridge column is absent", () => {
-    // A non-bridge agent: no `todos_update` column, only a
+  it("useMainTodoItems returns the rawInput fallback when the interactive column is absent", () => {
+    // A non-interactive agent: no `todos_update` column, only a
     // `manage_todo_list` tool-call in the session's transcript.
     useSessions.getState().applySessionUpdate("main1", {
       sessionUpdate: "tool_call",
@@ -215,7 +215,7 @@ describe("TodoBoardPanel", () => {
   });
 
   it("renders multi-line todo items with wrapping and min-height rather than fixed height", () => {
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         {

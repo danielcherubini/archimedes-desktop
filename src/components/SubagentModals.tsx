@@ -1,11 +1,11 @@
 import { useShallow } from "zustand/react/shallow";
 import { useSubagents } from "../store/subagents";
-import { useBridge, type BridgeRequestData } from "../store/bridge";
+import { useInteractive, type InteractiveRequestData } from "../store/interactive";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
 
 /**
- * The bridge sudo modals for the subagent entries (rendered at the
+ * The interactive sudo modals for the subagent entries (rendered at the
  * `SidePane` ROOT — a `fixed` overlay, NOT inside the scrollable content:
  * a collapsed pane never hides a pending modal; the `fixed` overlays
  * escape the frame's `width: 0` + `overflow: hidden` clipping).
@@ -14,8 +14,8 @@ import SudoPasswordModal from "./SudoPasswordModal";
  * the ACTIVE session's requests, and a subagent's session id is never
  * active — this component is the ONLY render site for subagent-session
  * `confirm`/`password` requests (an unrendered request would hang until
- * the bridge timeout). The answer path is unchanged
- * (`respondBridgeRequest` routes to the subagent manager).
+ * the interactive timeout). The answer path is unchanged
+ * (`respondInteractiveRequest` routes to the subagent manager).
  */
 export function SubagentModals() {
   const entries = useSubagents((s) => s.entries);
@@ -25,11 +25,11 @@ export function SubagentModals() {
   // any session's request churn (a whole-object selector re-renders on
   // every store change, since `addRequest` replaces the `requests`
   // object).
-  const entryRequests = useBridge(
+  const entryRequests = useInteractive(
     useShallow((s) => {
       // `| undefined` is honest: a session with no (yet) requests maps to
       // `undefined`, and the consumers guard with `?? []`.
-      const out: Record<string, BridgeRequestData[] | undefined> = {};
+      const out: Record<string, InteractiveRequestData[] | undefined> = {};
       for (const e of entryList) {
         out[e.sessionId] = s.requests[e.sessionId];
       }

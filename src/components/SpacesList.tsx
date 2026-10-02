@@ -24,7 +24,7 @@ import {
   type SpaceView,
 } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
 import NewSpaceDialog from "./NewSpaceDialog";
@@ -385,7 +385,7 @@ function SpaceGroup({
  * it works over `bg-sidebar` / `bg-selected` / `bg-surface-hover` alike;
  * the text is NOT `truncate`-ellipsized, it overflows under the fade), and
  * the right slot: the relative time of last activity, the green "Waiting"
- * attention pill (a pending permission prompt OR a pending bridge
+ * attention pill (a pending permission prompt OR a pending interactive
  * `ask`/`confirm`/`password` request — `password` included: a pending sudo
  * password shows no "Waiting" cue anywhere else) — swapped on row hover
  * for a Pause button (live sessions, the existing `closeSession` path) or
@@ -409,11 +409,11 @@ function SessionRow({
   // Selectors return stable references (no fresh `[]` fallbacks INSIDE the
   // selector) or Zustand re-renders forever.
   const prompts = usePermissions((s) => s.prompts[sessionId]) ?? [];
-  const bridgeRequests = useBridge((s) => s.requests[sessionId]) ?? [];
+  const interactiveRequests = useInteractive((s) => s.requests[sessionId]) ?? [];
 
   const waiting =
     prompts.length > 0 ||
-    bridgeRequests.some(
+    interactiveRequests.some(
       (r) => r.method === "ask" || r.method === "confirm" || r.method === "password",
     );
   const time = relativeTimeFor(messages);

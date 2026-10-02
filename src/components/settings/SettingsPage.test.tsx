@@ -16,9 +16,10 @@ import {
 const baseSettings: AppSettings = {
   theme: "dark",
   paneLayout: {},
-  defaultAgent: null,
   defaultTrustNewSpaces: false,
   defaultModel: null,
+  defaultThinkingLevel: null,
+  enabledTools: [],
   providers: [
     { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
   ],
@@ -38,9 +39,10 @@ vi.mock("../../lib/tauri", async () => {
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",
       paneLayout: {},
-      defaultAgent: null,
       defaultTrustNewSpaces: false,
       defaultModel: null,
+      defaultThinkingLevel: null,
+      enabledTools: [],
       providers: [
         { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
       ],
@@ -50,20 +52,29 @@ vi.mock("../../lib/tauri", async () => {
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
     }),
-    listAgents: vi.fn().mockResolvedValue([
-      { id: "pi", name: "Pi" },
-      { id: "archimedes", name: "Archimedes" },
-    ]),
-    // The effective catalog (Task 2's `ModelDto` camelCase shape).
+    // The effective catalog (Task 2's `ModelDto` camelCase shape): two
+    // models advertising OVERLAPPING thinking levels (the union is
+    // deduped in FIRST-SEEN order — `medium` / `high` appear in both;
+    // the first model's levels are deliberately NOT alphabetical so the
+    // order assertion discriminates first-seen from lexicographic).
     listModels: vi.fn().mockResolvedValue([
       {
         id: "Qwen3.8",
         provider: "tama",
         contextWindow: 128000,
-        supportsThinking: false,
-        thinkingLevels: [],
+        supportsThinking: true,
+        thinkingLevels: ["high", "medium", "low"],
+      },
+      {
+        id: "GPT-5",
+        provider: "openai",
+        contextWindow: 400000,
+        supportsThinking: true,
+        thinkingLevels: ["medium", "high", "xhigh"],
       },
     ]),
+    // The native harness's tool names (the enabled-tools checkbox list).
+    listTools: vi.fn().mockResolvedValue(["bash", "read", "write", "edit", "subagent"]),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     // The one-shot MCP test (ADR 0019): 0 tools by default (the tests
     // override per case).
@@ -98,7 +109,7 @@ afterEach(() => {
 
 /** Wait for the page's `getSettings` load to land in state (a marker row). */
 async function loaded(): Promise<void> {
-  await screen.findByText("Default agent");
+  await screen.findByText("Default model");
 }
 
 /** Navigate to a section (click its sidebar button) and wait for it. */
@@ -145,7 +156,8 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
     expect(saved.theme).toBe("light");
     // The other fields are intact (the complete document, not a patch).
-    expect(saved.defaultAgent).toBeNull();
+    expect(saved.defaultThinkingLevel).toBeNull();
+    expect(saved.enabledTools).toEqual([]);
     expect(saved.defaultModel).toBeNull();
     expect(saved.providers).toHaveLength(1);
     expect(saved.font).toEqual(baseSettings.font);
@@ -295,6 +307,156 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
         expect.objectContaining({ defaultModel: null }),
       ),
     );
+  });
+
+  it("the_default_thinking_level_select_offers_the_union_of_the_models_levels_and_commits_the_choice", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const trigger = await screen.findByRole("combobox", {
+      name: "Default thinking level",
+    });
+    fireEvent.click(trigger);
+    // The union across the two models (deduped, FIRST-SEEN order — NOT
+    // lexicographic): the overlapping `medium` / `high` appear once, in
+    // the first model's advertised order, then `xhigh` from the second.
+    expect(await screen.findByRole("option", { name: "Model default" })).toBeTruthy();
+    const options = await screen.findAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual([
+      "Model default",
+      "high",
+      "medium",
+      "low",
+      "xhigh",
+    ]);
+    // Choosing a level saves it.
+    fireEvent.click(screen.getByRole("option", { name: "xhigh" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ defaultThinkingLevel: "xhigh" }),
+      ),
+    );
+  });
+
+  it("the_default_thinking_level_select_commits_null_on_model_default", async () => {
+    // The loaded document remembers a level; choosing "Model default"
+    // commits `null` (the model's own default).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultThinkingLevel: "high",
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const trigger = await screen.findByRole("combobox", {
+      name: "Default thinking level",
+    });
+    fireEvent.click(trigger);
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Model default" }),
+    );
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ defaultThinkingLevel: null }),
+      ),
+    );
+  });
+
+  it("a_stored_default_thinking_level_outside_the_union_renders_as_its_own_option", async () => {
+    // A stored level no model currently advertises (a provider removed it /
+    // the level sets changed — the select offers the UNION): the select
+    // must show the ACTUAL stored value as its own selectable option, not
+    // fall back to the "Model default" placeholder (which would lie about
+    // the stored value).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultThinkingLevel: "ultra",
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const trigger = await screen.findByRole("combobox", {
+      name: "Default thinking level",
+    });
+    fireEvent.click(trigger);
+    // The raw stored value is offered (alongside the union) — and it is the
+    // SELECTED option: the trigger displays the actual stored level, not
+    // the "Model default" placeholder (the old fall-back, which lied about
+    // the stored value).
+    const ultra = await screen.findByRole("option", { name: "ultra" });
+    expect(ultra.getAttribute("data-state")).toBe("checked");
+    expect(trigger.textContent).toContain("ultra");
+    expect(trigger.textContent).not.toContain("Model default");
+  });
+
+  it("a_blank_stored_default_thinking_level_renders_no_extra_option", async () => {
+    // A hand-edited `settings.json` may carry `"defaultThinkingLevel": ""`
+    // (the frontend never SAVES `""`): the select must behave as for `null`
+    // — the "Model default" placeholder — NOT render a second `value=""`
+    // item alongside it (two items with the same value break Radix).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      defaultThinkingLevel: "",
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const trigger = await screen.findByRole("combobox", {
+      name: "Default thinking level",
+    });
+    // The trigger shows the "Model default" placeholder (blank = absent).
+    expect(trigger.textContent).toContain("Model default");
+    fireEvent.click(trigger);
+    // Exactly ONE "Model default" option — the union, unchanged.
+    const modelDefaults = await screen.findAllByRole("option", {
+      name: "Model default",
+    });
+    expect(modelDefaults).toHaveLength(1);
+    const options = screen.getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual([
+      "Model default",
+      "high",
+      "medium",
+      "low",
+      "xhigh",
+    ]);
+  });
+
+  it("the_enabled_tools_checkboxes_commit_the_checked_names", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // One row per native harness tool (the `listTools` fixture).
+    const bash = await screen.findByRole("checkbox", { name: /bash/ });
+    const edit = screen.getByRole("checkbox", { name: /edit/ });
+    // Toggle two on (the initial `enabledTools` is `[]`): each toggle
+    // commits the checked names (immediate save — two saves).
+    fireEvent.click(bash);
+    fireEvent.click(edit);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    const saved = vi.mocked(saveSettings).mock.calls[1][0] as AppSettings;
+    expect(saved.enabledTools).toEqual(["bash", "edit"]);
+  });
+
+  it("an_unchecked_all_enabled_tools_list_commits_an_empty_list", async () => {
+    // The loaded document explicitly enables two tools; unchecking both
+    // commits `[]` (= all tools — the backend's convention).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      enabledTools: ["bash", "read"],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    fireEvent.click(await screen.findByRole("checkbox", { name: /bash/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /read/ }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    const saved = vi.mocked(saveSettings).mock.calls[1][0] as AppSettings;
+    expect(saved.enabledTools).toEqual([]);
+  });
+
+  it("the_default_agent_select_is_gone", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // The removed UI: there is one harness — no agent to choose, so the
+    // "Default agent" control is absent (and the agent-catalog data source
+    // is gone from the module — nothing to fetch).
+    expect(screen.queryByText("Default agent")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Default agent" })).toBeNull();
   });
 
   it("the_update_round_trip_preserves_the_default_thinking_levels", async () => {

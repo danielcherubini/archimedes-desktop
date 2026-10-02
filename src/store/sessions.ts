@@ -361,9 +361,8 @@ export function rowToMessages(row: MessageRow): Message[] {
  * `null` when there's nothing.
  *
  * **Ordering note:** `SessionInfo` over IPC has NO `createdAt` field (it is
- * `{ sessionId, agentId, cwd, capabilities }` — the ACP `SessionInfo` struct
- * has no such field, and the Rust `list_sessions` command drops it when
- * mapping `SessionRow → SessionInfo`). So we CANNOT sort by `createdAt`.
+ * `{ sessionId, cwd, capabilities }` — the Rust `SessionInfo` struct has no
+ * such field). So we CANNOT sort by `createdAt`.
  * We rely on SERVER order instead: `Db::list_sessions` returns
  * `ORDER BY created_at DESC, id DESC` and `Db::list_spaces` returns
  * `ORDER BY last_opened_at DESC, path ASC`, and the store slices only
@@ -377,7 +376,7 @@ export function rowToMessages(row: MessageRow): Message[] {
  * The live session a space "points at" (for the space row's live dot and
  * boot auto-select).
  *
- * **Multi-live (ADR 0002 — the one-live cap is lifted):** a space may hold
+ * **Multi-live (the one-live cap is lifted):** a space may hold
  * MORE than one live session (a second `start_session` / `resume_session`
  * no longer supersedes the first). `sessions` is in INSERTION order —
  * `addSession` / `resumeSession` APPEND — so this returns the
@@ -404,7 +403,7 @@ export function autoSelectActive(
 ): string | null {
   for (const space of spaces) {
     // A space may hold MORE than one live session (the one-live cap is
-    // lifted, ADR 0002): `mostRecentLiveInSpace` picks the
+    // lifted): `mostRecentLiveInSpace` picks the
     // most-recently-started one (coherent with `activeSessionId`).
     const live = mostRecentLiveInSpace(sessions, space.path);
     if (live) return live.sessionId;
@@ -432,7 +431,7 @@ export interface SpaceView {
   title: string;
   /**
    * The space's live session (the most-recently-started one when a space
-   * holds more than one — the one-live cap is lifted, ADR 0002), or `null`.
+   * holds more than one — the one-live cap is lifted), or `null`.
    */
   liveSessionId: string | null;
   /** Stored sessions of this space, in `historySessions` order (newest-first as delivered by `list_sessions` — do NOT re-sort). */
@@ -457,7 +456,7 @@ export function spaceViewFor(
   archivedSessions: SessionInfo[],
 ): SpaceView {
   // A space may hold MORE than one live session (the one-live cap is
-  // lifted, ADR 0002): show the most-recently-started one (coherent with
+  // lifted): show the most-recently-started one (coherent with
   // `activeSessionId`), not just the first.
   const liveSessionId =
     mostRecentLiveInSpace(sessions, space.path)?.sessionId ?? null;
@@ -884,7 +883,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
       ...state.archivedSessions,
     ].find((s) => s.sessionId === sessionId);
     if (!session) throw new Error(`unknown session: ${sessionId}`);
-    const info = await resumeSessionCommand(session.agentId, sessionId, session.cwd);
+    const info = await resumeSessionCommand(sessionId, session.cwd);
     // STICKY: `archivedSessions` is deliberately NOT touched — a resumed
     // archived session stays in it while live (the Archived view filters
     // out live ids).

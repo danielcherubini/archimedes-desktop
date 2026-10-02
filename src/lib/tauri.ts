@@ -6,7 +6,7 @@
  * - command arguments: camelCase here (Tauri maps them to snake_case Rust
  *   parameters),
  * - `SessionInfo` (the `start_session` return value): camelCase
- *   (`sessionId`, `agentId`),
+ *   (`sessionId`, `cwd`),
  * - event payloads: camelCase (`sessionId`, `requestId`),
  * - ACP update discriminators: snake_case (`agent_message_chunk`, …).
  */
@@ -50,18 +50,11 @@ export interface SessionConfigOption {
 /** Return value of the `start_session` command (camelCase). */
 export interface SessionInfo {
   sessionId: string;
-  agentId: string;
   cwd: string;
   capabilities: Record<string, unknown>;
   configOptions?: SessionConfigOption[];
   /** The desktop's archived flag (ADR 0016): `true` hides the session from its Space group into the Archived section (the transcript is kept). Always present over IPC. */
   archived: boolean;
-}
-
-/** A registry entry over IPC (camelCase). */
-export interface AgentEntryDto {
-  id: string;
-  name: string;
 }
 
 /** A space bookkeeping row (camelCase over IPC). */
@@ -194,7 +187,7 @@ export interface PermissionRequestPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge (the delegated interactive UI — Task 4's listener emits these)
+// Interactive (the delegated interactive UI — the listener emits these)
 // ---------------------------------------------------------------------------
 
 /**
@@ -211,7 +204,7 @@ export interface AskQuestionDto {
 }
 
 /**
- * The user's answer to an `ask` bridge request — the `result` of the
+ * The user's answer to an `ask` interactive request — the `result` of the
  * response frame, verbatim (one result per question).
  */
 export interface AskResponsePayload {
@@ -220,14 +213,13 @@ export interface AskResponsePayload {
 }
 
 /**
- * A `bridge-request` event payload (camelCase over the wire — the Rust
- * listener builds it). `sessionId` is the ACP session id (the desktop sets
- * it on the listener once the ACP id is known; bridge requests only occur
- * mid-turn, so they always carry it). `params` = the method's params: the
- * ask schema (`{ questions }`) for `ask`, `{ command, reason }` for
- * `confirm`/`password`.
+ * An `interactive-request` event payload (camelCase over the wire — the Rust
+ * loop builds it). `sessionId` is the ACP session id (the native `AgentLoop`
+ * is constructed with it, so the events always carry it). `params` = the
+ * method's params: the ask schema (`{ questions }`) for `ask`, `{ command,
+ * reason }` for `confirm`/`password`.
  */
-export interface BridgeRequestPayload {
+export interface InteractiveRequestPayload {
   sessionId: string;
   requestId: string;
   method: "ask" | "confirm" | "password";
@@ -237,12 +229,12 @@ export interface BridgeRequestPayload {
 }
 
 /**
- * A `bridge-event` push (camelCase over the wire). `event` is the wire name
+ * An `interactive-event` push (camelCase over the wire). `event` is the wire name
  * (`todos_update` / `todos_clear` / `cost_update` / `state` / `session` —
  * the bus `COST_UPDATE` maps to `cost_update`, NOT `cost`); `payload` is the
  * bus payload verbatim.
  */
-export interface BridgeEventPayload {
+export interface InteractiveEventPayload {
   sessionId: string;
   seq: number;
   event: string;
@@ -250,11 +242,11 @@ export interface BridgeEventPayload {
 }
 
 /**
- * The `result` to send back via `respond_bridge_request` — for `ask`, the
+ * The `result` to send back via `respond_interactive_request` — for `ask`, the
  * `AskResponsePayload` verbatim; for `confirm`, `{ confirmed }`; for
  * `password`, `{ password }` (or `{ password: "" }` for a cancel).
  */
-export type BridgeResponseDto =
+export type InteractiveResponseDto =
   | AskResponsePayload
   | { confirmed: boolean }
   | { password: string };
@@ -363,9 +355,12 @@ export interface AppSettings {
   /** "system" follows the OS scheme live (the `matchMedia` listener in theme.ts). */
   theme: "system" | "dark" | "light";
   paneLayout: Record<string, unknown>;
-  defaultAgent: string | null;
   defaultTrustNewSpaces: boolean;
   defaultModel: string | null;
+  /** The per-app thinking-level seed (`null` = the model's own default — the session start's last rung: remembered > stored > this > `None`). */
+  defaultThinkingLevel: string | null;
+  /** The harness-level tool filter: `[]` = all tools enabled. */
+  enabledTools: string[];
   providers: ProviderConfig[];
   /** (ADR 0019) The user-managed MCP servers: `name → entry` (pi's entry shape). */
   mcpServers: Record<string, McpServerEntry>;
@@ -398,11 +393,8 @@ export interface SkillInfo {
 // Commands (invoke)
 // ---------------------------------------------------------------------------
 
-export async function startSession(
-  agentId: string,
-  cwd: string,
-): Promise<SessionInfo> {
-  return invoke<SessionInfo>("start_session", { agentId, cwd });
+export async function startSession(cwd: string): Promise<SessionInfo> {
+  return invoke<SessionInfo>("start_session", { cwd });
 }
 
 export async function sendPrompt(
@@ -426,11 +418,10 @@ export async function respondPermission(
 }
 
 export async function resumeSession(
-  agentId: string,
   sessionId: string,
   cwd: string,
 ): Promise<SessionInfo> {
-  return invoke<SessionInfo>("resume_session", { agentId, sessionId, cwd });
+  return invoke<SessionInfo>("resume_session", { sessionId, cwd });
 }
 
 /** Cancel the session's in-flight prompt turn (Esc). The agent resolves the open prompt with `stopReason: "cancelled"`. */
@@ -506,6 +497,11 @@ export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
   return invoke("list_models", { forceRefresh: forceRefresh ?? null });
 }
 
+/** The native harness's tool names, sorted (the Settings page's enabled-tools checkbox list). */
+export async function listTools(): Promise<string[]> {
+  return invoke<string[]>("list_tools");
+}
+
 /** Test ONE MCP server entry (the Settings page's Test action, ADR 0019): a one-shot bounded connect + `tools/list`. Resolves the tool count; rejects with the error text (a `needs-auth` / a network failure). */
 export async function testMcpServer(entry: McpServerEntry, name?: string): Promise<number> {
   return invoke("test_mcp_server", { name: name ?? null, entry });
@@ -517,13 +513,8 @@ export async function authMcpServer(name: string, entry: McpServerEntry): Promis
 }
 
 // ---------------------------------------------------------------------------
-// Spaces + agents commands (boot, the new-session dialog, "forget this space")
+// Spaces commands (boot, the new-session dialog, "forget this space")
 // ---------------------------------------------------------------------------
-
-/** All configured agents (the dialog's dropdown). */
-export async function listAgents(): Promise<AgentEntryDto[]> {
-  return invoke<AgentEntryDto[]>("list_agents");
-}
 
 /** All spaces, most recently opened first. */
 export async function listSpaces(): Promise<SpaceRow[]> {
@@ -578,38 +569,38 @@ export function listenPermissionRequest(
   );
 }
 
-export function listenBridgeRequest(
-  callback: (payload: BridgeRequestPayload) => void,
+export function listenInteractiveRequest(
+  callback: (payload: InteractiveRequestPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<BridgeRequestPayload>("bridge-request", (event) =>
+  return listen<InteractiveRequestPayload>("interactive-request", (event) =>
     callback(event.payload),
   );
 }
 
 /**
- * A `bridge-request-close` event payload (the Rust `SudoPromptCleanup` drop
+ * An `interactive-request-close` event payload (the Rust `SudoPromptCleanup` drop
  * guard emits it when a `sudo_exec` sub-prompt is DROPPED — a turn cancel
  * skips the flow's exit-path cleanup, so the modal must be closed here). The
  * `requestId` is the sub-prompt's derived id (`"{id}:confirm"` /
  * `"{id}:password"`).
  */
-export interface BridgeRequestClosePayload {
+export interface InteractiveRequestClosePayload {
   sessionId: string;
   requestId: string;
 }
 
-export function listenBridgeRequestClose(
-  callback: (payload: BridgeRequestClosePayload) => void,
+export function listenInteractiveRequestClose(
+  callback: (payload: InteractiveRequestClosePayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<BridgeRequestClosePayload>("bridge-request-close", (event) =>
+  return listen<InteractiveRequestClosePayload>("interactive-request-close", (event) =>
     callback(event.payload),
   );
 }
 
-export function listenBridgeEvent(
-  callback: (payload: BridgeEventPayload) => void,
+export function listenInteractiveEvent(
+  callback: (payload: InteractiveEventPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<BridgeEventPayload>("bridge-event", (event) =>
+  return listen<InteractiveEventPayload>("interactive-event", (event) =>
     callback(event.payload),
   );
 }
@@ -632,15 +623,15 @@ export function listenSubagentClosed(
 }
 
 /**
- * Answer a bridge request. The invoke key is `result` (the Rust command's
+ * Answer an interactive request. The invoke key is `result` (the Rust command's
  * `result: serde_json::Value` param — Tauri's camelCase↔snake_case handles
  * `sessionId`/`requestId` but will not alias `response`↔`result`). The
  * `result` is written into the response frame verbatim (no wrapper).
  */
-export async function respondBridgeRequest(
+export async function respondInteractiveRequest(
   sessionId: string,
   requestId: string,
-  result: BridgeResponseDto,
+  result: InteractiveResponseDto,
 ): Promise<void> {
-  return invoke("respond_bridge_request", { sessionId, requestId, result });
+  return invoke("respond_interactive_request", { sessionId, requestId, result });
 }

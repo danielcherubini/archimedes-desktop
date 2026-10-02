@@ -1,36 +1,34 @@
-//! Pi-RPC session core: spawn a pi agent, speak its JSONL RPC protocol,
-//! drive the session lifecycle.
+//! The native agent harness: the in-process `AgentLoop` session core —
+//! drive the session lifecycle, the interactive channel, the subagent
+//! manager.
 
-pub mod bridge;
 mod errors;
+pub mod events;
 mod fs_backend;
-pub mod gate;
 pub mod harness;
+pub mod interactive;
 pub mod mcp;
 mod permission;
-pub mod rpc;
 mod session;
 pub mod subagent;
 pub mod todo;
 pub mod tools;
-pub mod worker_runtime;
 
-pub use bridge::{
-    bridge_key, CachedPassword, PendingBridge, PendingSudo, RealSudoRunner, SudoRun, SudoRunner,
-};
-pub use errors::RpcError;
+pub use errors::SessionError;
+pub use events::RpcEvent;
 pub use fs_backend::{FsBackend, FsError};
-pub use gate::{gate_env, gate_spawn_args, install_gate_extension};
+pub use interactive::{
+    interactive_key, CachedPassword, PendingInteractive, PendingSudo, RealSudoRunner, SudoRun,
+    SudoRunner,
+};
 pub use permission::{permission_key, PendingPermissions, PermissionOutcome};
-pub use rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpc, PiRpcHandle, RpcEvent};
 pub use session::{
-    normalize_capabilities, user_message_payload, ClosedReason, EventSink, ImagePayload,
-    ProviderFactory, SessionInfo, SessionManager, StopReason, SubagentSpawn, MAX_IMAGE_BYTES,
+    normalize_capabilities, user_message_payload, ClosedReason, EffectiveCatalog, EventSink,
+    ImagePayload, ProviderFactory, SessionInfo, SessionManager, StopReason, MAX_IMAGE_BYTES,
 };
 pub use subagent::{
     CapturingSink, LaunchConfig, NativeDeps, SubagentMetrics, SubagentOutcome,
     SubagentSessionManager,
 };
 pub use todo::{TodoItem, TodoStatus, TodoStore};
-pub use tools::{install_tools_extension, tools_spawn_args};
-pub use worker_runtime::WorkerRuntime;
+pub use tools::{ContentBlock, ImageRef, ToolCtx, ToolResult};

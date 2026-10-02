@@ -4,7 +4,7 @@ import SubagentDelegatingCard from "./SubagentDelegatingCard";
 import { useSubagents } from "../store/subagents";
 import { useSubagentSelection } from "../store/subagentSelection";
 import { useSessions } from "../store/sessions";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import type { SubagentEntry } from "../store/subagents";
 
 const entry = (over: Partial<SubagentEntry>): SubagentEntry => ({
@@ -22,7 +22,7 @@ beforeEach(() => {
     useSubagents.getState().dismiss(id);
   }
   useSubagentSelection.getState().select(null);
-  useBridge.setState({ cost: {} });
+  useInteractive.setState({ cost: {} });
 });
 
 describe("SubagentDelegatingCard (the subagent tool card with the nested list)", () => {
@@ -131,7 +131,7 @@ describe("SubagentDelegatingCard (the subagent tool card with the nested list)",
     expect(screen.queryByText("running")).toBeNull();
   });
 
-  it("reads live accumulated cost and tokens from useBridge.cost", () => {
+  it("reads live accumulated cost and tokens from useInteractive.cost", () => {
     useSubagents.getState().addSession(
       entry({
         sessionId: "sub1",
@@ -142,7 +142,7 @@ describe("SubagentDelegatingCard (the subagent tool card with the nested list)",
       }),
     );
 
-    useBridge.getState().applyCost("sub1", {
+    useInteractive.getState().applyCost("sub1", {
       inputTokens: 25000,
       outputTokens: 5000,
       cost: 0.035,

@@ -1,12 +1,11 @@
-//! The native session e2e (native-agent-harness Task 7): a `kind: native`
-//! registry entry (the built-in `archimedes` merged into the loaded
-//! registry) → `start_session` spawns an in-process `AgentLoop` (NOT a
-//! subprocess — the provider comes from the `set_provider_factory` injection
-//! seam, so no real model call is made) → `send_prompt` → the normalized
-//! `session-update` events flow (the existing frozen shapes) → `resume_session`
-//! (the native branch — BEFORE the `piSessionFile` check: a native session's
-//! `capabilities_json` has no `piSessionFile`) → `load_messages` (resume)
-//! works.
+//! The native session e2e (native-agent-harness Task 7): `start_session`
+//! (settings-driven — no agent registry) spawns an in-process `AgentLoop`
+//! (NOT a subprocess — the provider comes from the `set_provider_factory`
+//! injection seam, so no real model call is made) → `send_prompt` → the
+//! normalized `session-update` events flow (the existing frozen shapes) →
+//! `resume_session` (the native branch — BEFORE the `piSessionFile` check: a
+//! native session's `capabilities_json` has no `piSessionFile`) →
+//! `load_messages` (resume) works.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -18,7 +17,6 @@ use archimedes_lib::agent::harness::{
     Provider, ProviderError, ProviderEvent,
 };
 use archimedes_lib::agent::{EventSink, SessionInfo, SessionManager, StopReason};
-use archimedes_lib::config::{AgentKind, Registry};
 use archimedes_lib::storage::Db;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -138,32 +136,22 @@ fn test_model(id: &str) -> Model {
     }
 }
 
-/// A temp config dir with an `agents.json` containing `pi` ONLY (the
-/// pre-Task-7 shape — the built-in `archimedes` native entry is merged in
-/// by `Registry::load`).
-fn temp_config_dir_pi_only() -> PathBuf {
+/// A temp config dir (the `settings.json` home — the effective catalog
+/// reads the `providers` entries from here; the seeded settings give the
+/// session start a `defaultThinkingLevel` — the settings-driven rung).
+fn temp_config_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("session-native-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("agents.json"),
-        json!({
-            "agents": [{
-                "id": "pi",
-                "name": "Pi",
-                "command": "pi",
-                "args": ["--mode", "rpc"],
-                "env": {},
-                "bridge": true,
-            }]
-        })
-        .to_string(),
+        dir.join("settings.json"),
+        json!({ "theme": "dark", "defaultThinkingLevel": "high" }).to_string(),
     )
     .unwrap();
     dir
 }
 
-/// A known catalog (the `set_catalog` seam — `SessionManager::new` seeds
-/// from the user's real pi config, which a test cannot control): two
+/// A known catalog (the `set_catalog` seam — the base catalog is empty
+/// in a test, so the effective catalog is this one): two
 /// OpenAI-compatible models, the default `test/m1`.
 fn test_catalog() -> ModelCatalog {
     ModelCatalog {
@@ -184,7 +172,7 @@ async fn build_manager(
     mpsc::UnboundedReceiver<(String, Value)>,
 ) {
     let db = Arc::new(Db::open(&dir.join("archimedes.db")).unwrap());
-    let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+    let mut manager = SessionManager::new(dir.to_path_buf());
     manager.attach_db(db);
 
     // The injection seams (BEFORE `start_session`): a mock `Provider`
@@ -239,25 +227,14 @@ async fn wait_for_update(rx: &mut mpsc::UnboundedReceiver<(String, Value)>, kind
 /// model request carries the loaded transcript).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_session_end_to_end() {
-    let dir = temp_config_dir_pi_only();
-
-    // The registry merge: the built-in `archimedes` native entry is APPENDED
-    // after the user's `pi` entry (the default remains `pi`).
-    {
-        let registry = Registry::load(&dir).unwrap();
-        assert_eq!(registry.agents[0].id, "pi", "pi stays the default");
-        let native = registry.get("archimedes").unwrap();
-        assert_eq!(native.kind, AgentKind::Native);
-        assert!(native.command.is_empty());
-        assert!(native.harness.is_some());
-    }
+    let dir = temp_config_dir();
 
     let (manager, recorded, sink, mut sink_rx) = build_manager(&dir).await;
 
-    // The built-in's `harness.default_model` is `None` → resolved from the
-    // catalog's default (`test/m1`).
+    // The base catalog is empty in a test → the model resolves from the
+    // `set_catalog` catalog's default (`test/m1`).
     let info = manager
-        .start_session("archimedes", dir.clone(), &sink)
+        .start_session(dir.clone(), &sink)
         .await
         .expect("the native session starts (in-process, no subprocess)");
     assert!(
@@ -350,7 +327,7 @@ async fn native_session_end_to_end() {
     // external path would be `NotResumable`).
     manager.close_session(&sid).await.expect("close works");
     let resumed = manager
-        .resume_session("archimedes", &sid, dir.clone(), &sink)
+        .resume_session(&sid, dir.clone(), &sink)
         .await
         .expect("a native session resumes from the native_messages table (not NotResumable)");
     assert_eq!(resumed.session_id, sid);
@@ -410,7 +387,7 @@ async fn native_session_end_to_end() {
 /// retains its exact ID when resumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resuming_legacy_bare_uuid_session_preserves_id() {
-    let dir = temp_config_dir_pi_only();
+    let dir = temp_config_dir();
     let (manager, _recorded, sink, mut sink_rx) = build_manager(&dir).await;
 
     let legacy_id = uuid::Uuid::new_v4().to_string();
@@ -423,7 +400,6 @@ async fn resuming_legacy_bare_uuid_session_preserves_id() {
     let db = Db::open(&dir.join("archimedes.db")).unwrap();
     let info = SessionInfo {
         session_id: legacy_id.clone(),
-        agent_id: "archimedes".to_string(),
         cwd: dir.clone(),
         capabilities: json!({
             "model": "test/m1",
@@ -448,7 +424,7 @@ async fn resuming_legacy_bare_uuid_session_preserves_id() {
     .unwrap();
 
     let resumed = manager
-        .resume_session("archimedes", &legacy_id, dir.clone(), &sink)
+        .resume_session(&legacy_id, dir.clone(), &sink)
         .await
         .expect("legacy session resumes");
 

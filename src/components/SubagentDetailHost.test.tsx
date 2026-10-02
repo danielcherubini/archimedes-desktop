@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { respondBridgeRequest } from "../lib/tauri";
+import { respondInteractiveRequest } from "../lib/tauri";
 import SubagentDetailHost from "./SubagentDetailHost";
 import { useSubagents } from "../store/subagents";
 import { useSubagentSelection } from "../store/subagentSelection";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSessions } from "../store/sessions";
 
@@ -13,7 +13,7 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     respondPermission: vi.fn().mockResolvedValue(undefined),
   };
 });
@@ -57,9 +57,9 @@ beforeEach(() => {
   for (const id of Object.keys(useSubagents.getState().entries)) {
     useSubagents.getState().dismiss(id);
   }
-  useBridge.getState().dismissSession("sub1");
-  useBridge.getState().dismissSession("sub2");
-  useBridge.getState().dismissSession("main1");
+  useInteractive.getState().dismissSession("sub1");
+  useInteractive.getState().dismissSession("sub2");
+  useInteractive.getState().dismissSession("main1");
   usePermissions.getState().dismissSessionPrompts("sub1");
   usePermissions.getState().dismissSessionPrompts("sub2");
   usePermissions.getState().dismissSessionPrompts("main1");
@@ -179,7 +179,7 @@ describe("SubagentDetailHost (the dedicated transcript modal + the always-mounte
     expect(useSubagents.getState().entries["sub1"]).toBeDefined();
     // ...and the transcript stays MOUNTED (it moved from the modal to
     // the hidden host in the SAME render — the prompt cards never
-    // unmount, so they never hang until the bridge timeout).
+    // unmount, so they never hang until the interactive timeout).
     expect(isHidden(screen.getByText("hello from the subagent"))).toBe(true);
   });
 
@@ -209,7 +209,7 @@ describe("SubagentDetailHost (the dedicated transcript modal + the always-mounte
     useSubagents.getState().addSession(entry);
     // The subagent's OWN `ask` (keyed by the subagent's session id) —
     // the card renders inside the modal's transcript.
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "ask",
       source: "main",
@@ -241,6 +241,6 @@ describe("SubagentDetailHost (the dedicated transcript modal + the always-mounte
     await act(async () => {
       await Promise.resolve();
     });
-    expect(vi.mocked(respondBridgeRequest)).toHaveBeenCalled();
+    expect(vi.mocked(respondInteractiveRequest)).toHaveBeenCalled();
   });
 });

@@ -1,35 +1,35 @@
-//! The pi RPC session layer: spawns a `pi --mode rpc` process, speaks the
-//! pi JSONL RPC protocol to it, and drives the session lifecycle.
+//! The native session layer: the in-process `AgentLoop` session core
+//! (ADR 0011) — drive the session lifecycle, the interactive channel, the
+//! subagent manager.
 //!
-//! The heart of the design is the **driver-task mechanism**. The pi child
-//! is long-lived (it lives for the session), so we never await it inline in
-//! [`SessionManager::start_session`] / [`Self::resume_session`]. Instead we
-//! spawn a *driver task* that owns a handle to the child for the whole
-//! session: it runs the *establisher* (the `get_state` round-trip that turns
-//! a fresh child into an established session), then blocks until the session
-//! closes, streaming `session-update` events as pi's events arrive.
+//! The heart of the design is the **driver-task mechanism**. The
+//! `AgentLoop` is long-lived (it lives for the session), so we never await
+//! it inline in [`SessionManager::start_session`] /
+//! [`Self::resume_session`]. Instead we spawn a *driver task* that owns a
+//! handle to the loop for the whole session: it blocks until the session
+//! closes, watching the loop's settle (the `agent_settled` watch — the
+//! RELIABLE settle signal) and tearing the session down on close.
 //! `close_session` (or a subagent cancel) flips a `watch` flag that makes
-//! the driver task return; dropping the last handle closes the child's
-//! stdin (a clean pi shutdown) and reaps the process.
+//! the driver task return; the driver teardown cancels the loop's tokens
+//! and drains the session's pending requests.
 //!
-//! The same driver is used for a new session (establisher = `get_state`)
-//! and a resume (establisher = `get_state` + `get_messages` replay — the
-//! child is spawned with `--session <file>` so `get_messages` returns the
-//! loaded session's transcript).
+//! The same driver is used for a new session and a resume (a fresh
+//! `AgentLoop` + `SessionStore::load_messages` — resume from the
+//! `native_messages` table; the stored row's `model` / `thinkingLevel`
+//! override the resolution chains).
 //!
-//! Multiple live sessions COEXIST (the one-live cap is lifted, ADR 0002):
+//! Multiple live sessions COEXIST (the one-live cap is lifted):
 //! `start_session` / `resume_session` do NOT close other live sessions; a
-//! session is torn down only by an explicit `close_session`, a subagent
-//! cancel, or the agent process exiting on its own.
+//! session is torn down only by an explicit `close_session` or a subagent
+//! cancel.
 //!
-//! **The `session-update` contract is FROZEN** (ADR 0009): [`normalize`]
-//! maps pi events onto the exact JSON envelopes the frontend consumes
-//! (`agent_message_chunk` / `agent_thought_chunk` / `tool_call` /
-//! `tool_call_update` / `session_info_update` / `config_option_update`), so
-//! the frontend needs no changes for the ACP → pi-RPC swap.
+//! **The `session-update` contract is FROZEN** (ADR 0011): [`normalize`]
+//! maps the harness's `RpcEvent`s onto the exact JSON envelopes the
+//! frontend consumes (`agent_message_chunk` / `agent_thought_chunk` /
+//! `tool_call` / `tool_call_update` / `session_info_update` /
+//! `config_option_update`), so the frontend needs no changes.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -38,19 +38,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch, Mutex};
 
-use crate::agent::bridge::{self, CachedPassword, PendingBridge, PendingSudo, SudoRunner};
-use crate::agent::errors::RpcError;
+use crate::agent::errors::SessionError;
+use crate::agent::events::RpcEvent;
 use crate::agent::harness::{
-    build_main_prompt, discover_models, merge_catalog, seed_from_pi_config, AgentLoop, ControlCmd,
-    Model, ModelCatalog, OpenAiCompatibleProvider, Prompt, PromptContext, Provider,
-    ProviderDiscovery, RetryPolicy, SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
+    build_main_prompt, discover_models, merge_catalog, AgentLoop, ControlCmd, Model, ModelCatalog,
+    OpenAiCompatibleProvider, Prompt, PromptContext, Provider, ProviderDiscovery, RetryPolicy,
+    SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
+};
+use crate::agent::interactive::{
+    self, CachedPassword, PendingInteractive, PendingSudo, SudoRunner,
 };
 use crate::agent::permission::{self, PendingPermissions};
-use crate::agent::rpc::{PiRpc, PiRpcHandle, RpcEvent};
 use crate::agent::todo::TodoStore;
 use crate::agent::tools::ImageRef;
 use crate::commands::settings::{load_settings, write_settings};
-use crate::config::{AgentEntry, AgentKind, ConfigError, Registry};
 use crate::storage::Db;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -160,20 +161,20 @@ const SUPPORTED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif",
 /// `SUPPORTED_IMAGE_TYPES`; `data` with ≤2 trailing `=` padding chars;
 /// decoded size (the padding-stripped `len * 3 / 4` estimate — `size_bytes`
 /// is NOT trusted) ≤ `MAX_IMAGE_BYTES`.
-fn validate_images(images: &[ImagePayload]) -> Result<(), RpcError> {
+fn validate_images(images: &[ImagePayload]) -> Result<(), SessionError> {
     if images.len() > MAX_IMAGE_COUNT {
-        return Err(RpcError::InvalidPrompt {
+        return Err(SessionError::InvalidPrompt {
             reason: format!("at most {MAX_IMAGE_COUNT} images per message"),
         });
     }
     for img in images {
         if img.name.len() > MAX_IMAGE_NAME_LEN {
-            return Err(RpcError::InvalidPrompt {
+            return Err(SessionError::InvalidPrompt {
                 reason: "image name exceeds 255 bytes".to_string(),
             });
         }
         if !SUPPORTED_IMAGE_TYPES.contains(&img.mime_type.as_str()) {
-            return Err(RpcError::InvalidPrompt {
+            return Err(SessionError::InvalidPrompt {
                 reason: format!(
                     "unsupported image type: {} (expected png, jpeg, gif, webp)",
                     img.mime_type
@@ -186,13 +187,13 @@ fn validate_images(images: &[ImagePayload]) -> Result<(), RpcError> {
         // (arbitrary `=` padding would otherwise bypass the size cap).
         let padding = img.data.len() - trimmed.len();
         if padding > 2 {
-            return Err(RpcError::InvalidPrompt {
+            return Err(SessionError::InvalidPrompt {
                 reason: "malformed base64 image data".to_string(),
             });
         }
         let decoded_bytes = (trimmed.len() as u64) * 3 / 4;
         if decoded_bytes > MAX_IMAGE_BYTES {
-            return Err(RpcError::InvalidPrompt {
+            return Err(SessionError::InvalidPrompt {
                 reason: "image exceeds the 10 MiB limit".to_string(),
             });
         }
@@ -234,22 +235,23 @@ pub fn mint_session_id() -> String {
 /// swap plan): `piSessionId` / `piSessionFile`? / `model`? /
 /// `thinkingLevel` / `loadSession` / `promptCapabilities` — the `model` key
 /// is ABSENT when `get_state` reports no model, and `piSessionFile` is
-/// ABSENT when the session has no file (`--no-session` runs; the session
-/// is unresumable → `loadSession: false`). The two trailing keys are
-/// load-bearing: `loadSession` gates the frontend's Resume button and
-/// `promptCapabilities.image` gates image sending (fail-closed).
+/// A live session's identity + its current configuration (what the UI shows
+/// in the header / the model selector). Serialized camelCase over IPC.
+///
+/// `capabilities` is the native session's capability envelope (item 1 of the
+/// swap plan): `model`? / `thinkingLevel` / `loadSession` / `promptCapabilities`
+/// — the `model` key is ABSENT when the session has no model, and the two
+/// trailing keys are load-bearing: `loadSession` gates the frontend's Resume
+/// button and `promptCapabilities.image` gates image sending (fail-closed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub session_id: String,
-    pub agent_id: String,
     pub cwd: PathBuf,
     pub capabilities: Value,
     /// The session's configuration options (model / thinking level
-    /// selectors) synthesized from `get_state` + `get_available_models` +
-    /// `get_available_thinking_levels`; `None` when the agent advertised
-    /// nothing (or for stored sessions — `list_sessions` always reports
-    /// `None`).
+    /// selectors) synthesized from the `ModelCatalog` (the native session's
+    /// model / thinking-level selectors); `None` for stored sessions.
     pub config_options: Option<Vec<Value>>,
     /// The desktop's archived flag (ADR 0016). `false` for a newly
     /// started or ephemeral session; the resume paths and
@@ -259,23 +261,19 @@ pub struct SessionInfo {
 
 /// A live, in-memory session handle.
 ///
-/// `session_id`, `cwd`, and `agent_id` are carried for diagnostics and for
-/// resume; they are not read by the prompt path.
+/// `session_id` and `cwd` are carried for diagnostics and for resume; they
+/// are not read by the prompt path.
 ///
 /// `pub(crate)` + `pub(crate)` fields: `subagent.rs` reads `driver.sessions`
 /// entries (to clone the `cx` for the subagent's task prompt), so the
 /// struct and its fields are visible to the whole crate.
-///
-/// (No `Debug` derive — `PiRpcHandle` does not implement `Debug`.)
 #[allow(dead_code)]
 pub(crate) struct LiveSession {
-    /// The session backend (the pi RPC handle for an EXTERNAL session; the
-    /// in-process `AgentLoop` handle for a NATIVE session) — cheap clone,
-    /// shared with the driver task.
-    pub(crate) handle: SessionBackend,
+    /// The in-process `AgentLoop` handle — cheap clone, shared with the
+    /// driver task.
+    pub(crate) handle: NativeHandle,
     pub(crate) session_id: String,
     pub(crate) cwd: PathBuf,
-    pub(crate) agent_id: String,
     /// Set to `true` to make the driver task's loop return, tearing the
     /// session down (dropping the handle closes the child's stdin).
     ///
@@ -291,8 +289,9 @@ pub(crate) struct LiveSession {
     /// (last-wins), the driver resolves it on `agent_settled` (a
     /// `cancel_requested` flag maps a late settle to `Cancelled`).
     pub(crate) pending_turn: Arc<StdMutex<Option<oneshot::Sender<StopReason>>>>,
-    /// Set by `cancel_session` BEFORE the `abort` is sent: a late
-    /// `agent_settled` after an abort maps to `Cancelled`, not `EndTurn`.
+    /// Set by `cancel_session` BEFORE the turn cancel
+    /// (`handle.cancel()`) is sent: a late `agent_settled` after the
+    /// cancel maps to `Cancelled`, not `EndTurn`.
     pub(crate) cancel_requested: Arc<StdMutex<bool>>,
     /// The most recent turn settle, watched by `SessionDriver::wait_for_settle`
     /// (the subagent's prompt wait): the driver sends `(seq, reason)` on
@@ -308,18 +307,6 @@ pub(crate) struct LiveSession {
     pub(crate) generation: u64,
 }
 
-/// The session backend (the `SessionDriver` generalization, Task 7): an
-/// EXTERNAL session is a `PiRpc` subprocess (the existing path — unchanged);
-/// a NATIVE session is an in-process `AgentLoop` tokio task (the harness,
-/// Tasks 4–6) driven through the `NativeHandle`.
-#[derive(Clone)]
-pub(crate) enum SessionBackend {
-    /// The pi RPC handle (the external path — `pi --mode rpc`).
-    Pi(PiRpcHandle),
-    /// The in-process `AgentLoop` handle (the native path).
-    Native(NativeHandle),
-}
-
 /// The native session's config state (the `set_config_option` re-synthesizer
 /// source — the loop's own `model` / `thinking_level` live INSIDE the spawned
 /// task, so the handle mirrors the applied config: `start_native_session`
@@ -330,8 +317,8 @@ pub(crate) struct NativeConfigState {
     pub(crate) thinking_level: Option<String>,
 }
 
-/// A cheap, `'static`-safe handle to the native `AgentLoop` task (the
-/// NATIVE counterpart of `PiRpcHandle`): `prompt_tx` / `control_tx` clone
+/// A cheap, `'static`-safe handle to the native `AgentLoop` task:
+/// `prompt_tx` / `control_tx` clone
 /// the loop's channels and `cancel` is the loop's cancellation token. The
 /// loop's `RpcEvent` `Receiver` is NOT held here (a `tokio` mpsc `Receiver`
 /// is not `Clone`) — `drive_native_session` takes it by move (the driver
@@ -444,76 +431,22 @@ impl NativeHandle {
     }
 }
 
-/// The external-close handle: the subagent cancel path (main sessions pass
-/// `None` to `drive_session`).
+/// The subagent-close handle: the subagent cancel path (a subagent session
+/// passes it to `drive_native_session`; a main session passes `None`).
 ///
 /// The dispatch worker task owns the `tx` + `kind` (it is handed to the
 /// caller as a [`SubagentCancel`]); the driver task keeps the `rx` and
-/// SELECTS on it in BOTH the establish phase and the block-until-close
-/// phase (so a cancel during the 30 s establish window is honored, not
-/// deferred), and reads the `kind` (INSTEAD of its own internal kind) for
-/// the close reason (one kind, first-set-wins across the whole session).
-/// The `tx` is also handed to the subagent's bridge listener, so a cancel
-/// cancels the subagent's in-flight `ask` waiters via their `close_rx` arm.
+/// SELECTS on it in the block-until-close phase, and reads the `kind`
+/// (INSTEAD of its own internal kind) for the close reason (one kind,
+/// first-set-wins across the whole session). The `tx` is also handed to
+/// the subagent's `ask` waiters, so a cancel cancels the subagent's
+/// in-flight `ask` waiters via their `close_rx` arm.
 #[derive(Clone)]
 pub(crate) struct ExternalClose {
-    /// The close flag sender (the `SubagentCancel` flips it; the bridge
-    /// listener observes it; the driver task selects on its receiver).
-    pub(crate) tx: watch::Sender<bool>,
-    /// The close flag receiver the driver task selects on.
+    /// The close flag receiver the driver task selects on (the
+    /// `SubagentCancel` flips the sender; a cancel — or a session close —
+    /// aborts the in-flight dispatch + its in-flight `ask` waiters).
     pub(crate) rx: watch::Receiver<bool>,
-    /// The close kind (first-set-wins): the `SubagentCancel` sets it `User`
-    /// before flipping the flag; the driver task reads it for the reason.
-    pub(crate) kind: Arc<StdMutex<Option<CloseKind>>>,
-}
-
-/// A cheap, `'static`-safe handle to the subagent dispatch (the `Arc` is
-/// NOT a `&` — `ConnCtx` is moved into `tokio::spawn` and must be `'static`).
-///
-/// The parent session's bridge listener carries one so it can service
-/// `dispatch_subagent` frames: `manager` is the `SubagentSessionManager`,
-/// `parent_cwd` is the parent's Space folder (the subagent's cwd + fs
-/// sandbox root), `parent_agent_id` is the parent's registry agent id (the
-/// subagent spawns the SAME registry entry as the parent — the built-in
-/// `pi` entry in production).
-#[derive(Clone)]
-pub struct SubagentSpawn {
-    pub manager: Arc<crate::agent::subagent::SubagentSessionManager>,
-    pub parent_cwd: PathBuf,
-    pub parent_agent_id: String,
-}
-
-/// Accumulated `cost_update` usage (the subagent metrics source). Sums the
-/// optional numeric fields across `cost_update` payloads (per-turn deltas
-/// from the suite's self-usage emitter — Task 1 of this plan); an absent
-/// field contributes 0. `Default` = all zeros (a session that never pushed
-/// usage — the pre-Task-1 v1 state).
-#[derive(Debug, Clone, Default)]
-pub struct CostAccumulator {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cost: f64,
-}
-
-impl CostAccumulator {
-    /// Fold one `cost_update` payload (the wire shape: `inputTokens` /
-    /// `outputTokens` / `cacheReadTokens` / `cacheWriteTokens` / `cost`,
-    /// all optional) into the accumulator (absent → 0).
-    pub fn add_payload(&mut self, p: &Value) {
-        self.input_tokens += p.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
-        self.output_tokens += p.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
-        self.cache_read_tokens += p
-            .get("cacheReadTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        self.cache_write_tokens += p
-            .get("cacheWriteTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        self.cost += p.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
-    }
 }
 
 /// Per-session thinking-persistence state: the accumulated text of the
@@ -566,7 +499,7 @@ pub struct TurnState {
 pub struct SessionDriver {
     pub(crate) sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
     pub(crate) pending_permissions: PendingPermissions,
-    pub(crate) pending_bridge: PendingBridge,
+    pub(crate) pending_bridge: PendingInteractive,
     /// The shared todo store (Phase 2, Task 1 — the `todo_update`
     /// handler's store; the main and subagent managers each get their
     /// OWN store, mirroring how `pending_bridge` is split across the
@@ -588,9 +521,6 @@ pub struct SessionDriver {
     /// in production; tests inject a fake via the `start_listener`
     /// parameter).
     pub(crate) runner: Arc<dyn SudoRunner>,
-    /// How long the establishment phase (agent spawn + `get_state`
-    /// establisher) may run before it is cancelled. Default: 30 s.
-    pub(crate) establish_timeout: Duration,
     /// How long to wait for a turn to settle before reporting a failure. A
     /// hung turn (a prompt that never settles) is torn down + reported
     /// failed after this, so a subagent can't linger forever (the
@@ -607,16 +537,6 @@ pub struct SessionDriver {
     /// trust lookup for BOTH main and subagent Sessions (`None` = fail-
     /// closed: the gate prompts, today's flow).
     pub(crate) trust_db: Option<Arc<Db>>,
-    /// In-memory per-`messageId` agent-text accumulator for the FINAL
-    /// OUTPUT (subagents only; `None` for main — main persists to the DB).
-    pub(crate) text_capture: Option<Arc<StdMutex<HashMap<String, String>>>>,
-    /// The last-seen `messageId` (updated for EVERY `agent_message_chunk`,
-    /// alongside `text_capture`): a plain `HashMap` has no insertion order,
-    /// so the "last message" is tracked separately, not derived from
-    /// iteration order.
-    pub(crate) last_message_id: Option<Arc<StdMutex<Option<String>>>>,
-    /// Accumulated `cost_update` usage (subagents only; `None` for main).
-    pub(crate) cost_capture: Option<Arc<StdMutex<CostAccumulator>>>,
     /// The subagent dispatch handle (main manager only — `Some`); `None`
     /// for the subagent manager itself (subagents cannot dispatch
     /// subagents — the tool is excluded from their spawn).
@@ -628,9 +548,8 @@ pub struct SessionDriver {
 }
 
 impl SessionDriver {
-    /// Create a driver (a fresh sessions map, empty pending maps, a 30 s
-    /// establish timeout, no persistence / trust db / captures / subagent
-    /// handle).
+    /// Create a driver (a fresh sessions map, empty pending maps, no
+    /// persistence / trust db / subagent handle).
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -640,541 +559,14 @@ impl SessionDriver {
             todo_store: Arc::new(TodoStore::new()),
             pending_sudo: Arc::new(Mutex::new(HashMap::new())),
             sudo_password: Arc::new(Mutex::new(HashMap::new())),
-            runner: Arc::new(bridge::RealSudoRunner),
-            establish_timeout: Duration::from_secs(30),
+            runner: Arc::new(interactive::RealSudoRunner),
             settle_timeout: Duration::from_secs(30 * 60),
             db: None,
             trust_db: None,
-            text_capture: None,
-            last_message_id: None,
-            cost_capture: None,
             subagent: None,
         }
     }
 
-    /// Shared driver: run the *establisher* against the (already spawned)
-    /// pi child, then stream the session's events until it closes.
-    ///
-    /// `handle` is a cheap clone of the pi RPC handle (the caller spawned
-    /// the `PiRpc` — a dropped `PiRpc` wrapper does NOT kill the child:
-    /// the child lives while ANY handle does). `establisher` receives the
-    /// handle and must return the established `SessionInfo`; on failure it
-    /// returns `Err` (the error is reported to the awaiting command; the
-    /// establish-timeout marker is applied here, not in the establisher).
-    ///
-    /// `external_close` (subagents only; `None` for main) is the cancel
-    /// path: the driver task selects on its receiver in BOTH the establish
-    /// phase and the block-until-close phase, and reads its `kind` (instead
-    /// of the internal kind) for the close reason (one kind, first-set-wins
-    /// across the whole session).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn drive_session<Establisher, EstablisherFut>(
-        &self,
-        handle: PiRpcHandle,
-        agent_id: &str,
-        hint: String,
-        cwd: PathBuf,
-        sink: &Arc<dyn EventSink>,
-        bridge_setup: Option<(String, PathBuf)>,
-        external_close: Option<ExternalClose>,
-        establisher: Establisher,
-    ) -> Result<SessionInfo, RpcError>
-    where
-        Establisher: FnOnce(PiRpcHandle) -> EstablisherFut + Send + 'static,
-        EstablisherFut: Future<Output = Result<SessionInfo, RpcError>> + Send + 'static,
-    {
-        // Split the external close (the subagent cancel path): the driver
-        // task selects on `rx` (establish + block phases) and reads `kind`
-        // for the reason; the bridge listener observes `tx` (a cancel also
-        // cancels in-flight `ask` waiters). `None` for main sessions.
-        let (ec_tx, ec_rx, ec_kind) = match external_close {
-            Some(ec) => (Some(ec.tx), Some(ec.rx), Some(ec.kind)),
-            None => (None, None, None),
-        };
-
-        // Channels that carry values out of the (long-lived) driver task.
-        let (session_ready_tx, session_ready_rx) = oneshot::channel::<SessionInfo>();
-        let (error_tx, mut error_rx) = oneshot::channel::<RpcError>();
-        let (close_tx, close_rx) = watch::channel(false);
-        // The internal close kind (main sessions). The driver reads the
-        // external kind INSTEAD when `external_close` is present (one kind,
-        // first-set-wins across the whole session). `None` means the agent
-        // process exited on its own (the close flag alone cannot carry the
-        // reason: on a user close the agent process may notice the EOF and
-        // exit first, so the reason must be decided by whoever closed).
-        let internal_kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
-        let kind: Arc<StdMutex<Option<CloseKind>>> =
-            ec_kind.clone().unwrap_or_else(|| internal_kind.clone());
-        // A clone for the driver task (held by the task until AFTER its kind
-        // read below); the original moves into the `LiveSession` value.
-        let kind_for_task = kind.clone();
-        // The close flag the bridge listener observes: the external close's
-        // sender (subagents — a cancel cancels in-flight `ask` waiters),
-        // else the driver's internal flag (main sessions).
-        let listener_close_tx: &watch::Sender<bool> = ec_tx.as_ref().unwrap_or(&close_tx);
-        // The turn-settle watch: the driver sends `(seq, reason)` on
-        // `agent_settled` (the sequence number forces `changed()` to fire
-        // on every settle — a watch coalesces equal values); the initial
-        // `(0, …)` means "no settle yet". `wait_for_settle` (the subagent's
-        // prompt wait) reads the receiver; a DROPPED sender (a teardown
-        // without a settle) resolves `changed()` too.
-        let (settle_tx, settle_rx) = watch::channel((0u64, StopReason::EndTurn));
-
-        // Bridge listener (ADR 0003): started BEFORE the driver task spawns
-        // (the push retry window is only ~2 s). The anchor is the desktop's
-        // own pid (`std::process::id()`, always alive). The driver-task
-        // `close_tx` is passed so a session close cancels every in-flight
-        // bridge request. `None` for non-bridge agents / macOS (fail-closed).
-        let bridge_handle = match bridge_setup {
-            Some((client_session_id, socket_path)) => {
-                // The subagent dispatch handle (main only — `Some`): the
-                // main session's listener services `dispatch_subagent`
-                // frames. Built from the driver's `subagent` handle + the
-                // session's `cwd` + `agent_id` (all in scope).
-                let subagent_spawn = self.subagent.clone().map(|m| SubagentSpawn {
-                    manager: m,
-                    parent_cwd: cwd.clone(),
-                    parent_agent_id: agent_id.to_string(),
-                });
-                let cost_capture = self.cost_capture.clone();
-                // The Phase 2 method-aware handler state (`todo_update` /
-                // `sudo_exec` — the desktop answers them itself): the
-                // shared todo store, the sudo sub-prompt oneshots, the
-                // per-session sudo credential cache, and the `sudo -S`
-                // execution seam.
-                let todo_store = self.todo_store.clone();
-                let pending_sudo = self.pending_sudo.clone();
-                let sudo_password = self.sudo_password.clone();
-                let runner = self.runner.clone();
-                Some(
-                    bridge::start_listener(
-                        client_session_id,
-                        &socket_path,
-                        std::process::id(),
-                        &cwd,
-                        sink.clone(),
-                        self.pending_bridge.clone(),
-                        listener_close_tx,
-                        bridge::DEFAULT_BRIDGE_TIMEOUT,
-                        subagent_spawn,
-                        cost_capture,
-                        todo_store,
-                        pending_sudo,
-                        sudo_password,
-                        runner,
-                    )
-                    .await
-                    .map_err(|e| RpcError::Io(format!("bridge listener: {e}")))?,
-                )
-            }
-            None => None,
-        };
-
-        // Per-session transcript accumulators for the persistence hook.
-        let agent_text_acc: Arc<StdMutex<HashMap<String, String>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-        let tool_call_state: Arc<StdMutex<HashMap<String, Value>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-        let thought_state: Arc<StdMutex<ThoughtState>> =
-            Arc::new(StdMutex::new(ThoughtState::default()));
-        // The normalizer's per-session turn state (the `messageId` counter +
-        // the tool-call partial-args buffers).
-        let turn_state: Arc<StdMutex<TurnState>> = Arc::new(StdMutex::new(TurnState::default()));
-        // The settle sequence for the turn-settle watch (moved into the
-        // driver task; incremented on every `agent_settled`).
-        let mut settle_seq = 0u64;
-        let _thought_state_task = thought_state.clone();
-
-        let sessions_arc = self.sessions.clone();
-        let pending_permissions_arc = self.pending_permissions.clone();
-        let pending_bridge_arc = self.pending_bridge.clone();
-        // The Phase 2 shared state for the driver-task teardown (the
-        // `sudo_password` cache + the `todo_store` entry are removed by the
-        // BARE session id; the `pending_sudo` oneshots are drained with the
-        // `pending_bridge` prefix drain below — their keys are compound).
-        let pending_sudo_arc = self.pending_sudo.clone();
-        let sudo_password_arc = self.sudo_password.clone();
-        let todo_store_arc = self.todo_store.clone();
-        let establish_timeout = self.establish_timeout;
-        let db = self.db.clone();
-        // The trust lookup source (ADR 0010 — the permission gate's
-        // `space_trusted` lookup; independent of `db`, which gates transcript
-        // persistence only).
-        let trust_db = self.trust_db.clone();
-        // The capture hooks (subagents only; `None` for main). Clones for
-        // the driver task's event handler.
-        let text_capture = self.text_capture.clone();
-        let last_message_id = self.last_message_id.clone();
-        let thought_capture = thought_state.clone();
-        let sink = sink.clone();
-        // The external close's receiver for the driver task (cloned per
-        // select phase — a `None` receiver is inert).
-        let ec_rx_task = ec_rx;
-
-        // SPAWN the driver task. The pi child is long-lived (it lives for
-        // the session), so the task must never be awaited inline here.
-        // The handle is CHEAP to clone (an `Arc`); the child lives while
-        // ANY clone is alive — the task takes a clone, the original moves
-        // into the `LiveSession` value below.
-        // The session's generation token (captured by the driver task —
-        // the teardown guard: a SUPERSEDED driver (a resume overwrote this
-        // entry under the same session id) must not clobber the
-        // replacement's entry).
-        let live_generation = self
-            .generation_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let handle_task = handle.clone();
-        tokio::spawn(async move {
-            // The event / extension-UI / exit streams (a fresh receiver per
-            // call — the queues buffer until a consumer attaches).
-            let handle = handle_task;
-            let mut events_rx = handle.events();
-            let mut ui_rx = handle.extension_ui();
-            let mut exited_rx = handle.exited();
-
-            // Establish the session (the `get_state` round-trip for a new
-            // session; `get_state` + `get_messages` replay for a resume).
-            // Bounded + external-close aware: a cancel during the establish
-            // window is honored (not deferred to the timeout).
-            let timeout_detail = format!(
-                "agent did not answer get_state within {}s",
-                establish_timeout.as_secs()
-            );
-            let mut establish_rx = ec_rx_task.clone();
-            let established = tokio::select! {
-                r = tokio::time::timeout(establish_timeout, establisher(handle.clone())) => {
-                    match r {
-                        Ok(Ok(info)) => Some(info),
-                        Ok(Err(err)) => {
-                            // Report the failure to the awaiting command,
-                            // then tear the child down.
-                            error_tx.send(err).ok();
-                            None
-                        }
-                        Err(_) => {
-                            error_tx
-                                .send(RpcError::EstablishTimeout {
-                                    detail: timeout_detail,
-                                })
-                                .ok();
-                            None
-                        }
-                    }
-                }
-                // A cancel during the establish window is honored (not
-                // deferred to the timeout); a `None` receiver is inert
-                // (main sessions).
-                _ = changed_or_inert(&mut establish_rx) => None,
-            };
-            let info = match established {
-                Some(info) => info,
-                // The establisher failed (it sent the error first) or a
-                // cancel won the race: tear the child down and exit.
-                None => {
-                    bridge::teardown(bridge_handle);
-                    return;
-                }
-            };
-
-            session_ready_tx.send(info.clone()).ok();
-
-            // Hand the pi `session_id` to the bridge handle so
-            // `bridge-request`/`bridge-event` payloads carry the pi id
-            // (bridge requests only occur mid-turn, after establish, so
-            // they always carry the pi id).
-            if let Some(h) = &bridge_handle {
-                h.set_session_id(&info.session_id).await;
-            }
-
-            // BLOCK until close_session OR agent death OR the external
-            // close, streaming the session's events as they arrive.
-            let mut internal_rx = ec_rx_task.is_none().then_some(close_rx);
-            // The internal close flag is inert for SUBAGENTS (the external
-            // close is their cancel path — the internal sender is dropped,
-            // and a dropped sender's `changed()` resolves immediately, which
-            // would tear the session down right after establishment).
-            let mut block_rx = ec_rx_task.clone();
-            loop {
-                tokio::select! {
-                    ev = events_rx.recv() => {
-                        let Some(ev) = ev else {
-                            // The reader task ended (the child's stdout
-                            // closed — treat it as an exit).
-                            break;
-                        };
-                        // A settled turn resolves the pending prompt (a
-                        // `cancel_requested` flag maps it to `Cancelled`) AND
-                        // records the settle on the watch (the subagent's
-                        // prompt wait — `wait_for_settle`).
-                        if matches!(ev, RpcEvent::agent_settled) {
-                            settle_seq += 1;
-                            // (finding 6) The `pending_turn` take + the settle
-                            // watch send happen under ONE `sessions` lock,
-                            // the watch send LAST (the `wait_for_settle`
-                            // race — see the native driver's settle arm).
-                            let _reason = {
-                                let sessions = sessions_arc.lock().await;
-                                let reason = if let Some(live) = sessions.get(&info.session_id) {
-                                    let cancelled = *live
-                                        .cancel_requested
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner());
-                                    if cancelled {
-                                        StopReason::Cancelled
-                                    } else {
-                                        StopReason::EndTurn
-                                    }
-                                } else {
-                                    StopReason::EndTurn
-                                };
-                                if let Some(live) = sessions.get(&info.session_id) {
-                                    if let Some(tx) = live
-                                        .pending_turn
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .take()
-                                    {
-                                        let _ = tx.send(reason);
-                                    }
-                                }
-                                let _ = settle_tx.send((settle_seq, reason));
-                                reason
-                            };
-                        }
-                        // A thinking-level change re-synthesizes the config
-                        // options (the normalizer has no model list — the
-                        // fetch is async, so it lives here, not in the
-                        // pure normalizer).
-                        if matches!(ev, RpcEvent::thinking_level_changed { .. }) {
-                            resynthesize_config_options(&handle, &info.session_id, &sink).await;
-                            continue;
-                        }
-                        let updates = {
-                            let mut turn =
-                                turn_state.lock().unwrap_or_else(|p| p.into_inner());
-                            normalize(&ev, &mut turn)
-                        };
-                        for update in updates {
-                            let frame = json!({
-                                "sessionId": info.session_id,
-                                "update": update,
-                            });
-                            sink.emit("session-update", frame);
-                            // The client owns history: upsert the transcript
-                            // row as the update streams in.
-                            if let Some(db) = &db {
-                                persist_update(
-                                    db,
-                                    &info.session_id,
-                                    &update,
-                                    &agent_text_acc,
-                                    &tool_call_state,
-                                    &thought_capture,
-                                );
-                            }
-                            // (a) Capture the agent text for the FINAL
-                            // OUTPUT (subagents only; `None` for main —
-                            // main persists to the DB). Fed from the
-                            // normalized `agent_message_chunk` frames keyed
-                            // by the derived `messageId`.
-                            if let Some(tc) = &text_capture {
-                                if update
-                                    .get("sessionUpdate")
-                                    .and_then(Value::as_str)
-                                    == Some("agent_message_chunk")
-                                {
-                                    if let Some(text) = update
-                                        .get("content")
-                                        .and_then(|c| c.get("text"))
-                                        .and_then(Value::as_str)
-                                    {
-                                        if !text.is_empty() {
-                                            let key = update
-                                                .get("messageId")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("default")
-                                                .to_string();
-                                            let mut acc = tc
-                                                .lock()
-                                                .unwrap_or_else(|p| p.into_inner());
-                                            acc.entry(key.clone()).or_default().push_str(text);
-                                            if let Some(lmi) = &last_message_id {
-                                                *lmi.lock().unwrap_or_else(
-                                                    |p| p.into_inner(),
-                                                ) = Some(key);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    req = ui_rx.recv() => {
-                        let Some(req) = req else {
-                            break;
-                        };
-                        // The permission gate (the bundled gate extension's
-                        // `ctx.ui.confirm` / `ctx.ui.select` dialogs).
-                        // `trust_db` + `cwd` let a TRUSTED Space's `confirm`
-                        // short-circuit (ADR 0010) — one call site serves both
-                        // main and subagent Sessions: the main manager's
-                        // `attach_db` sets `trust_db` (the same db), and the
-                        // subagent manager threads it through `new` (its `db`
-                        // stays `None` — ephemeral, no transcript persistence).
-                        permission::handle_extension_ui_request(
-                            &info.session_id, req, &handle, &sink, &pending_permissions_arc,
-                            trust_db.as_ref(), &info.cwd,
-                        )
-                        .await;
-                    }
-                    // The child exited (reaped by the exit-watcher task).
-                    _ = exited_rx.changed() => break,
-                    // The internal close flag (main sessions).
-                    _ = changed_or_inert(&mut internal_rx) => break,
-                    // The external close (subagent cancel); a `None`
-                    // receiver is inert (main sessions).
-                    _ = changed_or_inert(&mut block_rx) => break,
-                }
-            }
-
-            // The session is over: clean up. The reason comes from the close
-            // kind the closer recorded: a kind set before the flag send
-            // wins; `None` means the agent process exited on its own and
-            // nobody closed it.
-            //
-            // Close the child's stdin EXPLICITLY (idempotent — `close_session`
-            // may have done it already): dropping this task's handle clone
-            // is NOT enough to close the stdin, because the exit-watcher
-            // task holds its own `Arc<Inner>` clone for the whole
-            // `child.wait()` — and `wait()` only returns once the child
-            // exits, which (for a well-behaved agent) only happens on the
-            // stdin EOF. Without this explicit close the cycle would leak
-            // the agent process (and the exit-watcher task) forever.
-            handle.close().await;
-            let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
-            let reason = match kind {
-                Some(CloseKind::User) => ClosedReason::User,
-                None => ClosedReason::AgentExited,
-            };
-            // Guard by the generation token (captured above): a
-            // SUPERSEDED driver (a resume overwrote this entry under the
-            // same session id) must not clobber the replacement's entry.
-            // Resolve the pending turn (an in-flight `send_prompt`
-            // awaiting its `agent_settled`) with `Cancelled` BEFORE the
-            // session is removed (finding 3a — the agent died / the
-            // session was torn down mid-turn, so the turn will never
-            // settle; without this the `send_prompt`'s unbounded
-            // `rx.await` hangs forever).
-            {
-                let mut sessions = sessions_arc.lock().await;
-                if sessions
-                    .get(&info.session_id)
-                    .is_some_and(|l| l.generation == live_generation)
-                {
-                    if let Some(live) = sessions.get(&info.session_id) {
-                        if let Some(tx) = live
-                            .pending_turn
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .take()
-                        {
-                            let _ = tx.send(StopReason::Cancelled);
-                        }
-                    }
-                    sessions.remove(&info.session_id);
-                }
-            }
-            // Keys are `"{session_id}/{request_id}"` — match on the
-            // trailing-slash prefix so closing "s1" does not cancel
-            // the pending prompt of the longer session "s10".
-            let prefix = permission::session_key_prefix(&info.session_id);
-            pending_permissions_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&prefix));
-            // Drain this session's pending bridge requests too (dropping
-            // the senders cancels the spawned waiters, which write the
-            // terminal `error:"cancelled"` frame).
-            let bridge_prefix = bridge::session_key_prefix(&info.session_id);
-            pending_bridge_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&bridge_prefix));
-            // Phase 2: drain this session's pending `sudo_exec` sub-prompts
-            // too (dropping the senders cancels the in-flight confirm /
-            // password waiters). The `pending_sudo` entries are COMPOUND-keyed
-            // (`"{sid}/{id}:confirm"`), so the trailing-slash prefix is correct
-            // there.
-            pending_sudo_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&bridge_prefix));
-            // Clear the cached sudo password (the suite's `credentialCache`
-            // is cleared at every session boundary — a stale credential must
-            // not survive the session, and a resume under the same id must
-            // re-prompt, not silently reuse it). The cache is keyed by the
-            // BARE session id (NOT compound — `cache.get(sid)`), so it is
-            // removed by the bare key: a `"{sid}/"` prefix would never match
-            // `"{sid}"` and the plaintext credential would leak.
-            sudo_password_arc.lock().await.remove(&info.session_id);
-            // Same boundary for the todo store (a resumed session must not
-            // read the previous incarnation's todos; the map must not grow
-            // one entry per session forever).
-            todo_store_arc.remove(&info.session_id);
-            sink.emit(
-                "session-closed",
-                json!({
-                    "sessionId": info.session_id,
-                    "reason": reason.as_str(),
-                }),
-            );
-            // Tear the bridge listener down UNCONDITIONALLY (do NOT nest it
-            // inside the session guard, or a failed establisher would leak
-            // the listener): stop the accept loop + unlink the socket
-            // (Unix; Windows pipes vanish on last close).
-            bridge::teardown(bridge_handle);
-        });
-
-        // Await the established session.
-        let info = match session_ready_rx.await {
-            Ok(info) => info,
-            Err(_) => {
-                // The driver never delivered an established session: either
-                // the establisher failed (it sent the error first) or the
-                // child died mid-establish.
-                match error_rx.try_recv() {
-                    Ok(err) => return Err(err),
-                    Err(_) => {
-                        return Err(RpcError::EstablishTimeout {
-                            detail: format!("agent did not complete establish ({hint})"),
-                        })
-                    }
-                }
-            }
-        };
-
-        let live = LiveSession {
-            // The EXTERNAL backend (the `PiRpc` handle — the task keeps its
-            // own clone; the child lives while ANY clone is alive).
-            handle: SessionBackend::Pi(handle),
-            generation: live_generation,
-            session_id: info.session_id.clone(),
-            cwd,
-            agent_id: agent_id.to_string(),
-            close_tx: ec_tx.unwrap_or_else(|| close_tx.clone()),
-            close_kind: kind,
-            thought_state,
-            pending_turn: Arc::new(StdMutex::new(None)),
-            cancel_requested: Arc::new(StdMutex::new(false)),
-            settle_rx,
-        };
-        self.sessions
-            .lock()
-            .await
-            .insert(live.session_id.clone(), live);
-
-        Ok(info)
-    }
     /// Await the session's next turn settle (the driver's `agent_settled` watch).
     ///
     /// BOUNDED by `settle_timeout` (a hung turn can't linger forever — the
@@ -1182,8 +574,8 @@ impl SessionDriver {
     /// being waited for (resolves `Ok(reason)` — the `cancel_requested` flag
     /// already mapped a cancel to `Cancelled`), on a teardown (the driver
     /// task ending DROPS the watch sender, which resolves `changed()` as
-    /// `Err` → `Err(ProcessExited)` — the agent died mid-turn, or the
-    /// session was torn down), or on the settle timeout (a hung turn →
+    /// `Err` → `Err(UnknownSession)` — the session was torn down mid-turn),
+    /// or on the settle timeout (a hung turn →
     /// `Err(SettleTimeout)` — the caller's cancel tears the session down).
     ///
     /// STALE-SETTLE GUARD: the wait is pinned to the channel's current
@@ -1198,12 +590,12 @@ impl SessionDriver {
     /// is SKIPPED: the clone inherits the stored receiver's initial version,
     /// so `changed()` resolves immediately with the latest settle (the fast
     /// turn's — not hung on a new settle that never comes).
-    pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, RpcError> {
+    pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, SessionError> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
             let live = sessions
                 .get(session_id)
-                .ok_or_else(|| RpcError::UnknownSession {
+                .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             // A `send_prompt` turn is in flight (the slot is occupied —
@@ -1232,19 +624,22 @@ impl SessionDriver {
             rx
         };
         // A bounded wait: a hung turn (no settle within `settle_timeout`)
-        // resolves `Err(SettleTimeout)`; a teardown (sender dropped)
-        // resolves `Err(ProcessExited)`; a settle resolves `Ok(reason)`.
+        // resolves `Err(SettleTimeout)`; a teardown (sender dropped — the
+        // session is gone) resolves `Err(UnknownSession)`; a settle
+        // resolves `Ok(reason)`.
         match tokio::time::timeout(self.settle_timeout, rx.changed()).await {
             Ok(Ok(_)) => {} // a settle was recorded (fall through)
             Ok(Err(_)) => {
-                // The sender was dropped without a settle (the agent died
-                // mid-turn, or the session was torn down).
-                return Err(RpcError::ProcessExited(None));
+                // The sender was dropped without a settle (the session was
+                // torn down mid-turn — it no longer exists).
+                return Err(SessionError::UnknownSession {
+                    id: session_id.to_string(),
+                });
             }
             Err(_elapsed) => {
                 // The settle timed out (a hung turn — the caller's cancel
                 // tears the session down; see the dispatch).
-                return Err(RpcError::SettleTimeout {
+                return Err(SessionError::SettleTimeout {
                     detail: format!(
                         "the turn did not settle within {}s",
                         self.settle_timeout.as_secs()
@@ -1254,14 +649,16 @@ impl SessionDriver {
         }
         let (seq, reason) = *rx.borrow();
         if seq == 0 {
-            Err(RpcError::ProcessExited(None))
+            Err(SessionError::UnknownSession {
+                id: session_id.to_string(),
+            })
         } else {
             Ok(reason)
         }
     }
 
-    /// Shared driver for a NATIVE session (the `AgentLoop` variant of
-    /// [`Self::drive_session`]).
+    /// Shared driver for a NATIVE session (the in-process `AgentLoop`
+    /// variant).
     ///
     /// The loop task (spawned by the caller) emits `RpcEvent`s on
     /// `events_rx` (moved in — a `tokio` mpsc `Receiver` is not `Clone`)
@@ -1280,11 +677,10 @@ impl SessionDriver {
         handle: NativeHandle,
         events_rx: mpsc::Receiver<RpcEvent>,
         loop_settle_rx: watch::Receiver<u64>,
-        agent_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
         info: SessionInfo,
-    ) -> Result<SessionInfo, RpcError> {
+    ) -> Result<SessionInfo, SessionError> {
         let (close_tx, mut close_rx) = watch::channel(false);
         let kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
         // The turn-settle watch (the external path's `settle_tx` — the
@@ -1399,9 +795,9 @@ impl SessionDriver {
             }
 
             // The session is over: tear the loop down (the prompt queue +
-            // the in-flight turn stop) and clean up (the `drive_session`
-            // teardown, minus the bridge listener — a native session has no
-            // bridge: it runs in-process).
+            // the in-flight turn stop) and clean up the pending maps +
+            // emit `session-closed` (a native session runs in-process —
+            // there is no external machinery to tear down).
             backend.cancel.cancel();
             let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
             let reason = match kind {
@@ -1442,15 +838,15 @@ impl SessionDriver {
                 .lock()
                 .await
                 .retain(|key, _| !key.starts_with(&prefix));
-            let bridge_prefix = bridge::session_key_prefix(&info_task.session_id);
+            let interactive_prefix = interactive::session_key_prefix(&info_task.session_id);
             pending_bridge_arc
                 .lock()
                 .await
-                .retain(|key, _| !key.starts_with(&bridge_prefix));
+                .retain(|key, _| !key.starts_with(&interactive_prefix));
             pending_sudo_arc
                 .lock()
                 .await
-                .retain(|key, _| !key.starts_with(&bridge_prefix));
+                .retain(|key, _| !key.starts_with(&interactive_prefix));
             sudo_password_arc.lock().await.remove(&info_task.session_id);
             todo_store_arc.remove(&info_task.session_id);
             sink.emit(
@@ -1463,11 +859,10 @@ impl SessionDriver {
         });
 
         let live = LiveSession {
-            handle: SessionBackend::Native(handle),
+            handle,
             generation: live_generation,
             session_id: info.session_id.clone(),
             cwd,
-            agent_id: agent_id.to_string(),
             close_tx: close_tx.clone(),
             close_kind: kind,
             thought_state: Arc::new(StdMutex::new(ThoughtState::default())),
@@ -1484,64 +879,6 @@ impl SessionDriver {
     }
 }
 
-/// Re-synthesize the session's config options after a `thinking_level_changed`
-/// (the normalizer has no model list — the fetch is async, so this lives in
-/// the driver task): `get_state` (the current model + level) +
-/// `get_available_models` + `get_available_thinking_levels` → emit a
-/// `config_option_update` with the fresh options. A no-op (silently) when
-/// any fetch fails (a config refresh is a convenience, not a correctness
-/// signal).
-async fn resynthesize_config_options(
-    handle: &PiRpcHandle,
-    session_id: &str,
-    sink: &Arc<dyn EventSink>,
-) {
-    let Ok(state) = handle.send(json!({ "type": "get_state" })).await else {
-        return;
-    };
-    let models = handle
-        .send(json!({ "type": "get_available_models" }))
-        .await
-        .ok()
-        .and_then(|v| v.get("models").cloned());
-    let levels = handle
-        .send(json!({ "type": "get_available_thinking_levels" }))
-        .await
-        .ok()
-        .and_then(|v| v.get("levels").cloned());
-    if let Some(opts) = synthesize_config_options(&state, models.as_ref(), levels.as_ref()) {
-        sink.emit(
-            "session-update",
-            json!({
-                "sessionId": session_id,
-                "update": { "sessionUpdate": "config_option_update", "configOptions": opts },
-            }),
-        );
-    }
-}
-
-/// A future that resolves when the (optional) close receiver's value
-/// changes; inert (never resolves) when `None` — so a session with no such
-/// receiver is unaffected by the select arm. Used for BOTH the internal-close
-/// arm and the external-close arm:
-///
-/// - the EXTERNAL arm is `None` for a MAIN session (no external close — the
-///   `None` receiver is inert, so the select arm never fires);
-/// - the INTERNAL arm is `None` for a SUBAGENT session (its internal sender
-///   is dropped — the `LiveSession` holds the external one — and a dropped
-///   sender's `changed()` resolves immediately, which would tear the session
-///   down right after establishment).
-async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
-    match rx {
-        Some(rx) => {
-            let _ = rx.changed().await;
-        }
-        None => {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
 /// A factory that builds a `Provider` from a `Model` (the native path's
 /// provider seam — `SessionManager::provider_factory`; the production
 /// default is `OpenAiCompatibleProvider`, a test sets a mock before
@@ -1549,36 +886,104 @@ async fn changed_or_inert(rx: &mut Option<watch::Receiver<bool>>) {
 /// one (the native dispatch builds the `Provider` through it).
 pub type ProviderFactory = Arc<dyn Fn(&Model) -> Box<dyn Provider> + Send + Sync>;
 
-/// Manages all live ACP sessions (the MAIN sessions).
+/// The effective-catalog supplier: the BASE catalog + the user's providers
+/// from `settings.json` (a fresh read) + live per-provider discovery (`GET
+/// /v1/models`, cached per-provider) — merged via `merge_catalog` (ADR
+/// 0014). `resolve` is the extracted core of the old
+/// `SessionManager::effective_catalog`: the `SessionManager` keeps a thin
+/// wrapper over it, and `NativeDeps` carries one so a named agent's `model:`
+/// frontmatter resolves against the EFFECTIVE catalog at dispatch time (NOT
+/// a startup snapshot — the base catalog is empty after the pi-config
+/// seeding removal, and a startup snapshot would never resolve a
+/// user-provider model).
+#[derive(Clone)]
+pub struct EffectiveCatalog {
+    pub config_dir: PathBuf,
+    pub cache: Arc<tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>>,
+    pub base: ModelCatalog,
+}
+
+impl EffectiveCatalog {
+    /// The effective catalog (the `SessionManager::effective_catalog` core):
+    /// the base catalog + the user's providers from `settings.json` (fresh
+    /// read via `load_settings`), discovered via `discover_models`
+    /// (best-effort; the per-provider `cache` — `force_refresh` bypasses
+    /// the cache for provider `force_refresh` when `Some`). A provider whose
+    /// discovery fails contributes 0 models but still shadows the base
+    /// models for its id (ADR 0014 — via `merge_catalog`'s
+    /// `shadowed_provider_ids`).
+    pub async fn resolve(&self, force_refresh: Option<&str>) -> ModelCatalog {
+        let settings = load_settings(&self.config_dir);
+        let mut user_models: Vec<Model> = Vec::new();
+        let mut cache = self.cache.lock().await;
+        for provider in &settings.providers {
+            let entry = cache
+                .entry(provider.id.clone())
+                .or_insert_with(ProviderDiscovery::default);
+            // `force_refresh` (a provider id) bypasses the cache for that
+            // provider (the settings page's refresh affordance); a failed
+            // re-fetch clears the stale entry (0 models — the provider row
+            // shows `unreachable` + refresh, the stale base models stay
+            // shadowed).
+            let bypass = Some(provider.id.as_str()) == force_refresh;
+            if !entry.attempted || bypass {
+                entry.attempted = true;
+                match discover_models(&provider.base_url, &provider.api_key).await {
+                    Ok(models) => entry.models = models,
+                    Err(_) => entry.models.clear(),
+                }
+            }
+            // A discovered model becomes a `Model`: the provider's
+            // `base_url` / `api_key`; `context_window` falls back to
+            // `DEFAULT_CONTEXT_WINDOW` (a user model has no static metadata);
+            // the thinking fields map straight from the `DiscoveredMeta`
+            // (`None` → `vec![]` / `false`); v1 is OpenAI-compatible only.
+            for (id, meta) in &entry.models {
+                user_models.push(Model {
+                    id: id.clone(),
+                    provider: provider.id.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key.clone(),
+                    context_window: meta.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                    cost_per_mtok_in: 0.0,
+                    cost_per_mtok_out: 0.0,
+                    supports_tools: true,
+                    supports_thinking: meta.supports_thinking.unwrap_or(false),
+                    thinking_levels: meta.thinking_levels.clone().unwrap_or_default(),
+                    api: Some("openai-completions".to_string()),
+                });
+            }
+        }
+        // EVERY configured provider id shadows (regardless of whether its
+        // discovery succeeded — a provider that discovered 0 models still
+        // replaces the stale base models for its id, ADR 0014).
+        let shadowed: Vec<String> = settings.providers.iter().map(|p| p.id.clone()).collect();
+        merge_catalog(&self.base, &user_models, &shadowed)
+    }
+}
+
+/// Manages all live native sessions (the MAIN sessions).
 ///
 /// Owns a [`SessionDriver`] (db: attached via [`Self::attach_db`],
 /// `trust_db`: the same db, attached via [`Self::attach_db`],
 /// captures: `None`, subagent: injected via [`Self::set_subagent_manager`])
-/// plus the agent registry + config dir. DB recording and
-/// `record_session` stay here; the shared driver
-/// (`drive_session`) is delegated to. (The one-live policy is LIFTED,
-/// ADR 0002 — sessions coexist; a session is torn down only by an
-/// explicit `close_session`, a subagent cancel, or agent death.)
+/// plus the config dir (the `settings.json` home — the settings-driven
+/// native session source) + the base model catalog. DB recording and
+/// `record_session` stay here; the driver is delegated to. (The one-live
+/// policy is LIFTED — sessions coexist; a session is torn down
+/// only by an explicit `close_session` or a subagent cancel.)
 ///
 /// `Sync` — the mutable state is `Arc<Mutex<…>>` internally, so the
 /// manager is managed directly (no outer lock); each method locks only
 /// its own internal maps, briefly.
 pub struct SessionManager {
     driver: SessionDriver,
-    registry: Registry,
     config_dir: PathBuf,
-    /// The installed gate extension's path (`None` when the install
-    /// failed — the spawn then skips the gate args/env, and the session
-    /// runs ungated rather than broken).
-    gate_path: Option<PathBuf>,
-    /// The installed tools-override extension's path (`None` when the
-    /// install failed — the spawn then skips the tools args, and the
-    /// session runs on the suite's original tools rather than broken).
-    tools_path: Option<PathBuf>,
-    /// The model catalog (Task 5 — seeded from the user's pi config, ADR
-    /// 0012; the native session's model source + the `set_config_option`
-    /// re-synthesizer). Best-effort: a missing pi config degrades to an
-    /// empty catalog (a logged warning), never a crash.
+    /// The BASE model catalog (the desktop is native-only — the catalog is
+    /// the base of the effective catalog; a test overrides it via
+    /// `set_catalog`). The effective catalog merges the user's providers
+    /// (the `settings.json` `providers` list, ADR 0014) + live discovery
+    /// over the base (see `effective_catalog` / `EffectiveCatalog`).
     catalog: ModelCatalog,
     /// The provider factory seam (reviewer-corrected Major #21): the native
     /// path builds the `Provider` through it (the production default is
@@ -1589,8 +994,9 @@ pub struct SessionManager {
     /// the OpenAI endpoint "supplies everything"; the `pi-provider-litellm`
     /// `fetchModels` pattern). At most one fetch per provider (a failed /
     /// unreachable endpoint is not retried every session); a failure /
-    /// absent model degrades to the static `models-store.json` metadata.
-    discovery_cache: tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>,
+    /// absent model degrades to the static metadata (an empty base catalog
+    /// contributes nothing — the effective catalog IS the providers list).
+    discovery_cache: Arc<tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>>,
 }
 
 impl SessionManager {
@@ -1598,43 +1004,18 @@ impl SessionManager {
     pub fn config_dir(&self) -> &PathBuf {
         &self.config_dir
     }
-    /// Create a manager, loading the agent registry from `config_dir`.
-    pub fn new(config_dir: PathBuf) -> Result<Self, ConfigError> {
-        let registry = Registry::load(&config_dir)?;
-        // Install the bundled gate extension (idempotent; both managers
-        // install the same file — the write is skipped when it matches).
-        // A failure is NON-fatal: the session runs ungated rather than
-        // broken at startup.
-        let gate_path = match crate::agent::gate::install_gate_extension(&config_dir) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                eprintln!("gate extension install failed: {e} (sessions run ungated)");
-                None
-            }
-        };
-        // Install the desktop-provided tools override (idempotent — both
-        // managers install the same file). A failure is NON-fatal: the
-        // session runs on the suite's original tools rather than broken.
-        let tools_path = match crate::agent::tools::install_tools_extension(&config_dir) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                eprintln!(
-                    "tools extension install failed: {e} (sessions run on the suite's tools)"
-                );
-                None
-            }
-        };
-        Ok(Self {
+    /// Create a manager (the config dir is the `settings.json` home — the
+    /// settings-driven native session source; there is no agent registry
+    /// and no pi config seeding: the desktop is native-only).
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self {
             driver: SessionDriver::new(),
-            registry,
             config_dir,
-            gate_path,
-            tools_path,
-            // The model catalog (Task 5 — seeded from the user's pi
-            // config; best-effort, ADR 0012). Tests override it via
-            // `set_catalog` (a test cannot control the user's real pi
-            // config).
-            catalog: seed_from_pi_config(),
+            // The base catalog (empty — the desktop is native-only: the
+            // effective catalog is the Settings' providers list + live
+            // discovery, merged over the base, ADR 0014). Tests override it
+            // via `set_catalog`.
+            catalog: ModelCatalog::default(),
             // The provider factory seam (reviewer-corrected Major #21 —
             // the production default; a test sets a mock via
             // `set_provider_factory` BEFORE `start_session`).
@@ -1644,12 +1025,20 @@ impl SessionManager {
                     api_key: m.api_key.clone(),
                 }) as Box<dyn Provider>
             }),
-            discovery_cache: tokio::sync::Mutex::new(HashMap::new()),
-        })
+            discovery_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
 
-    /// Override the model catalog (tests — `new` seeds from the user's pi
-    /// config, which a test cannot control). Set BEFORE `start_session`.
+    /// Override the BASE model catalog (tests — the production base is
+    /// empty; the effective catalog is the Settings' providers list + live
+    /// discovery, merged over the base). Set BEFORE `start_session`.
+    ///
+    /// CAVEAT (tests): a `NativeDeps` wired by `set_subagent_manager`
+    /// CLONES `self.catalog` into the subagent dispatch's
+    /// `EffectiveCatalog` base ONCE at wiring time — a LATER `set_catalog`
+    /// desynchronizes that base (the subagent dispatch keeps the old
+    /// base). Call `set_catalog` BEFORE `set_subagent_manager` (or
+    /// re-call `set_subagent_manager` afterwards).
     pub fn set_catalog(&mut self, catalog: ModelCatalog) {
         self.catalog = catalog;
     }
@@ -1706,62 +1095,25 @@ impl SessionManager {
         updated
     }
 
-    /// The effective catalog: the seeded catalog (ADR 0012) + the user's
-    /// providers from `settings.json` (fresh read via `load_settings`),
-    /// discovered via `discover_models` (best-effort; the existing
-    /// per-provider `discovery_cache` — `force_refresh` bypasses the cache
-    /// for provider `force_refresh` when `Some`). A provider whose discovery
-    /// fails contributes 0 models but still shadows the seeded models for
-    /// its id (ADR 0014 — via `merge_catalog`'s `shadowed_provider_ids`).
+    /// The effective catalog: the base catalog (the desktop is native-only —
+    /// the base is the static catalog a test `set_catalog`s; production is
+    /// empty) + the user's providers from `settings.json` (fresh read via
+    /// `load_settings`), discovered via `discover_models` (best-effort; the
+    /// existing per-provider `discovery_cache` — `force_refresh` bypasses
+    /// the cache for provider `force_refresh` when `Some`). A provider whose
+    /// discovery fails contributes 0 models but still shadows the base
+    /// models for its id (ADR 0014 — via `merge_catalog`'s
+    /// `shadowed_provider_ids`). Thin wrapper over
+    /// [`EffectiveCatalog::resolve`] (the `NativeDeps` supplier carries the
+    /// same core).
     pub async fn effective_catalog(&self, force_refresh: Option<&str>) -> ModelCatalog {
-        let settings = load_settings(&self.config_dir);
-        let mut user_models: Vec<Model> = Vec::new();
-        let mut cache = self.discovery_cache.lock().await;
-        for provider in &settings.providers {
-            let entry = cache
-                .entry(provider.id.clone())
-                .or_insert_with(ProviderDiscovery::default);
-            // `force_refresh` (a provider id) bypasses the cache for that
-            // provider (the settings page's refresh affordance); a failed
-            // re-fetch clears the stale entry (0 models — the provider row
-            // shows `unreachable` + refresh, the stale seeded models stay
-            // shadowed).
-            let bypass = Some(provider.id.as_str()) == force_refresh;
-            if !entry.attempted || bypass {
-                entry.attempted = true;
-                match discover_models(&provider.base_url, &provider.api_key).await {
-                    Ok(models) => entry.models = models,
-                    Err(_) => entry.models.clear(),
-                }
-            }
-            // A discovered model becomes a `Model`: the provider's
-            // `base_url` / `api_key`; `context_window` falls back to
-            // `DEFAULT_CONTEXT_WINDOW` (a user model has no static metadata);
-            // the thinking fields map straight from the `DiscoveredMeta`
-            // (`None` → `vec![]` / `false` — the `refresh_model_metadata`
-            // field-mapping pattern, minus the static-value fallback); v1 is
-            // OpenAI-compatible only (ADR 0012).
-            for (id, meta) in &entry.models {
-                user_models.push(Model {
-                    id: id.clone(),
-                    provider: provider.id.clone(),
-                    base_url: provider.base_url.clone(),
-                    api_key: provider.api_key.clone(),
-                    context_window: meta.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
-                    cost_per_mtok_in: 0.0,
-                    cost_per_mtok_out: 0.0,
-                    supports_tools: true,
-                    supports_thinking: meta.supports_thinking.unwrap_or(false),
-                    thinking_levels: meta.thinking_levels.clone().unwrap_or_default(),
-                    api: Some("openai-completions".to_string()),
-                });
-            }
+        EffectiveCatalog {
+            config_dir: self.config_dir.clone(),
+            cache: self.discovery_cache.clone(),
+            base: self.catalog.clone(),
         }
-        // EVERY configured provider id shadows (regardless of whether its
-        // discovery succeeded — a provider that discovered 0 models still
-        // replaces the stale seeded models for its id, ADR 0014).
-        let shadowed: Vec<String> = settings.providers.iter().map(|p| p.id.clone()).collect();
-        merge_catalog(&self.catalog, &user_models, &shadowed)
+        .resolve(force_refresh)
+        .await
     }
 
     /// Attach the persistence database. Sets BOTH `db` (transcript
@@ -1773,35 +1125,33 @@ impl SessionManager {
         self.driver.trust_db = Some(db);
     }
 
-    /// Override the establishment timeout (default 30 s; tests shrink it
-    /// so a hanging agent does not make them wait).
-    pub fn set_establish_timeout(&mut self, timeout: Duration) {
-        self.driver.establish_timeout = timeout;
-    }
-
     /// Inject the subagent manager (main only — sets the driver's
-    /// `subagent` handle so the main session's bridge listener can service
-    /// `dispatch_subagent` frames). The subagent manager needs nothing from
-    /// the main manager; only this field points at it (intra-crate type
-    /// cycles are fine in Rust).
+    /// `subagent` handle so the main session's `task` tool can dispatch
+    /// through it). The subagent manager needs nothing from the main
+    /// manager; only this field points at it (intra-crate type cycles are
+    /// fine in Rust).
     ///
     /// ALSO wires the native-harness deps onto the manager (set-once via
     /// `set_native_deps` — a `&self` `OnceLock`, so it's callable through
-    /// the `Arc` received here): the `db` is the SIGNAL that native
-    /// wiring is present (skipped when `None` — the manager stays
-    /// external-pi-only); it is NOT passed (the throwaway child `Db` is
-    /// built fresh in `dispatch_native`). `trust_db` IS threaded (the
-    /// SAME db — ADR 0010: a native child in a trusted Space inherits
-    /// the parent's trust, matching the external `dispatch`); it is
-    /// `Some` whenever `db` is (both are set together by `attach_db`).
-    /// In production the native-session path always `attach_db`s, so
-    /// this is set.
+    /// the `Arc` received here): the `db` is the SIGNAL that native wiring
+    /// is present (skipped when `None`); the `catalog` is the EFFECTIVE
+    /// catalog supplier (`EffectiveCatalog` — the base catalog + the
+    /// settings' providers + live discovery, resolved at dispatch time —
+    /// the desktop is native-only, so a named agent's `model:` frontmatter
+    /// resolves against the effective catalog, not a startup snapshot).
+    /// `trust_db` IS threaded (the SAME db — ADR 0010: a native child in a
+    /// trusted Space inherits the parent's trust); it is `Some` whenever
+    /// `db` is (both are set together by `attach_db`).
     pub fn set_subagent_manager(&mut self, m: Arc<crate::agent::subagent::SubagentSessionManager>) {
         self.driver.subagent = Some(m.clone());
         if let Some(_db) = &self.driver.db {
             m.set_native_deps(crate::agent::subagent::NativeDeps {
                 provider_factory: self.provider_factory.clone(),
-                catalog: self.catalog.clone(),
+                catalog: EffectiveCatalog {
+                    config_dir: self.config_dir.clone(),
+                    cache: self.discovery_cache.clone(),
+                    base: self.catalog.clone(),
+                },
                 todo_store: self.driver.todo_store.clone(),
                 sudo: SudoDeps {
                     runner: self.driver.runner.clone(),
@@ -1832,11 +1182,6 @@ impl SessionManager {
     /// Number of live sessions.
     pub async fn session_count(&self) -> usize {
         self.driver.sessions.lock().await.len()
-    }
-
-    /// The configured agents (consumed by the `list_agents` command).
-    pub fn agents(&self) -> &[AgentEntry] {
-        &self.registry.agents
     }
 
     /// Record a session in the persistence layer (no-op without a database).
@@ -1871,59 +1216,65 @@ impl SessionManager {
     /// existing `synthesize_config_options` shape — the frontend is
     /// unchanged; a new `get_models` command driving a native-only picker
     /// would be a UI change, so there is none).
+    /// The native session (the desktop is native-only, ADR 0011): resolve
+    /// the model (the `Settings.default_model` → the catalog default —
+    /// the resolution chain, never a hard error), build the `Provider`
+    /// (the `provider_factory` seam), the `SessionStore` (the
+    /// `native_messages` table), and the `AgentLoop` — `tokio::spawn` it
+    /// (IN-PROCESS; no subprocess), drive it (the `drive_native_session`
+    /// driver task — `pending_turn` / `settle_tx` / `close_kind` populated
+    /// identically to a subagent dispatch), and record the session (the
+    /// `capabilities_json` has NO `piSessionFile` — resume is from the
+    /// `native_messages` table, so `loadSession` is `true`).
+    ///
+    /// The `config_options` are SYNTHESIZED from the `ModelCatalog` (the
+    /// `synthesize_catalog_config_options` shape — the frontend is
+    /// unchanged).
     async fn start_native_session(
         &self,
-        entry: &AgentEntry,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, RpcError> {
-        let info = self.build_native_session(entry, cwd, sink, None).await?;
+    ) -> Result<SessionInfo, SessionError> {
+        let info = self.build_native_session(cwd, sink, None).await?;
         self.record_session(&info);
         Ok(info)
     }
 
-    /// The NATIVE resume (Task 7, reviewer-corrected Major #18): a native
-    /// session's `capabilities_json` has NO `piSessionFile` (the external
-    /// path would be `NotResumable`), so `kind: native` routes HERE — a
-    /// fresh `AgentLoop` + `SessionStore::load_messages` (resume from the
-    /// `native_messages` table). The model comes from the stored
-    /// `capabilities.model` (a stale / unknown key falls back to the
-    /// harness / catalog default); the thinking level from the stored
-    /// `thinkingLevel` (the raw value — the resolution chain (memory →
-    /// stored → harness seed) resolves in `build_native_session`, after
-    /// the model metadata refresh).
+    /// The native resume (the desktop is native-only): a fresh `AgentLoop`
+    /// and `SessionStore::load_messages` (resume from the `native_messages`
+    /// table). The model comes from the stored `capabilities.model` (a
+    /// stale / unknown key falls back to the resolution chain); the
+    /// thinking level from the stored `thinkingLevel` (the raw value —
+    /// the resolution chain (remembered → stored → settings) resolves in
+    /// `build_native_session`, after the model metadata refresh).
     async fn resume_native_session(
         &self,
-        entry: &AgentEntry,
         session_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, RpcError> {
+    ) -> Result<SessionInfo, SessionError> {
         let db = self.driver.db.clone().ok_or_else(|| {
-            RpcError::Io("a native session requires an attached database".to_string())
+            SessionError::Io("a native session requires an attached database".to_string())
         })?;
         // The stored row must exist (a native session is recorded at start
-        // — `record_session`; a missing row is unresumable, like the
-        // external path's missing row). KEEP THE WHOLE ROW: the resume
-        // carries the desktop's `archived` flag (ADR 0016 — the desktop
-        // is the source of truth; a resumed session may be re-archived
-        // later and the client's sticky view must agree with the DB).
-        let row = db
-            .session(session_id)
-            .ok()
-            .flatten()
-            .ok_or_else(|| RpcError::NotResumable {
-                id: session_id.to_string(),
-            })?;
+        // — `record_session`; a missing row is unresumable). KEEP THE
+        // WHOLE ROW: the resume carries the desktop's `archived` flag
+        // (ADR 0016 — the desktop is the source of truth; a resumed
+        // session may be re-archived later and the client's sticky view
+        // must agree with the DB).
+        let row =
+            db.session(session_id)
+                .ok()
+                .flatten()
+                .ok_or_else(|| SessionError::NotResumable {
+                    id: session_id.to_string(),
+                })?;
         let caps_json = row.capabilities_json;
         let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
-        let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
-            error: "the native entry has no harness config".to_string(),
-        })?;
         // The model: the stored `model` (a composed key → the EFFECTIVE
         // catalog — a user-provider model resolves); an absent / stale key
-        // falls back to the resolution chain (the harness / the settings /
-        // the catalog default — never a hard error; the transcript still
+        // falls back to the resolution chain (the settings default → the
+        // catalog default — never a hard error; the transcript still
         // loads).
         let catalog = self.effective_catalog(None).await;
         let settings = load_settings(&self.config_dir);
@@ -1931,16 +1282,14 @@ impl SessionManager {
             .get("model")
             .and_then(Value::as_str)
             .and_then(|key| resolve_composed_model(&catalog, key))
-            .or_else(|| {
-                resolve_native_model(&catalog, &harness.default_model, &settings.default_model).ok()
-            });
+            .or_else(|| resolve_native_model(&catalog, &settings.default_model).ok());
         let Some(model) = model else {
-            return Err(RpcError::Command {
+            return Err(SessionError::Command {
                 error: "no models available for the native session".to_string(),
             });
         };
-        // The raw STORED `thinkingLevel` (NO harness fallback — the
-        // resolution chain (memory → stored → harness seed) resolves in
+        // The raw STORED `thinkingLevel` (NO settings fallback — the
+        // resolution chain (remembered → stored → settings) resolves in
         // `build_native_session`, after the model metadata refresh).
         let thinking_level = caps
             .get("thinkingLevel")
@@ -1948,7 +1297,7 @@ impl SessionManager {
             .map(str::to_string);
 
         let mut info = self
-            .build_native_session(entry, cwd, sink, Some((session_id, model, thinking_level)))
+            .build_native_session(cwd, sink, Some((session_id, model, thinking_level)))
             .await?;
         // The desktop's `archived` flag (ADR 0016): a native start mints a
         // fresh session (`build_native_session` reports `false`); a resume
@@ -1960,60 +1309,41 @@ impl SessionManager {
         Ok(info)
     }
 
-    /// Build + spawn + drive one native session (shared by `start` / `resume`;
-    /// `resume` carries the stored `session_id` + the loaded transcript
-    /// source — `start` mints a fresh UUID and starts with an empty
-    /// transcript).
+    /// Build + spawn + drive one native session (shared by `start` /
+    /// `resume`; `resume` carries the stored `session_id` + the loaded
+    /// transcript source — `start` mints a fresh UUID and starts with an
+    /// empty transcript).
     async fn build_native_session(
         &self,
-        entry: &AgentEntry,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
         resume: Option<(&str, Model, Option<String>)>,
-    ) -> Result<SessionInfo, RpcError> {
+    ) -> Result<SessionInfo, SessionError> {
         let db = self.driver.db.clone().ok_or_else(|| {
-            RpcError::Io("a native session requires an attached database".to_string())
+            SessionError::Io("a native session requires an attached database".to_string())
         })?;
-        let harness = entry.harness.as_ref().ok_or_else(|| RpcError::Command {
-            error: "the native entry has no harness config".to_string(),
-        })?;
-        // (finding 13b) The harness `provider` must be
-        // `"openai-compatible"` (v1 is OpenAI-compatible only — ADR
-        // 0012): any other value is REJECTED at session start rather
-        // than silently accepted (pre-fix it got the OpenAI wire
-        // regardless).
-        if harness.provider != "openai-compatible" {
-            return Err(RpcError::Command {
-                error: format!(
-                    "unsupported harness provider `{}` (v1 is OpenAI-compatible only, ADR 0012)",
-                    harness.provider
-                ),
-            });
-        }
-        // The EFFECTIVE catalog (Task 2 — the seeded catalog + the user's
-        // providers, a fresh `load_settings` read; the per-provider
-        // `discovery_cache` makes the fetch cheap): the model resolution,
-        // the `AgentLoop`'s catalog, and the synthesized config options
-        // all run against it (a user-provider model is selectable +
-        // switchable in-session).
+        // The EFFECTIVE catalog (the base catalog + the user's providers,
+        // a fresh `load_settings` read; the per-provider `discovery_cache`
+        // makes the fetch cheap): the model resolution, the `AgentLoop`'s
+        // catalog, and the synthesized config options all run against it
+        // (a user-provider model is selectable + switchable in-session).
         let catalog = self.effective_catalog(None).await;
-        // The model: the resolution chain (the harness's `default_model`
-        // → the `Settings.default_model` (a fresh `load_settings` read)
-        // → the catalog's `default_model` → the v1-selectable
-        // (`openai_compatible`) set — an unresolvable key at any rung
-        // falls through to the next rung). A resume overrides it with the
-        // stored model (see `resume_native_session`).
+        // The model: the resolution chain (the `Settings.default_model`
+        // (a fresh `load_settings` read) → the catalog's `default_model`
+        // → the v1-selectable (`openai_compatible`) set — an unresolvable
+        // key at any rung falls through to the next rung). A resume
+        // overrides it with the stored model (see `resume_native_session`).
         let settings = load_settings(&self.config_dir);
         let is_resume = resume.is_some();
-        // The resume carries the raw STORED `thinkingLevel` (NO harness
-        // fallback — the resolution chain (memory → stored → harness seed)
+        // The resume carries the raw STORED `thinkingLevel` (NO settings
+        // fallback — the resolution chain (remembered → stored → settings)
         // resolves BELOW, after the model metadata refresh); the start arm
         // has no stored level.
         let (session_id, model, stored_level) = match resume {
             Some((id, model, level)) => (id.to_string(), model.clone(), level),
             None => (
                 mint_session_id(),
-                resolve_native_model(&catalog, &harness.default_model, &settings.default_model)?,
+                resolve_native_model(&catalog, &settings.default_model)?,
                 None,
             ),
         };
@@ -2021,14 +1351,18 @@ impl SessionManager {
         // metadata from the provider's live endpoint (the OpenAI endpoint
         // "supplies everything" — the `pi-provider-litellm` `fetchModels`
         // pattern). Bounded + cached per-provider; a failure degrades to
-        // the static (`models-store.json`) metadata.
+        // the static metadata (the base catalog's entry — absent for a
+        // user-provider model, which keeps the discovered value).
         let model = self.refresh_model_metadata(&model).await;
         // (ADR 0015) The effective thinking level: the remembered (VALIDATED
         // against the model's live `thinking_levels`) > the stored (LENIENT
         // — non-empty levels must be a member; empty levels apply as-is, the
-        // pre-change behavior) > the harness seed > `None` (the model's own
-        // default). Validated against the POST-refresh model (the live
-        // `thinking_levels` are the freshest).
+        // pre-change behavior) > the `Settings.default_thinking_level`
+        // (VALIDATED like the stored rung — the Settings UI offers the UNION
+        // of ALL models' levels, so a settings default may not be a member of
+        // THIS model's set: a non-member is DROPPED)
+        // > `None` (the model's own default). Validated against the
+        // POST-refresh model (the live `thinking_levels` are the freshest).
         let thinking_level = remembered_thinking_level(&settings.default_thinking_levels, &model)
             .or_else(|| {
                 stored_level
@@ -2039,7 +1373,16 @@ impl SessionManager {
                     })
                     .cloned()
             })
-            .or_else(|| harness.default_thinking_level.clone());
+            .or_else(|| {
+                settings
+                    .default_thinking_level
+                    .as_ref()
+                    .filter(|l| {
+                        model.thinking_levels.is_empty()
+                            || model.thinking_levels.iter().any(|t| t == *l)
+                    })
+                    .cloned()
+            });
 
         let store = SessionStore::new(db.clone());
         let (events_tx, events_rx) = mpsc::channel(256);
@@ -2088,17 +1431,16 @@ impl SessionManager {
             RetryPolicy::new(),
             Some(self.config_dir.clone()),
         );
-        // The harness config's `enabled_tools` (`[]` = all — finding
-        // 13b: a disabled tool is a tool-result error, NOT executed).
-        // The `[]` = all convention maps to `None` (all); a non-empty
-        // set is `Some(v)` (exactly `v`).
-        let parent_enabled_tools = harness.enabled_tools.clone();
-        loop_.set_enabled_tools(if parent_enabled_tools.is_empty() {
+        // The `Settings.enabled_tools` (`[]` = all — finding 13b: a disabled
+        // tool is a tool-result error, NOT executed). The `[]` = all
+        // convention maps to `None` (all); a non-empty set is `Some(v)`
+        // (exactly `v`).
+        loop_.set_enabled_tools(if settings.enabled_tools.is_empty() {
             None
         } else {
-            Some(parent_enabled_tools)
+            Some(settings.enabled_tools.clone())
         });
-        // The default thinking level (the harness's; a resume overrides it
+        // The default thinking level (the settings'; a resume overrides it
         // with the stored `thinkingLevel`).
         if let Some(level) = &thinking_level {
             loop_.set_thinking_level(Some(level.clone()));
@@ -2125,7 +1467,6 @@ impl SessionManager {
             let state = state_guard.lock().unwrap();
             SessionInfo {
                 session_id: session_id.clone(),
-                agent_id: entry.id.clone(),
                 cwd: cwd.clone(),
                 capabilities: native_capabilities(&state.model, state.thinking_level.as_deref()),
                 config_options: synthesize_catalog_config_options(
@@ -2179,375 +1520,64 @@ impl SessionManager {
             // 1, 2, …), so a load failure fails the session start.
             let messages = store
                 .load_messages(&session_id)
-                .map_err(|e| RpcError::Io(e.to_string()))?;
+                .map_err(|e| SessionError::Io(e.to_string()))?;
             loop_.load_transcript(messages);
         }
-        // SPAWN the loop task (in-process — no subprocess; the external
-        // path's `PiRpc::spawn` is NEVER reached for a native kind).
+        // SPAWN the loop task (in-process — no subprocess).
         let loop_handle = tokio::spawn(loop_.run());
         // The test-only seam: store the `AbortHandle` so a test can kill the
         // loop task DIRECTLY (no token cancel → no settle → deterministic
         // `changed()` `Err`).
         handle.set_loop_task(loop_handle.abort_handle());
         self.driver
-            .drive_native_session(
-                handle,
-                events_rx,
-                settle_rx,
-                &entry.id,
-                cwd,
-                sink,
-                info.clone(),
-            )
+            .drive_native_session(handle, events_rx, settle_rx, cwd, sink, info.clone())
             .await?;
         Ok(info)
     }
 
-    /// Spawn a pi agent, establish the session (`get_state`), and register
-    /// it.
+    /// Start a native session: canonicalize the cwd, then delegate to
+    /// [`Self::start_native_session`] (the desktop is native-only — there
+    /// is no external path and no agent id; the model / thinking level /
+    /// tools come from the `Settings`).
     ///
     /// Returns the [`SessionInfo`] once the session is established. The
-    /// child is driven by a background task that lives for the session's
-    /// lifetime; it is torn down by [`Self::close_session`] or agent death.
+    /// loop is driven by a background task that lives for the session's
+    /// lifetime; it is torn down by [`Self::close_session`].
     pub async fn start_session(
         &self,
-        agent_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, RpcError> {
-        // Canonicalize BEFORE the registry lookup and before the space row is
-        // touched: the spaces join key is the canonicalized cwd, so a
-        // `~/x` / symlink spelling must not produce a different row.
-        let cwd = std::fs::canonicalize(&cwd).map_err(|_| RpcError::FolderMissing {
+    ) -> Result<SessionInfo, SessionError> {
+        // Canonicalize BEFORE the space row is touched: the spaces join
+        // key is the canonicalized cwd, so a `~/x` / symlink spelling must
+        // not produce a different row.
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| SessionError::FolderMissing {
             path: cwd.display().to_string(),
         })?;
-
-        let entry = self
-            .registry
-            .get(agent_id)
-            .ok_or_else(|| RpcError::UnknownAgent {
-                id: agent_id.to_string(),
-            })?;
-
-        // The NATIVE backend (Task 7): a `kind: native` entry carries a
-        // harness config, NOT a spawn spec — spawn an in-process `AgentLoop`
-        // task (the external path below is UNCHANGED for `kind: external`).
-        if entry.kind == AgentKind::Native {
-            return self.start_native_session(entry, cwd, sink).await;
-        }
-
-        // Bridge wiring (ADR 0003): for a bridge agent (on a platform where
-        // the bridge is available — NOT macOS), set the 4 bridge env vars
-        // and pass the (client session id, socket path) to the driver so it
-        // starts the peer-verified listener before the spawn returns. For a
-        // NEW session the client session id is a fresh UUID (the pi
-        // `sessionId` does not exist until the session is established).
-        let client_session_id = mint_session_id();
-        let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id) {
-            Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
-            None => (entry.env.clone(), None),
-        };
-
-        // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`
-        // (the extension is inert without the env var). The tools override
-        // (Phase 1 + Phase 2): a SECOND `-e <tools.ts>` (inert without the
-        // bridge env, which the bridge setup above already set when
-        // available) + `--no-builtin-tools` ONLY when the override will
-        // actually register the built-ins (a Linux bridge spawn — the
-        // override is self-gated on the platform; `tools_path` is `Some`
-        // on EVERY platform, so keying the flag on it would strip pi's
-        // built-ins off-Linux with nothing to replace them → zero tools).
-        let args = crate::agent::tools::spawn_args(
-            &entry.args,
-            self.gate_path.as_deref(),
-            self.tools_path.as_deref(),
-            bridge_setup.is_some() && cfg!(target_os = "linux"),
-        );
-        let mut agent_env = agent_env;
-        if self.gate_path.is_some() {
-            crate::agent::gate::gate_env(&mut agent_env);
-        }
-        let rpc = PiRpc::spawn(&entry.command, &args, &agent_env, &cwd)?;
-        let handle = rpc.handle();
-
-        let agent_id_owned = agent_id.to_string();
-        let cwd_owned = cwd.clone();
-        // The `config_dir` is captured into the establisher closure (a
-        // `PathBuf` — cloned; the closure is `move`).
-        let config_dir = self.config_dir.clone();
-
-        let info = self
-            .driver
-            .drive_session(
-                handle,
-                agent_id,
-                spawn_hint(&entry.command),
-                cwd,
-                sink,
-                bridge_setup,
-                None,
-                move |handle: PiRpcHandle| async move {
-                    // The default model (settings): a validly-shaped
-                    // `default_model` (a `"provider/id"` split — the CATALOG
-                    // is NOT consulted: pi's own `get_available_models` is
-                    // the real source for an external session, and a model
-                    // pi doesn't know about is rejected by pi) → `set_model`
-                    // sent BEFORE the first `get_state` (LENIENT — a failure
-                    // is logged and the session establishes on pi's own
-                    // default; an absent/unset setting sends nothing). The
-                    // `get_state` response then reflects the applied model
-                    // (`build_capabilities` picks up `state.model`).
-                    let settings = load_settings(&config_dir);
-                    if let Some(key) = settings.default_model.clone() {
-                        if let Some((provider, model_id)) = key.split_once('/') {
-                            if let Err(e) = handle
-                                .send(json!({
-                                    "type": "set_model",
-                                    "provider": provider,
-                                    "modelId": model_id
-                                }))
-                                .await
-                            {
-                                eprintln!(
-                                    "settings default model: set_model failed at start: {e} (establishing on pi's default)"
-                                );
-                            }
-                        }
-                    }
-                    // (ADR 0015) The remembered thinking level for the
-                    // starting model: sent LENIENT after the `set_model`
-                    // (a failure is logged — the session establishes on pi's
-                    // own default level; pi is the authority, so NO
-                    // validation). When `defaultModel` is absent the
-                    // starting model is unknown → nothing is sent.
-                    if let Some(key) = &settings.default_model {
-                        if let Some(level) = settings.default_thinking_levels.get(key) {
-                            if let Err(e) = handle
-                                .send(json!({
-                                    "type": "set_thinking_level",
-                                    "level": level
-                                }))
-                                .await
-                            {
-                                eprintln!(
-                                    "remembered thinking level: set_thinking_level failed at start: {e} (establishing on pi's default level)"
-                                );
-                            }
-                        }
-                    }
-                    // The establisher: `get_state` (the session's identity)
-                    // + the config-option sources (models / levels —
-                    // lenient: a missing source just means no selectors).
-                    let state = handle.send(json!({ "type": "get_state" })).await?;
-                    let session_id = state
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let models = handle
-                        .send(json!({ "type": "get_available_models" }))
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("models").cloned());
-                    let levels = handle
-                        .send(json!({ "type": "get_available_thinking_levels" }))
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("levels").cloned());
-                    Ok(SessionInfo {
-                        session_id,
-                        agent_id: agent_id_owned,
-                        cwd: cwd_owned,
-                        capabilities: build_capabilities(&state),
-                        config_options: synthesize_config_options(
-                            &state,
-                            models.as_ref(),
-                            levels.as_ref(),
-                        ),
-                        // A fresh START is never archived (ADR 0016).
-                        archived: false,
-                    })
-                },
-            )
-            .await?;
-
-        self.record_session(&info);
-        Ok(info)
+        self.start_native_session(cwd, sink).await
     }
 
-    /// Resume a stored session: spawn a fresh pi for `agent_id` WITH
-    /// `--session <stored pi session file>` (the child loads the stored
-    /// session at startup), then establish (`get_state` + `get_messages`
-    /// replay — `get_messages` returns the LOADED session's transcript).
+    /// Resume a stored session: canonicalize the cwd, then delegate to
+    /// [`Self::resume_native_session`] (a fresh `AgentLoop` +
+    /// `SessionStore::load_messages` — resume from the `native_messages`
+    /// table; the stored row's `model` / `thinkingLevel` override the
+    /// resolution chains).
     ///
-    /// The driver-task lifecycle is shared verbatim with
-    /// [`Self::start_session`]; only the establisher differs.
-    ///
-    /// Returns [`RpcError::NotResumable`] when the stored session has no
-    /// pi session file (a legacy ACP row, or a `--no-session` run — the UI
-    /// shows the history-only banner instead).
+    /// Returns [`SessionError::NotResumable`] when the stored row is
+    /// missing (the UI shows the history-only banner instead).
     pub async fn resume_session(
         &self,
-        agent_id: &str,
         session_id: &str,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<SessionInfo, RpcError> {
-        // Canonicalize BEFORE the registry lookup (same rationale as
-        // `start_session`): everything downstream (the spawn cwd,
-        // `SessionInfo.cwd`, the space join key) uses the canonical path.
-        let cwd = std::fs::canonicalize(&cwd).map_err(|_| RpcError::FolderMissing {
+    ) -> Result<SessionInfo, SessionError> {
+        // Canonicalize (same rationale as `start_session`): everything
+        // downstream (the loop cwd, `SessionInfo.cwd`, the space join key)
+        // uses the canonical path.
+        let cwd = std::fs::canonicalize(&cwd).map_err(|_| SessionError::FolderMissing {
             path: cwd.display().to_string(),
         })?;
-
-        let entry = self
-            .registry
-            .get(agent_id)
-            .ok_or_else(|| RpcError::UnknownAgent {
-                id: agent_id.to_string(),
-            })?;
-
-        // The NATIVE branch (reviewer-corrected Major #18) — BEFORE the
-        // `piSessionFile` extraction below (a native session's
-        // `capabilities_json` has NO `piSessionFile`, so the external path
-        // would be `NotResumable`): route `kind: native` to a fresh
-        // `AgentLoop` + `SessionStore::load_messages` (resume from the
-        // `native_messages` table).
-        if entry.kind == AgentKind::Native {
-            return self
-                .resume_native_session(entry, session_id, cwd, sink)
-                .await;
-        }
-
-        // Read the stored capability envelope (the `piSessionFile` is the
-        // `--session` argument). A missing row / unparseable envelope /
-        // absent `piSessionFile` is unresumable (a legacy ACP row or a
-        // `--no-session` run).
-        let caps_json = self
-            .driver
-            .db
-            .as_ref()
-            .and_then(|db| db.session(session_id).ok().flatten())
-            .map(|row| row.capabilities_json)
-            .ok_or_else(|| RpcError::NotResumable {
-                id: session_id.to_string(),
-            })?;
-        let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
-        let session_file = caps
-            .get("piSessionFile")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::NotResumable {
-                id: session_id.to_string(),
-            })?;
-
-        // The restored transcript is replaced by the agent's replay, which
-        // doubles as the authoritative history: clear the stored rows
-        // BEFORE the spawn so a replay reusing a known `messageId`
-        // overwrites (rather than clobbers) and a replay under a new id
-        // does not duplicate the stored text.
-        if let Some(db) = &self.driver.db {
-            let _ = db.clear_messages_for(session_id);
-        }
-
-        // Bridge wiring (ADR 0003): same as `start_session`, but the client
-        // session id is the STORED `session_id` (a resume re-uses it, so
-        // the agent's `session` push echoes the same id the desktop set).
-        let (agent_env, bridge_setup) = match bridge_spawn_setup(entry, session_id) {
-            Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
-            None => (entry.env.clone(), None),
-        };
-
-        // The resume spawn LOADS the pi session: `--session <file>` (the
-        // stored `piSessionFile`) so `get_messages` returns the loaded
-        // transcript, not an empty fresh session.
-        let mut args = entry.args.clone();
-        args.push("--session".to_string());
-        args.push(session_file.to_string());
-
-        // The gate injection (Task 4): `-e <gate.ts>` + `PI_ARCHIMEDES_GATE=1`.
-        // The tools override (Phase 1 + Phase 2): a second `-e <tools.ts>`
-        // + `--no-builtin-tools` ONLY when the override will actually
-        // register the built-ins (a Linux bridge spawn — see `start_session`
-        // for the zero-tools regression the condition guards against).
-        let args = crate::agent::tools::spawn_args(
-            &args,
-            self.gate_path.as_deref(),
-            self.tools_path.as_deref(),
-            bridge_setup.is_some() && cfg!(target_os = "linux"),
-        );
-        let mut agent_env = agent_env;
-        if self.gate_path.is_some() {
-            crate::agent::gate::gate_env(&mut agent_env);
-        }
-        let rpc = PiRpc::spawn(&entry.command, &args, &agent_env, &cwd)?;
-        let handle = rpc.handle();
-
-        let agent_id_owned = agent_id.to_string();
-        let cwd_owned = cwd.clone();
-        let db = self.driver.db.clone();
-        let session_id_owned = session_id.to_string();
-
-        let info = self
-            .driver
-            .drive_session(
-                handle,
-                agent_id,
-                spawn_hint(&entry.command),
-                cwd,
-                sink,
-                bridge_setup,
-                None,
-                move |handle: PiRpcHandle| async move {
-                    // The establisher: `get_state` (now reflects the loaded
-                    // session) + `get_messages` (the loaded transcript) →
-                    // replay the stored rows (user rows persisted directly;
-                    // assistant / toolResult messages through the
-                    // normalizer per the replay-feed rule).
-                    let state = handle.send(json!({ "type": "get_state" })).await?;
-                    let messages = handle.send(json!({ "type": "get_messages" })).await?;
-                    if let Some(db) = &db {
-                        replay_messages(db, &session_id_owned, &messages);
-                    }
-                    let models = handle
-                        .send(json!({ "type": "get_available_models" }))
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("models").cloned());
-                    let levels = handle
-                        .send(json!({ "type": "get_available_thinking_levels" }))
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("levels").cloned());
-                    // The desktop's `archived` flag (ADR 0016): the desktop
-                    // is the source of truth (a resumed session may be
-                    // re-archived later; the client's sticky view must
-                    // agree with the DB). A missing row fails closed to
-                    // `false` — the command's pre-check has already
-                    // rejected an unresumable row, so in practice the row
-                    // exists.
-                    let archived = db
-                        .as_ref()
-                        .and_then(|db| db.session(&session_id_owned).ok().flatten())
-                        .map(|row| row.archived)
-                        .unwrap_or(false);
-                    Ok(SessionInfo {
-                        session_id: session_id_owned,
-                        agent_id: agent_id_owned,
-                        cwd: cwd_owned,
-                        capabilities: build_capabilities(&state),
-                        config_options: synthesize_config_options(
-                            &state,
-                            models.as_ref(),
-                            levels.as_ref(),
-                        ),
-                        archived,
-                    })
-                },
-            )
-            .await?;
-
-        self.record_session(&info);
-        Ok(info)
+        self.resume_native_session(session_id, cwd, sink).await
     }
 
     /// Send a prompt to a live session and wait for the turn to finish.
@@ -2558,7 +1588,7 @@ impl SessionManager {
         &self,
         session_id: &str,
         text: String,
-    ) -> Result<StopReason, RpcError> {
+    ) -> Result<StopReason, SessionError> {
         self.send_prompt_with_images(session_id, text, Vec::new())
             .await
     }
@@ -2580,9 +1610,9 @@ impl SessionManager {
         session_id: &str,
         text: String,
         images: Vec<ImagePayload>,
-    ) -> Result<StopReason, RpcError> {
-        // Clone just the (cheap) backend handle, not the whole LiveSession.
-        let (backend, pending_turn, cancel_requested) = {
+    ) -> Result<StopReason, SessionError> {
+        // Clone just the (cheap) `NativeHandle`, not the whole LiveSession.
+        let (handle, pending_turn, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
@@ -2593,7 +1623,7 @@ impl SessionManager {
                         l.cancel_requested.clone(),
                     )
                 })
-                .ok_or_else(|| RpcError::UnknownSession {
+                .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             live
@@ -2605,14 +1635,13 @@ impl SessionManager {
         // guarantee real.
         validate_images(&images)?;
 
-        // A NATIVE session is one-turn-at-a-time (the frontend's
-        // composer is locked until the turn resolves): a turn ALREADY
-        // IN FLIGHT (the `pending_turn` slot is occupied) is REJECTED
-        // rather than queued — the slot is a single last-wins resolver,
-        // and a queued prompt would be settled by the PREVIOUS turn's
-        // `agent_settled` (mis-attribution: the composer unlocks while
-        // a turn is still live). The external path keeps its
-        // steer/last-wins behavior UNCHANGED (a single steer turn).
+        // A session is one-turn-at-a-time (the frontend's composer is
+        // locked until the turn resolves): a turn ALREADY IN FLIGHT (the
+        // `pending_turn` slot is occupied) is REJECTED rather than queued —
+        // the slot is a single last-wins resolver, and a queued prompt
+        // would be settled by the PREVIOUS turn's `agent_settled`
+        // (mis-attribution: the composer unlocks while a turn is still
+        // live).
         //
         // The check-and-claim is ATOMIC under ONE `pending_turn` lock
         // acquisition (finding 2 — the pre-fix check DROPPED the lock, then
@@ -2631,11 +1660,8 @@ impl SessionManager {
         let (tx, rx) = oneshot::channel::<StopReason>();
         {
             let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
-            // Native: rejected if a turn is already in flight (the slot is
-            // occupied); external: last-wins (a replaced turn's sender is
-            // dropped → its `send_prompt` resolves `Cancelled` below).
-            if matches!(&backend, SessionBackend::Native(_)) && slot.is_some() {
-                return Err(RpcError::Command {
+            if slot.is_some() {
+                return Err(SessionError::Command {
                     error: "a turn is already in flight".to_string(),
                 });
             }
@@ -2652,63 +1678,24 @@ impl SessionManager {
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
 
-        // Dispatch the prompt (the `SessionBackend` generalization, Task 7):
-        // the EXTERNAL path is UNCHANGED (the pi `prompt` command — the text
-        // message + the image content + a `get_state` steer check); the
-        // NATIVE path queues the text + the image attachments on the loop's
-        // prompt queue (a full queue is a best-effort drop, mapped to the
-        // same error path as a pi refusal below).
-        let send_error = match &backend {
-            SessionBackend::Pi(handle) => {
-                // Build the prompt command: the text message + the image
-                // content (pi's `ImageContent` = `{type: "image", data,
-                // mimeType}` — the `ImagePayload` maps onto it verbatim; the
-                // `name` / `sizeBytes` are transcript-only, not wire fields).
-                let mut command = json!({ "type": "prompt", "message": text });
-                if !images.is_empty() {
-                    command["images"] = Value::Array(
-                        images
-                            .iter()
-                            .map(|img| {
-                                json!({
-                                    "type": "image",
-                                    "data": img.data,
-                                    "mimeType": img.mime_type,
-                                })
-                            })
-                            .collect(),
-                    );
-                }
-                // A prompt while the session is already streaming is a STEER
-                // (the turn continues with the new input — the frontend's
-                // composer is locked until the turn resolves, so a
-                // concurrent send means the previous turn is still running).
-                if let Ok(state) = handle.send(json!({ "type": "get_state" })).await {
-                    if state.get("isStreaming").and_then(Value::as_bool) == Some(true) {
-                        command["streamingBehavior"] = json!("steer");
-                    }
-                }
-                handle.send(command).await.err()
-            }
-            SessionBackend::Native(handle) => {
-                // The wire `ImagePayload` maps onto the loop's `ImageRef`
-                // (the `name` / `sizeBytes` are transcript-only — the
-                // model transcript carries the `data` + `mimeType`).
-                let image_refs: Vec<ImageRef> = images
-                    .iter()
-                    .map(|img| ImageRef {
-                        data: img.data.clone(),
-                        mime_type: img.mime_type.clone(),
-                    })
-                    .collect();
-                if handle.send_prompt(&text, &image_refs) {
-                    None
-                } else {
-                    Some(RpcError::Command {
-                        error: "the native session is busy; the prompt was dropped".to_string(),
-                    })
-                }
-            }
+        // Queue the text + the image attachments on the loop's prompt queue
+        // (a full / closed queue is a best-effort drop, mapped to the same
+        // error path as a refusal below). The wire `ImagePayload` maps onto
+        // the loop's `ImageRef` (the `name` / `sizeBytes` are transcript-only
+        // — the model transcript carries the `data` + `mimeType`).
+        let image_refs: Vec<ImageRef> = images
+            .iter()
+            .map(|img| ImageRef {
+                data: img.data.clone(),
+                mime_type: img.mime_type.clone(),
+            })
+            .collect();
+        let send_error = if handle.send_prompt(&text, &image_refs) {
+            None
+        } else {
+            Some(SessionError::Command {
+                error: "the session is busy; the prompt was dropped".to_string(),
+            })
         };
 
         // A `success: false` prompt response is a REFUSAL — emit the error
@@ -2716,12 +1703,12 @@ impl SessionManager {
         // without waiting for a settle that never comes.
         if let Some(e) = send_error {
             match e {
-                RpcError::Command { error } => {
+                SessionError::Command { error } => {
                     let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(tx) = slot.take() {
                         let _ = tx.send(StopReason::Refusal);
                     }
-                    return Err(RpcError::Command { error });
+                    return Err(SessionError::Command { error });
                 }
                 other => return Err(other),
             }
@@ -2736,296 +1723,189 @@ impl SessionManager {
         }
     }
 
-    /// Cancel the session's in-flight prompt turn (the pi `abort` command —
-    /// the agent aborts the turn and settles it). The `cancel_requested`
-    /// flag is set BEFORE the `abort` is sent so a fast settle maps to
-    /// `Cancelled`, not `EndTurn`. Fire-and-forget on the agent side: a
-    /// no-op if there is no in-flight turn.
+    /// Cancel the session's in-flight prompt turn (the user pressed Esc).
+    /// The `cancel_requested` flag is set BEFORE the cancel is sent so a
+    /// fast settle maps to `Cancelled`, not `EndTurn`. Fire-and-forget on
+    /// the loop side: a no-op if there is no in-flight turn.
     ///
-    /// BEHAVIOR (finding 8c, documented per the reviewer's request): the
-    /// EXTERNAL path is the pi `abort` — the agent aborts the TURN and the
-    /// session STAYS ALIVE (a new prompt reuses it). The NATIVE path
-    /// matches it: `handle.cancel()` cancels the loop's current TURN token
-    /// (the loop settles the turn `Cancelled` and STAYS ALIVE — a new
-    /// prompt reuses the session; only a `close_session` — `handle.close`
-    /// — tears the native session down). Pre-fix the native Stop cancelled
-    /// the loop's teardown token, which ENDED THE WHOLE SESSION (the
-    /// driver tore it down) — a silent asymmetry with the external path.
-    pub async fn cancel_session(&self, session_id: &str) -> Result<(), RpcError> {
-        let (backend, cancel_requested) = {
+    /// BEHAVIOR (finding 8c): `handle.cancel()` cancels the loop's current
+    /// TURN token — the loop settles the turn `Cancelled` and STAYS ALIVE
+    /// (a new prompt reuses the session; only a `close_session` —
+    /// `handle.close` — tears the session down). Pre-fix the Stop cancelled
+    /// the loop's teardown token, which ENDED THE WHOLE SESSION (the driver
+    /// tore it down) — a silent asymmetry with the pi `abort`.
+    pub async fn cancel_session(&self, session_id: &str) -> Result<(), SessionError> {
+        let (handle, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
                 .map(|l| (l.handle.clone(), l.cancel_requested.clone()))
-                .ok_or_else(|| RpcError::UnknownSession {
+                .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             live
         };
         *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path is the
-        // pi `abort` command (UNCHANGED — stop the turn, keep the session
-        // alive); the NATIVE path cancels the loop's current TURN token
-        // (finding 8c — the native Stop matches the external `abort`:
-        // the turn stops and the session STAYS ALIVE — a new prompt
-        // reuses it; only a `close_session` tears the native session
-        // down). The `cancel_requested` flag (set above) maps the settle
-        // to `Cancelled`.
-        match &backend {
-            SessionBackend::Pi(handle) => {
-                handle.send(json!({ "type": "abort" })).await?;
-            }
-            SessionBackend::Native(handle) => {
-                handle.cancel();
-            }
-        }
+        // The loop's current TURN token (finding 8c — the turn stops and the
+        // session STAYS ALIVE — a new prompt reuses it; only a
+        // `close_session` tears the session down). The `cancel_requested`
+        // flag (set above) maps the settle to `Cancelled`.
+        handle.cancel();
         Ok(())
     }
     /// Set a session config option (the model or the thinking level) on a
     /// live session.
     ///
-    /// Sends the pi command (`set_model` — the value is parsed as
-    /// `"<provider>/<modelId>"`; `set_thinking_level`), then re-synthesizes
-    /// the config options from the fresh `get_state` and emits a
-    /// `config_option_update` (pi does not emit one itself — the client
-    /// owns the frame).
+    /// Applies the change through the loop's control channel (`AgentLoop::set_model`
+    /// / `set_thinking_level` — applied when the loop is idle), then
+    /// re-synthesizes the config options FROM THE `ModelCatalog` (a native
+    /// session has no `get_state`) and emits a `config_option_update` (the
+    /// agent does not emit one itself — the client owns the frame).
     pub async fn set_config_option(
         &self,
         session_id: &str,
         config_id: &str,
         value: &str,
         sink: &Arc<dyn EventSink>,
-    ) -> Result<Vec<Value>, RpcError> {
-        let (backend, config_state) = {
+    ) -> Result<Vec<Value>, SessionError> {
+        let (handle, config_state) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
-                .map(|l| {
-                    let state = match &l.handle {
-                        SessionBackend::Native(handle) => Some(handle.config_state()),
-                        SessionBackend::Pi(_) => None,
-                    };
-                    (l.handle.clone(), state)
-                })
-                .ok_or_else(|| RpcError::UnknownSession {
+                .map(|l| (l.handle.clone(), l.handle.config_state()))
+                .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             live
         };
 
-        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path is
-        // UNCHANGED (the pi `set_model` / `set_thinking_level` commands +
-        // re-synthesize from `get_state` / `get_available_models` /
-        // `get_available_thinking_levels`); the NATIVE path routes to
-        // `AgentLoop::set_model` / `set_thinking_level` (the loop's control
-        // channel — applied when the loop is idle) and RE-SYNTHESIZES FROM
-        // THE `ModelCatalog` (a native session has no `get_state`).
-        match &backend {
-            SessionBackend::Pi(handle) => {
-                // The config id → the pi command. `model` values are
-                // `"<provider>/<modelId>"` (the synthesizer's option
-                // values).
-                let command = match config_id {
-                    "model" => {
-                        let (provider, model_id) =
-                            value
-                                .split_once('/')
-                                .ok_or_else(|| RpcError::InvalidPrompt {
-                                    reason: format!(
-                                        "invalid model value: {value} (expected provider/modelId)"
-                                    ),
-                                })?;
-                        json!({ "type": "set_model", "provider": provider, "modelId": model_id })
-                    }
-                    "thought_level" => {
-                        json!({ "type": "set_thinking_level", "level": value })
-                    }
-                    other => {
-                        return Err(RpcError::Command {
-                            error: format!("unknown config option: {other}"),
-                        })
-                    }
-                };
-                handle.send(command).await?;
-
-                // Re-synthesize + emit (the agent does not emit a
-                // `config_option_update` itself).
-                let state = handle.send(json!({ "type": "get_state" })).await?;
-                // (ADR 0015) An EXPLICIT thinking-level change remembers
-                // the level for the session's CURRENT model (the
-                // `get_state` response's `model` — absent → skip;
-                // best-effort: a write failure is logged and does NOT
-                // fail the config change, which pi applied either way).
-                if config_id == "thought_level" && !value.is_empty() {
-                    if let Some(model) = state.get("model") {
-                        let provider = model
-                            .get("provider")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let key = format!("{provider}/{id}");
-                        let mut settings = load_settings(&self.config_dir);
-                        settings
-                            .default_thinking_levels
-                            .insert(key, value.to_string());
-                        if let Err(e) = write_settings(&self.config_dir, &settings) {
-                            eprintln!("remembered thinking level: save failed: {e}");
-                        }
-                    }
-                }
-                let models = handle
-                    .send(json!({ "type": "get_available_models" }))
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("models").cloned());
-                let levels = handle
-                    .send(json!({ "type": "get_available_thinking_levels" }))
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("levels").cloned());
-                let options = synthesize_config_options(&state, models.as_ref(), levels.as_ref())
-                    .ok_or_else(|| RpcError::Command {
-                    error: "no config options available".to_string(),
-                })?;
-                sink.emit(
-                    "session-update",
-                    json!({
-                        "sessionId": session_id,
-                        "update": { "sessionUpdate": "config_option_update", "configOptions": options },
-                    }),
-                );
-                Ok(options)
-            }
-            SessionBackend::Native(handle) => {
-                let Some(state) = config_state else {
-                    return Err(RpcError::Command {
-                        error: "no config options available".to_string(),
+        // The `Model` lookup + the re-synthesizer run against the EFFECTIVE
+        // catalog (the base catalog + the user's providers — a
+        // user-provider model can be switched TO mid-session, not just
+        // the base ones).
+        let catalog = self.effective_catalog(None).await;
+        // Apply (the loop's control channel — `AgentLoop::set_model` /
+        // `set_thinking_level` on the loop task) + mirror the change on the
+        // handle's config state (the re-synthesizer source). Mirror + emit
+        // ONLY when `try_send` SUCCEEDS (finding 12): a full / closed queue
+        // means the loop never applies the change — claiming success (a
+        // mirrored state + a `config_option_update`) would silently diverge
+        // from the model / level the loop is actually running.
+        match config_id {
+            "model" => {
+                let (provider, model_id) =
+                    value
+                        .split_once('/')
+                        .ok_or_else(|| SessionError::InvalidPrompt {
+                            reason: format!(
+                                "invalid model value: {value} (expected provider/modelId)"
+                            ),
+                        })?;
+                let model = catalog
+                    .models
+                    .iter()
+                    .find(|m| m.provider == provider && m.id == model_id)
+                    .cloned()
+                    .ok_or_else(|| SessionError::Command {
+                        error: format!("unknown model: {value}"),
+                    })?;
+                let sent = handle
+                    .control_tx_clone()
+                    .try_send(ControlCmd::SetModel(model.clone()));
+                if sent.is_err() {
+                    return Err(SessionError::Command {
+                        error: "the session's loop is not running; the config change could not be applied".to_string(),
                     });
-                };
-                // The EFFECTIVE catalog (Task 2 — the seeded catalog +
-                // the user's providers): the model lookup + the re-
-                // synthesizer run against it (a user-provider model can
-                // be switched TO mid-session, not just the seeded ones).
-                let catalog = self.effective_catalog(None).await;
-                // Apply (the loop's control channel — `AgentLoop::set_model`
-                // / `set_thinking_level` on the loop task) + mirror the
-                // change on the handle's config state (the re-synthesizer
-                // source). Mirror + emit ONLY when `try_send` SUCCEEDS
-                // (finding 12): a full / closed queue means the loop never
-                // applies the change — claiming success (a mirrored state +
-                // a `config_option_update`) would silently diverge from
-                // the model / level the loop is actually running.
-                match config_id {
-                    "model" => {
-                        let (provider, model_id) =
-                            value
-                                .split_once('/')
-                                .ok_or_else(|| RpcError::InvalidPrompt {
-                                    reason: format!(
-                                        "invalid model value: {value} (expected provider/modelId)"
-                                    ),
-                                })?;
-                        let model = catalog
-                            .models
-                            .iter()
-                            .find(|m| m.provider == provider && m.id == model_id)
-                            .cloned()
-                            .ok_or_else(|| RpcError::Command {
-                                error: format!("unknown model: {value}"),
-                            })?;
+                }
+                let mut state = config_state.lock().unwrap_or_else(|p| p.into_inner());
+                state.model = model.clone();
+                // (ADR 0015) Minimal-surprise reset: the current level is
+                // KEPT across the switch when valid for the new model (its
+                // `thinking_levels` are non-empty and contain it — or EMPTY,
+                // the status quo); it is replaced (the new model's
+                // remembered level, or `None`) only when the new model
+                // doesn't support it. The second `try_send` mirrors ONLY on
+                // success (finding 12): a failed send leaves the mirror
+                // untouched (the loop never applies the reset). The arm does
+                // NOT write memory.
+                if let Some(level) = state.thinking_level.as_deref() {
+                    let valid = model.thinking_levels.is_empty()
+                        || model.thinking_levels.iter().any(|t| t == level);
+                    if !valid {
+                        let reset = remembered_thinking_level(
+                            &load_settings(&self.config_dir).default_thinking_levels,
+                            &model,
+                        );
                         let sent = handle
                             .control_tx_clone()
-                            .try_send(ControlCmd::SetModel(model.clone()));
-                        if sent.is_err() {
-                            return Err(RpcError::Command {
-                                error: "the session's loop is not running; the config change could not be applied".to_string(),
-                            });
+                            .try_send(ControlCmd::SetThinkingLevel(reset.clone()));
+                        if sent.is_ok() {
+                            state.thinking_level = reset;
                         }
-                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.model = model.clone();
-                        // (ADR 0015) Minimal-surprise reset: the current
-                        // level is KEPT across the switch when valid for
-                        // the new model (its `thinking_levels` are
-                        // non-empty and contain it — or EMPTY, the status
-                        // quo); it is replaced (the new model's
-                        // remembered level, or `None`) only when the new
-                        // model doesn't support it. The second `try_send`
-                        // mirrors ONLY on success (finding 12): a failed
-                        // send leaves the mirror untouched (the loop never
-                        // applies the reset). The arm does NOT write
-                        // memory.
-                        if let Some(level) = state.thinking_level.as_deref() {
-                            let valid = model.thinking_levels.is_empty()
-                                || model.thinking_levels.iter().any(|t| t == level);
-                            if !valid {
-                                let reset = remembered_thinking_level(
-                                    &load_settings(&self.config_dir).default_thinking_levels,
-                                    &model,
-                                );
-                                let sent = handle
-                                    .control_tx_clone()
-                                    .try_send(ControlCmd::SetThinkingLevel(reset.clone()));
-                                if sent.is_ok() {
-                                    state.thinking_level = reset;
-                                }
-                            }
-                        }
-                    }
-                    "thought_level" => {
-                        let sent = handle
-                            .control_tx_clone()
-                            .try_send(ControlCmd::SetThinkingLevel(Some(value.to_string())));
-                        if sent.is_err() {
-                            return Err(RpcError::Command {
-                                error: "the session's loop is not running; the config change could not be applied".to_string(),
-                            });
-                        }
-                        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.thinking_level = Some(value.to_string());
-                        // (ADR 0015) Remember the level for the session's
-                        // CURRENT model (best-effort: a write failure is
-                        // logged and does NOT fail the config change — the
-                        // level is applied in the loop either way). Only a
-                        // non-empty `value` is remembered.
-                        if !value.is_empty() {
-                            let key = format!("{}/{}", state.model.provider, state.model.id);
-                            let mut settings = load_settings(&self.config_dir);
-                            settings
-                                .default_thinking_levels
-                                .insert(key, value.to_string());
-                            if let Err(e) = write_settings(&self.config_dir, &settings) {
-                                eprintln!("remembered thinking level: save failed: {e}");
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(RpcError::Command {
-                            error: format!("unknown config option: {other}"),
-                        })
                     }
                 }
-                // Re-synthesize FROM THE `ModelCatalog` (a native session
-                // has no `get_state`) + emit (the agent does not emit a
-                // `config_option_update` itself — the client owns the frame).
-                let state = state.lock().unwrap_or_else(|p| p.into_inner());
-                let options = synthesize_catalog_config_options(
-                    &catalog,
-                    &state.model,
-                    state.thinking_level.as_deref(),
-                )
-                .ok_or_else(|| RpcError::Command {
-                    error: "no config options available".to_string(),
-                })?;
-                sink.emit(
-                    "session-update",
-                    json!({
-                        "sessionId": session_id,
-                        "update": { "sessionUpdate": "config_option_update", "configOptions": options },
-                    }),
-                );
-                Ok(options)
+            }
+            "thought_level" => {
+                // (review finding) An empty level is rejected BEFORE the
+                // control channel is touched (mirroring the model arm's
+                // rejection of an unresolvable key — an empty level would
+                // flow `reasoning_effort: Some("")` into the provider
+                // request body, which some endpoints reject).
+                if value.is_empty() {
+                    return Err(SessionError::Command {
+                        error: "a thinking level must be non-empty".to_string(),
+                    });
+                }
+                let sent = handle
+                    .control_tx_clone()
+                    .try_send(ControlCmd::SetThinkingLevel(Some(value.to_string())));
+                if sent.is_err() {
+                    return Err(SessionError::Command {
+                        error: "the session's loop is not running; the config change could not be applied".to_string(),
+                    });
+                }
+                let mut state = config_state.lock().unwrap_or_else(|p| p.into_inner());
+                state.thinking_level = Some(value.to_string());
+                // (ADR 0015) Remember the level for the session's CURRENT
+                // model (best-effort: a write failure is logged and does NOT
+                // fail the config change — the level is applied in the loop
+                // either way; the value is guaranteed non-empty — an empty
+                // one is rejected above).
+                let key = format!("{}/{}", state.model.provider, state.model.id);
+                let mut settings = load_settings(&self.config_dir);
+                settings
+                    .default_thinking_levels
+                    .insert(key, value.to_string());
+                if let Err(e) = write_settings(&self.config_dir, &settings) {
+                    eprintln!("remembered thinking level: save failed: {e}");
+                }
+            }
+            other => {
+                return Err(SessionError::Command {
+                    error: format!("unknown config option: {other}"),
+                })
             }
         }
+        // Re-synthesize FROM THE `ModelCatalog` (a native session has no
+        // `get_state`) + emit (the agent does not emit a
+        // `config_option_update` itself — the client owns the frame).
+        let state = config_state.lock().unwrap_or_else(|p| p.into_inner());
+        let options = synthesize_catalog_config_options(
+            &catalog,
+            &state.model,
+            state.thinking_level.as_deref(),
+        )
+        .ok_or_else(|| SessionError::Command {
+            error: "no config options available".to_string(),
+        })?;
+        sink.emit(
+            "session-update",
+            json!({
+                "sessionId": session_id,
+                "update": { "sessionUpdate": "config_option_update", "configOptions": options },
+            }),
+        );
+        Ok(options)
     }
 
     /// Deliver the user's answer to a pending permission request.
@@ -3040,7 +1920,7 @@ impl SessionManager {
         session_id: &str,
         request_id: &str,
         outcome: permission::PermissionOutcome,
-    ) -> Result<bool, RpcError> {
+    ) -> Result<bool, SessionError> {
         let key = permission::permission_key(session_id, request_id);
         let sender = self.driver.pending_permissions.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the prompt was
@@ -3055,7 +1935,7 @@ impl SessionManager {
         }
     }
 
-    /// Deliver the user's answer to a pending bridge request.
+    /// Deliver the user's answer to a pending interactive request.
     ///
     /// Looks up the oneshot sender by the compound key
     /// `"{session_id}/{request_id}"` and sends the `result` `Value` verbatim
@@ -3064,13 +1944,13 @@ impl SessionManager {
     /// gone (the session closed, or the request already resolved), this is a
     /// silent no-op. Returns `true` when an entry was resolved (the caller
     /// can then route a miss to the subagent manager).
-    pub async fn respond_bridge_request(
+    pub async fn respond_interactive_request(
         &self,
         session_id: &str,
         request_id: &str,
         result: serde_json::Value,
-    ) -> Result<bool, RpcError> {
-        let key = bridge::bridge_key(session_id, request_id);
+    ) -> Result<bool, SessionError> {
+        let key = interactive::interactive_key(session_id, request_id);
         let sender = self.driver.pending_bridge.lock().await.remove(&key);
         // Best-effort: if the receiver is already gone the request was
         // already resolved (timeout / session close), so there is nothing to
@@ -3105,10 +1985,11 @@ impl SessionManager {
     /// Records the `User` close kind (first-set-wins) and sends the close
     /// flag; the driver task performs the map removal and the
     /// `session-closed` emit. The handle's `close` is idempotent (the
-    /// driver teardown may also call it): closing the child's stdin is the
-    /// clean pi shutdown (its `onInputEnd` → exit 0).
-    pub async fn close_session(&self, session_id: &str) -> Result<(), RpcError> {
-        let (close_tx, close_kind, backend, cancel_requested) = {
+    /// driver teardown may also call it): it stops the prompt queue + the
+    /// in-flight turn and cancels the loop's teardown token (a clean
+    /// shutdown — the loop's `run()` exits on the token).
+    pub async fn close_session(&self, session_id: &str) -> Result<(), SessionError> {
+        let (close_tx, close_kind, handle, cancel_requested) = {
             let sessions = self.driver.sessions.lock().await;
             let live = sessions
                 .get(session_id)
@@ -3120,7 +2001,7 @@ impl SessionManager {
                         l.cancel_requested.clone(),
                     )
                 })
-                .ok_or_else(|| RpcError::UnknownSession {
+                .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
             live
@@ -3144,20 +2025,10 @@ impl SessionManager {
         }
         close_tx
             .send(true)
-            .map_err(|_| RpcError::Io("session already closed".to_string()))?;
-        // The `SessionBackend` dispatch (Task 7): the EXTERNAL path closes
-        // the child's stdin (idempotent — the driver teardown may close it
-        // too): a clean pi shutdown. The NATIVE path tears the loop down
-        // (the prompt queue + the in-flight turn stop; the driver teardown
-        // cancels too — idempotent).
-        match &backend {
-            SessionBackend::Pi(handle) => {
-                handle.close().await;
-            }
-            SessionBackend::Native(handle) => {
-                handle.close();
-            }
-        }
+            .map_err(|_| SessionError::Io("session already closed".to_string()))?;
+        // Tear the loop down (the prompt queue + the in-flight turn stop; the
+        // driver teardown cancels too — idempotent).
+        handle.close();
         Ok(())
     }
 }
@@ -3191,21 +2062,17 @@ fn remembered_thinking_level(levels: &HashMap<String, String>, model: &Model) ->
         .cloned()
 }
 
-/// Resolve a native session's model (the harness's `default_model` composed
-/// key → the catalog; `None` (the built-in) → the `Settings.default_model`
-/// (the middle rung — a fresh `load_settings` read) → the catalog's
+/// Resolve a native session's model (the `Settings.default_model` composed
+/// key — a fresh `load_settings` read → the catalog; the catalog's
 /// `default_model` → the v1-selectable (`openai_compatible`) set). Each rung
 /// is tried IN ORDER: an UNRESOLVABLE key at any rung falls through to the
-/// NEXT rung (only when all three rungs are absent/unresolvable does it fall
-/// to the set) — a stale configured default degrades rather than a hard
-/// error.
+/// NEXT rung (only when both rungs are absent/unresolvable does it fall to
+/// the set) — a stale configured default degrades rather than a hard error.
 fn resolve_native_model(
     catalog: &ModelCatalog,
-    harness_default: &Option<String>,
     settings_default: &Option<String>,
-) -> Result<Model, RpcError> {
+) -> Result<Model, SessionError> {
     for key in [
-        harness_default.as_deref(),
         settings_default.as_deref(),
         catalog.default_model.as_deref(),
     ]
@@ -3221,7 +2088,7 @@ fn resolve_native_model(
         .first()
         .copied()
         .cloned()
-        .ok_or_else(|| RpcError::Command {
+        .ok_or_else(|| SessionError::Command {
             error: "no models available for the native session".to_string(),
         })
 }
@@ -3301,130 +2168,27 @@ fn synthesize_catalog_config_options(
     (!out.is_empty()).then_some(out)
 }
 
-/// The session's capability envelope (item 1 of the swap plan) built from a
-/// `get_state` payload:
-///
-/// ```json
-/// {
-///   "piSessionId": "<sessionId>",
-///   "piSessionFile": "<sessionFile>",        // ABSENT when get_state omits it
-///   "model": "<provider>/<modelId>",        // ABSENT when the model is absent
-///   "thinkingLevel": "<level>",
-///   "loadSession": <sessionFile was present>,
-///   "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false }
-/// }
-/// ```
-///
-/// The two trailing keys are load-bearing, not decoration: the frontend's
-/// Resume button gates on `loadSession === true` and image sending
-/// fail-closes on `promptCapabilities.image === true`.
-fn build_capabilities(state: &Value) -> Value {
-    let mut caps = json!({
-        "piSessionId": state.get("sessionId").cloned().unwrap_or(Value::Null),
-        "promptCapabilities": {
-            "image": true,
-            "audio": false,
-            "embeddedContext": false,
-        },
-    });
-    if let Some(file) = state.get("sessionFile") {
-        caps["piSessionFile"] = file.clone();
-    }
-    // `model` is OPTIONAL in `RpcSessionState` (absent for a session with no
-    // model — e.g. a fresh `--no-session` run before the first model
-    // selection): the key is omitted, not nulled.
-    if let Some(model) = state.get("model") {
-        let provider = model
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-        caps["model"] = Value::String(format!("{provider}/{id}"));
-    }
-    if let Some(level) = state.get("thinkingLevel") {
-        caps["thinkingLevel"] = level.clone();
-    }
-    // `loadSession` is the frontend's Resume-button gate: a session with no
-    // file (`--no-session`) is unresumable.
-    caps["loadSession"] = json!(state.get("sessionFile").is_some());
-    caps
+/// A one-line `agent_message_chunk` with the dedicated `"system"` messageId
+/// (the bookkeeping one-liners — never mixed into a real message's
+/// accumulated text).
+fn system_chunk(text: impl Into<String>) -> Value {
+    let text = text.into();
+    json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": text },
+        "messageId": "system",
+    })
 }
 
-/// Synthesize the session's config options (the model / thinking-level
-/// selectors) from a `get_state` payload + the available models / levels.
-///
-/// The field names mirror the frontend's `SessionConfigOption` type
-/// (`tauri.ts`); the frontend also supports GROUPED options, but the
-/// synthesizer emits flat lists only (parity with what the agent
-/// advertises). `None` when there is nothing to synthesize (no model AND
-/// no levels).
-fn synthesize_config_options(
-    state: &Value,
-    models: Option<&Value>,
-    levels: Option<&Value>,
-) -> Option<Vec<Value>> {
-    let mut out: Vec<Value> = Vec::new();
-    if let Some(models) = models.and_then(Value::as_array) {
-        // The current model is `"<provider>/<modelId>"` (the option value
-        // form); absent → no model selector (nothing to select).
-        if let Some(current) = state.get("model").and_then(|m| {
-            m.get("provider")
-                .and_then(Value::as_str)
-                .zip(m.get("id").and_then(Value::as_str))
-                .map(|(p, i)| format!("{p}/{i}"))
-        }) {
-            let options: Vec<Value> = models
-                .iter()
-                .filter_map(|m| {
-                    m.get("provider")
-                        .and_then(Value::as_str)
-                        .zip(m.get("id").and_then(Value::as_str))
-                        .map(|(p, i)| {
-                            json!({
-                                "value": format!("{p}/{i}"),
-                                "name": m.get("name").and_then(Value::as_str).unwrap_or(i),
-                            })
-                        })
-                })
-                .collect();
-            out.push(json!({
-                "id": "model",
-                "name": "Model",
-                "category": "model",
-                "type": "select",
-                "currentValue": current,
-                "options": options,
-            }));
+/// Shallow-merge `patch` into `base`: non-null fields of `patch` win.
+fn merge_json(base: &mut Value, patch: &Value) {
+    if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch {
+            if !v.is_null() {
+                base.insert(k.clone(), v.clone());
+            }
         }
     }
-    if let Some(levels) = levels.and_then(Value::as_array) {
-        let current = state
-            .get("thinkingLevel")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let options: Vec<Value> = levels
-            .iter()
-            .filter_map(|l| l.as_str().map(|s| s.to_string()))
-            .map(|s| {
-                // The display name is the capitalized level
-                // (`"medium"` → `"Medium"`).
-                let mut name = s.clone();
-                if let Some(c0) = name.chars().next() {
-                    name = format!("{}{}", c0.to_uppercase(), &name[c0.len_utf8()..]);
-                }
-                json!({ "value": s, "name": name })
-            })
-            .collect();
-        out.push(json!({
-            "id": "thought_level",
-            "name": "Thinking",
-            "category": "thought_level",
-            "type": "select",
-            "currentValue": current,
-            "options": options,
-        }));
-    }
-    (!out.is_empty()).then_some(out)
 }
 
 /// Map one pi event onto the FROZEN `session-update` JSON the frontend
@@ -3708,200 +2472,6 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
     }
 }
 
-/// A one-line `agent_message_chunk` with the dedicated `"system"` messageId
-/// (the bookkeeping one-liners — never mixed into a real message's
-/// accumulated text).
-fn system_chunk(text: impl Into<String>) -> Value {
-    let text = text.into();
-    json!({
-        "sessionUpdate": "agent_message_chunk",
-        "content": { "type": "text", "text": text },
-        "messageId": "system",
-    })
-}
-
-/// Replay a stored transcript (`get_messages` payload) through the
-/// normalizer (the resume establisher's persistence step).
-///
-/// Per the replay-feed rule, the replay synthesizes the DELTA events the
-/// live stream would have produced (a literal replay fed as
-/// `message_end` would produce ZERO frames — the no-re-emit rule is
-/// live-stream-only, and `message_end` is never fed):
-///
-/// - an **assistant** message → a `message_start` (advancing the counter
-///   per the role rule) + one `message_update` per content block: a
-///   `text_delta` with the block's full text as a SINGLE delta, a
-///   `thinking_delta` per thinking block, and `toolcall_start` +
-///   `toolcall_end` (arguments = the block's `arguments` object) per
-///   toolCall. No `message_end` / `text_end` / `thinking_end`.
-/// - a **toolResult** message → a `tool_execution_end` (`toolCallId` from
-///   the message's own `toolCallId`, `result` = the content, `isError`
-///   from the message).
-/// - a **user** message → persisted DIRECTLY as a `kind: "user"` row with
-///   the `{ "text": …, "images": […]? }` payload shape (the normalizer has
-///   no user-message input) — an explicit improvement over the ACP replay,
-///   which dropped user rows.
-fn replay_messages(db: &Db, session_id: &str, messages: &Value) {
-    let Some(msgs) = messages.get("messages").and_then(Value::as_array) else {
-        return;
-    };
-    let mut turn = TurnState::default();
-    let text_acc = StdMutex::new(HashMap::new());
-    let tool_state = StdMutex::new(HashMap::new());
-    let thought = StdMutex::new(ThoughtState::default());
-
-    for msg in msgs {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
-        match role {
-            "user" => {
-                let payload = user_replay_payload(msg.get("content").unwrap_or(&Value::Null));
-                let _ = db.record_message(session_id, "user", None, &payload.to_string());
-            }
-            "assistant" => {
-                // The `message_start` (advances the counter per the role
-                // rule — the replay uses the SAME rule in message order so
-                // the live and replay `messageId`s match).
-                let start: RpcEvent =
-                    serde_json::from_value(json!({ "type": "message_start", "message": msg }))
-                        .expect("message_start is always parseable");
-                let _ = normalize(&start, &mut turn);
-                for block in msg
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .unwrap_or(&Vec::new())
-                {
-                    let block_type = block
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let update = match block_type {
-                        "text" => json!({
-                            "type": "message_update",
-                            "usage": null,
-                            "assistantMessageEvent": {
-                                "type": "text_delta",
-                                "contentIndex": 0,
-                                "delta": block.get("text"),
-                            },
-                        }),
-                        "thinking" => json!({
-                            "type": "message_update",
-                            "usage": null,
-                            "assistantMessageEvent": {
-                                "type": "thinking_delta",
-                                "contentIndex": 0,
-                                "delta": block.get("thinking"),
-                            },
-                        }),
-                        "toolCall" => {
-                            // `toolcall_start` + `toolcall_end` (the block IS
-                            // the wire `toolCall` object: `{id, name,
-                            // arguments}`).
-                            let start: RpcEvent = serde_json::from_value(json!({
-                                "type": "message_update",
-                                "usage": null,
-                                "assistantMessageEvent": {
-                                    "type": "toolcall_start",
-                                    "contentIndex": 0,
-                                    "id": block.get("id"),
-                                    "toolName": block.get("name"),
-                                },
-                            }))
-                            .expect("toolcall_start is always parseable");
-                            let end: RpcEvent = serde_json::from_value(json!({
-                                "type": "message_update",
-                                "usage": null,
-                                "assistantMessageEvent": { "type": "toolcall_end", "toolCall": block },
-                            }))
-                            .expect("toolcall_end is always parseable");
-                            for u in normalize(&start, &mut turn) {
-                                persist_update(
-                                    db,
-                                    session_id,
-                                    &u,
-                                    &text_acc,
-                                    &tool_state,
-                                    &thought,
-                                );
-                            }
-                            for u in normalize(&end, &mut turn) {
-                                persist_update(
-                                    db,
-                                    session_id,
-                                    &u,
-                                    &text_acc,
-                                    &tool_state,
-                                    &thought,
-                                );
-                            }
-                            continue;
-                        }
-                        _ => continue,
-                    };
-                    let ev: RpcEvent =
-                        serde_json::from_value(update).expect("message_update is always parseable");
-                    for u in normalize(&ev, &mut turn) {
-                        persist_update(db, session_id, &u, &text_acc, &tool_state, &thought);
-                    }
-                }
-                // NO `message_end` / `text_end` / `thinking_end` (the
-                // authoritative content is not re-emitted).
-            }
-            "toolResult" => {
-                let ev: RpcEvent = serde_json::from_value(json!({
-                    "type": "tool_execution_end",
-                    "toolCallId": msg.get("toolCallId"),
-                    "toolName": msg.get("toolName"),
-                    "result": msg.get("content"),
-                    "isError": msg.get("isError").cloned().unwrap_or(Value::Bool(false)),
-                }))
-                .expect("tool_execution_end is always parseable");
-                for u in normalize(&ev, &mut turn) {
-                    persist_update(db, session_id, &u, &text_acc, &tool_state, &thought);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The `kind: "user"` replay payload from a stored user message's content
-/// (`string | (TextContent | ImageContent)[]`): `{ "text": … }` (the
-/// `images` key omitted when absent) — the same shape `user_message_payload`
-/// writes at `send_prompt` time (the frontend's `rowToMessages` reads it).
-/// A stored image block is `{type, data, mimeType}` (no `name` /
-/// `sizeBytes` on the wire — they are omitted).
-fn user_replay_payload(content: &Value) -> Value {
-    if let Some(s) = content.as_str() {
-        return json!({ "text": s });
-    }
-    let mut text = String::new();
-    let mut images: Vec<Value> = Vec::new();
-    for block in content.as_array().unwrap_or(&Vec::new()) {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                text.push_str(
-                    block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                );
-            }
-            Some("image") => images.push(json!({
-                "mimeType": block.get("mimeType"),
-                "data": block.get("data"),
-            })),
-            _ => {}
-        }
-    }
-    if images.is_empty() {
-        json!({ "text": text })
-    } else {
-        json!({ "text": text, "images": images })
-    }
-}
-
-/// Normalize a stored `capabilities_json` before it reaches the frontend
 /// (the `list_sessions` path — NOT `load_history`, which returns raw
 /// `MessageRow`s and never touches `capabilities_json`): an envelope that
 /// (a) fails to parse as JSON, or (b) parses but lacks the `loadSession`
@@ -4056,186 +2626,12 @@ pub(crate) fn persist_update(
     }
 }
 
-/// Shallow-merge `patch` into `base`: non-null fields of `patch` win.
-fn merge_json(base: &mut Value, patch: &Value) {
-    if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
-        for (k, v) in patch {
-            if !v.is_null() {
-                base.insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
-/// Build a remediation hint for a spawn failure, mentioning the pi install
-/// path.
-fn spawn_hint(command: &str) -> String {
-    format!(
-        "could not spawn '{}'. If this is the 'pi' agent, make sure `pi` is \
-         installed and on PATH (e.g. `npm install -g \
-         @earendil-works/pi-coding-agent`), then retry.",
-        command
-    )
-}
-
-/// A per-spawn randomized bridge socket path (ADR 0003).
-///
-/// On Linux: a `bridge-<uuid>.sock` under a `0700` dir named
-/// `archimedes-bridge-<uid>` — under `XDG_RUNTIME_DIR` when set (a
-/// per-user, `0700` dir the system manages), else the temp dir.
-/// **Fail-closed:** the dir is verified to be owned by the current uid
-/// (and chmodded `0700`) BEFORE the socket is bound into it — a dir
-/// pre-created by ANOTHER user (a pre-squat of the guessable name in a
-/// shared temp dir) makes the bridge unavailable for this spawn
-/// (`None`) rather than the desktop binding its socket inside an
-/// attacker-owned dir. The uid in the dir name is a hint, not a
-/// guarantee — the ownership check is the gate. A symlinked dir path is
-/// also rejected (chmod/uid checks follow symlinks and would validate
-/// the target instead). On Windows: the bare
-/// name `bridge-<uuid>` (the listener prefixes `\\.\\pipe\\`; the dir is
-/// per-user already). On macOS the bridge is unavailable, so this
-/// returns a placeholder that is never used (`bridge::available()` is
-/// `false`).
-pub(crate) fn bridge_socket_path() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        use std::path::Path;
-        let uid = unsafe { libc::getuid() };
-        // Prefer `XDG_RUNTIME_DIR` (per-user, `0700`, managed by the
-        // system) over the shared temp dir when it is set. A relative
-        // `XDG_RUNTIME_DIR` is treated as UNSET (XDG spec) — using it as
-        // is would create the dir relative to the desktop's CWD.
-        let base = std::env::var("XDG_RUNTIME_DIR")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .filter(|p| Path::new(p).is_absolute())
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("archimedes-bridge-{uid}"));
-        // Fail closed on any setup error: the bridge is a per-spawn
-        // convenience — a failed socket dir must not abort the spawn.
-        if std::fs::create_dir_all(&dir).is_err() {
-            return None;
-        }
-        // `set_permissions` / `metadata` FOLLOW symlinks: a local attacker
-        // who can write the base dir can pre-create `dir` as a symlink to
-        // a victim-owned directory — the chmod + uid check would then pass
-        // against the TARGET (chmodding an attacker-chosen victim-owned
-        // dir to 0700, a local DoS) and the socket would bind inside an
-        // attacker-chosen location. Reject a symlinked path before
-        // trusting the dir (fail-closed).
-        if std::fs::symlink_metadata(&dir)
-            .ok()
-            .is_some_and(|m| m.file_type().is_symlink())
-        {
-            return None;
-        }
-        if std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .is_err()
-        {
-            // EPERM: the dir pre-exists owned by ANOTHER user (a
-            // pre-squat) — do not bind a socket inside a foreign dir.
-            return None;
-        }
-        // Defense in depth: even after the chmod, verify the dir is
-        // actually owned by us (the real gate against a foreign dir).
-        let meta = std::fs::metadata(&dir).ok()?;
-        if meta.uid() != uid {
-            return None;
-        }
-        Some(dir.join(format!("bridge-{}.sock", uuid::Uuid::new_v4())))
-    }
-    #[cfg(windows)]
-    {
-        Some(PathBuf::from(format!("bridge-{}", uuid::Uuid::new_v4())))
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        // macOS (bridge unavailable): a placeholder, never used (the
-        // listener is not started — `bridge::available()` is `false`).
-        Some(std::env::temp_dir().join(format!("bridge-{}.sock", uuid::Uuid::new_v4())))
-    }
-}
-
-/// Build the 4 bridge env vars (ADR 0003) and the `(client session id,
-/// socket path)` the driver uses to start the listener. Returns `None` when
-/// the agent is not a bridge agent OR the bridge is unavailable on this
-/// platform (macOS — fail-closed).
-pub(crate) fn bridge_spawn_setup(
-    entry: &AgentEntry,
-    session_id: &str,
-) -> Option<(BTreeMap<String, String>, String, PathBuf)> {
-    if !entry.bridge || !bridge::available() {
-        return None;
-    }
-    // Fail-closed: the socket dir could not be set up safely (e.g.
-    // pre-squatted by another user) — spawn WITHOUT the bridge.
-    let socket_path = bridge_socket_path()?;
-    let mut env = entry.env.clone();
-    env.insert("PI_ARCHIMEDES_BRIDGE".to_string(), "1".to_string());
-    env.insert(
-        "PI_ARCHIMEDES_BRIDGE_SESSION".to_string(),
-        session_id.to_string(),
-    );
-    env.insert(
-        "PI_ARCHIMEDES_BRIDGE_SERVER_PID".to_string(),
-        std::process::id().to_string(),
-    );
-    env.insert(
-        "PI_ARCHIMEDES_BRIDGE_SOCKET".to_string(),
-        socket_path.to_string_lossy().to_string(),
-    );
-    Some((env, session_id.to_string(), socket_path))
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::CostAccumulator;
-
-    /// Two payloads with one ABSENT field each → the sums (an absent field
-    /// contributes 0; payload 1 has NO `cacheReadTokens` / `cacheWriteTokens`).
-    #[test]
-    fn add_payload_sums_fields_across_payloads() {
-        let mut acc = CostAccumulator::default();
-        acc.add_payload(
-            &json!({ "source": "main", "inputTokens": 100, "outputTokens": 50, "cost": 0.001 }),
-        );
-        acc.add_payload(
-            &json!({ "source": "main", "inputTokens": 200, "outputTokens": 25, "cacheReadTokens": 10, "cost": 0.002 }),
-        );
-        assert_eq!(acc.input_tokens, 300, "inputTokens should SUM (100 + 200)");
-        assert_eq!(acc.output_tokens, 75, "outputTokens should SUM (50 + 25)");
-        assert_eq!(acc.cache_read_tokens, 10, "the absent field contributes 0");
-        assert_eq!(acc.cache_write_tokens, 0, "the absent field contributes 0");
-        assert!(
-            (acc.cost - 0.003).abs() < 1e-9,
-            "cost should SUM (0.001 + 0.002 = 0.003), got {}",
-            acc.cost
-        );
-    }
-
-    /// An all-absent payload (only `source`) → NO change to the accumulator.
-    #[test]
-    fn add_payload_all_absent_is_a_no_op() {
-        let mut acc = CostAccumulator::default();
-        acc.add_payload(&json!({ "source": "main" }));
-        assert_eq!(acc.input_tokens, 0);
-        assert_eq!(acc.output_tokens, 0);
-        assert_eq!(acc.cache_read_tokens, 0);
-        assert_eq!(acc.cache_write_tokens, 0);
-        assert_eq!(acc.cost, 0.0);
-    }
-}
-
 #[cfg(test)]
 mod normalize_tests {
     use serde_json::json;
 
-    use super::{build_capabilities, normalize, synthesize_config_options, TurnState};
-    use crate::agent::rpc::RpcEvent;
+    use super::{normalize, TurnState};
+    use crate::agent::events::RpcEvent;
 
     fn ev(v: serde_json::Value) -> RpcEvent {
         serde_json::from_value(v).expect("event should parse")
@@ -4634,62 +3030,6 @@ mod normalize_tests {
             );
         }
     }
-
-    /// The capability envelope: `piSessionFile` / `model` keys ABSENT when
-    /// `get_state` omits them; `loadSession: false` when the session file is
-    /// absent; the load-bearing `promptCapabilities` always present.
-    #[test]
-    fn capabilities_envelope_shape() {
-        let full = build_capabilities(&json!({
-            "sessionId": "s1",
-            "sessionFile": "/tmp/s1.jsonl",
-            "model": { "provider": "fake", "id": "m1", "name": "M1" },
-            "thinkingLevel": "medium",
-        }));
-        assert_eq!(full["piSessionId"], "s1");
-        assert_eq!(full["piSessionFile"], "/tmp/s1.jsonl");
-        assert_eq!(full["model"], "fake/m1");
-        assert_eq!(full["thinkingLevel"], "medium");
-        assert_eq!(full["loadSession"], true);
-        assert_eq!(
-            full["promptCapabilities"],
-            json!({ "image": true, "audio": false, "embeddedContext": false })
-        );
-
-        // A `--no-session` run (no sessionFile, no model): the keys are
-        // ABSENT (not nulled) and the session is unresumable.
-        let bare = build_capabilities(&json!({ "sessionId": "s2" }));
-        assert!(bare.get("piSessionFile").is_none(), "no file → key absent");
-        assert!(bare.get("model").is_none(), "no model → key absent");
-        assert_eq!(bare["loadSession"], false, "no file → unresumable");
-    }
-
-    /// The config synthesizer: model + thinking selectors (the flat shape
-    /// the frontend's `SessionConfigOption` reads); `None` when there is
-    /// nothing to synthesize.
-    #[test]
-    fn config_synthesizer_shape() {
-        let state = json!({
-            "model": { "provider": "fake", "id": "m1" },
-            "thinkingLevel": "medium",
-        });
-        let models = json!([{ "provider": "fake", "id": "m1", "name": "M1" }, { "provider": "fake", "id": "m2", "name": "M2" }]);
-        let levels = json!(["off", "medium"]);
-        let opts = synthesize_config_options(&state, Some(&models), Some(&levels)).unwrap();
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0]["id"], "model");
-        assert_eq!(opts[0]["currentValue"], "fake/m1");
-        assert_eq!(opts[0]["options"].as_array().unwrap().len(), 2);
-        assert_eq!(opts[1]["id"], "thought_level");
-        assert_eq!(opts[1]["currentValue"], "medium");
-        assert_eq!(
-            opts[1]["options"][0]["name"], "Off",
-            "levels are capitalized"
-        );
-
-        // No model AND no levels → `None`.
-        assert!(synthesize_config_options(&json!({}), None, None).is_none());
-    }
 }
 
 #[cfg(test)]
@@ -4698,7 +3038,6 @@ mod session_tests {
     use crate::agent::harness::provider::{
         ChatRole, FinishReason, MessageContent, ModelRequest, ProviderError, ProviderEvent,
     };
-    use crate::agent::permission::PermissionOutcome;
     use crate::storage::Db;
     use futures_util::StreamExt;
     use std::path::Path;
@@ -4734,316 +3073,8 @@ mod session_tests {
         dir
     }
 
-    /// The `fake_pi` binary path. These tests spawn it DIRECTLY (no copy):
-    /// they never reap processes by binary path (the driver kills via the
-    /// child handle `PiRpc` owns), so a shared path cannot false-positive —
-    /// and a copy races the kernel's ETXTBSY check (the copy's write-fd
-    /// can still be in flight when the forked child execs).
-    fn fake_pi_bin() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/fake_pi"))
-    }
-
-    /// Write an `agents.json` with a single `fake` entry pointing at
-    /// `fake_pi` + the given mode env vars (e.g. `FAKE_PI_PROMPT=1`).
-    fn write_agents_json_pi(dir: &Path, env: &[(&str, &str)]) {
-        // `env` is a JSON OBJECT (a `BTreeMap` on the wire) — the slice
-        // form would serialize as an array of pairs and fail to
-        // deserialize.
-        let env_map: serde_json::Map<String, serde_json::Value> = env
-            .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-            .collect();
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "fake",
-                "name": "Fake Pi",
-                "command": fake_pi_bin(),
-                "args": [],
-                "env": env_map,
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
-    }
-
     fn open_db(dir: &Path) -> std::sync::Arc<Db> {
         std::sync::Arc::new(Db::open(&dir.join("archimedes.db")).expect("db should open"))
-    }
-
-    /// (start) `start_session` + `send_prompt` against `fake_pi`
-    /// (`FAKE_PI_PROMPT=1`): the turn streams 2 `agent_message_chunk`
-    /// frames keyed `m1` (the `messageId` role rule — the user
-    /// `message_start` does not advance the counter), resolves `EndTurn`,
-    /// persists ONE accumulated `agent-text` row ("Hello"), and stores a
-    /// `capabilities_json` carrying the load-bearing keys
-    /// (`piSessionFile` + `loadSession: true` + `promptCapabilities.image:
-    /// true`).
-    #[tokio::test]
-    async fn start_session_streams_and_persists() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[("FAKE_PI_PROMPT", "1")]);
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
-        manager.attach_db(db.clone());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-
-        // The capability envelope (item 1 — the load-bearing keys). The
-        // session id is UNIQUE per process (mirroring real pi — the fake
-        // derives it from the process's time + pid).
-        assert!(
-            info.session_id.starts_with("fake-pi-"),
-            "a fresh session gets a unique pi id, got {}",
-            info.session_id
-        );
-        assert_eq!(
-            info.capabilities["piSessionId"],
-            Value::String(info.session_id.clone())
-        );
-        assert_eq!(
-            info.capabilities["piSessionFile"],
-            "/tmp/fake-pi-session.jsonl"
-        );
-        assert_eq!(info.capabilities["model"], "fake/fake-model");
-        assert_eq!(info.capabilities["loadSession"], true);
-        assert_eq!(
-            info.capabilities["promptCapabilities"]["image"], true,
-            "the image-send gate key must be present (fail-closed)"
-        );
-        // The config options (the synthesizer — 2 selectors).
-        assert_eq!(info.config_options.as_ref().unwrap().len(), 2);
-
-        // The turn: 2 `agent_message_chunk` frames keyed `m1`, then
-        // `EndTurn`.
-        let reason = manager
-            .send_prompt(&info.session_id, "hi".to_string())
-            .await
-            .unwrap();
-        assert_eq!(reason, StopReason::EndTurn);
-
-        let mut chunks: Vec<Value> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline && chunks.len() < 2 {
-            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                let msg = msg.unwrap();
-                if msg["event"] == "session-update" {
-                    let update = &msg["payload"]["update"];
-                    if update["sessionUpdate"] == "agent_message_chunk" {
-                        chunks.push(update.clone());
-                    }
-                }
-            }
-        }
-        assert_eq!(chunks.len(), 2, "two text deltas (Hel + lo)");
-        assert_eq!(
-            chunks[0]["messageId"], "m1",
-            "the role rule keys the first assistant chunk m1"
-        );
-        assert_eq!(chunks[1]["messageId"], "m1");
-        assert_eq!(chunks[0]["content"]["text"], "Hel");
-        assert_eq!(chunks[1]["content"]["text"], "lo");
-
-        // Persistence: ONE `agent-text` row with the accumulated "Hello" +
-        // the `user` row written by `send_prompt`.
-        let rows = db
-            .messages_for(&info.session_id)
-            .expect("messages_for should work");
-        let agent_rows: Vec<_> = rows.iter().filter(|r| r.kind == "agent-text").collect();
-        assert_eq!(agent_rows.len(), 1, "two chunks, one messageId → one row");
-        assert_eq!(agent_rows[0].message_key.as_deref(), Some("m1"));
-        assert_eq!(agent_rows[0].payload_json, r#"{"text":"Hello"}"#);
-        let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
-        assert_eq!(user_rows.len(), 1, "exactly ONE user row (no double write)");
-        assert_eq!(user_rows[0].payload_json, r#"{"text":"hi"}"#);
-
-        // The stored `capabilities_json` (the sessions row).
-        let stored = db
-            .session(&info.session_id)
-            .expect("session should work")
-            .unwrap();
-        let stored_caps: Value = serde_json::from_str(&stored.capabilities_json).unwrap();
-        assert_eq!(stored_caps["loadSession"], true);
-        assert_eq!(stored_caps["promptCapabilities"]["image"], true);
-        assert_eq!(stored_caps["piSessionFile"], "/tmp/fake-pi-session.jsonl");
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (resume) `resume_session` against a pre-seeded stored row
-    /// (`capabilities_json` = the item-1 shape with a `piSessionFile`):
-    /// the stored rows are cleared then re-populated from `get_messages` —
-    /// 2+ rows, including a `kind: "user"` row (the explicit improvement
-    /// over the ACP replay, which dropped user rows) and an accumulated
-    /// `agent-text` row keyed by the SAME `messageId` rule. A legacy row
-    /// WITHOUT `loadSession` → `list_sessions`-normalized capabilities have
-    /// `loadSession: false` (item 6b) and `resume_session` →
-    /// `NotResumable`.
-    #[tokio::test]
-    async fn resume_replays_messages() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
-        manager.attach_db(db.clone());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        // Pre-seed the stored row: the item-1 capability envelope (a
-        // resumption of a session with a file).
-        db.record_session(&SessionInfo {
-            session_id: "resume-1".to_string(),
-            agent_id: "fake".to_string(),
-            cwd: dir.clone(),
-            capabilities: serde_json::json!({
-                "piSessionId": "resume-1",
-                // The file's STEM is the loaded session's id (the fake
-                // models real pi: `--session <file>` → the file's stem) —
-                // it must match the stored id for the resume to round-trip.
-                "piSessionFile": "/tmp/resume-1.jsonl",
-                "model": "fake/fake-model",
-                "thinkingLevel": "off",
-                "loadSession": true,
-                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
-            }),
-            config_options: None,
-            archived: false,
-        })
-        .expect("record_session should succeed");
-        // Two stored rows the resume must CLEAR (the replay re-populates).
-        db.record_message("resume-1", "agent-text", Some("m1"), r#"{"text":"stale"}"#)
-            .expect("record_message should succeed");
-        db.record_message("resume-1", "user", None, r#"{"text":"stale-user"}"#)
-            .expect("record_message should succeed");
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.resume_session("fake", "resume-1", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-        assert_eq!(info.session_id, "resume-1");
-
-        // The replay re-populated the transcript: 2+ rows, including a
-        // `kind: "user"` row with the `{"text": "hello"}` payload (the
-        // stored "stale" rows are gone — the clear happened first).
-        let rows = db
-            .messages_for("resume-1")
-            .expect("messages_for should work");
-        assert!(
-            rows.len() >= 2,
-            "the replay re-populated the transcript: {rows:?}"
-        );
-        let user_rows: Vec<_> = rows.iter().filter(|r| r.kind == "user").collect();
-        assert_eq!(user_rows.len(), 1, "exactly ONE user row (the replay's)");
-        assert_eq!(user_rows[0].payload_json, r#"{"text":"hello"}"#);
-        let agent_rows: Vec<_> = rows.iter().filter(|r| r.kind == "agent-text").collect();
-        assert_eq!(
-            agent_rows.len(),
-            1,
-            "one assistant message → one agent-text row"
-        );
-        assert_eq!(
-            agent_rows[0].message_key.as_deref(),
-            Some("m1"),
-            "the replay uses the same messageId rule as the live stream"
-        );
-        assert_eq!(agent_rows[0].payload_json, r#"{"text":"world"}"#);
-        assert!(
-            !rows.iter().any(|r| r.payload_json.contains("stale")),
-            "the stale rows were cleared"
-        );
-
-        // (item 6b) A legacy row WITHOUT `loadSession` → normalized
-        // capabilities have `loadSession: false` + `resume_session` →
-        // `NotResumable`.
-        db.record_session(&SessionInfo {
-            session_id: "legacy-1".to_string(),
-            agent_id: "fake".to_string(),
-            cwd: dir.clone(),
-            capabilities: serde_json::json!({ "promptCapabilities": { "image": true } }),
-            config_options: None,
-            archived: false,
-        })
-        .expect("record_session should succeed");
-        assert_eq!(
-            normalize_capabilities(&db.session("legacy-1").unwrap().unwrap().capabilities_json)
-                ["loadSession"],
-            false,
-            "a legacy row (no loadSession key) normalizes to loadSession: false"
-        );
-        let result = manager
-            .resume_session("fake", "legacy-1", dir.clone(), &sink)
-            .await;
-        assert!(
-            matches!(result, Err(RpcError::NotResumable { .. })),
-            "a legacy row is NotResumable, got: {result:?}"
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (ADR 0016) The EXTERNAL resume carries the stored `archived` flag:
-    /// `set_session_archived` before the resume; the resumed `SessionInfo`
-    /// reports the stored flag, and the resume's `record_session` re-record
-    /// did NOT clear it (the `DO UPDATE` branch never touches `archived`).
-    #[tokio::test]
-    async fn resume_carries_the_archived_flag() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
-        manager.attach_db(db.clone());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        // Pre-seed the stored row (a resumption of a session with a file)
-        // and archive it BEFORE the resume.
-        db.record_session(&SessionInfo {
-            session_id: "resume-arch-1".to_string(),
-            agent_id: "fake".to_string(),
-            cwd: dir.clone(),
-            capabilities: serde_json::json!({
-                "piSessionId": "resume-arch-1",
-                "piSessionFile": "/tmp/resume-arch-1.jsonl",
-                "model": "fake/fake-model",
-                "thinkingLevel": "off",
-                "loadSession": true,
-                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
-            }),
-            config_options: None,
-            archived: false,
-        })
-        .expect("record_session should succeed");
-        db.set_session_archived("resume-arch-1", true)
-            .expect("set_session_archived should succeed");
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.resume_session("fake", "resume-arch-1", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-        assert_eq!(info.session_id, "resume-arch-1");
-        assert!(
-            info.archived,
-            "the external resume carries the stored archived flag"
-        );
-        let row = db
-            .session("resume-arch-1")
-            .expect("session should work")
-            .expect("the row exists");
-        assert!(
-            row.archived,
-            "the resume's re-record did not clear the stored flag"
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (ADR 0016) The NATIVE resume carries the stored `archived` flag:
@@ -5053,29 +3084,26 @@ mod session_tests {
     #[tokio::test]
     async fn native_resume_carries_the_archived_flag() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.attach_db(db.clone());
         manager.set_catalog(native_test_catalog());
         manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.clone(), &sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(dir.clone(), &sink)
+            .await
+            .expect("the native session started");
         assert!(!info.archived, "a fresh native start is never archived");
         db.set_session_archived(&info.session_id, true)
             .expect("set_session_archived should succeed");
 
-        let resumed = crate::test_support::run_with_retry(|| {
-            manager.resume_session("nativetest", &info.session_id, dir.clone(), &sink)
-        })
-        .await
-        .expect("the native resume succeeded");
+        let resumed = manager
+            .resume_session(&info.session_id, dir.clone(), &sink)
+            .await
+            .expect("the native resume succeeded");
         assert_eq!(resumed.session_id, info.session_id);
         assert!(
             resumed.archived,
@@ -5100,7 +3128,6 @@ mod session_tests {
     fn session_info_round_trips_the_archived_flag_camel_case() {
         let info = SessionInfo {
             session_id: "s1".to_string(),
-            agent_id: "fake".to_string(),
             cwd: PathBuf::from("/tmp/proj"),
             capabilities: serde_json::json!({ "loadSession": true }),
             config_options: None,
@@ -5110,105 +3137,6 @@ mod session_tests {
         assert!(json.contains("\"archived\":true"), "got: {json}");
         let back: SessionInfo = serde_json::from_str(&json).unwrap();
         assert!(back.archived);
-    }
-
-    /// (cancel) `send_prompt` + `cancel_session` (`FAKE_PI_WAIT_ABORT=1` —
-    /// the turn stays in-flight until the `abort`): the `abort` settles
-    /// the turn and the in-flight `send_prompt` resolves `Cancelled` (the
-    /// `cancel_requested` flag — set BEFORE the abort).
-    #[tokio::test]
-    async fn cancel_resolves_cancelled() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[("FAKE_PI_WAIT_ABORT", "1")]);
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-
-        // The prompt + the cancel, CONCURRENTLY (`join!` — the `send_prompt`
-        // awaits the turn's `agent_settled`, which the fake emits on the
-        // `abort` the cancel sends; the `cancel_requested` flag set BEFORE
-        // the abort maps the settle to `Cancelled`).
-        let sid = info.session_id.clone();
-        let (reason, cancel_res) = tokio::join!(
-            async { manager.send_prompt(&sid, "hi".to_string()).await },
-            async {
-                // A head start for the prompt (the fake answers the prompt
-                // preflight immediately, then waits for the abort).
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                manager.cancel_session(&sid).await
-            },
-        );
-        assert_eq!(cancel_res, Ok(()), "cancel should succeed");
-        assert_eq!(reason, Ok(StopReason::Cancelled));
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (config) `set_config_option("model", "fake/fake-model-2")`: the
-    /// `set_model` command reaches the agent (the fake echoes the requested
-    /// provider/modelId), the response's re-synthesized options come back
-    /// (`currentValue` moved to `fake/fake-model-2`), AND a
-    /// `config_option_update` event arrives with the same options.
-    #[tokio::test]
-    async fn set_config_option_roundtrip() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-
-        let updated = manager
-            .set_config_option(&info.session_id, "model", "fake/fake-model-2", &sink)
-            .await
-            .unwrap();
-        let model = updated
-            .iter()
-            .find(|o| o["id"] == "model")
-            .expect("the model selector");
-        assert_eq!(
-            model["currentValue"], "fake/fake-model-2",
-            "the echoed model becomes the current value"
-        );
-
-        // The `config_option_update` event (the client owns the frame — pi
-        // does not emit one itself).
-        let mut found = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline && !found {
-            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                let msg = msg.unwrap();
-                if msg["event"] == "session-update"
-                    && msg["payload"]["update"]["sessionUpdate"] == "config_option_update"
-                {
-                    found = true;
-                    let opts = &msg["payload"]["update"]["configOptions"];
-                    let model = opts
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|o| o["id"] == "model")
-                        .unwrap();
-                    assert_eq!(model["currentValue"], "fake/fake-model-2");
-                }
-            }
-        }
-        assert!(found, "the config_option_update event was not emitted");
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write a `settings.json` with the given `defaultModel` (the
@@ -5223,67 +3151,9 @@ mod session_tests {
         .unwrap();
     }
 
-    /// (settings) an EXTERNAL session started with a validly-shaped
-    /// `Settings.default_model` (a `"provider/id"` split) gets a
-    /// `set_model` sent BEFORE the first `get_state` (LENIENT — a failure
-    /// is logged and the session establishes on pi's own default; an
-    /// absent/unset setting sends nothing): the `get_state`-based
-    /// `info.capabilities.model` reflects the applied model (`fake_pi`'s
-    /// `set_model` handler updates `current_model_id` and its
-    /// `get_state` response substitutes it).
-    #[tokio::test]
-    async fn an_external_session_start_sends_set_model_for_the_settings_default() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        write_settings_default_model(&dir, Some("fake/fake-model-2"));
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .expect("the external session started");
-        assert_eq!(
-            info.capabilities["model"], "fake/fake-model-2",
-            "the settings default model is applied before the first get_state"
-        );
-        let _ = manager.close_session(&info.session_id).await;
-
-        // The negative: NO `defaultModel` → no `set_model` sent → the
-        // session establishes on pi's own default.
-        write_settings_default_model(&dir, None);
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .expect("the external session started");
-        assert_eq!(
-            info.capabilities["model"], "fake/fake-model",
-            "an absent settings default sends no set_model (pi's own default)"
-        );
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // ── Native-backend tests (the in-process `AgentLoop` — a NATIVE
     // registry entry + a mock `provider_factory` seam; the production
     // default is `OpenAiCompatibleProvider`) ──
-
-    /// Write an `agents.json` with a single NATIVE entry (the `harness`
-    /// config points at `fake/m1` — the `native_test_catalog` model).
-    fn write_agents_json_native(dir: &Path) {
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "nativetest",
-                "name": "Native Test",
-                "kind": "native",
-                "harness": { "provider": "openai-compatible", "default_model": "fake/m1" },
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
-    }
 
     /// The native test catalog (a single `fake/m1` OpenAI-compatible
     /// model — `set_config_option` + `resolve_native_model` resolve it
@@ -5329,15 +3199,14 @@ mod session_tests {
         factory: impl Fn(&Model) -> Box<dyn Provider> + Send + Sync + 'static,
     ) -> (SessionManager, SessionInfo) {
         let db = open_db(dir);
-        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        let mut manager = SessionManager::new(dir.to_path_buf());
         manager.attach_db(db);
         manager.set_catalog(native_test_catalog());
         manager.set_provider_factory(factory);
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.to_path_buf(), sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(dir.to_path_buf(), sink)
+            .await
+            .expect("the native session started");
         (manager, info)
     }
 
@@ -5383,46 +3252,6 @@ mod session_tests {
         );
     }
 
-    /// Write an `agents.json` with a single NATIVE entry whose harness
-    /// `default_model` is `harness_default` (`None` = the built-in).
-    fn write_agents_json_native_with_default(dir: &Path, harness_default: Option<&str>) {
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "nativetest",
-                "name": "Native Test",
-                "kind": "native",
-                "harness": {
-                    "provider": "openai-compatible",
-                    "default_model": harness_default,
-                },
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
-    }
-
-    /// Write an `agents.json` with a single NATIVE entry whose harness
-    /// `default_model` is `harness_default` and `default_thinking_level` is
-    /// `harness_level` (both `None`-able).
-    fn write_agents_json_native_with_thinking(
-        dir: &Path,
-        harness_default: Option<&str>,
-        harness_level: Option<&str>,
-    ) {
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "nativetest",
-                "name": "Native Test",
-                "kind": "native",
-                "harness": {
-                    "provider": "openai-compatible",
-                    "default_model": harness_default,
-                    "default_thinking_level": harness_level,
-                },
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
-    }
-
     /// Write a `settings.json` with arbitrary JSON (the camelCase wire
     /// shape — absent keys parse to the defaults).
     fn write_settings_json(dir: &Path, settings: serde_json::Value) {
@@ -5459,15 +3288,14 @@ mod session_tests {
         catalog: ModelCatalog,
     ) -> (SessionManager, SessionInfo) {
         let db = open_db(dir);
-        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
+        let mut manager = SessionManager::new(dir.to_path_buf());
         manager.attach_db(db);
         manager.set_catalog(catalog);
         manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.to_path_buf(), sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(dir.to_path_buf(), sink)
+            .await
+            .expect("the native session started");
         (manager, info)
     }
 
@@ -5475,7 +3303,7 @@ mod session_tests {
     /// model's `thinking_levels`) wins over the harness's
     /// `default_thinking_level` seed.
     #[tokio::test]
-    async fn a_native_session_starts_with_the_remembered_level_over_the_harness_default() {
+    async fn a_native_session_starts_with_the_remembered_level_over_the_settings_default() {
         let catalog = ModelCatalog {
             models: vec![level_test_model(
                 "tama",
@@ -5488,28 +3316,32 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
         write_settings_json(
             &dir,
             serde_json::json!({
                 "defaultModel": null,
+                "defaultThinkingLevel": "high",
                 "defaultThinkingLevels": { "tama/m1": "xhigh" },
             }),
         );
         let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
         assert_eq!(
             info.capabilities["thinkingLevel"], "xhigh",
-            "the remembered (validated) level beats the harness seed"
+            "the remembered (validated) level beats the settings default"
         );
         let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (ADR 0015) A STALE remembered entry (not a member of the model's
-    /// current `thinking_levels` — the provider changed its levels) is
-    /// IGNORED: the harness seed applies.
+    /// A STALE remembered entry (not a member of the model's
+    /// `thinking_levels` — the provider changed its levels) is IGNORED, AND
+    /// the `Settings.default_thinking_level` rung is VALIDATED the same way
+    /// (the Settings UI offers the UNION of all models' levels — a level one
+    /// model advertises may not be a member of THIS model's set): a settings
+    /// default that is NOT a member is DROPPED (the session starts with no
+    /// thinking level — the model's own default).
     #[tokio::test]
-    async fn a_stale_remembered_level_falls_back_to_the_harness_default() {
+    async fn a_stale_remembered_level_and_an_invalid_settings_default_start_with_no_level() {
         let catalog = ModelCatalog {
             models: vec![level_test_model(
                 "tama",
@@ -5522,18 +3354,82 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("high"));
         write_settings_json(
             &dir,
             serde_json::json!({
                 "defaultModel": null,
+                "defaultThinkingLevel": "high",
                 "defaultThinkingLevels": { "tama/m1": "ultra" },
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert!(
+            info.capabilities.get("thinkingLevel").is_none(),
+            "the stale entry is ignored AND the settings default (not a member of the model's levels) is dropped — no thinking level, got {:?}",
+            info.capabilities
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `Settings.default_thinking_level` rung APPLIES when it is a
+    /// member of the model's `thinking_levels` (no remembered entry):
+    /// the settings default is a validated rung, not a bypass.
+    #[tokio::test]
+    async fn a_settings_default_level_applies_when_it_is_a_member_of_the_model_levels() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "medium", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevel": "xhigh",
+            }),
+        );
+        let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
+        assert_eq!(
+            info.capabilities["thinkingLevel"], "xhigh",
+            "a settings default that IS a member of the model's levels applies"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (the stored rung's lenient rule, mirrored on the settings rung) A
+    /// model that advertises NO `thinking_levels` applies the
+    /// `Settings.default_thinking_level` AS-IS (no membership check — the
+    /// pre-change behavior).
+    #[tokio::test]
+    async fn a_settings_default_level_applies_as_is_for_a_model_without_levels() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model("tama", "m1", &[])],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        write_settings_json(
+            &dir,
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevel": "high",
             }),
         );
         let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
         assert_eq!(
             info.capabilities["thinkingLevel"], "high",
-            "a stale (unvalidated) entry is ignored — the harness seed applies"
+            "a model with no advertised levels applies the settings default as-is"
         );
         let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -5553,7 +3449,6 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), None);
         write_settings_json(
             &dir,
             serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
@@ -5574,7 +3469,6 @@ mod session_tests {
     #[tokio::test]
     async fn a_native_thought_level_change_remembers_the_level() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         write_settings_json(&dir, serde_json::json!({}));
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
@@ -5597,6 +3491,64 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (review finding) An EMPTY `thought_level` value is rejected BEFORE
+    /// the control channel is touched (an empty level would flow
+    /// `reasoning_effort: Some("")` into the provider request body — some
+    /// endpoints reject it): a `Command` error, the mirror is UNCHANGED,
+    /// NO `config_option_update` is emitted (mirroring the model arm's
+    /// rejection of an unresolvable key).
+    #[tokio::test]
+    async fn a_native_empty_thought_level_change_is_rejected() {
+        let dir = temp_config_dir();
+        write_settings_json(&dir, serde_json::json!({}));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, info) = start_native_session(&dir, &sink).await;
+        // Drain any startup events (the assertion below is about the
+        // rejected change only).
+        while rx.try_recv().is_ok() {}
+        let err = manager
+            .set_config_option(&info.session_id, "thought_level", "", &sink)
+            .await
+            .expect_err("an empty level must be rejected");
+        assert!(
+            matches!(
+                err,
+                SessionError::Command {
+                    ref error
+                } if error == "a thinking level must be non-empty"
+            ),
+            "the empty level is rejected with a Command error, got {err:?}"
+        );
+        // The mirror is UNCHANGED (a fresh session has no level — an
+        // applied change would have mirrored `Some("")`).
+        let state = {
+            let sessions = manager.driver.sessions.lock().await;
+            sessions
+                .get(&info.session_id)
+                .expect("the session is live")
+                .handle
+                .config_state()
+        };
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .thinking_level
+                .as_deref(),
+            None,
+            "the mirror must be untouched by a rejected change"
+        );
+        // NO `config_option_update` was emitted (a rejected change
+        // re-synthesizes nothing).
+        assert!(
+            rx.try_recv().is_err(),
+            "no event may be emitted for a rejected change"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (ADR 0015) A native model switch is a MINIMAL-SURPRISE reset: the
     /// current level is invalid for the NEW model (its `thinking_levels`
     /// are non-empty and don't contain it) → the level resets to the new
@@ -5614,7 +3566,6 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
         write_settings_json(
             &dir,
             serde_json::json!({ "defaultThinkingLevels": { "tama/b": "xhigh" } }),
@@ -5659,7 +3610,6 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/a"), None);
         write_settings_json(&dir, serde_json::json!({}));
         let (manager, info) = start_native_session_with_catalog(&dir, &sink, catalog).await;
         let _ = manager
@@ -5699,13 +3649,12 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        write_agents_json_native_with_thinking(&dir, Some("tama/m1"), Some("low"));
         write_settings_json(
             &dir,
             serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
         );
         let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.attach_db(db.clone());
         manager.set_catalog(catalog);
         manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
@@ -5713,7 +3662,6 @@ mod session_tests {
         // the model; a mid-session change to `xhigh` is only in the memory).
         db.record_session(&SessionInfo {
             session_id: "nat-resume-1".to_string(),
-            agent_id: "nativetest".to_string(),
             cwd: dir.clone(),
             capabilities: json!({
                 "native": true,
@@ -5725,11 +3673,10 @@ mod session_tests {
             archived: false,
         })
         .expect("record_session should succeed");
-        let info = crate::test_support::run_with_retry(|| {
-            manager.resume_session("nativetest", "nat-resume-1", dir.clone(), &sink)
-        })
-        .await
-        .expect("the native resume works");
+        let info = manager
+            .resume_session("nat-resume-1", dir.clone(), &sink)
+            .await
+            .expect("the native resume works");
         assert_eq!(
             info.capabilities["thinkingLevel"], "xhigh",
             "memory wins over the stale stored value"
@@ -5738,64 +3685,12 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (ADR 0015) External (pi) start: a remembered level for
-    /// `settings.defaultModel` is sent LENIENT (`set_thinking_level` after
-    /// `set_model`, BEFORE the first `get_state` — the `get_state` response
-    /// reflects it). `fake_pi`'s `get_state` substitutes `__LEVEL__` with
-    /// the level it was sent (default `"off"`).
+    /// (settings chain) the native model resolution chain: the
+    /// `Settings.default_model` (a fresh `load_settings` read) > the
+    /// catalog's `default_model` > the v1-selectable (`openai_compatible`)
+    /// set. An UNRESOLVABLE key at any rung falls through to the NEXT rung.
     #[tokio::test]
-    async fn an_external_session_start_sends_the_remembered_thinking_level() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        write_settings_json(
-            &dir,
-            serde_json::json!({
-                "defaultModel": "fake/fake-model-2",
-                "defaultThinkingLevels": { "fake/fake-model-2": "medium" },
-            }),
-        );
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .expect("the external session started");
-        assert_eq!(
-            info.capabilities["thinkingLevel"], "medium",
-            "the remembered level is sent before the first get_state"
-        );
-        let _ = manager.close_session(&info.session_id).await;
-
-        // The negative: the same `defaultModel` but NO memory entry →
-        // nothing sent → pi's own default level.
-        write_settings_json(
-            &dir,
-            serde_json::json!({ "defaultModel": "fake/fake-model-2" }),
-        );
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .expect("the external session started");
-        assert_eq!(
-            info.capabilities["thinkingLevel"], "off",
-            "no memory entry → no set_thinking_level → pi's default level"
-        );
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (settings chain) the native model resolution chain: per-agent
-    /// `HarnessConfig.default_model` > `Settings.default_model` (the new
-    /// MIDDLE rung — a fresh `load_settings` read) > the catalog's
-    /// `default_model` > the v1-selectable (`openai_compatible`) set. An
-    /// UNRESOLVABLE key at any rung falls through to the NEXT rung (the
-    /// settings rung is tried BEFORE the catalog default — not skipped).
-    #[tokio::test]
-    async fn the_native_model_chain_settings_default_sits_between_per_agent_and_catalog() {
+    async fn the_native_model_chain_settings_default_wins_over_the_catalog_default() {
         let catalog = ModelCatalog {
             models: vec![
                 chain_test_model("s", "m1"),
@@ -5809,63 +3704,57 @@ mod session_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        // Phase 1: harness `None` + settings `s/m1` → the settings rung
-        // wins (it sits between the per-agent and the catalog default).
-        write_agents_json_native_with_default(&dir, None);
+        // Phase 1: settings `s/m1` (in the catalog) → the settings rung
+        // wins over the catalog default.
         write_settings_default_model(&dir, Some("s/m1"));
         let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.attach_db(db);
         manager.set_catalog(catalog.clone());
         manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.clone(), &sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(dir.clone(), &sink)
+            .await
+            .expect("the native session started");
         assert_eq!(
             info.capabilities["model"], "s/m1",
-            "the settings default sits between the per-agent and the catalog default"
+            "the settings default wins over the catalog default"
         );
         let _ = manager.close_session(&info.session_id).await;
 
-        // Phase 2: harness `h/m3` (in the catalog) + settings `s/m1` →
-        // the per-agent rung wins.
-        write_agents_json_native_with_default(&dir, Some("h/m3"));
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
-        manager.attach_db(db);
-        manager.set_catalog(catalog.clone());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.clone(), &sink)
-        })
-        .await
-        .expect("the native session started");
-        assert_eq!(
-            info.capabilities["model"], "h/m3",
-            "the per-agent default wins over the settings default"
-        );
-        let _ = manager.close_session(&info.session_id).await;
-
-        // Phase 3: harness `None` + settings `gone/m1` (NOT in the
-        // catalog) → the unresolvable settings key falls through to the
-        // CATALOG DEFAULT rung (not straight to the v1-selectable set).
-        write_agents_json_native_with_default(&dir, None);
+        // Phase 2: settings `gone/m1` (NOT in the catalog) → the
+        // unresolvable settings key falls through to the CATALOG DEFAULT
+        // rung (not straight to the v1-selectable set).
         write_settings_default_model(&dir, Some("gone/m1"));
         let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.attach_db(db);
         manager.set_catalog(catalog.clone());
         manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.clone(), &sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(dir.clone(), &sink)
+            .await
+            .expect("the native session started");
         assert_eq!(
             info.capabilities["model"], "c/m2",
             "an unresolvable settings key degrades to the catalog default"
+        );
+        let _ = manager.close_session(&info.session_id).await;
+
+        // Phase 3: NO settings default → the catalog default applies.
+        write_settings_default_model(&dir, None);
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone());
+        manager.attach_db(db);
+        manager.set_catalog(catalog.clone());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let info = manager
+            .start_session(dir.clone(), &sink)
+            .await
+            .expect("the native session started");
+        assert_eq!(
+            info.capabilities["model"], "c/m2",
+            "an absent settings default degrades to the catalog default"
         );
         let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -5913,7 +3802,7 @@ mod session_tests {
         });
         let dir = std::env::temp_dir().join(format!("refresh-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.set_catalog(ModelCatalog {
             models: vec![Model {
                 id: "m1".into(),
@@ -5997,11 +3886,6 @@ mod session_tests {
     #[tokio::test]
     async fn effective_catalog_discovers_a_user_provider() {
         let dir = temp_config_dir();
-        std::fs::write(
-            dir.join("agents.json"),
-            serde_json::json!({ "agents": [] }).to_string(),
-        )
-        .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = crate::test_support::raw_json_server(
@@ -6014,7 +3898,7 @@ mod session_tests {
         write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
         // A seeded catalog under a DIFFERENT provider id (coexists — no
         // clash).
-        let mut manager = SessionManager::new(dir).unwrap();
+        let mut manager = SessionManager::new(dir);
         manager.set_catalog(ModelCatalog {
             models: vec![provider_model("s/1", "other", "https://other/v1")],
             ..Default::default()
@@ -6043,13 +3927,8 @@ mod session_tests {
     #[tokio::test]
     async fn effective_catalog_a_failed_discovery_still_shadows_the_seeded_provider() {
         let dir = temp_config_dir();
-        std::fs::write(
-            dir.join("agents.json"),
-            serde_json::json!({ "agents": [] }).to_string(),
-        )
-        .unwrap();
         write_settings_provider(&dir, "tama", "http://127.0.0.1:1/v1"); // unreachable
-        let mut manager = SessionManager::new(dir).unwrap();
+        let mut manager = SessionManager::new(dir);
         manager.set_catalog(ModelCatalog {
             models: vec![
                 provider_model("stale/1", "tama", "https://stale/v1"),
@@ -6077,11 +3956,6 @@ mod session_tests {
     #[tokio::test]
     async fn effective_catalog_caches_and_force_refresh_bypasses_the_cache() {
         let dir = temp_config_dir();
-        std::fs::write(
-            dir.join("agents.json"),
-            serde_json::json!({ "agents": [] }).to_string(),
-        )
-        .unwrap();
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6093,7 +3967,7 @@ mod session_tests {
         )
         .await;
         write_settings_provider(&dir, "tama", &format!("http://{addr}/v1"));
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
+        let mut manager = SessionManager::new(dir.clone());
         manager.set_catalog(ModelCatalog::default());
         let first = manager.effective_catalog(None).await;
         assert!(first.models.iter().any(|m| m.id == "v1"));
@@ -6173,7 +4047,6 @@ mod session_tests {
     #[tokio::test]
     async fn native_close_resolves_the_in_flight_prompt() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6211,7 +4084,6 @@ mod session_tests {
     #[tokio::test]
     async fn native_loop_task_death_resolves_the_in_flight_prompt_cancelled() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6222,10 +4094,7 @@ mod session_tests {
         let handle = {
             let sessions = manager.driver.sessions.lock().await;
             let live = sessions.get(&sid).expect("the session is live");
-            match &live.handle {
-                SessionBackend::Native(h) => h.clone(),
-                _ => panic!("a native session has a native handle"),
-            }
+            live.handle.clone()
         };
         // Start a `send_prompt` (the turn hangs in the `HangingProvider`
         // `complete()`). Poll it (via a `select!` with a sleep arm) until
@@ -6280,7 +4149,6 @@ mod session_tests {
     #[tokio::test]
     async fn two_concurrent_native_send_prompts_exactly_one_is_accepted() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         // `HangingProvider`: the turn hangs in the model call, so the
@@ -6317,7 +4185,7 @@ mod session_tests {
         let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
         let busy = outcomes
             .iter()
-            .filter(|r| matches!(r, Err(RpcError::Command { .. })))
+            .filter(|r| matches!(r, Err(SessionError::Command { .. })))
             .count();
         assert_eq!(
             accepted, 1,
@@ -6340,7 +4208,6 @@ mod session_tests {
     #[tokio::test]
     async fn two_concurrent_native_send_prompts_exactly_one_is_accepted_five_rounds() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         // `HangingProvider`: the turn hangs in the model call, so the
@@ -6377,7 +4244,7 @@ mod session_tests {
             let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
             let busy = outcomes
                 .iter()
-                .filter(|r| matches!(r, Err(RpcError::Command { .. })))
+                .filter(|r| matches!(r, Err(SessionError::Command { .. })))
                 .count();
             assert_eq!(
                 accepted, 1,
@@ -6411,7 +4278,6 @@ mod session_tests {
     #[tokio::test]
     async fn wait_for_settle_does_not_return_a_stale_settle() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let settle = Arc::new(tokio::sync::Notify::new());
@@ -6477,44 +4343,6 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (finding 13b) A native entry with a `provider` that is NOT
-    /// `"openai-compatible"` is REJECTED at session start with a clear
-    /// error (v1 is OpenAI-compatible only — ADR 0012) rather than
-    /// silently accepting it (pre-fix any value got the OpenAI wire).
-    #[tokio::test]
-    async fn a_non_openai_compatible_harness_provider_is_rejected_at_session_start() {
-        let dir = temp_config_dir();
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "nativetest",
-                "name": "Native Test",
-                "kind": "native",
-                "harness": { "provider": "anthropic", "default_model": "fake/m1" },
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.to_path_buf()).unwrap();
-        manager.attach_db(db);
-        manager.set_catalog(native_test_catalog());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let res = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", dir.to_path_buf(), &sink)
-        })
-        .await;
-        let err = res.unwrap_err().to_string();
-        assert!(
-            err.contains("anthropic"),
-            "the error names the unsupported provider, got {err}"
-        );
-        assert!(
-            err.contains("OpenAI-compatible"),
-            "the error explains the v1 constraint, got {err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// (native, finding 8c) A native Stop matches the external `abort`:
     /// the turn stops (the `send_prompt` resolves `Cancelled`) and the
     /// session STAYS ALIVE (a new prompt reuses it — the pre-fix Stop
@@ -6525,7 +4353,6 @@ mod session_tests {
     #[tokio::test]
     async fn native_cancel_stops_the_turn_and_keeps_the_session() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6576,7 +4403,6 @@ mod session_tests {
     #[tokio::test]
     async fn a_native_prompt_writes_exactly_one_user_row() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6612,7 +4438,6 @@ mod session_tests {
     #[tokio::test]
     async fn a_concurrent_native_prompt_is_rejected_busy() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6625,7 +4450,7 @@ mod session_tests {
         let _ = tokio::time::timeout(Duration::from_millis(300), &mut p1).await;
         let r2 = manager.send_prompt(&sid, "two".to_string()).await;
         assert!(
-            matches!(&r2, Err(RpcError::Command { error }) if error.contains("already in flight")),
+            matches!(&r2, Err(SessionError::Command { error }) if error.contains("already in flight")),
             "the concurrent prompt is rejected busy, got {r2:?}"
         );
         // The first resolver was NOT overwritten: a Stop settles the
@@ -6648,7 +4473,6 @@ mod session_tests {
     #[tokio::test]
     async fn native_set_config_option_fails_when_the_queue_is_full() {
         let dir = temp_config_dir();
-        write_agents_json_native(&dir);
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
         let (manager, info) = start_native_session(&dir, &sink).await;
@@ -6667,138 +4491,31 @@ mod session_tests {
             .set_config_option(&sid, "thought_level", "low", &sink)
             .await;
         assert!(
-            matches!(result, Err(RpcError::Command { .. })),
+            matches!(result, Err(SessionError::Command { .. })),
             "a full control queue is an error (finding 12), got {result:?}"
         );
         let _ = manager.close_session(&sid).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (permission) `FAKE_PI_GATE=1`: the `prompt` turn fires the gate
-    /// dialog (`extension_ui_request` `confirm` → a `permission-request`
-    /// event with the `[Allow, Block, Don't ask again for this Space]`
-    /// options — no `db` is attached, so the Space is untrusted and the
-    /// third option is offered) → `respond_permission`
-    /// (`Selected("allow")` → `confirmed: true`) → the turn still resolves
-    /// `EndTurn` (the fake only settles after the response).
-    #[tokio::test]
-    async fn permission_gate_roundtrip() {
-        let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[("FAKE_PI_GATE", "1")]);
-        let manager = SessionManager::new(dir.clone()).unwrap();
-        // The injection (Task 4): `new` installed the bundled gate
-        // extension (the spawn passes `-e <path>` + `PI_ARCHIMEDES_GATE=1`;
-        // the fake's `FAKE_PI_GATE=1` mode plays the extension's part —
-        // it emits the `extension_ui_request` the extension would cause).
-        let gate_file = dir.join("pi-gate").join("gate.ts");
-        assert!(
-            gate_file.exists(),
-            "SessionManager::new installs the gate extension"
-        );
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
-
-        // The prompt + the gate answer, CONCURRENTLY (`join!` — the
-        // `send_prompt` awaits the turn's `agent_settled`, which the fake
-        // emits only AFTER the client's `confirmed: true` response; the
-        // `permission-request` event arrives mid-turn, and the pending
-        // entry is registered BEFORE the event is emitted, so
-        // `respond_permission` finds it by the time the event is seen).
-        let sid = info.session_id.clone();
-        let (reason, answer) = tokio::join!(
-            async { manager.send_prompt(&sid, "hi".to_string()).await },
-            async {
-                // The `permission-request` event (the synthesized shape —
-                // the `request` sub-object mirrors the frontend's
-                // `PermissionRequest` type; `confirm` frames offer
-                // `[Allow, Block, Don't ask again for this Space]`).
-                let mut request_id = None;
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                while std::time::Instant::now() < deadline && request_id.is_none() {
-                    if let Ok(msg) =
-                        tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-                    {
-                        let msg = msg.unwrap();
-                        if msg["event"] == "permission-request" {
-                            let request = &msg["payload"]["request"];
-                            let options: Vec<String> = request["options"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|o| o["optionId"].as_str().unwrap().to_string())
-                                .collect();
-                            assert_eq!(
-                                options,
-                                vec!["allow", "reject", "trust-space"],
-                                "confirm frames offer [Allow, Block, Don't ask again for this Space]"
-                            );
-                            assert_eq!(request["sessionId"], sid);
-                            // The tool name is in the title (the frontend's
-                            // `PermissionPrompt` renders it).
-                            let title = request["toolCall"]["title"].as_str().unwrap_or("");
-                            assert!(
-                                title.contains("bash"),
-                                "the title carries the gated tool name, got {title:?}"
-                            );
-                            request_id =
-                                Some(msg["payload"]["requestId"].as_str().unwrap().to_string());
-                        }
-                    }
-                }
-                let request_id = request_id.expect("the permission-request event was not emitted");
-                // The user allows → the fake receives `confirmed: true`
-                // and settles the turn.
-                let hit = manager
-                    .respond_permission(
-                        &sid,
-                        &request_id,
-                        PermissionOutcome::Selected {
-                            option_id: "allow".to_string(),
-                        },
-                    )
-                    .await
-                    .unwrap();
-                assert!(hit, "the pending entry must be resolved");
-                Ok::<(), RpcError>(())
-            },
-        );
-        assert!(answer.is_ok());
-        assert_eq!(
-            reason,
-            Ok(StopReason::EndTurn),
-            "the turn settles after the allowed gate"
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// (teardown) A session close clears the session's Phase 2 shared
-    /// state: the cached sudo password (keyed by the BARE session id —
-    /// the suite's `credentialCache` is cleared at every session boundary,
-    /// so a resumed session under the same id must re-prompt, not silently
-    /// reuse the pre-close credential) and the `TodoStore` entry (a
-    /// resumed session must not read the previous incarnation's todos).
+    /// state (the `sudo_password` cache + the `todo_store` entry — the
+    /// suite's `credentialCache` is cleared at every session boundary; a
+    /// stale credential must not survive the session, and a resume under
+    /// the same id must re-prompt, not silently reuse it). Ported to a
+    /// NATIVE session (the desktop is native-only).
     #[tokio::test]
     async fn session_close_clears_the_cached_sudo_password_and_the_todos() {
         let dir = temp_config_dir();
-        write_agents_json_pi(&dir, &[]);
-        let mut manager = SessionManager::new(dir.clone()).unwrap();
-        manager.set_establish_timeout(Duration::from_secs(15));
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone());
+        manager.attach_db(db.clone());
+        manager.set_catalog(native_test_catalog());
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
 
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("fake", dir.clone(), &sink)
-        })
-        .await
-        .unwrap();
+        let info = manager.start_session(dir.clone(), &sink).await.unwrap();
         let sid = info.session_id.clone();
 
         // Simulate mid-session state: a cached credential + todos for this
@@ -6896,23 +4613,15 @@ mod session_tests {
         if let Some(content) = agents_md {
             std::fs::write(space.join("AGENTS.md"), content).unwrap();
         }
-        let agents = serde_json::json!({
-            "agents": [{
-                "id": "nativetest",
-                "name": "Native Test",
-                "kind": "native",
-                "harness": {
-                    "provider": "openai-compatible",
-                    "default_model": "fake/m1",
-                    "enabled_tools": enabled_tools,
-                },
-            }]
-        });
-        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+        // The harness-level tool filter (the `Settings.enabled_tools` —
+        // `[]` = all): the settings.json replacement for the old
+        // agents.json harness fixture.
+        let settings = serde_json::json!({ "enabledTools": enabled_tools });
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
         let db = open_db(&dir);
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let factory_requests = requests.clone();
-        let mut manager = SessionManager::new(dir).unwrap();
+        let mut manager = SessionManager::new(dir);
         manager.attach_db(db.clone());
         manager.set_catalog(native_test_catalog());
         manager.set_provider_factory(move |_m: &Model| {
@@ -6934,11 +4643,10 @@ mod session_tests {
         requests: &Arc<StdMutex<Vec<ModelRequest>>>,
         sink: &Arc<dyn EventSink>,
     ) -> (SessionInfo, ModelRequest) {
-        let info = crate::test_support::run_with_retry(|| {
-            manager.start_session("nativetest", space.to_path_buf(), sink)
-        })
-        .await
-        .expect("the native session started");
+        let info = manager
+            .start_session(space.to_path_buf(), sink)
+            .await
+            .expect("the native session started");
         let sid = info.session_id.clone();
         let reason = tokio::time::timeout(Duration::from_secs(15), {
             manager.send_prompt(&sid, "hello".to_string())
@@ -7129,11 +4837,10 @@ mod session_tests {
         let marker = uuid::Uuid::new_v4().to_string();
         std::fs::write(space.join("AGENTS.md"), format!("v2 rules {marker}")).unwrap();
 
-        let resumed = crate::test_support::run_with_retry(|| {
-            manager.resume_session("nativetest", &info.session_id, space.clone(), &sink)
-        })
-        .await
-        .expect("the native resume succeeded");
+        let resumed = manager
+            .resume_session(&info.session_id, space.clone(), &sink)
+            .await
+            .expect("the native resume succeeded");
         assert_eq!(resumed.session_id, info.session_id);
         let sid = resumed.session_id.clone();
         let reason = tokio::time::timeout(Duration::from_secs(15), {
@@ -7186,16 +4893,15 @@ mod session_tests {
             .expect("the db works");
 
         // The resume FAILS (the load error is propagated as
-        // `RpcError::Io` — NOT silently swallowed into an empty
+        // `SessionError::Io` — NOT silently swallowed into an empty
         // transcript).
-        let err = crate::test_support::run_with_retry(|| {
-            manager.resume_session("nativetest", &sid, space.clone(), &sink)
-        })
-        .await
-        .expect_err("a corrupt transcript must fail the resume");
+        let err = manager
+            .resume_session(&sid, space.clone(), &sink)
+            .await
+            .expect_err("a corrupt transcript must fail the resume");
         assert!(
-            matches!(err, RpcError::Io(_)),
-            "the load error is propagated as `RpcError::Io`, got: {err:?}"
+            matches!(err, SessionError::Io(_)),
+            "the load error is propagated as `SessionError::Io`, got: {err:?}"
         );
 
         let _ = manager.close_session(&sid).await;

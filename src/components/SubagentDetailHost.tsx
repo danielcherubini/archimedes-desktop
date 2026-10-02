@@ -15,7 +15,7 @@ import { StatusIcon, STATUS_CHIP_STYLES } from "./SubagentStatusIcon";
  *   in the visible modal (the `fixed` right-side sheet);
  * - every NON-selected subagent: in a HIDDEN host (the `hidden` attribute
  *   = CSS `display: none` — the component stays MOUNTED, so the prompt
- *   cards are always rendered and never hang until the bridge timeout).
+ *   cards are always rendered and never hang until the interactive timeout).
  *
  * The modal's OUTER `div` is ALWAYS mounted (the `hidden` class toggles
  * `display: none`); the INNER content is conditionally mounted. When the

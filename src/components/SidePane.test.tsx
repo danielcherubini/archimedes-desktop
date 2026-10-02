@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import SidePane from "./SidePane";
 import { useSubagents } from "../store/subagents";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { setSidePaneCollapsed } from "../lib/sidePaneState";
@@ -12,7 +12,7 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    respondBridgeRequest: vi.fn().mockResolvedValue(undefined),
+    respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     respondPermission: vi.fn().mockResolvedValue(undefined),
   };
 });
@@ -42,8 +42,8 @@ beforeEach(() => {
   }
   usePermissions.getState().dismissSessionPrompts("sub1");
   usePermissions.getState().dismissSessionPrompts("main1");
-  useBridge.getState().dismissSession("sub1");
-  useBridge.getState().dismissSession("main1");
+  useInteractive.getState().dismissSession("sub1");
+  useInteractive.getState().dismissSession("main1");
   useSessions.setState({ messages: {}, activeSessionId: null });
 });
 
@@ -58,7 +58,7 @@ describe("SidePane (the status panel)", () => {
 
   it("renders the Todos section (label + N/M + progress) when there are open todos", () => {
     useSessions.setState({ activeSessionId: "main1" });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "a", status: "pending" },
@@ -75,7 +75,7 @@ describe("SidePane (the status panel)", () => {
 
   it("hides the Todos section when all todos are completed", () => {
     useSessions.setState({ activeSessionId: "main1" });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [
         { content: "a", status: "completed" },
@@ -101,7 +101,7 @@ describe("SidePane (the status panel)", () => {
     expect(frame.style.width).toBe("0px");
     // Open todos appear (the 0 → visible edge): the frame EXPANDS.
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [{ content: "a", status: "pending" }],
       });
@@ -111,7 +111,7 @@ describe("SidePane (the status panel)", () => {
 
   it("does NOT auto-expand on mount when todos already exist (no 0 → visible edge on the first render)", () => {
     useSessions.setState({ activeSessionId: "main1" });
-    useBridge.getState().applyTodoUpdate("main1", {
+    useInteractive.getState().applyTodoUpdate("main1", {
       source: "main",
       todos: [{ content: "a", status: "pending" }],
     });
@@ -129,7 +129,7 @@ describe("SidePane (the status panel)", () => {
     const { container } = render(<SidePane />);
     const frame = container.firstChild as HTMLElement;
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [
           { content: "a", status: "pending" },
@@ -141,7 +141,7 @@ describe("SidePane (the status panel)", () => {
     // All todos complete (the visible → 0 edge): the frame COLLAPSES (the
     // Todos section is hidden — the pane is hidden with it).
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [
           { content: "a", status: "completed" },
@@ -172,7 +172,7 @@ describe("SidePane (the status panel)", () => {
     const { container } = render(<SidePane />);
     const frame = container.firstChild as HTMLElement;
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [{ content: "a", status: "pending" }],
       });
@@ -186,7 +186,7 @@ describe("SidePane (the status panel)", () => {
     // Another todo arrives (1 → 2 — still visible, NO edge): the manual
     // collapse is respected (no re-expand).
     act(() => {
-      useBridge.getState().applyTodoUpdate("main1", {
+      useInteractive.getState().applyTodoUpdate("main1", {
         source: "main",
         todos: [
           { content: "a", status: "pending" },
@@ -274,7 +274,7 @@ describe("SidePane (the status panel)", () => {
     // in the document (the pane is clipped, not hidden).
     act(() => {
       useSubagents.getState().addSession(entry);
-      useBridge.getState().addRequest("sub1", {
+      useInteractive.getState().addRequest("sub1", {
         requestId: "r1",
         method: "password",
         source: "subagent:reviewer",

@@ -1,0 +1,400 @@
+Window State | Tauri
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+- 
+@@SCRIPT@@
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+- 
+- 
+@@STYLE@@
+@layer starlight.components{.card:where(.astro-uoylmrmj){--sl-card-border:var(--sl-color-purple);--sl-card-bg:var(--sl-color-purple-low);border:1px solid var(--sl-color-gray-5);background-color:var(--sl-color-black);flex-direction:column;gap:clamp(.5rem,.125rem + 1vw,1rem);padding:clamp(1rem,.125rem + 3vw,2.5rem)}.card:where(.astro-uoylmrmj):nth-child(4n+1){--sl-card-border:var(--sl-color-orange);--sl-card-bg:var(--sl-color-orange-low)}.card:where(.astro-uoylmrmj):nth-child(4n+3){--sl-card-border:var(--sl-color-green);--sl-card-bg:var(--sl-color-green-low)}.card:where(.astro-uoylmrmj):nth-child(4n+4){--sl-card-border:var(--sl-color-red);--sl-card-bg:var(--sl-color-red-low)}.card:where(.astro-uoylmrmj):nth-child(4n+5){--sl-card-border:var(--sl-color-blue);--sl-card-bg:var(--sl-color-blue-low)}.title:where(.astro-uoylmrmj){font-weight:600;font-size:var(--sl-text-h4);color:var(--sl-color-white);line-height:var(--sl-line-height-headings);align-items:center;gap:1rem}.card:where(.astro-uoylmrmj) .icon:where(.astro-uoylmrmj){border:1px solid var(--sl-card-border);background-color:var(--sl-card-bg);border-radius:.25rem;flex-shrink:0;padding:.2em}.card:where(.astro-uoylmrmj) .body:where(.astro-uoylmrmj){font-size:clamp(var(--sl-text-sm), calc(.5rem + 1vw), var(--sl-text-body));margin:0}}
+@layer starlight.components{.card-grid:where(.astro-ndljr3oz){grid-template-columns:100%;gap:1rem;display:grid}.card-grid:where(.astro-ndljr3oz)>*{margin-top:0!important}@media (width>=50rem){.card-grid:where(.astro-ndljr3oz){grid-template-columns:1fr 1fr;gap:1.5rem}.stagger:where(.astro-ndljr3oz){--stagger-height:5rem;padding-bottom:var(--stagger-height)}.stagger:where(.astro-ndljr3oz)>:nth-child(2n){transform:translateY(var(--stagger-height))}}}
+@layer starlight.components{svg:where(.astro-rg4rwwxs){color:var(--sl-icon-color);font-size:var(--sl-icon-size,1em);width:1em;height:1em}}
+@layer starlight.components{starlight-tabs:where(.astro-4d55wg7u){display:block}.tablist-wrapper:where(.astro-4d55wg7u){overflow-x:auto}:where(.astro-4d55wg7u)[role=tablist]{border-bottom:2px solid var(--sl-color-gray-5);padding:0;list-style:none;display:flex}.tab:where(.astro-4d55wg7u){display:flex}.tab:where(.astro-4d55wg7u)>:where(.astro-4d55wg7u)[role=tab]{--sl-tab-color-border:var(--sl-color-gray-5);line-height:var(--sl-line-height-headings);box-shadow:0 2px 0 var(--sl-tab-color-border);color:var(--sl-color-gray-3);outline-offset:var(--sl-outline-offset-inside);overflow-wrap:initial;align-items:center;gap:.5rem;padding:.275rem 1.25rem;text-decoration:none;display:flex}.tab:where(.astro-4d55wg7u) :where(.astro-4d55wg7u)[role=tab][aria-selected=true]{--sl-tab-color-border:var(--sl-color-text-accent);color:var(--sl-color-white);font-weight:600}.tablist-wrapper:where(.astro-4d55wg7u)~[role=tabpanel]{margin-top:1rem}}
+@layer starlight.components{.sl-link-card:where(.astro-p5ne6glh){border:1px solid var(--sl-color-gray-5);box-shadow:var(--sl-shadow-sm);border-radius:.5rem;grid-template-columns:1fr auto;gap:.5rem;padding:1rem;display:grid;position:relative}a:where(.astro-p5ne6glh){line-height:var(--sl-line-height-headings);text-decoration:none}a:where(.astro-p5ne6glh):before{content:"";position:absolute;inset:0}.stack:where(.astro-p5ne6glh){flex-direction:column;gap:.5rem}.title:where(.astro-p5ne6glh){color:var(--sl-color-white);font-weight:600;font-size:var(--sl-text-lg)}.description:where(.astro-p5ne6glh){color:var(--sl-color-gray-3);line-height:1.5}.icon:where(.astro-p5ne6glh){color:var(--sl-color-gray-3)}.sl-link-card:where(.astro-p5ne6glh):hover{background:var(--sl-color-gray-7,var(--sl-color-gray-6));border-color:var(--sl-color-gray-2)}.sl-link-card:where(.astro-p5ne6glh):hover .icon:where(.astro-p5ne6glh){color:var(--sl-color-white)}}
+@layer starlight.components{.sl-steps{--bullet-size:calc(var(--sl-line-height) * 1rem);--bullet-margin:.375rem;counter-reset:steps-counter var(--sl-steps-start,0);padding-inline-start:0;list-style:none}.sl-steps>li{counter-increment:steps-counter;padding-inline-start:calc(var(--bullet-size) + 1rem);min-height:calc(var(--bullet-size) + var(--bullet-margin));padding-bottom:1px;position:relative}.sl-steps>li+li{margin-top:0}.sl-steps>li:before{content:counter(steps-counter);top:0;width:var(--bullet-size);height:var(--bullet-size);line-height:var(--bullet-size);font-size:var(--sl-text-xs);text-align:center;color:var(--sl-color-white);background-color:var(--sl-color-gray-6);box-shadow:inset 0 0 0 1px var(--sl-color-gray-5);border-radius:99rem;font-weight:600;position:absolute;inset-inline-start:0}.sl-steps>li:after{--guide-width:1px;content:"";top:calc(var(--bullet-size) + var(--bullet-margin));bottom:var(--bullet-margin);width:var(--guide-width);background-color:var(--sl-color-hairline-light);position:absolute;inset-inline-start:calc((var(--bullet-size) - var(--guide-width)) / 2)}}@layer starlight.content{.sl-steps>li>:first-child{--lh:calc(1em * var(--sl-line-height));--shift-y:calc(.5 * (var(--bullet-size) - var(--lh)));transform:translateY(var(--shift-y));margin-bottom:var(--shift-y)}.sl-steps>li>:first-child:where(h1,h2,h3,h4,h5,h6){--lh:calc(1em * var(--sl-line-height-headings))}@supports (--prop:1lh){.sl-steps>li>:first-child{--lh:1lh}}}
+@layer starlight.components{.sl-link-button:where(.astro-jgaw6nip){font-size:var(--sl-text-sm);outline-offset:.25rem;border:1px solid #0000;border-radius:999rem;align-items:center;gap:.5em;padding:.4375rem 1.125rem;line-height:1.1875;text-decoration:none;display:inline-flex}.sl-link-button:where(.astro-jgaw6nip).primary{background:var(--sl-color-text-accent);border-color:var(--sl-color-text-accent);color:var(--sl-color-black)}.sl-link-button:where(.astro-jgaw6nip).primary:hover{color:var(--sl-color-black)}.sl-link-button:where(.astro-jgaw6nip).secondary{border-color:inherit;color:var(--sl-color-white)}.sl-link-button:where(.astro-jgaw6nip).minimal{color:var(--sl-color-white);padding-inline:0}.sl-link-button:where(.astro-jgaw6nip) svg{flex-shrink:0}@media (width>=50rem){.sl-link-button:where(.astro-jgaw6nip){font-size:var(--sl-text-base);padding:.9375rem 1.25rem}}.sl-markdown-content .sl-link-button:where(.astro-jgaw6nip){margin-inline-end:1rem}.sl-markdown-content .sl-link-button:where(.astro-jgaw6nip):not(:where(p *)){margin-block:1rem}}
+@@SCRIPT@@
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/service-worker.js');
+}
+@@STYLE@@
+.flex:where(.astro-pj2lbztw){font-size:var(--sl-text-sm);flex-wrap:wrap;align-items:center;display:flex}.flex:where(.astro-pj2lbztw).row{gap:.5em 1.5em}a:where(.astro-pj2lbztw){color:var(--sl-color-text);gap:.5em;text-decoration:none}a:where(.astro-pj2lbztw).flex:hover{color:var(--sl-color-text-accent);text-decoration:underline}svg:where(.astro-pj2lbztw){height:calc(var(--sl-text-sm) * 1.5)}.flex:where(.astro-pj2lbztw).api{gap:1em}.icon:where(.astro-lonjfibw){width:1rem}table:where(.astro-lonjfibw){width:100%}table:where(.astro-lonjfibw) td:where(.astro-lonjfibw){width:1px}table:where(.astro-lonjfibw) td:where(.astro-lonjfibw):last-child{width:100%}
+Skip to contentTauriGuidesReferencesBlogReleasesSearchCtrlKCancel
+@@SCRIPT@@
+	(() => {
+		const openBtn = document.querySelector('button[data-open-modal]');
+		const shortcut = openBtn?.querySelector('kbd');
+		if (!openBtn || !(shortcut instanceof HTMLElement)) return;
+		const platformKey = shortcut.querySelector('kbd');
+		if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+			platformKey.textContent = '⌘';
+			openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+		}
+		shortcut.style.display = '';
+	})();
+- Guides
+- References
+- Blog
+@@SCRIPT@@
+		(() => {
+			try {
+				if (!matchMedia('(min-width: 50em)').matches) return;
+				/** @type {HTMLElement | null} */
+				const target = document.querySelector('sl-sidebar-state-persist');
+				const state = JSON.parse(sessionStorage.getItem('sl-sidebar-state') || '0');
+				if (!target || !state || target.dataset.hash !== state.hash) return;
+				window._starlightScrollRestore = state.scroll;
+				customElements.define(
+					'sl-sidebar-restore',
+					class SidebarRestore extends HTMLElement {
+						connectedCallback() {
+							try {
+								const idx = parseInt(this.dataset.index || '');
+								const details = this.closest('details');
+								if (details && typeof state.open[idx] === 'boolean') details.open = state.open[idx];
+							} catch {}
+						}
+					}
+				);
+			} catch {}
+		})();
+- Quick Start
+- What is Tauri?
+- Prerequisites
+- Create a Project
+- Project Structure
+- Frontend Configuration
+- Overview
+- Leptos
+- Next.js
+- Nuxt
+- Qwik
+- SvelteKit
+- Trunk
+- Vite
+- Upgrade & Migrate
+- Overview
+- Upgrade from Tauri 1.0
+- Upgrade from Tauri 2.0 Beta
+- Core Concepts
+- Overview
+- Tauri Architecture
+- Process Model
+- App Size
+- Inter-Process Communication
+- Overview
+- Brownfield Pattern
+- Isolation Pattern
+- Security
+- Overview
+- Permissions
+- Command Scopes
+- Capabilities
+- Asset protocol scope
+- Content Security Policy (CSP)
+- HTTP Headers
+- Tauri Ecosystem Security
+- Application Lifecycle Threats
+- Future Work
+- Runtime Authority
+- Develop
+- Overview
+- Configuration Files
+- Calling Rust from the Frontend
+- Calling the Frontend from Rust
+- Embedding Additional Files
+- Embedding External Binaries
+- State Management
+- Updating Dependencies
+- App Icons
+- Debug
+- Overview
+- CrabNebula DevToolsNew
+- Linux Graphics Issues
+- Debug in Neovim
+- Debug in JetBrains IDEs
+- Debug in VS Code
+- Plugins
+- Overview
+- Mobile Plugin Development
+- Tests
+- Overview
+- Mock Tauri APIs
+- WebDriver
+- Overview
+- Manual setup
+- Continuous Integration
+- Example
+- Selenium
+- WebdriverIO
+- Distribute
+- Overview
+- App Store
+- AppImage
+- AUR
+- CrabNebula Cloud
+- Debian
+- DMG
+- Flathub
+- Google Play
+- macOS Application Bundle
+- Microsoft Store
+- RPM
+- Snapcraft
+- Windows Installer
+- Sign
+- macOS
+- Windows
+- Linux
+- iOS
+- Android
+- Pipelines
+- CrabNebula Cloud
+- GitHub
+- Learn
+- Overview
+- Node.js as a sidecar
+- Splashscreen
+- System Tray
+- Window Customization
+- Multi-Window on Mobile
+- File Associations on Mobile
+- Security
+- Using Plugin Permissions
+- Capabilities for Different Windows and Platforms
+- Writing Plugin Permissions
+- Window Menu
+- Plugins
+- Overview
+- Autostart
+- Barcode Scanner
+- Biometric
+- Command Line Interface (CLI)
+- Clipboard
+- Deep Linking
+- Dialog
+- File System
+- Geolocation
+- Global Shortcut
+- Haptics
+- HTTP Client
+- Localhost
+- Logging
+- NFC
+- Notifications
+- Opener
+- OS Information
+- Persisted Scope
+- Positioner
+- Process
+- Shell
+- Single Instance
+- SQL
+- Store
+- Stronghold
+- Updater
+- Upload
+- Websocket
+- Window State
+- About
+- About Tauri
+- The Tauri Book
+- Tauri Governance
+- Tauri Philosophy
+- Trademark Guidelines
+@@SCRIPT@@
+		(() => {
+			const scroller = document.getElementById('starlight__sidebar');
+			if (!window._starlightScrollRestore || !scroller) return;
+			scroller.scrollTop = window._starlightScrollRestore;
+			delete window._starlightScrollRestore;
+		})();
+	GitHubDiscordTwitterBlueskyMastodonRSSSelect languageEnglishFrançaisEspañol简体中文日本語German
+## Window StateGitHubnpmcrates.ioAPI Reference:
+Save window positions and sizes and restore them when the app is reopened.
+## Supported PlatformsSection titled “Supported Platforms”
+This plugin requires a Rust version of at least 1.77.2
+PlatformLevelNoteswindows<svg aria-label="Full support" alt="Full support" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"
+  ><path
+    fill="currentColor"
+    d="m10.562 15.908l6.396-6.396l-.708-.708l-5.688 5.688l-2.85-2.85l-.708.708zM12.003 21q-1.866 0-3.51-.708q-1.643-.709-2.859-1.924t-1.925-2.856T3 12.003t.709-3.51Q4.417 6.85 5.63 5.634t2.857-1.925T11.997 3t3.51.709q1.643.708 2.859 1.922t1.925 2.857t.709 3.509t-.708 3.51t-1.924 2.859t-2.856 1.925t-3.509.709"
+  ></svg
+>linux<svg aria-label="Full support" alt="Full support" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"
+  ><path
+    fill="currentColor"
+    d="m10.562 15.908l6.396-6.396l-.708-.708l-5.688 5.688l-2.85-2.85l-.708.708zM12.003 21q-1.866 0-3.51-.708q-1.643-.709-2.859-1.924t-1.925-2.856T3 12.003t.709-3.51Q4.417 6.85 5.63 5.634t2.857-1.925T11.997 3t3.51.709q1.643.708 2.859 1.922t1.925 2.857t.709 3.509t-.708 3.51t-1.924 2.859t-2.856 1.925t-3.509.709"
+  ></svg
+>macos<svg aria-label="Full support" alt="Full support" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"
+  ><path
+    fill="currentColor"
+    d="m10.562 15.908l6.396-6.396l-.708-.708l-5.688 5.688l-2.85-2.85l-.708.708zM12.003 21q-1.866 0-3.51-.708q-1.643-.709-2.859-1.924t-1.925-2.856T3 12.003t.709-3.51Q4.417 6.85 5.63 5.634t2.857-1.925T11.997 3t3.51.709q1.643.708 2.859 1.922t1.925 2.857t.709 3.509t-.708 3.51t-1.924 2.859t-2.856 1.925t-3.509.709"
+  ></svg
+>android<svg aria-label="No support" alt="No support" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"
+  ><path
+    fill="currentColor"
+    d="m12 12.708l-5.246 5.246q-.14.14-.344.15t-.364-.15t-.16-.354t.16-.354L11.292 12L6.046 6.754q-.14-.14-.15-.344t.15-.364t.354-.16t.354.16L12 11.292l5.246-5.246q.14-.14.345-.15q.203-.01.363.15t.16.354t-.16.354L12.708 12l5.246 5.246q.14.14.15.345q.01.203-.15.363t-.354.16t-.354-.16z"
+  ></svg
+>
+ios<svg aria-label="No support" alt="No support" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"
+  ><path
+    fill="currentColor"
+    d="m12 12.708l-5.246 5.246q-.14.14-.344.15t-.364-.15t-.16-.354t.16-.354L11.292 12L6.046 6.754q-.14-.14-.15-.344t.15-.364t.354-.16t.354.16L12 11.292l5.246-5.246q.14-.14.345-.15q.203-.01.363.15t.16.354t-.16.354L12.708 12l5.246 5.246q.14.14.15.345q.01.203-.15.363t-.354.16t-.354-.16z"
+  ></svg
+>
+## SetupSection titled “Setup”
+Install the window-state plugin to get started.
+- Automatic
+- ManualUse your project’s package manager to add the dependency: 
+@@SCRIPT@@
+(() => {
+	class StarlightTabsRestore extends HTMLElement {
+		connectedCallback() {
+			const starlightTabs = this.closest('starlight-tabs');
+			if (!(starlightTabs instanceof HTMLElement) || typeof localStorage === 'undefined') return;
+			const syncKey = starlightTabs.dataset.syncKey;
+			if (!syncKey) return;
+			const label = localStorage.getItem(`starlight-synced-tabs__${syncKey}`);
+			if (!label) return;
+			const tabs = [...starlightTabs?.querySelectorAll('[role="tab"]')];
+			const tabIndexToRestore = tabs.findIndex(
+				(tab) => tab instanceof HTMLAnchorElement && tab.textContent?.trim() === label
+			);
+			const panels = starlightTabs?.querySelectorAll(':scope > [role="tabpanel"]');
+			const newTab = tabs[tabIndexToRestore];
+			const newPanel = panels[tabIndexToRestore];
+			if (tabIndexToRestore < 1 || !newTab || !newPanel) return;
+			tabs[0]?.setAttribute('aria-selected', 'false');
+			tabs[0]?.setAttribute('tabindex', '-1');
+			panels?.[0]?.setAttribute('hidden', 'true');
+			newTab.removeAttribute('tabindex');
+			newTab.setAttribute('aria-selected', 'true');
+			newPanel.removeAttribute('hidden');
+		}
+	}
+	customElements.define('starlight-tabs-restore', StarlightTabsRestore);
+})()
+- npm
+- yarn
+- pnpm
+- deno
+- bun
+- cargo
+- 
+- 
+Run the following command in the `src-tauri` folder to add the plugin to the project’s dependencies in `Cargo.toml`:
+- 
+```
+`cargo add tauri-plugin-window-state --target 'cfg(any(target_os = "macos", windows, target_os = "linux"))'````
+- 
+Modify `lib.rs` to initialize the plugin:
+src-tauri/src/lib.rs
+```
+`#[cfg_attr(mobile, tauri::mobile_entry_point)]pub fn run() {    tauri::Builder::default()        .setup(|app| {            #[cfg(desktop)]            app.handle().plugin(tauri_plugin_window_state::Builder::default().build());            Ok(())        })        .run(tauri::generate_context!())        .expect("error while running tauri application");}````
+- 
+Install the JavaScript Guest bindings using your preferred JavaScript package manager:
+- npm
+- yarn
+- pnpm
+- deno
+- bun
+```
+`npm install @tauri-apps/plugin-window-state````
+```
+`yarn add @tauri-apps/plugin-window-state````
+```
+`pnpm add @tauri-apps/plugin-window-state````
+```
+`deno add npm:@tauri-apps/plugin-window-state````
+```
+`bun add @tauri-apps/plugin-window-state````
+## UsageSection titled “Usage”
+After adding the window-state plugin, all windows will remember their state when the app is being closed and will restore to their previous state on the next launch.
+You can also access the window-state plugin in both JavaScript and Rust.
+TipRestoring the state will happen after window creation,
+so to prevent the window from flashing, you can set `visible` to `false` when creating the window,
+the plugin will show the window when it restores the state
+## JavaScriptSection titled “JavaScript”
+You can use `saveWindowState` to manually save the window state:
+```
+`import { saveWindowState, StateFlags } from '@tauri-apps/plugin-window-state';// when using `"withGlobalTauri": true`, you may use// const { saveWindowState, StateFlags } = window.__TAURI__.windowState;
+saveWindowState(StateFlags.ALL);````
+Similarly you can manually restore a window’s state from disk:
+```
+`import {  restoreStateCurrent,  StateFlags,} from '@tauri-apps/plugin-window-state';// when using `"withGlobalTauri": true`, you may use// const { restoreStateCurrent, StateFlags } = window.__TAURI__.windowState;
+restoreStateCurrent(StateFlags.ALL);````
+## RustSection titled “Rust”
+You can use the `save_window_state()` method exposed by the `AppHandleExt` trait:
+```
+`use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+// `tauri::AppHandle` now has the following additional methodapp.save_window_state(StateFlags::all()); // will save the state of all open windows to disk````
+Similarly you can manually restore a window’s state from disk using the `restore_state()` method exposed by the `WindowExt` trait:
+```
+`use tauri_plugin_window_state::{WindowExt, StateFlags};
+// all `Window` types now have the following additional methodwindow.restore_state(StateFlags::all()); // will restore the window's state from disk````
+## PermissionsSection titled “Permissions”
+By default all potentially dangerous plugin commands and scopes are blocked and cannot be accessed. You must modify the permissions in your `capabilities` configuration to enable these.
+See the Capabilities Overview for more information and the step by step guide to use plugin permissions.
+src-tauri/capabilities/default.json
+```
+`{  "permissions": [    ...,    "window-state:default",  ]}````
+## Default Permission
+This permission set configures what kind of
+operations are available from the window state plugin.
+## Granted Permissions
+All operations are enabled by default.
+## This default permission set includes the following:
+- `allow-filename`
+- `allow-restore-state`
+- `allow-save-window-state`
+## Permission Table
+Identifier
+Description
+`window-state:allow-filename`
+Enables the filename command without any pre-configured scope.
+`window-state:deny-filename`
+Denies the filename command without any pre-configured scope.
+`window-state:allow-restore-state`
+Enables the restore_state command without any pre-configured scope.
+`window-state:deny-restore-state`
+Denies the restore_state command without any pre-configured scope.
+`window-state:allow-save-window-state`
+Enables the save_window_state command without any pre-configured scope.
+`window-state:deny-save-window-state`
+Denies the save_window_state command without any pre-configured scope.
+Edit pageLast updated: Apr 11, 2025Previous
+WebsocketNext
+About TauriSupport on Open CollectiveSponsor on GitHub&copy; 2026 Tauri Contributors. CC-BY / MIT

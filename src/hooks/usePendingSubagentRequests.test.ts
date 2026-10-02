@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useSubagents } from "../store/subagents";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { usePendingSubagentRequests } from "./usePendingSubagentRequests";
 
@@ -17,8 +17,8 @@ beforeEach(() => {
   for (const id of Object.keys(useSubagents.getState().entries)) {
     useSubagents.getState().dismiss(id);
   }
-  useBridge.getState().dismissSession("sub1");
-  useBridge.getState().dismissSession("main1");
+  useInteractive.getState().dismissSession("sub1");
+  useInteractive.getState().dismissSession("main1");
   usePermissions.getState().dismissSessionPrompts("sub1");
   usePermissions.getState().dismissSessionPrompts("main1");
 });
@@ -31,7 +31,7 @@ describe("usePendingSubagentRequests", () => {
 
   it("returns 1 with a subagent entry and a pending ask request for its session", () => {
     useSubagents.getState().addSession(entry);
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "ask",
       source: "subagent:reviewer",
@@ -43,13 +43,13 @@ describe("usePendingSubagentRequests", () => {
 
   it("returns 2 with a pending ask and a pending password request", () => {
     useSubagents.getState().addSession(entry);
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "ask",
       source: "subagent:reviewer",
       params: { question: "which library?" },
     });
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r2",
       method: "password",
       source: "subagent:reviewer",
@@ -61,7 +61,7 @@ describe("usePendingSubagentRequests", () => {
 
   it("returns 0 after removeRequest / removePrompt settle the requests", () => {
     useSubagents.getState().addSession(entry);
-    useBridge.getState().addRequest("sub1", {
+    useInteractive.getState().addRequest("sub1", {
       requestId: "r1",
       method: "confirm",
       source: "subagent:reviewer",
@@ -77,7 +77,7 @@ describe("usePendingSubagentRequests", () => {
     // pick up the settled request (a bare `getState()` mutation outside
     // `act` would leave `result.current` stale).
     act(() => {
-      useBridge.getState().removeRequest("sub1", "r1");
+      useInteractive.getState().removeRequest("sub1", "r1");
     });
     expect(result.current).toBe(1);
     act(() => {
@@ -87,7 +87,7 @@ describe("usePendingSubagentRequests", () => {
   });
 
   it("does NOT count requests for sessions with no subagent entry (the main session)", () => {
-    useBridge.getState().addRequest("main1", {
+    useInteractive.getState().addRequest("main1", {
       requestId: "r1",
       method: "ask",
       source: "main",

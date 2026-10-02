@@ -1,53 +1,29 @@
-//! Errors for the session layer: `RpcError` is the only error type (the
-//! protocol layer's error type died with the pi-RPC swap; the read-only
-//! pre-approval `FsBackend` has its own local `FsError` in `fs_backend.rs`).
+//! Errors for the session layer: `SessionError` is the only error type
+//! (the read-only pre-approval `FsBackend` has its own local `FsError`
+//! in `fs_backend.rs`).
 
 use serde::Serialize;
-/// Errors surfaced by the pi RPC session layer.
+/// Errors surfaced by the session layer.
 ///
-/// Derives `Serialize` so it can cross the Tauri IPC boundary as a command
-/// error (the same set of derives + `Display`/`Error` impls the protocol
-/// error type had, so it replaces it in command signatures).
+/// Derives `Serialize` so it can cross the Tauri IPC boundary as a
+/// command error.
 #[derive(Debug, thiserror::Error, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RpcError {
-    /// The pi process could not be spawned.
-    #[error("failed to spawn pi: {0}")]
-    Spawn(String),
-
-    /// A stdin/stdout read-write failure.
+pub enum SessionError {
+    /// A filesystem read-write failure.
     #[error("i/o error: {0}")]
     Io(String),
 
-    /// The child died while a command was in flight (`Some(code)` = the exit
-    /// code, `None` = the stream ended without a reaped code).
-    #[error("pi process exited: {0:?}")]
-    ProcessExited(Option<i32>),
-
-    /// The establish (session start / resume) did not complete in time —
-    /// replaces the protocol layer's initialize-failed error (the kept
-    /// establish-timeout mechanism).
-    #[error("establish timeout: {detail}")]
-    EstablishTimeout { detail: String },
-
-    /// A response arrived with `success: false`.
+    /// A command failed.
     #[error("command failed: {error}")]
     Command { error: String },
-
-    /// A malformed JSON line on stdout (the stream is untrustworthy; the
-    /// reader fails all in-flight sends and stops).
-    #[error("malformed JSON on stdout: {0}")]
-    Parse(String),
-
-    /// The requested `agent_id` is not present in the registry.
-    #[error("unknown agent: {id}")]
-    UnknownAgent { id: String },
 
     /// No live session with the given id exists.
     #[error("unknown session: {id}")]
     UnknownSession { id: String },
 
-    /// The stored session cannot be resumed (no stored pi session file).
+    /// The stored session cannot be resumed (a stored row with
+    /// `loadSession: false` has no native transcript to load).
     #[error("session {id} cannot be resumed")]
     NotResumable { id: String },
 

@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { closeSession, deleteSession, deleteSpace, listSkills, setSessionArchived, setSpaceTrusted, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
-import { useBridge } from "../store/bridge";
+import { useInteractive } from "../store/interactive";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import SpacesList from "./SpacesList";
 
@@ -12,30 +12,27 @@ vi.mock("../lib/tauri", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../lib/tauri");
   return {
     ...actual,
-    // `NewSpaceDialog` fetches the settings for its default-agent precedence
-    // (the dialog's `.catch` keeps a rejection from going unhandled, but the
-    // mock makes the dialog's effective selection deterministic here): a full
-    // `AppSettings` with `defaultAgent: null` (the `agents[0]` behavior holds).
+    // `AppSettings` document (a full shape — the `AppSettings` interface
+    // mirrors the Rust `Settings` struct exactly).
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",
       paneLayout: {},
-      defaultAgent: null,
       defaultTrustNewSpaces: false,
       defaultModel: null,
+      defaultThinkingLevel: null,
+      enabledTools: [],
       providers: [],
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
     }),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "new1",
-      agentId: "pi",
       cwd: "/tmp/ws",
       capabilities: { loadSession: false },
       archived: false,
     }),
-    listAgents: vi.fn().mockResolvedValue([{ id: "pi", name: "pi" }]),
     respondPermission: vi.fn(),
-    respondBridgeRequest: vi.fn(),
+    respondInteractiveRequest: vi.fn(),
     loadHistory: vi.fn().mockResolvedValue([]),
     closeSession: vi.fn().mockRejectedValue(new Error("boom")),
     setSpaceTrusted: vi.fn().mockResolvedValue(undefined),
@@ -78,11 +75,11 @@ function seed(): void {
       { path: "/tmp/beta", createdAt: now, lastOpenedAt: now, trusted: true },
     ],
     sessions: [
-      { sessionId: "s1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+      { sessionId: "s1", cwd: "/tmp/alpha", capabilities: {}, archived: false },
     ],
     historySessions: [
-      { sessionId: "h1", agentId: "pi", cwd: "/tmp/alpha", capabilities: {}, archived: false },
-      { sessionId: "h2", agentId: "pi", cwd: "/tmp/beta", capabilities: {}, archived: false },
+      { sessionId: "h1", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+      { sessionId: "h2", cwd: "/tmp/beta", capabilities: {}, archived: false },
     ],
     activeSessionId: "s1",
     closeReasons: {},
@@ -96,7 +93,7 @@ function seed(): void {
     stopReasons: {},
   });
   usePermissions.setState({ prompts: {} });
-  useBridge.setState({
+  useInteractive.setState({
     requests: {},
     todos: {},
     agentState: {},
@@ -149,7 +146,6 @@ describe("SpacesList", () => {
       sessions: [
         {
           sessionId: "s-orphan",
-          agentId: "pi",
           cwd: "/tmp/gamma",
           capabilities: {},
           archived: false,
@@ -183,7 +179,7 @@ describe("SpacesList", () => {
       screen.getByRole("button", { name: /New session in beta/ }),
     );
     await waitFor(() =>
-      expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/beta"),
+      expect(mockedStartSession).toHaveBeenCalledWith("/tmp/beta"),
     );
   });
 
@@ -476,8 +472,8 @@ describe("SpacesList", () => {
     expect(row!.textContent).not.toContain("now");
   });
 
-  it("renders the Waiting pill for a pending bridge ask/confirm/password request", () => {
-    useBridge.setState({
+  it("renders the Waiting pill for a pending interactive ask/confirm/password request", () => {
+    useInteractive.setState({
       requests: {
         h1: [
           {
@@ -570,7 +566,7 @@ describe("SpacesList", () => {
       // `contenteditable="false"` is NOT editable: the shortcut fires.
       fireEvent.keyDown(div, { key: "n", metaKey: true });
       await waitFor(() =>
-        expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/alpha"),
+        expect(mockedStartSession).toHaveBeenCalledWith("/tmp/alpha"),
       );
     } finally {
       div.remove();
@@ -582,13 +578,13 @@ describe("SpacesList", () => {
     // No modifier: ignored.
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "n" }));
     expect(mockedStartSession).not.toHaveBeenCalled();
-    // ⌘N: the active session's view owns `s1` (agentId `pi`, cwd
-    // `/tmp/alpha`) → `startSession("pi", "/tmp/alpha")`.
+    // ⌘N: the active session's view owns `s1` (cwd `/tmp/alpha`) →
+    // `startSession("/tmp/alpha")` (a native session — no agent to choose).
     window.dispatchEvent(
       new KeyboardEvent("keydown", { key: "n", metaKey: true }),
     );
     await waitFor(() =>
-      expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/alpha"),
+      expect(mockedStartSession).toHaveBeenCalledWith("/tmp/alpha"),
     );
     // Ctrl+N (uppercase key): the same handler.
     window.dispatchEvent(
@@ -658,7 +654,6 @@ describe("SpacesList (archive, ADR 0016)", () => {
   ): void {
     const row = {
       sessionId: id,
-      agentId: "pi",
       cwd: "/tmp/alpha",
       capabilities: {},
       archived: true,
@@ -776,10 +771,9 @@ describe("SpacesList (archive, ADR 0016)", () => {
     render(<SpacesList />);
     fireEvent.click(screen.getByRole("button", { name: /New Session/ }));
     // The `activeView` predicate matches via `archivedSessionIds` → the
-    // hook starts in that space (no live/stored session → the registry
-    // default agent `pi`).
+    // hook starts a native session in that space.
     await waitFor(() =>
-      expect(mockedStartSession).toHaveBeenCalledWith("pi", "/tmp/alpha"),
+      expect(mockedStartSession).toHaveBeenCalledWith("/tmp/alpha"),
     );
     expect(screen.queryByText("New space")).toBeNull();
   });

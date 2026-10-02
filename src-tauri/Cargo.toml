@@ -5,9 +5,9 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
-# Two binaries exist (the app + the dev-only `fake_pi` fixture — a
-# stand-in for the real `pi --mode rpc` agent in integration tests); tell
-# cargo which one `cargo run` (and thus `tauri dev`) should launch.
+# A single binary (the app — the desktop is native-only, the external
+# `pi` path is gone; the dev-only `fake_pi` test fixture is deleted);
+# tell cargo which one `cargo run` (and thus `tauri dev`) should launch.
 default-run = "archimedes"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -72,31 +72,16 @@ tauri = { version = "2", features = ["test"] }
 # Mock HTTP server for the `Provider` integration tests (canned SSE
 # streams, canned status codes).
 wiremock = "0.6"
-# Temp dirs for the `ModelCatalog` seeding tests (Task 5) — the
-# `~/.pi/agent` fixture is written into a temp dir (pointing `seed_from`
-# at a real `HOME` would be racy).
+# Temp dirs for the `skills` / `settings` / `mcp` tests (the config
+# fixtures are written into a temp dir — pointing them at a real `HOME`
+# would be racy).
 tempfile = "3"
 
-# Platform-gated bridge deps: `libc` is needed on ALL unix platforms — Linux
-# for the bridge's `SO_PEERCRED`/`ucred` peer verification (those specific
-# uses stay `#[cfg(target_os = "linux")]`-gated) and macOS because
-# `run_sudo_real`'s `#[cfg(unix)]` `setpgid`/`kill` (process-group kill) code
-# compiles there too (the bridge is inert on macOS, but the code must still
-# COMPILE). The `windows` crate (named-pipe client pid + Toolhelp) is only on
-# Windows — a top-level dep would pull each into the other platform's build.
+# `libc` is needed on ALL unix platforms: `RealSudoRunner`'s
+# `#[cfg(unix)]` `setpgid`/`kill` (process-group kill) code compiles on
+# every unix target.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-# The `windows` crate features are for the `TODO(windows)` named-pipe
-# implementation in `bridge.rs` (the client pid via
-# `GetNamedPipeClientProcessId` — `Win32_System_Pipes`; the Toolhelp
-# parent walk — `Win32_System_Diagnostics_ToolHelp`; the
-# `FILE_FLAG_FIRST_PIPE_INSTANCE` pre-squat detection —
-# `Win32_Storage_FileSystem`): the v1 Windows stub uses NONE of them,
-# but the features are kept so the implementation doesn't need a
-# Cargo.toml change.
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
