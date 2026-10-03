@@ -689,6 +689,7 @@ pub(crate) fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> 
                         .collect();
                     (!tools.is_empty()).then_some(tools)
                 }),
+            ..Default::default()
         },
     ))
 }

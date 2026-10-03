@@ -4,6 +4,7 @@ import SettingsPage from "./SettingsPage";
 import {
   authMcpServer,
   getSettings,
+  listAgentDefinitions,
   listModels,
   saveSettings,
   testMcpServer,
@@ -28,6 +29,7 @@ const baseSettings: AppSettings = {
   },
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
   defaultThinkingLevels: {},
+  subagentModels: {},
 };
 
 vi.mock("../../lib/tauri", async () => {
@@ -51,7 +53,11 @@ vi.mock("../../lib/tauri", async () => {
       },
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
+      subagentModels: {},
     }),
+    // The discovered agent definitions (ADR 0023 — the Subagents section's
+    // data source): empty by default (the tests override per case).
+    listAgentDefinitions: vi.fn().mockResolvedValue([]),
     // The effective catalog (Task 2's `ModelDto` camelCase shape): two
     // models advertising OVERLAPPING thinking levels (the union is
     // deduped in FIRST-SEEN order — `medium` / `high` appear in both;
@@ -113,11 +119,15 @@ async function loaded(): Promise<void> {
 }
 
 /** Navigate to a section (click its sidebar button) and wait for it. */
-async function go(section: "Appearance" | "Providers" | "MCP"): Promise<void> {
+async function go(section: "Appearance" | "Providers" | "Subagents" | "MCP"): Promise<void> {
   fireEvent.click(screen.getByRole("button", { name: section }));
   if (section === "Appearance") await screen.findByText("Theme");
   else if (section === "Providers")
     await screen.findByRole("button", { name: "Add provider" });
+  // The Subagents card has no always-present button/heading (an empty
+  // agents list renders a nearly empty card) — the per-test `findByText`
+  // on a row handles the wait.
+  else if (section === "Subagents") return;
   // The "Add server" button is always in the MCP section (below the card).
   else await screen.findByRole("button", { name: "Add server" });
 }
@@ -214,6 +224,7 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
       ...baseSettings,
       defaultModel: "tama/Qwen3.8",
       defaultThinkingLevels: { "tama/Qwen3.8": "xhigh" },
+      subagentModels: { scout: "tama/m1" },
     });
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -232,6 +243,10 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     expect(saved.defaultThinkingLevels).toEqual({
       "another-name/Qwen3.8": "xhigh",
     });
+    // (ADR 0023) The per-agent subagent overrides ride along re-mapped by
+    // VALUE (the agent name is the key — the model ref is the value; a
+    // non-matching value stays untouched).
+    expect(saved.subagentModels).toEqual({ scout: "another-name/m1" });
     // The discovery re-runs under the new id.
     expect(listModels).toHaveBeenCalledWith("another-name");
   });
@@ -663,5 +678,296 @@ describe("SettingsPage (the MCP section — ADR 0019)", () => {
       { url: "https://auth.example/mcp", auth: "oauth" },
       "oauth_srv",
     );
+  });
+});
+
+describe("SettingsPage (the Subagents section — ADR 0023)", () => {
+  it("renders_the_subagents_section_rows_for_discovered_agents", async () => {
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: {},
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      { name: "builder", description: "", model: null, scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    // One row per discovered agent: the name + the description (with the
+    // file's model — read-only; `null` = the agent inherits the parent
+    // model).
+    expect(await screen.findByText("scout")).toBeTruthy();
+    expect(screen.getByText("builder")).toBeTruthy();
+    expect(screen.getByText(/Fast recon · file: p\/m1/)).toBeTruthy();
+    expect(
+      screen.getByText(/No description · file: — \(inherits parent model\)/),
+    ).toBeTruthy();
+    // Both selects default to "File value (no override)" (the placeholder —
+    // no override stored).
+    const scoutTrigger = screen.getByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    expect(scoutTrigger.textContent).toContain("File value (no override)");
+    const builderTrigger = screen.getByRole("combobox", {
+      name: "Subagent model for builder",
+    });
+    expect(builderTrigger.textContent).toContain("File value (no override)");
+  });
+
+  it("a_stale_override_value_renders_as_its_own_option", async () => {
+    // A stored override whose model key is no longer in the catalog (a
+    // renamed/removed provider): the select must show the ACTUAL stored
+    // value as its own (disabled) option — NOT fall back to the "File
+    // value (no override)" placeholder (which would lie about the stored
+    // value — the `storedLevelOutsideUnion` pattern).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { scout: "gone/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    // The trigger displays the stored value, not the placeholder.
+    expect(trigger.textContent).toContain("gone/m1");
+    expect(trigger.textContent).not.toContain("File value (no override)");
+    fireEvent.click(trigger);
+    // The raw stored value is offered (alongside the catalog) — and it is
+    // the SELECTED option; disabled (it is not a live catalog model).
+    const stale = await screen.findByRole("option", { name: "gone/m1" });
+    expect(stale.getAttribute("data-state")).toBe("checked");
+    expect(stale.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("selecting_a_model_saves_the_subagent_models_entry", async () => {
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    fireEvent.click(trigger);
+    // Pick a catalog model (the `listModels` fixture's first model).
+    fireEvent.click(await screen.findByRole("option", { name: "tama/Qwen3.8" }));
+    // Immediate save of the COMPLETE document: `subagentModels` gains the
+    // entry; every other field is the loaded document, unchanged.
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith({
+        ...baseSettings,
+        subagentModels: { scout: "tama/Qwen3.8" },
+      }),
+    );
+  });
+
+  it("selecting_file_value_deletes_the_subagent_models_entry", async () => {
+    // The loaded document carries an override; picking "File value (no
+    // override)" deletes the key (the agent falls back to its file's
+    // model).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { scout: "p/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    expect(trigger.textContent).toContain("p/m1");
+    fireEvent.click(trigger);
+    fireEvent.click(
+      await screen.findByRole("option", { name: "File value (no override)" }),
+    );
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ subagentModels: {} }),
+      ),
+    );
+    const saved =
+      vi.mocked(saveSettings).mock.calls[
+        vi.mocked(saveSettings).mock.calls.length - 1
+      ]?.[0] as AppSettings;
+    // The key is ABSENT (not `null` / `""` — deleted).
+    expect("scout" in saved.subagentModels).toBe(false);
+    expect(saved.subagentModels).toEqual({});
+  });
+
+  it("an_orphaned_override_renders_with_a_remove_button", async () => {
+    // The loaded document carries an override for an agent that is no
+    // longer discovered (its file was removed/renamed): a muted row with
+    // a remove button — the ONLY cleanup path (no confirm: a stale entry
+    // is inert).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { ghost: "p/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    // The orphan row: the muted name + the stale copy.
+    expect(await screen.findByText("ghost")).toBeTruthy();
+    expect(screen.getByText("No longer discovered (stale override)"))
+      .toBeTruthy();
+    // The discovered agent is still listed (the orphan is ADDITIONAL).
+    expect(screen.getByText("scout")).toBeTruthy();
+    // Remove: deletes the key (immediate save, the complete document).
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove subagent override ghost" }),
+    );
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ subagentModels: {} }),
+      ),
+    );
+    const saved =
+      vi.mocked(saveSettings).mock.calls[
+        vi.mocked(saveSettings).mock.calls.length - 1
+      ]?.[0] as AppSettings;
+    expect("ghost" in saved.subagentModels).toBe(false);
+  });
+
+  it("a_mixed_case_stored_override_renders_in_the_row", async () => {
+    // The backend resolves `subagentModels` keys case-insensitively (`eq_ignore_ascii_case`),
+    // so a hand-edited key `"Scout"` for a discovered agent `scout` IS the stored
+    // override — the row must show the ACTUAL stored value (here no longer in the
+    // catalog → its own disabled option), NOT the "File value (no override)" placeholder
+    // (an exact-case lookup would misrepresent the saved state).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { Scout: "gone/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    // The trigger displays the stored value, not the placeholder.
+    expect(trigger.textContent).toContain("gone/m1");
+    expect(trigger.textContent).not.toContain("File value (no override)");
+    fireEvent.click(trigger);
+    // The raw stored value is offered (alongside the catalog) — and it is
+    // the SELECTED option; disabled (it is not a live catalog model).
+    const stale = await screen.findByRole("option", { name: "gone/m1" });
+    expect(stale.getAttribute("data-state")).toBe("checked");
+    expect(stale.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("a_case_variant_key_is_not_treated_as_an_orphan", async () => {
+    // The orphan filter matches case-insensitively, so a hand-edited key
+    // `"Ghost"` for a discovered agent `ghost` is NOT an orphan (it is the
+    // agent's stored override) — and the agent's row shows the stored value
+    // (no longer in the catalog → its own disabled option), not the placeholder.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { Ghost: "p/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "ghost", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    // No orphan row for the case-variant key (it matches the def).
+    expect(screen.queryByText("Ghost")).toBeNull();
+    expect(
+      screen.queryByText("No longer discovered (stale override)"),
+    ).toBeNull();
+    // The def's row shows the stored value (the case-insensitive lookup
+    // finds it — an exact-case lookup would show the placeholder).
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for ghost",
+    });
+    expect(trigger.textContent).toContain("p/m1");
+    expect(trigger.textContent).not.toContain("File value (no override)");
+  });
+
+  it("saving_drops_case_variant_twin_keys", async () => {
+    // A case-variant twin (`"Scout"` alongside `"scout"` — a pre-fix save could
+    // create one): picking a model must leave EXACTLY ONE key for the agent
+    // (the canonical `def.name` key) — the case-variant twin is dropped, so the
+    // backend's case-insensitive `.find` never picks between twins in
+    // nondeterministic HashMap iteration order.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { Scout: "gone/m1", scout: "p/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for scout",
+    });
+    // Pick a different catalog model.
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("option", { name: "openai/GPT-5" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ subagentModels: { scout: "openai/GPT-5" } }),
+      ),
+    );
+    const saved =
+      vi.mocked(saveSettings).mock.calls[
+        vi.mocked(saveSettings).mock.calls.length - 1
+      ]?.[0] as AppSettings;
+    // EXACTLY ONE key for the agent — the canonical `def.name` key (no
+    // `Scout` twin left behind).
+    expect(Object.keys(saved.subagentModels)).toEqual(["scout"]);
+    expect("Scout" in saved.subagentModels).toBe(false);
+  });
+
+  it("a_non_ascii_case_variant_key_is_not_matched", async () => {
+    // The backend folds ASCII A–Z only (`eq_ignore_ascii_case`) — a non-ASCII
+    // case pair (a hand-edited key `"É-claude"` for a discovered agent
+    // `é-claude`) is NOT matched by the backend, so the UI must not claim the
+    // stored value either (a Unicode `toLowerCase()` fold would — the two
+    // foldings agree on ASCII input only, and the divergence is reachable
+    // only with non-ASCII case pairs). Under the ASCII-only fold the key
+    // matches no def, so it is ALSO an orphan (a muted row with the remove
+    // button — the only cleanup path).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      subagentModels: { "É-claude": "p/m1" },
+    });
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
+      { name: "é-claude", description: "Fast recon", model: null, scope: "user" },
+    ]);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Subagents");
+    // The def's row shows the PLACEHOLDER (the ASCII-only fold does not
+    // match the non-ASCII pair — mirroring the backend, which ignores the
+    // key), NOT the stored value (a `toLowerCase()` fold would show it).
+    const trigger = await screen.findByRole("combobox", {
+      name: "Subagent model for é-claude",
+    });
+    expect(trigger.textContent).toContain("File value (no override)");
+    // The key matches no def under the ASCII-only fold → a muted orphan
+    // row (the stale copy).
+    expect(await screen.findByText("É-claude")).toBeTruthy();
+    expect(
+      screen.getByText("No longer discovered (stale override)"),
+    ).toBeTruthy();
   });
 });

@@ -95,6 +95,7 @@ pub fn run() {
             commands::settings::list_tools,
             commands::settings::test_mcp_server,
             commands::settings::auth_mcp_server,
+            commands::agents::list_agent_definitions,
             commands::spaces::list_spaces,
             commands::spaces::delete_space,
             commands::spaces::space_for_path,

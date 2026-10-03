@@ -103,6 +103,13 @@ pub struct Settings {
     /// `#[serde(default)]` — a pre-feature file parses to an empty map.
     #[serde(default)]
     pub default_thinking_levels: HashMap<String, String>,
+    /// (ADR 0023) Per-agent subagent model overrides: agent name → model key
+    /// (`"provider/id"`, or a hand-edited `"provider/id:<level>"` — the
+    /// `:<level>` suffix is picked up by the dispatch's existing thinking
+    /// candidate handling). `#[serde(default)]` — a pre-feature file parses
+    /// to an empty map (no migration).
+    #[serde(default)]
+    pub subagent_models: HashMap<String, String>,
 }
 
 impl Default for Settings {
@@ -118,6 +125,7 @@ impl Default for Settings {
             mcp_servers: HashMap::new(),
             font: FontSettings::default(),
             default_thinking_levels: HashMap::new(),
+            subagent_models: HashMap::new(),
         }
     }
 }
@@ -324,6 +332,7 @@ mod tests {
         assert_eq!(settings.default_model, None);
         assert!(settings.providers.is_empty());
         assert_eq!(settings.font, FontSettings::default());
+        assert!(settings.subagent_models.is_empty());
     }
 
     #[test]
@@ -339,6 +348,7 @@ mod tests {
         assert!(settings.providers.is_empty());
         assert!(settings.mcp_servers.is_empty());
         assert_eq!(settings.font, FontSettings::default());
+        assert!(settings.subagent_models.is_empty());
     }
 
     #[test]
@@ -431,6 +441,31 @@ mod tests {
     }
 
     #[test]
+    fn subagent_models_round_trips_in_camel_case() {
+        // (ADR 0023) The per-agent subagent model-override map defaults to
+        // empty and round-trips in camelCase.
+        assert!(Settings::default().subagent_models.is_empty());
+        // A pre-feature file (WITHOUT the field) parses to an empty map
+        // (`#[serde(default)]` — no migration needed).
+        let settings: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
+        assert!(settings.subagent_models.is_empty());
+        // A file WITH the field parses to the entry.
+        let with_map: Settings =
+            serde_json::from_str(r#"{ "subagentModels": { "scout": "tama/m-1" } }"#).unwrap();
+        assert_eq!(with_map.subagent_models["scout"], "tama/m-1");
+        // camelCase on the wire (a populated map serializes the field).
+        let settings = Settings {
+            subagent_models: std::collections::HashMap::from([(
+                "scout".to_string(),
+                "tama/m-1".to_string(),
+            )]),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(json.contains("\"subagentModels\""), "missing key in {json}");
+    }
+
+    #[test]
     fn font_settings_default_is_size_14_not_zero() {
         // Guards against a regression to a `#[derive(Default)]` (which would
         // give `size_px: 0`, a second "default" diverging from the serde
@@ -472,6 +507,10 @@ mod tests {
                 "a/b".to_string(),
                 "xhigh".to_string(),
             )]),
+            subagent_models: std::collections::HashMap::from([(
+                "scout".to_string(),
+                "tama/m-1".to_string(),
+            )]),
         };
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
@@ -484,6 +523,7 @@ mod tests {
             "\"font\"",
             "\"sizePx\"",
             "\"defaultThinkingLevels\"",
+            "\"subagentModels\"",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }

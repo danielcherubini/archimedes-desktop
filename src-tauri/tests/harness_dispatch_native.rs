@@ -165,6 +165,7 @@ fn default_launch() -> LaunchConfig {
         system_prompt: None,
         model: None,
         thinking: None,
+        frontmatter_thinking: None,
         tools: None,
     }
 }

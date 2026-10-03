@@ -367,6 +367,8 @@ export interface AppSettings {
   font: FontSettings;
   /** Per-model remembered thinking level (ADR 0015): `"<provider>/<id>"` → the last level the user set for that model. */
   defaultThinkingLevels: Record<string, string>;
+  /** (ADR 0023) Per-agent subagent model overrides: agent name → model key. */
+  subagentModels: Record<string, string>;
 }
 
 /** The effective catalog's model (the Default-model select + provider discovery status). */
@@ -376,6 +378,14 @@ export interface ModelDto {
   contextWindow: number;
   supportsThinking: boolean;
   thinkingLevels: string[];
+}
+
+/** One discovered agent definition (camelCase over IPC — the Rust `AgentDefinitionDto`). */
+export interface AgentDefinitionDto {
+  name: string;
+  description: string;
+  model: string | null;
+  scope: "space" | "user";
 }
 
 /** One discovered skill (camelCase over IPC — the Rust `SkillInfo`). */
@@ -500,6 +510,11 @@ export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
 /** The native harness's tool names, sorted (the Settings page's enabled-tools checkbox list). */
 export async function listTools(): Promise<string[]> {
   return invoke<string[]>("list_tools");
+}
+
+/** The user-level discovered agent definitions (the Settings page's Subagents section — ADR 0023). */
+export async function listAgentDefinitions(): Promise<AgentDefinitionDto[]> {
+  return invoke<AgentDefinitionDto[]>("list_agent_definitions");
 }
 
 /** Test ONE MCP server entry (the Settings page's Test action, ADR 0019): a one-shot bounded connect + `tools/list`. Resolves the tool count; rejects with the error text (a `needs-auth` / a network failure). */

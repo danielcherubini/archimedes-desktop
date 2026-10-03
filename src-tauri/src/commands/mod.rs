@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod clipboard;
 pub mod history;
 pub mod sessions;

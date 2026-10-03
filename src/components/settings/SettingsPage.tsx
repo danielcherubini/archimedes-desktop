@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import {
   ArrowLeftIcon,
+  BotIcon,
   EyeIcon,
   EyeOffIcon,
   KeyIcon,
@@ -19,10 +20,12 @@ import { applySettingsToDocument, MAX_FONT_PX, MIN_FONT_PX } from "@/lib/setting
 import {
   authMcpServer,
   getSettings,
+  listAgentDefinitions,
   listModels,
   listTools,
   saveSettings,
   testMcpServer,
+  type AgentDefinitionDto,
   type AppSettings,
   type McpServerEntry,
   type ModelDto,
@@ -65,7 +68,7 @@ import {
   SettingsSidebarButton,
 } from "./primitives";
 
-type Section = "general" | "appearance" | "providers" | "mcp";
+type Section = "general" | "appearance" | "providers" | "subagents" | "mcp";
 
 /** A ZCode-style slug: lowercase alphanumeric + `-`. */
 function slugify(name: string): string {
@@ -84,6 +87,14 @@ function uniqueSlug(slug: string, taken: Set<string>): string {
     n += 1;
   }
   return id;
+}
+
+/**
+ * ASCII-only case fold (mirrors the backend's `eq_ignore_ascii_case` — a
+ * Unicode `toLowerCase()` would fold non-ASCII pairs the backend ignores).
+ */
+function foldAscii(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
 }
 
 /**
@@ -718,7 +729,7 @@ function ProviderRow({
 /**
  * The settings page (the approved ZCode-parity design, spec §1/§4): a full
  * content-area view — a 268px section sidebar (back button + General /
- * Appearance / Providers / MCP) + the active section's content. Immediate save:
+ * Appearance / Providers / Subagents / MCP) + the active section's content. Immediate save:
  * a control change → `saveSettings` with the COMPLETE document (text
  * fields commit on blur/Enter; no save button, no dirty state).
  */
@@ -726,6 +737,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [section, setSection] = useState<Section>("general");
   const [models, setModels] = useState<ModelDto[]>([]);
+  // The user-level discovered agent definitions (ADR 0023 — the Subagents
+  // section's data source; `null` until the first list lands).
+  const [agentDefs, setAgentDefs] = useState<AgentDefinitionDto[] | null>(null);
   // The native harness's tool names (the enabled-tools checkbox list).
   const [tools, setTools] = useState<string[]>([]);
   // The MCP add/edit dialog draft (`null` = closed — a fresh draft per open
@@ -744,6 +758,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     listModels()
       .then(setModels)
       .catch(() => {});
+    void listAgentDefinitions()
+      .then(setAgentDefs)
+      .catch(() => setAgentDefs([]));
     listTools()
       .then(setTools)
       .catch(() => {});
@@ -838,6 +855,15 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
         current.id,
         id,
       );
+      // (ADR 0023) `subagentModels` is `agent name → model key`: the model
+      // refs are the VALUES (the agent names are the KEYS — `remapModelRefs`
+      // remaps map KEYS and would be a no-op here). A non-matching value
+      // stays untouched.
+      const remappedSubagentModels: Record<string, string> = {};
+      for (const [name, model] of Object.entries(settings.subagentModels)) {
+        remappedSubagentModels[name] = remapModelRef(model, current.id, id) ?? model;
+      }
+      nextSettings.subagentModels = remappedSubagentModels;
     }
     update(nextSettings);
     void listModels(id).then(setModels).catch(() => {});
@@ -1119,6 +1145,124 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     </div>
   );
 
+  // (ADR 0023) Orphaned override entries (a key matching no discovered
+  // agent — its file was removed/renamed): the ONLY cleanup path is the
+  // row's remove button. Gated on `agentDefs !== null`: while the
+  // definitions are still loading, `agentDefs` is `null` — treating "not
+  // loaded yet" as "no discovered agents" would flash every override as a
+  // stale orphan with a live remove button before the list lands.
+  const orphanedSubagentModels =
+    settings === null || agentDefs === null
+      ? []
+      : Object.entries(settings.subagentModels).filter(
+          ([name]) =>
+            !agentDefs.some((d) => foldAscii(d.name) === foldAscii(name)),
+        );
+
+  // (ADR 0023) The Subagents section: one row per discovered user-level
+  // agent (name + description + the file's model — read-only) + a model
+  // `Select` defaulting to "File value (no override)" (immediate save: a
+  // pick sets `subagentModels[name]`, "File value" deletes the key) + the
+  // orphaned entries as muted rows with a remove button.
+  const subagentsSection = settings === null ? null : (
+    <SettingsGroupCard>
+      {agentDefs?.map((def) => {
+        // (ADR 0023 review) The backend resolves the `subagentModels` keys
+        // case-insensitively (`eq_ignore_ascii_case` — a hand-edited
+        // mixed-case key must still match), so the row's stored override is
+        // looked up the SAME way — an exact-case lookup would make a
+        // hand-edited `"Scout"` for agent `scout` invisible in the UI (the
+        // Select would show the "File value (no override)" placeholder — a
+        // false claim about the saved state).
+        const storedEntry = Object.entries(settings.subagentModels).find(
+          ([key]) => foldAscii(key) === foldAscii(def.name),
+        );
+        const storedOverride = storedEntry?.[1];
+        // A stored override whose model key is no longer in the catalog
+        // (a renamed/removed provider) matches no `SelectItem` — Radix
+        // would fall back to the placeholder and misrepresent the saved
+        // state, so it is offered as its own (disabled) option (the
+        // `storedLevelOutsideUnion` pattern).
+        const staleOverride =
+          storedOverride !== undefined &&
+          !models.some((m) => `${m.provider}/${m.id}` === storedOverride)
+            ? storedOverride
+            : null;
+        return (
+          <SettingsRow
+            key={def.name}
+            label={def.name}
+            description={`${def.description || "No description"} · file: ${def.model ?? "— (inherits parent model)"}`}
+            control={
+              <Select
+                value={storedOverride ?? ""}
+                onValueChange={(value) => {
+                  const subagentModels = { ...settings.subagentModels };
+                  // (ADR 0023 review) Drop EVERY key that is a case-variant
+                  // of this agent's name (not just the exact `def.name`
+                  // key) — leaving a twin (`"Scout"` alongside `scout`)
+                  // would make the backend's case-insensitive `.find` pick
+                  // between them in nondeterministic HashMap iteration order.
+                  const foldedName = foldAscii(def.name);
+                  for (const key of Object.keys(subagentModels)) {
+                    if (foldAscii(key) === foldedName) delete subagentModels[key];
+                  }
+                  if (value !== "") subagentModels[def.name] = value;
+                  update({ subagentModels });
+                }}
+              >
+                <SelectTrigger
+                  aria-label={`Subagent model for ${def.name}`}
+                  className="w-64"
+                >
+                  <SelectValue placeholder="File value (no override)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">File value (no override)</SelectItem>
+                  {models.map((model) => (
+                    <SelectItem
+                      key={`${model.provider}/${model.id}`}
+                      value={`${model.provider}/${model.id}`}
+                    >
+                      {model.provider}/{model.id}
+                    </SelectItem>
+                  ))}
+                  {staleOverride !== null && (
+                    <SelectItem value={staleOverride} disabled>
+                      {staleOverride}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            }
+          />
+        );
+      })}
+      {orphanedSubagentModels.map(([name]) => (
+        <SettingsRow
+          key={name}
+          label={<span className="text-foreground-subtle">{name}</span>}
+          description="No longer discovered (stale override)"
+          control={
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={`Remove subagent override ${name}`}
+              onClick={() => {
+                const subagentModels = { ...settings.subagentModels };
+                delete subagentModels[name];
+                update({ subagentModels });
+              }}
+            >
+              <TrashIcon className="size-3.5" />
+            </Button>
+          }
+        />
+      ))}
+    </SettingsGroupCard>
+  );
+
   // (ADR 0019) The MCP section: the desktop's OWN `mcpServers` entries
   // (pi's `mcp.json` entries stay in their own files — not listed here).
   const mcpSection = settings === null ? null : (
@@ -1206,6 +1350,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
                 onClick={() => setSection("providers")}
               />
               <SettingsSidebarButton
+                icon={BotIcon}
+                label="Subagents"
+                active={section === "subagents"}
+                onClick={() => setSection("subagents")}
+              />
+              <SettingsSidebarButton
                 icon={ServerIcon}
                 label="MCP"
                 active={section === "mcp"}
@@ -1223,7 +1373,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
               ? appearanceSection
               : section === "providers"
                 ? providersSection
-                : mcpSection}
+                : section === "subagents"
+                  ? subagentsSection
+                  : mcpSection}
         </div>
       </section>
     </div>

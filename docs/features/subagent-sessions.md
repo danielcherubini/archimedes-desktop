@@ -1,7 +1,7 @@
 ---
 status: live
-last-verified: 2026-10-02
-verified-by: cargo test (the subagent.rs native-dispatch, throwaway-Db, and cancel suites) + pnpm test in archimedes-desktop
+last-verified: 2026-10-03
+verified-by: cargo test (the subagent.rs native-dispatch, throwaway-Db, and cancel suites) + pnpm test in archimedes-desktop + the subagent-model-overrides plan (docs/roadmap/subagent-model-overrides.md)
 ---
 
 # Subagent sessions
@@ -19,7 +19,7 @@ teardown) and are excluded from the one-live policy by definition. A
 subagent cannot dispatch subagents (the `subagent` tool is stripped from the
 child's tool set — the recursion guard).
 
-## Config resolution (layered: explicit > frontmatter > parent defaults)
+## Config resolution (layered: explicit > override > frontmatter > parent defaults)
 
 The main agent's `subagent` tool takes `task` (required) + optional
 `agentName` / `model` / `systemPrompt` / `tools` / `thinking` (`launch`
@@ -30,8 +30,11 @@ Agent definitions** (ADR 0020 — flat `*.md` files, space-level
 tool). An **unknown or omitted `agentName` is a config-less label-only
 dispatch** — never an error. The layers:
 
-- **`model`**: the explicit param, else the frontmatter `model`, else the
-  parent's model. Resolved **at dispatch time against the effective catalog**
+- **`model`**: the explicit param, else the **settings override** (the
+  `settings.json` `subagentModels` entry for the agent's name — ADR 0023; read
+  at dispatch time; a stale value degrades to the next layer, like the
+  frontmatter), else the frontmatter `model`, else the parent's model.
+  Resolved **at dispatch time against the effective catalog**
   (`EffectiveCatalog::resolve` — the base catalog + the settings' providers
   + live discovery; `NativeDeps` carries a catalog *supplier*, NOT a startup
   snapshot — the base catalog is empty after the pi-config seeding removal,
