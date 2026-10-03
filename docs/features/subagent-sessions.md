@@ -1,7 +1,7 @@
 ---
 status: live
 last-verified: 2026-10-03
-verified-by: cargo test (the subagent.rs native-dispatch, throwaway-Db, and cancel suites) + pnpm test in archimedes-desktop + the subagent-model-overrides plan (docs/roadmap/subagent-model-overrides.md)
+verified-by: cargo test (the subagent.rs native-dispatch, throwaway-Db, and cancel suites) + pnpm test in archimedes-desktop + the subagent-model-overrides plan (shipped 2026-10-03; history in git)
 ---
 
 # Subagent sessions
