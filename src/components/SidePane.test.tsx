@@ -56,6 +56,46 @@ describe("SidePane (the status panel)", () => {
     expect(container.textContent).toBe("");
   });
 
+  it("shows the session title (the first user message, truncated to 80 chars) at the top of the pane", () => {
+    // The old chat header's title moved here (the header is gone): the
+    // first `user` message, truncated to ~80 chars (the SAME derivation
+    // the sidebar rows use).
+    const long = "x".repeat(120);
+    useSessions.setState({
+      activeSessionId: "main1",
+      messages: {
+        main1: [{ kind: "user", text: long, at: Date.now() }],
+      },
+    });
+    render(<SidePane />);
+    const title = screen.getByText(long.slice(0, 80));
+    expect(title).toBeTruthy();
+    // The title sits ABOVE the Todos section (the pane's top section).
+    const todos = screen.queryByText("Todos");
+    expect(todos).toBeNull(); // no todos — but the title still renders
+    // (the title is NOT data-gated on todos).
+  });
+
+  it("falls back to the Space's base name when the session has no user message yet", () => {
+    useSessions.setState({
+      activeSessionId: "main1",
+      sessions: [
+        {
+          sessionId: "main1",
+          cwd: "/tmp/MyProject",
+          capabilities: {},
+          archived: false,
+        },
+      ],
+      messages: {},
+    });
+    render(<SidePane />);
+    // No `user` message → the title is the active session's cwd's base
+    // name (a session whose cwd is no known Space still shows its
+    // folder's base name).
+    expect(screen.getByText("MyProject")).toBeTruthy();
+  });
+
   it("renders the Todos section (label + N/M + progress) when there are open todos", () => {
     useSessions.setState({ activeSessionId: "main1" });
     useInteractive.getState().applyTodoUpdate("main1", {
@@ -195,6 +235,37 @@ describe("SidePane (the status panel)", () => {
       });
     });
     expect(frame.style.width).toBe("0px");
+  });
+
+  // -- The footer toggle (the old header's toggle moved to the frame's
+  // -- bottom-right; the collapsed rail keeps it reachable) --
+
+  it("holds NO footer toggle (it moved to the chrome bar — the top menubar)", () => {
+    render(<SidePane />);
+    expect(screen.queryByRole("button", { name: "Toggle side pane" })).toBeNull();
+  });
+
+  it("collapses to width 0 (the content stays mounted, clipped — the chrome bar's button is the re-expand control)", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    useInteractive.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [{ content: "a", status: "pending" }],
+    });
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    const { container } = render(<SidePane />);
+    const frame = container.firstChild as HTMLElement;
+    expect(frame.style.width).toBe("0px");
+    // The content (the Todos section) is clipped (width 0 +
+    // `overflow: hidden`) — NOT unmounted (the `fixed` sudo modals +
+    // the todo state stay alive).
+    expect(screen.queryByText("Todos")).not.toBeNull();
+    // Expanding via the shared flag restores the full frame.
+    act(() => {
+      setSidePaneCollapsed(false);
+    });
+    expect(frame.style.width).toBe("320px");
   });
 
   it("flushes the drag width to localStorage on mouseup only (not on every mousemove)", () => {

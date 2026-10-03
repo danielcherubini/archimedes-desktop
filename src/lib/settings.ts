@@ -1,5 +1,6 @@
 import { getSettings, type AppSettings, type FontSettings } from "./tauri";
 import { applySettingsTheme, applyThemeToDocument } from "./theme";
+import { useSettings } from "../store/settings";
 
 /** The font-size clamp bounds (the settings UI's slider range). */
 export const MIN_FONT_PX = 12;
@@ -55,6 +56,9 @@ export async function loadAndApplySettings(): Promise<AppSettings | null> {
   try {
     const settings = await getSettings();
     applySettingsToDocument(settings);
+    // Seed the app-wide settings store (the working-indicator spinner style
+    // and friends read it at runtime; the Settings page re-fetches on mount).
+    useSettings.getState().setSettings(settings);
     return settings;
   } catch (error) {
     console.error(

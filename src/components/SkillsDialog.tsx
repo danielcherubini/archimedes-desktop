@@ -53,11 +53,11 @@ export default function SkillsDialog({
 
   return (
     <Dialog open onOpenChange={(nextOpen) => !nextOpen && onClose()}>
-      <DialogContent className="max-h-[70vh]">
+      <DialogContent className="max-h-[70vh] max-w-3xl">
         <DialogHeader>
           <DialogTitle>Skills</DialogTitle>
         </DialogHeader>
-        <div className="flex max-h-[calc(70vh-7.5rem)] flex-col gap-3">
+        <div className="flex max-h-[calc(70vh-7.5rem)] min-w-0 flex-col gap-3">
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -72,7 +72,7 @@ export default function SkillsDialog({
               No skills match "{query}".
             </p>
           ) : (
-            <div className="flex flex-col gap-0.5 overflow-y-auto">
+            <div className="flex min-w-0 flex-col gap-0.5 overflow-y-auto pr-2">
               {filtered.map((skill) => (
                 <div
                   key={skill.path}
@@ -82,10 +82,14 @@ export default function SkillsDialog({
                   onKeyDown={(e) => {
                     if (e.key === "Enter") insertSkill(skill.name);
                   }}
-                  className="group flex cursor-pointer flex-col gap-0.5 rounded-lg px-2.5 py-1 hover:bg-surface-hover"
+                  className="group flex min-w-0 cursor-pointer flex-col gap-0.5 rounded-lg px-2.5 py-1 hover:bg-surface-hover"
                 >
                   <div className="flex items-center gap-2">
-                    <span className="flex-1 truncate text-ui-base">
+                    {/* `min-w-0` lets the span shrink below its content
+                        width so `truncate` clips it (without it the
+                        min-width:auto floor would push the row past the
+                        dialog's right edge). */}
+                    <span className="min-w-0 flex-1 truncate text-ui-base">
                       {skill.name}
                     </span>
                     {skill.scope === "user" && (
@@ -96,7 +100,7 @@ export default function SkillsDialog({
                   </div>
                   {skill.description !== "" && (
                     <span
-                      className="truncate text-ui-sm text-foreground-subtle"
+                      className="min-w-0 truncate text-ui-sm text-foreground-subtle"
                       title={skill.description}
                     >
                       {skill.description}

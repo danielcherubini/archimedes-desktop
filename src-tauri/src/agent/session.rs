@@ -251,12 +251,35 @@ pub struct SessionInfo {
     pub capabilities: Value,
     /// The session's configuration options (model / thinking level
     /// selectors) synthesized from the `ModelCatalog` (the native session's
-    /// model / thinking-level selectors); `None` for stored sessions.
+    /// model / thinking-level selectors); `None` when they can't be
+    /// synthesized (no catalog / unresolvable stored model).
     pub config_options: Option<Vec<Value>>,
     /// The desktop's archived flag (ADR 0016). `false` for a newly
     /// started or ephemeral session; the resume paths and
     /// `list_sessions` read it from the stored row.
     pub archived: bool,
+    /// The session's last known context usage (the `context_usage_update`
+    /// frame's values — the provider's `input_tokens` vs the model's
+    /// window), persisted on the `sessions` row on every frame so a
+    /// CLOSED session's context survives (the frontend's store drops the
+    /// entry on close — the row is the source of truth for the stored
+    /// session's context bar). `None` until the first frame (a fresh
+    /// session with no usage yet).
+    pub context_usage: Option<ContextUsage>,
+}
+
+/// A session's last known context usage (the `context_usage_update` frame's
+/// values — the provider's `input_tokens` vs the model's `context_window`).
+/// Persisted on the `sessions` row on every frame (the row's
+/// `context_usage_json` column — `{"used": n, "window": n}`) so a CLOSED
+/// session's context survives: the frontend's store drops the entry on
+/// close, but the row keeps the last known value for the stored session's
+/// context bar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    pub used: u64,
+    pub window: u64,
 }
 
 /// A live, in-memory session handle.
@@ -1310,8 +1333,76 @@ impl SessionManager {
         // below never clears it — the `DO UPDATE` branch never touches
         // `archived`).
         info.archived = row.archived;
+        // The stored `context_usage` (the last known before the close —
+        // the row's `context_usage_json`; the `load_transcript`
+        // re-estimate's first frame refreshes it after the resume).
+        info.context_usage = row
+            .context_usage_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ContextUsage>(s).ok());
         self.record_session(&info);
         Ok(info)
+    }
+
+    /// All stored sessions (newest first), as `SessionInfo` (the
+    /// `list_sessions` command's shape): the row's `capabilities` (the
+    /// `normalize_capabilities` camelCase envelope), `config_options`
+    /// synthesized from the stored `model` / `thinkingLevel` (the same
+    /// resolution as `resume_native_session` — the stored composed key →
+    /// the effective catalog; an absent / unresolvable key falls back to
+    /// the resolution chain, never a hard error) so a STORED session's
+    /// composer selectors are populated (the frontend renders them
+    /// disabled — a stored session can't receive `set_config_option`),
+    /// and `context_usage` read from the row's `context_usage_json` (the
+    /// last known usage — the frontend's store drops it on close, so the
+    /// row is the source of truth for the stored session's context bar).
+    pub async fn list_sessions(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<SessionInfo>, SessionError> {
+        let db = self.driver.db.clone().ok_or_else(|| {
+            SessionError::Io("list_sessions requires an attached database".to_string())
+        })?;
+        let rows = db
+            .list_sessions(include_archived)
+            .map_err(|e| SessionError::Io(e.to_string()))?;
+        let catalog = self.effective_catalog(None).await;
+        let settings = load_settings(&self.config_dir);
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let caps: Value =
+                    serde_json::from_str(&row.capabilities_json).unwrap_or(Value::Null);
+                // The model: the stored `model` (a composed key → the
+                // effective catalog); an absent / unresolvable key falls
+                // back to the resolution chain (the settings default →
+                // the catalog default → the selectable set — never a
+                // hard error). `None` when the chain is empty (no models
+                // at all — the options can't be synthesized).
+                let model = caps
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .and_then(|key| resolve_composed_model(&catalog, key))
+                    .or_else(|| resolve_native_model(&catalog, &settings.default_model).ok());
+                let thinking_level = caps
+                    .get("thinkingLevel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                SessionInfo {
+                    session_id: row.id,
+                    cwd: PathBuf::from(row.cwd),
+                    capabilities: normalize_capabilities(&row.capabilities_json),
+                    config_options: model.as_ref().and_then(|m| {
+                        synthesize_catalog_config_options(&catalog, m, thinking_level.as_deref())
+                    }),
+                    archived: row.archived,
+                    context_usage: row
+                        .context_usage_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<ContextUsage>(s).ok()),
+                }
+            })
+            .collect())
     }
 
     /// Build + spawn + drive one native session (shared by `start` /
@@ -1483,6 +1574,11 @@ impl SessionManager {
                 // resume overrides `archived` with the stored row's flag
                 // (`resume_native_session`).
                 archived: false,
+                // A fresh session has no known usage yet (`None` — the
+                // `load_transcript` re-estimate's first frame fills it in;
+                // a resume's stored usage is applied in
+                // `resume_native_session`).
+                context_usage: None,
             }
         };
         // (NEW) The `sessions` row BEFORE the seq-0 persist (the FK fix):
@@ -3137,6 +3233,7 @@ mod session_tests {
             capabilities: serde_json::json!({ "loadSession": true }),
             config_options: None,
             archived: true,
+            context_usage: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"archived\":true"), "got: {json}");
@@ -3676,6 +3773,7 @@ mod session_tests {
             }),
             config_options: None,
             archived: false,
+            context_usage: None,
         })
         .expect("record_session should succeed");
         let info = manager
@@ -3686,6 +3784,138 @@ mod session_tests {
             info.capabilities["thinkingLevel"], "xhigh",
             "memory wins over the stale stored value"
         );
+        let _ = manager.close_session(&info.session_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `list_sessions` carries the stored session's `config_options`
+    /// (synthesized from the stored `model` / `thinkingLevel` — the
+    /// frontend's `SessionConfigSelect` renders them in the stored
+    /// session's composer, disabled) and `context_usage` (persisted via
+    /// `record_session_context_usage` — the frontend's store drops it on
+    /// close, so the row is the source of truth for the stored session's
+    /// context bar).
+    #[tokio::test]
+    async fn list_sessions_carries_the_stored_config_options_and_context_usage() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "high", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone());
+        manager.attach_db(db.clone());
+        manager.set_catalog(catalog);
+        // The stored row: the start-of-session `model` / `thinkingLevel`
+        // (the `capabilities` envelope) + a persisted context usage.
+        db.record_session(&SessionInfo {
+            session_id: "nat-list-1".to_string(),
+            cwd: dir.clone(),
+            capabilities: json!({
+                "native": true,
+                "model": "tama/m1",
+                "thinkingLevel": "high",
+                "loadSession": true,
+            }),
+            config_options: None,
+            archived: false,
+            context_usage: None,
+        })
+        .expect("record_session should succeed");
+        db.record_session_context_usage("nat-list-1", 53_760, 128_000)
+            .expect("record_session_context_usage should succeed");
+        let rows = manager
+            .list_sessions(true)
+            .await
+            .expect("list_sessions should work");
+        assert_eq!(rows.len(), 1, "the stored row is listed");
+        let row = &rows[0];
+        // `config_options`: the model selector (current value = the stored
+        // composed key) + the thinking-level selector (current value = the
+        // stored level).
+        let options = row
+            .config_options
+            .as_ref()
+            .expect("config_options are synthesized for the stored session");
+        let model = options
+            .iter()
+            .find(|o| o["id"] == "model")
+            .expect("the model option");
+        assert_eq!(model["currentValue"], "tama/m1");
+        assert!(
+            model["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["value"] == "tama/m1"),
+            "the stored model is in the options list"
+        );
+        let thinking = options
+            .iter()
+            .find(|o| o["id"] == "thought_level")
+            .expect("the thinking-level option");
+        assert_eq!(thinking["currentValue"], "high");
+        // `context_usage`: the persisted last-known usage.
+        let usage = row
+            .context_usage
+            .as_ref()
+            .expect("context_usage is carried from the row");
+        assert_eq!(usage.used, 53_760);
+        assert_eq!(usage.window, 128_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resume carries the stored `context_usage` (the last known before
+    /// the close — the `load_transcript` re-estimate's first frame
+    /// refreshes it after the resume).
+    #[tokio::test]
+    async fn a_resume_carries_the_stored_context_usage() {
+        let catalog = ModelCatalog {
+            models: vec![level_test_model(
+                "tama",
+                "m1",
+                &["off", "low", "high", "xhigh"],
+            )],
+            default_model: Some("tama/m1".to_string()),
+            compaction: crate::agent::harness::catalog::CompactionConfig::default(),
+        };
+        let dir = temp_config_dir();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let db = open_db(&dir);
+        let mut manager = SessionManager::new(dir.clone());
+        manager.attach_db(db.clone());
+        manager.set_catalog(catalog);
+        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        db.record_session(&SessionInfo {
+            session_id: "nat-resume-cu-1".to_string(),
+            cwd: dir.clone(),
+            capabilities: json!({
+                "native": true,
+                "model": "tama/m1",
+                "loadSession": true,
+            }),
+            config_options: None,
+            archived: false,
+            context_usage: None,
+        })
+        .expect("record_session should succeed");
+        db.record_session_context_usage("nat-resume-cu-1", 96_000, 128_000)
+            .expect("record_session_context_usage should succeed");
+        let info = manager
+            .resume_session("nat-resume-cu-1", dir.clone(), &sink)
+            .await
+            .expect("the native resume works");
+        let usage = info
+            .context_usage
+            .expect("the resume carries the stored context usage");
+        assert_eq!(usage.used, 96_000);
+        assert_eq!(usage.window, 128_000);
         let _ = manager.close_session(&info.session_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -44,6 +44,13 @@ pub struct SessionRow {
     /// The desktop's archived flag (ADR 0016): `true` hides the session from
     /// its Space group into the Archived section; the transcript is kept.
     pub archived: bool,
+    /// The session's last known context usage (`{"used": n, "window": n}` —
+    /// the `context_usage_update` frame's values: the provider's
+    /// `input_tokens` vs the model's window), persisted on every frame so a
+    /// CLOSED session's context survives (the frontend's store drops it on
+    /// close — the row is the source of truth for the stored session's bar).
+    /// `None` until the first frame (a fresh session with no usage yet).
+    pub context_usage_json: Option<String>,
 }
 
 /// A row from the `messages` table.
@@ -180,6 +187,24 @@ impl Db {
                 [],
             )?;
         }
+        // One-time migration for pre-existing databases: add
+        // `context_usage_json` to `sessions` (fresh databases already have
+        // it from SCHEMA). The same pragma-gated pattern as the `archived`
+        // migration above — the ALTER runs only when the column is absent,
+        // so a re-open never issues it. `NULL` (no default): a pre-existing
+        // row has NO known usage (the bar shows nothing) — a default value
+        // would fabricate one.
+        let has_context_usage: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'context_usage_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_context_usage == 0 {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN context_usage_json TEXT",
+                [],
+            )?;
+        }
         // One-time migration for pre-existing databases: give
         // `native_messages` its `ON DELETE CASCADE` foreign key (a
         // pre-existing table cannot GAIN an FK in place — recreate it,
@@ -285,6 +310,33 @@ impl Db {
         Ok(())
     }
 
+    /// Persist the session's last known context usage (the
+    /// `context_usage_update` frame's values — the provider's
+    /// `input_tokens` vs the model's window). Called on EVERY frame, so a
+    /// CLOSED session's context survives: the frontend's store drops the
+    /// entry on close, but the row keeps the last known value for the
+    /// stored session's context bar. A SEPARATE statement — the
+    /// `record_session` upsert's `DO UPDATE` never touches
+    /// `context_usage_json`, so a re-record on resume can't clobber the
+    /// persisted usage. A missing row is a no-op (the session is recorded
+    /// before its first frame can land).
+    pub fn record_session_context_usage(
+        &self,
+        id: &str,
+        used: u64,
+        window: u64,
+    ) -> Result<(), DbError> {
+        let payload = serde_json::to_string(&serde_json::json!({
+            "used": used,
+            "window": window,
+        }))?;
+        self.conn.lock().expect("db mutex poisoned").execute(
+            "UPDATE sessions SET context_usage_json = ?2 WHERE id = ?1",
+            params![id.to_string(), payload],
+        )?;
+        Ok(())
+    }
+
     /// Insert or update a message.
     ///
     /// `INSERT ... ON CONFLICT(session_id, kind, message_key) DO UPDATE` —
@@ -314,7 +366,7 @@ impl Db {
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, cwd, created_at, title, capabilities_json, archived \
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json \
              FROM sessions WHERE id = ?1",
         )?;
         let row = stmt
@@ -326,6 +378,7 @@ impl Db {
                     title: row.get(3)?,
                     capabilities_json: row.get(4)?,
                     archived: row.get::<_, i64>(5)? != 0,
+                    context_usage_json: row.get(6)?,
                 })
             })?
             .next()
@@ -341,11 +394,11 @@ impl Db {
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let sql = if include_archived {
-            "SELECT id, cwd, created_at, title, capabilities_json, archived
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json
              FROM sessions
              ORDER BY created_at DESC, id DESC"
         } else {
-            "SELECT id, cwd, created_at, title, capabilities_json, archived
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json
              FROM sessions
              WHERE archived = 0
              ORDER BY created_at DESC, id DESC"
@@ -360,6 +413,7 @@ impl Db {
                     title: row.get(3)?,
                     capabilities_json: row.get(4)?,
                     archived: row.get::<_, i64>(5)? != 0,
+                    context_usage_json: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -627,7 +681,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL,
     title TEXT,
     capabilities_json TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0
+    archived INTEGER NOT NULL DEFAULT 0,
+    context_usage_json TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -1148,6 +1203,7 @@ mod tests {
             }),
             config_options: None,
             archived: false,
+            context_usage: None,
         };
         // Two sessions; one of them gets archived.
         db.record_session(&mk("sess-1"))
@@ -1223,6 +1279,7 @@ mod tests {
             }),
             config_options: None,
             archived: false,
+            context_usage: None,
         };
         db.record_session(&session)
             .expect("record_session should succeed");
@@ -1238,6 +1295,134 @@ mod tests {
         assert!(
             all[0].archived,
             "a re-record never clears the archived flag"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-existing database whose `sessions` table predates the
+    /// `context_usage_json` column must open CLEANLY (the one-time
+    /// migration adds the column) and the pre-existing rows must read
+    /// `context_usage == None` (the default).
+    #[test]
+    fn context_usage_column_migration_on_a_preexisting_db() {
+        let dir = std::env::temp_dir().join(format!("db-context-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        // A pre-existing database: the `sessions` table WITHOUT
+        // `context_usage_json` (the `archived` column IS present — this
+        // test isolates the context migration).
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                title TEXT,
+                capabilities_json TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO sessions VALUES ('s1', '/tmp', 1, NULL, '{}', 0);",
+        )
+        .unwrap();
+        drop(conn);
+        // The next `Db::open` must SUCCEED (the migration adds the column).
+        let db = Db::open(&path).expect("the context_usage migration is one-time and idempotent");
+        // ...and the column is in place now.
+        let has: i64 = db
+            .conn
+            .lock()
+            .expect("db mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'context_usage_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has, 1,
+            "the context_usage_json column is in place after the migration"
+        );
+        // ...and the pre-existing row reads `context_usage == None` (no data yet).
+        let rows = db
+            .list_sessions(true)
+            .expect("list_sessions should succeed");
+        assert_eq!(rows.len(), 1, "the pre-existing row survived");
+        assert!(
+            rows[0].context_usage_json.is_none(),
+            "a pre-existing row reads context_usage == None"
+        );
+        // ...and a SECOND open of the already-migrated database is a clean
+        // no-op (the `pragma_table_info` gate skips the ALTER) — the
+        // migration is idempotent.
+        drop(db);
+        let db = Db::open(&path).expect("a re-open of the migrated db must succeed");
+        let rows = db
+            .list_sessions(true)
+            .expect("list_sessions should succeed on the second open");
+        assert!(
+            rows[0].context_usage_json.is_none(),
+            "the re-opened row still reads context_usage == None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `record_session_context_usage` persists the session's last known
+    /// context usage (the frontend's context-percentage display for a
+    /// CLOSED session — the store drops it on close, but the row keeps
+    /// it): `session()` / `list_sessions()` read it back, and
+    /// `record_session` (the resume re-record) does NOT clobber it.
+    #[test]
+    fn record_session_context_usage_persists_and_survives_record_session() {
+        let dir = std::env::temp_dir().join(format!("db-context-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).expect("db should open");
+        let session = SessionInfo {
+            session_id: "sess-1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({
+                "piSessionId": "sess-1",
+                "loadSession": true,
+            }),
+            config_options: None,
+            context_usage: None,
+            archived: false,
+        };
+        db.record_session(&session)
+            .expect("record_session should succeed");
+        // Persist the last known usage (the `context_usage_update` frame's
+        // values — the provider's `input_tokens` vs the model's window).
+        db.record_session_context_usage("sess-1", 53_760, 128_000)
+            .expect("record_session_context_usage should succeed");
+        // `session()` reads it back.
+        let row = db
+            .session("sess-1")
+            .expect("session should succeed")
+            .unwrap();
+        let usage: serde_json::Value =
+            serde_json::from_str(&row.context_usage_json.unwrap()).expect("the usage is JSON");
+        assert_eq!(usage["used"], 53_760);
+        assert_eq!(usage["window"], 128_000);
+        // `list_sessions()` reads it back too.
+        let all = db
+            .list_sessions(true)
+            .expect("list_sessions(true) should succeed");
+        assert_eq!(all.len(), 1);
+        assert!(all[0].context_usage_json.is_some());
+        // The resume re-record (the same upsert, a refreshed row) must NOT
+        // clobber the persisted usage (the `record_session` DO UPDATE never
+        // touches `context_usage_json`).
+        db.record_session(&session)
+            .expect("re-record should succeed");
+        let row = db
+            .session("sess-1")
+            .expect("session should succeed")
+            .unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&row.context_usage_json.unwrap())
+            .expect("the usage survived the re-record");
+        assert_eq!(
+            usage["used"], 53_760,
+            "a re-record never clobbers the context usage"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

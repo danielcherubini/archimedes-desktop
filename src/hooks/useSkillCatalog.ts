@@ -10,8 +10,8 @@ import { listSkills, type SkillInfo } from "../lib/tauri";
  * changes (the active Space changed) or on first mount (app start).
  * No loading state (the spec: discovery is a local disk walk — the
  * section simply re-renders when the result arrives). A failed fetch
- * degrades to `[]` (logged via `console.error`, same convention as the
- * existing `closeSession` failure path in `SpacesList.tsx`).
+ * degrades to `[]` (logged via `console.error` — the app's convention
+ * for a non-critical background fetch failure).
  *
  * Freshness guarantees:
  * - A key change IMMEDIATELY serves `[]` until the new fetch resolves —
@@ -62,8 +62,8 @@ export function useSkillCatalog(spacePath: string | null): SkillInfo[] {
     if (!p) {
       p = listSkills(spacePath)
         .catch((err) => {
-          // A failed fetch degrades to [] (logged — the same convention as
-          // the existing `closeSession` failure path in `SpacesList.tsx`).
+          // A failed fetch degrades to [] (logged — the app's convention
+          // for a non-critical background fetch failure).
           // A FAILED promise is NOT cached (delete it) so a later effect
           // retries — but only if THIS promise is still the cached entry
           // (a test's `clearSkillCatalogCache()` + re-mount may have cached

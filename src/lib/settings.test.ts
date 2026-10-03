@@ -108,6 +108,7 @@ describe("loadAndApplySettings", () => {
       font: { sizePx: 16, uiFamily: "Inter", codeFamily: null },
       defaultThinkingLevels: {},
       subagentModels: {},
+      spinnerStyle: null,
     });
     stubMatchMedia(true); // OS is dark → "system" resolves to zai-dark
     const settings = await loadAndApplySettings();

@@ -4,13 +4,13 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
 } from "react";
-import { ArrowUp, FolderIcon, MoreHorizontalIcon, PanelRightIcon, X } from "lucide-react";
+import { ArrowUp, Brain, Plus, X } from "lucide-react";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   cancelSession,
-  closeSession,
   readClipboardImage,
+  readFileBytes,
   sendPrompt,
   setSessionConfigOption,
   type SkillInfo,
@@ -25,34 +25,17 @@ import {
   releaseAttachment,
   type ChatComposerAttachment,
 } from "../lib/chatAttachments";
-import { shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
-import { useSessions, spaceViewFor, type SpaceView } from "../store/sessions";
+import { inferAttachmentMimeType, shouldPreferSpreadsheetClipboardText } from "../lib/chatAttachmentMetadata";
+import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useInteractive } from "../store/interactive";
-import { useStartNewConversation } from "../hooks/useStartNewConversation";
+import { useSettings } from "../store/settings";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
-import {
-  getSidePaneCollapsed,
-  setSidePaneCollapsed,
-  subscribeSidePane,
-} from "../lib/sidePaneState";
 import { BrailleLoader } from "./ui/braille-loader";
+import { normalizeVariant } from "../lib/braille-loader";
 import { Button } from "./ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "./ui/dropdown-menu";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "./ui/select";
 import SessionConfigSelect from "./SessionConfigSelect";
 import MessageBubble from "./MessageBubble";
 import ChangesGroupCard from "./ChangesGroupCard";
@@ -109,12 +92,6 @@ export default function ChatStream() {
           ))
       : undefined,
   );
-  const spaces = useSessions((s) => s.spaces);
-  const sessions = useSessions((s) => s.sessions);
-  const historySessions = useSessions((s) => s.historySessions);
-  const archivedSessions = useSessions((s) => s.archivedSessions);
-  const closeReasons = useSessions((s) => s.closeReasons);
-  const openSession = useSessions((s) => s.openSession);
   const inTurn = useSessions((s) => (s.activeSessionId ? !!s.inTurn[s.activeSessionId] : false));
   const stopReason = useSessions((s) => (s.activeSessionId ? s.stopReasons[s.activeSessionId] : undefined));
   const prompts =
@@ -166,27 +143,80 @@ export default function ChatStream() {
     activeSessionId ? s.agentState[activeSessionId] : undefined,
   );
   const workingOrInTurn = agentState === "working" || inTurn;
+  // The working-indicator spinner style (the settings' `spinnerStyle` — a
+  // `braille-loader` variant name): `null` / absent = the `typing` default.
+  // A hand-edited settings file may carry an unknown name: `normalizeVariant`
+  // falls back to the loader's `breathe` default (never an invalid variant).
+  const spinnerStyle = normalizeVariant(
+    useSettings((s) => s.settings?.spinnerStyle ?? "typing"),
+  );
   // A `blocked` agent is mid-turn AWAITING a request response
-  // (`inTurn` is true) — the composer must stay locked for the whole
-  // wait (pre-branch, `main`'s composer locked on `inTurn`): sending
-  // concurrently would double-send and clobber the turn bookkeeping.
-  // (`agentState === "blocked"` also covers a blocked state without an
-  // in-flight turn, where `inTurn` alone would not lock.)
+  // (`inTurn` is true) — the SEND must stay disabled for the whole wait
+  // (pre-branch, `main`'s composer locked on `inTurn`): the harness is
+  // one-turn-at-a-time (a prompt while a turn is in flight is REJECTED,
+  // not queued — `send_prompt`'s atomic `pending_turn` claim), so sending
+  // concurrently would fail + clobber the turn bookkeeping. The TEXTAREA
+  // is always editable (you can draft while the agent works — `send()`'
+  // `composerLocked` guard no-ops Enter, the draft is kept for when the
+  // turn ends). (`agentState === "blocked"` also covers a blocked state
+  // without an in-flight turn, where `inTurn` alone would not lock.)
   const composerLocked = workingOrInTurn || agentState === "blocked";
   // Called UNCONDITIONALLY at the top of the component body (the hook
   // contains `useState`/`useEffect` — invoking it inside the `working`
   // branch would be a conditional hook call and crash React when the
   // state flips).
   const quip = useSpinQuip(workingOrInTurn);
-  // The shared side-pane collapsed flag (Task 4): the header toggle reads
-  // it for its `aria-pressed` and sets it on click (no events, no store).
-  const sidePaneCollapsed = useSyncExternalStore(
-    subscribeSidePane,
-    getSidePaneCollapsed,
-  );
-  const configOptions = useSessions(
-    (s) => s.configOptions[s.activeSessionId ?? ""] ?? null,
-  );
+  // The session's config options (model / thinking-level selectors):
+  // the store's map FIRST (the freshest — the live frames; a session
+  // closed in this app session keeps its last known entry — the close
+  // no longer drops it), falling back to the session row's
+  // `configOptions` (the Rust `list_sessions` shape — synthesized from
+  // the stored `model` / `thinkingLevel`): a STORED session's bottom bar
+  // is POPULATED (the selectors render disabled — a stored session can't
+  // set config; a resume re-emits the fresh values).
+  const configOptions = useSessions((s) => {
+    const id = s.activeSessionId;
+    if (!id) return null;
+    return (
+      s.configOptions[id] ??
+      s.sessions.find((x) => x.sessionId === id)?.configOptions ??
+      s.historySessions.find((x) => x.sessionId === id)?.configOptions ??
+      s.archivedSessions.find((x) => x.sessionId === id)?.configOptions ??
+      null
+    );
+  });
+  // The session's context usage (the context-percentage display — from
+  // the harness's `context_usage_update` frames; the store's map first,
+  // falling back to the session row's `contextUsage` — a STORED
+  // session's last known usage, persisted on every frame): `undefined`
+  // until the first frame, so a fresh session shows no percentage.
+  const contextUsage = useSessions((s) => {
+    const id = s.activeSessionId;
+    if (!id) return undefined;
+    return (
+      s.contextUsage[id] ??
+      s.sessions.find((x) => x.sessionId === id)?.contextUsage ??
+      s.historySessions.find((x) => x.sessionId === id)?.contextUsage ??
+      s.archivedSessions.find((x) => x.sessionId === id)?.contextUsage
+    );
+  });
+  const contextPercent =
+    contextUsage && contextUsage.window > 0
+      ? Math.min(100, Math.round((contextUsage.used / contextUsage.window) * 100))
+      : undefined;
+  // The context bar's color ramp (the traffic-light scheme — the label
+  // follows the fill's color): green at 0–49%, yellow at 50–69%, orange
+  // at 70–89%, the destructive red at 90–100%.
+  const contextRamp =
+    contextPercent === undefined
+      ? { fill: "bg-success", label: "text-success" }
+      : contextPercent < 50
+        ? { fill: "bg-success", label: "text-success" }
+        : contextPercent < 70
+          ? { fill: "bg-yellow-500", label: "text-yellow-500" }
+          : contextPercent < 90
+            ? { fill: "bg-orange-500", label: "text-orange-500" }
+            : { fill: "bg-destructive", label: "text-destructive" };
   const findOption = (category: string, id: string) =>
     configOptions?.find(
       (o) =>
@@ -425,61 +455,18 @@ export default function ChatStream() {
   const isHistoryOnly = !isLive && historySession !== undefined;
   const canResume =
     isHistoryOnly && historySession?.capabilities.loadSession === true;
-  // The composer is usable for a live session OR a RESUMABLE stored session
-  // (a non-resumable stored session stays fully disabled):
-  // a resumable stored session auto-resumes on send.
+  // The composer's SEND is enabled for a live session OR a RESUMABLE
+  // stored session (a non-resumable stored session can't receive a prompt
+  // — no agent process to deliver to, and the harness's `send_prompt`
+  // rejects an unknown session): a resumable stored session auto-resumes
+  // on send. The TEXTAREA is always editable regardless (the draft is
+  // kept — it just can't be SENT while `composerEnabled` is false).
   const composerEnabled = isLive || canResume;
 
-  // The current space's `SpaceView` for `activeSessionId`: the space that
-  // owns it — by its live session OR any of its stored sessions (NOT
-  // `[0]`-only: the conversation selector below lets the user open
-  // `#2`+ sessions, which are stored sessions of the space too, and the
-  // space bar must stay rendered while they are open) OR any of its
-  // ARCHIVED sessions (a space whose only sessions are archived still
-  // resolves its `view` — the space bar + conversation selector stay
-  // rendered). `undefined` when the active session belongs to no space
-  // (e.g. a legacy pre-Spaces DB row) — rendered exactly as today (no space
-  // chip, no selector).
-  const views = useMemo(
-    () =>
-      spaces.map((s) =>
-        spaceViewFor(s, sessions, historySessions, closeReasons, archivedSessions),
-      ),
-    [spaces, sessions, historySessions, closeReasons, archivedSessions],
-  );
-  const view: SpaceView | undefined =
-    activeSessionId === null
-      ? undefined
-      : views.find(
-          (v) =>
-            v.liveSessionId === activeSessionId ||
-            v.storedSessionIds.includes(activeSessionId) ||
-            v.archivedSessionIds.includes(activeSessionId),
-        );
-
-  // `New session` in this space (the extracted hook): `spacePath =
-  // view.path` (the active session's `cwd` by the match above; the
-  // backend canonicalizes) — a native session (one harness — no agent
-  // to choose). With the one-live cap lifted, a new
-  // conversation does NOT displace a live one — they coexist.
-  // `view === undefined` → the hook no-ops (the `New Session`
-  // sidebar button routes that case to the Open Space dialog instead).
-  const { startNewConversation, error: newConversationError } =
-    useStartNewConversation(view);
-
-  // `Pause`: close the live session. It moves to `historySessions` AND —
-  // because a close keeps `activeSessionId` — the pane stays on that
-  // conversation showing the stored/paused banner (NOT the `No active
-  // session` empty state; re-selecting another space is how you leave).
-  const pause = async () => {
-    if (!activeSessionId) return;
-    try {
-      await closeSession(activeSessionId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
+  // The session's `SpaceView` + the `New Session in this Space` action
+  // + the side-pane toggle moved to `SpaceTabs` (the top tab bar — the
+  // old header row is gone: the session title lives in the side pane
+  // now, and the `Live` conversation selector is replaced by the tabs).
   // Auto-scroll to the bottom as new content streams in.
   useEffect(() => {
     const el = scrollRef.current;
@@ -488,9 +475,9 @@ export default function ChatStream() {
 
   if (!activeSessionId) {
     return (
-      <main className="m-1 flex min-w-0 flex-1 items-center justify-center rounded-xl bg-background-alt">
+      <main className="m-1 flex min-w-0 min-h-0 flex-1 items-center justify-center rounded-xl bg-background-alt">
         <p className="text-ui-base text-foreground-subtle">
-          No active session — open a Space from the list on the left
+          No active session — open a Space from the tabs above
         </p>
       </main>
     );
@@ -653,60 +640,10 @@ export default function ChatStream() {
     return true;
   };
 
-  // Conversation selector options for the space: the live session first
-  // (label `Live`), then stored sessions in order (`#1`, `#2`, …); when
-  // the live session is absent the first stored gets the label `Latest`.
-  // An ARCHIVED session is NOT in `storedSessionIds` (the Space group
-  // renders stored sessions only) — but the active session must still have
-  // a matching item, or the `Select` renders an empty trigger + empty
-  // dropdown (zero items with a `value` matching nothing).
-  const options: Array<{ id: string; label: string }> = [];
-  if (view && view.liveSessionId !== null) {
-    options.push({ id: view.liveSessionId, label: "Live" });
-  }
-  if (view) {
-    view.storedSessionIds.forEach((id, i) => {
-      options.push({ id, label: view.liveSessionId === null && i === 0 ? "Latest" : `#${i + 1}` });
-    });
-    // Only add the fallback when the active session is NOT already
-    // represented above: `spaceViewFor` does NOT filter live ids
-    // out of `archivedSessionIds` (it's view-membership only), so a
-    // STICKY-archived session (resumed, now live — the id is in BOTH
-    // `sessions` and `archivedSessions`) would otherwise be pushed TWICE
-    // (once as `Live`, once as `Archived` — two `SelectItem`s with the
-    // same `key`/`value`). Label it `Live` when it IS live (in `sessions`
-    // — a multi-live space where a second, more recent live session is
-    // `view.liveSessionId`); `Archived` only when it isn't.
-    if (
-      activeSessionId !== view.liveSessionId &&
-      !view.storedSessionIds.includes(activeSessionId) &&
-      view.archivedSessionIds.includes(activeSessionId)
-    ) {
-      options.push({
-        id: activeSessionId,
-        label: sessions.some((s) => s.sessionId === activeSessionId) ? "Live" : "Archived",
-      });
-    }
-  }
-
-  const spaceTitle = view
-    ? view.title !== ""
-      ? view.title
-      : basenameOfPath(liveSession?.cwd ?? historySession?.cwd ?? "")
-    : undefined;
-
-  // The session title: the first `user` message truncated to ~80 chars
-  // (the same derivation as the sidebar rows), else the Space name.
-  const firstUserText = (() => {
-    const m = messages.find((x) => x.kind === "user");
-    return m && m.text !== "" ? m.text : undefined;
-  })();
-  const title =
-    firstUserText !== undefined
-      ? firstUserText.length > 80
-        ? firstUserText.slice(0, 80)
-        : firstUserText
-      : spaceTitle ?? "";
+  // The conversation selector + the session title + the space chip moved
+  // out of the header: the Spaces are the TOP TABS (`SpaceTabs` — one
+  // tab per space, the active one selected) and the session title lives
+  // in the side pane (its top section).
 
   // The most recent turn (the messages after the last `user` message) and
   // its standalone `diff` messages — the SINGLE SOURCE OF TRUTH for the
@@ -832,6 +769,59 @@ export default function ChatStream() {
     stageFiles(Array.from(e.dataTransfer.files));
   };
 
+  // The `+` button (the native file picker): the dialog returns PATHS (a
+  // webview `File` is not available for a picked file — no `fs` plugin),
+  // so the bytes are read via `read_file_bytes` (the Rust command — the
+  // image-extension allowlist + the 10 MiB cap re-validated server-side),
+  // rebuilt into `File`s (the MIME inferred from the extension), and
+  // staged through the SAME `stageFiles` path as a paste / drop (the
+  // capability gate + the attachment caps apply identically).
+  const handleAttachClick = async () => {
+    if (!composerEnabled || composerLocked || !imageCapable) return;
+    let raw: string | string[] | null;
+    try {
+      raw = await openFileDialog({
+        multiple: true,
+        // The image allowlist (the SAME set as the backend command — the
+        // dialog filters, the command re-validates, `stageFiles` re-validates
+        // the MIME a third time).
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "gif", "webp"],
+          },
+        ],
+      });
+    } catch {
+      return; // the dialog is unavailable (e.g. a non-Tauri context)
+    }
+    if (raw == null) return; // cancelled
+    const paths = Array.isArray(raw) ? raw : [raw];
+    const files: File[] = [];
+    let readError: string | null = null;
+    for (const path of paths) {
+      try {
+        const bytes = await readFileBytes(path);
+        if (!bytes || bytes.length === 0) continue; // not an image (the backend allowlist)
+        files.push(
+          new File([new Uint8Array(bytes)], basenameOfPath(path), {
+            type: inferAttachmentMimeType(path),
+          }),
+        );
+      } catch (e) {
+        // A read failure (e.g. the file over the 10 MiB cap — the command
+        // rejects): keep the readable selections staged, surface the error
+        // only when NOTHING was staged.
+        readError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    if (files.length > 0) {
+      stageFiles(files);
+    } else if (readError) {
+      setError(readError);
+    }
+  };
+
   const removeAttachment = (id: string) => {
     // Revoke OUTSIDE the state updater (updaters must be pure — StrictMode
     // runs them twice; a double revoke is harmless but the wrong pattern).
@@ -875,95 +865,20 @@ export default function ChatStream() {
   const units = groupConsecutiveFileWrites(messages);
 
   return (
-    <main className="m-1 flex min-w-0 flex-1 flex-col rounded-xl bg-background-alt">
-      {isHistoryOnly && (
-        <div className="m-2 flex items-center justify-between gap-2 rounded-md bg-surface px-3 py-2 text-ui-sm">
-          {canResume ? (
-            // Informational ONLY (the manual Resume button is gone — the
-            // first `send()` auto-resumes the session before sending).
-            <span className="text-foreground-subtle">
-              This session is stored. Sending a message resumes it.
-            </span>
-          ) : (
-            <span className="text-warning">
-              History only — continuing starts a new session.
-            </span>
-          )}
-        </div>
-      )}
-      <div className="flex h-12 items-center gap-2 border-b border-border/50 p-2">
-        {title !== "" && (
-          <span
-            className="min-w-0 flex-1 truncate text-ui-base font-medium"
-            style={{
-              maskImage:
-                "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
-              WebkitMaskImage:
-                "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
-            }}
-          >
-            {title}
-          </span>
-        )}
-        {view && (
-          <span className="flex shrink-0 items-center gap-1 rounded-lg bg-surface px-2 py-0.5">
-            <FolderIcon className="size-3.5" />
-            <span className="text-ui-sm">{spaceTitle}</span>
-          </span>
-        )}
-        {view && (
-          <Select value={activeSessionId} onValueChange={openSession}>
-            <SelectTrigger
-              variant="ghost"
-              size="sm"
-              className="w-24"
-              aria-label="Conversation"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {options.map((opt) => (
-                <SelectItem key={opt.id} value={opt.id}>
-                  {opt.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon-sm" aria-label="Session actions">
-              <MoreHorizontalIcon className="size-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent>
-            {isLive && (
-              <DropdownMenuItem onSelect={() => void pause()}>
-                Pause
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuItem onSelect={() => void startNewConversation()}>
-              New Session in this Space
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Toggle side pane"
-          aria-pressed={!sidePaneCollapsed}
-          onClick={() => setSidePaneCollapsed(!sidePaneCollapsed)}
-          className="relative ml-auto"
-        >
-          <PanelRightIcon className="size-4" />
-          {hasPendingRequest && (
-            <span
-              className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
-              aria-hidden
-            />
-          )}
-        </Button>
-      </div>
+    // The `min-h-0` is LOAD-BEARING (the classic flexbox `min-height: auto`
+    // trap): the `main` is a `flex-1` item of the center column (a
+    // `flex-col`) with `overflow: visible`, so its automatic minimum size
+    // is the CONTENT's height — without `min-h-0` a long transcript grows
+    // the `main` past the column (the composer is pushed off the bottom
+    // of the window) and the inner `overflow-y-auto` div never scrolls.
+    // (`min-h-0` zeroes the automatic minimum, so the `main` stays at the
+    // column's height and the inner div scrolls.)
+    <main className="m-1 flex min-w-0 min-h-0 flex-1 flex-col rounded-xl bg-background-alt">
+      {/* The old header row (session title + space chip + `Live`
+          conversation selector + `...` menu + side-pane toggle) is gone:
+          the Spaces are the top TABS (`SpaceTabs`, above this component —
+          the `...` menu + the toggle live on that row) and the session
+          title lives in the side pane (its top section). */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
         {/* The request cards and the working/blocked/stop-reason lines
             render UNCONDITIONALLY (regardless of the transcript's
@@ -1041,26 +956,6 @@ export default function ChatStream() {
           />
         ))}
         {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
-        {/* `blocked` takes precedence: a blocked agent that is also
-            mid-turn (`inTurn`) shows the waiting line, NOT the braille
-            loader (both would render otherwise). */}
-        {agentState === "blocked" ? (
-          <p className="text-ui-sm text-foreground-subtle">
-            Waiting for your input…
-          </p>
-        ) : (
-          workingOrInTurn && (
-            <div className="flex items-center gap-2">
-              <BrailleLoader
-                variant="typing"
-                speed="normal"
-                fontSize={14}
-                label="Agent working"
-              />
-              <p className="text-ui-sm text-foreground-subtle">{quip}</p>
-            </div>
-          )
-        )}
         {!inTurn && stopReason && stopReason !== "end_turn" && (
           <p className="text-ui-sm text-foreground-subtlest">
             Turn ended: {stopReason}
@@ -1068,11 +963,42 @@ export default function ChatStream() {
         )}
       </div>
 
-      {(error ?? newConversationError) && (
+      {error && (
         <p className="mb-2 px-3 text-ui-sm text-destructive">
-          {error ?? newConversationError}
+          {error}
         </p>
       )}
+      {/* The working indicator is PINNED above the composer (the top of
+          the text input field — the reference TUI's editor bottom-border
+          row: the spinner + the rotating quip). It appears while the
+          agent works or waits for input; the message stream scrolls above
+          it. `blocked` takes precedence over `working` (a blocked agent
+          that is also mid-turn shows the waiting line, NOT the braille
+          loader — both would render otherwise). The `-mb-2` pulls the row
+          a few px down so it hugs the composer (the composer's `m-3` top
+          margin minus 8px). */}
+      {agentState === "blocked" || workingOrInTurn ? (
+        <div
+          className="-mb-2 flex items-center gap-2 px-4 py-1.5"
+          data-testid="working-indicator"
+        >
+          {agentState === "blocked" ? (
+            <p className="text-ui-sm text-foreground-subtle">
+              Waiting for your input…
+            </p>
+          ) : (
+            <>
+              <BrailleLoader
+                variant={spinnerStyle}
+                speed="normal"
+                fontSize={14}
+                label="Agent working"
+              />
+              <p className="text-ui-sm text-foreground-subtle">{quip}</p>
+            </>
+          )}
+        </div>
+      ) : null}
       <div
         className="relative m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
         onDrop={handleDrop}
@@ -1215,33 +1141,83 @@ export default function ChatStream() {
               void send();
             }
           }}
-          placeholder={
-            isLive
-              ? composerLocked
-                ? "Agent is working…"
-                : messages.length === 0
-                  ? imageCapable
-                    ? "Ask anything — or paste an image…"
-                    : "Ask anything…"
-                  : "Ask for follow-up changes"
-              : canResume
-                ? "Resume this session to send"
-                : "This session is closed"
-          }
+          // The SINGLE static placeholder (the state if/else is gone — the
+          // working indicator carries the working state, and a closed
+          // session's send auto-resumes it, so "follow-up changes" is
+          // accurate there too).
+          placeholder="Ask for follow-up changes"
           rows={2}
-          disabled={!composerEnabled || composerLocked}
-          className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest disabled:opacity-50"
+          className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest"
         />
-        <div className="mt-1 flex items-center justify-end gap-2">
+        <div className="mt-1 flex items-center gap-2">
+          {/* The `+` attach button (the native file picker — the same
+              staging path as a paste / drop; disabled while the composer
+              is locked or the agent doesn't advertise image support,
+              fail-closed). */}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Attach files"
+            disabled={!composerEnabled || composerLocked || !imageCapable}
+            title={
+              imageCapable
+                ? "Attach an image (file picker)"
+                : "The agent does not support images"
+            }
+            onClick={() => void handleAttachClick()}
+          >
+            <Plus className="size-4" />
+          </Button>
+          {/* The context bar (the dynamic percentage — a progress bar
+              spanning from the `+` button to the model selector, the
+              reference UI's `🧠 [====] 61%` look). ALWAYS rendered (the
+              `isLive` gate is gone): a live session's fill appears as the
+              session grows, the label waits for the first frame, and a
+              closed session (the context is dropped on close — re-emitted
+              on resume) shows the empty 0% track. */}
+          <div
+              className="flex min-w-0 flex-1 items-center gap-2"
+              data-testid="context-usage-bar"
+            >
+              <Brain
+                className="size-3.5 shrink-0 text-foreground-subtle"
+                aria-hidden
+                data-testid="context-bar-icon"
+              />
+              <div
+                role="progressbar"
+                aria-label="Context used"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={contextPercent ?? 0}
+                className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground-subtlest"
+              >
+                <div
+                  className={`h-full rounded-full transition-[width] duration-500 ${contextRamp.fill}`}
+                  style={{ width: `${contextPercent ?? 0}%` }}
+                />
+              </div>
+              {contextPercent !== undefined && contextUsage && (
+                <span
+                  data-testid="context-usage"
+                  className={`shrink-0 text-ui-sm tabular-nums ${contextRamp.label}`}
+                  title={`${contextPercent}% of context used (${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens)`}
+                >
+                  {contextPercent}%
+                </span>
+              )}
+          </div>
           {/* ZCode's composer carries the config controls in its toolbar
-              (left of the send button) — the header does not. */}
-          <div className="flex flex-wrap items-center gap-2">
-            {isLive && modelOption && (
-              <SessionConfigSelect option={modelOption} onSet={setConfigValue} />
-            )}
-            {isLive && thinkingOption && (
-              <SessionConfigSelect option={thinkingOption} onSet={setConfigValue} />
-            )}
+              (left of the send button) — the header does not. ALWAYS
+              rendered (the `isLive` gate is gone): a live session shows
+              the live values, a stored session shows the POPULATED
+              values (the store's kept entry, else the row's synthesized
+              `configOptions` / persisted `contextUsage`) with DISABLED
+              selectors (a stored session can't set config — a resume
+              re-emits the fresh values). */}
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <SessionConfigSelect kind="model" option={modelOption ?? null} onSet={setConfigValue} disabled={!isLive} />
+            <SessionConfigSelect kind="thinking" option={thinkingOption ?? null} onSet={setConfigValue} disabled={!isLive} />
             <Button
               size="icon-md"
               aria-label="Send"

@@ -121,4 +121,51 @@ describe("SkillsDialog", () => {
     expect(screen.queryByText("beta")).toBeNull();
     expect(screen.getByText('No skills match "zzz".')).toBeTruthy();
   });
+
+  it("the dialog content is bounded (max-w-3xl — not the full-width default)", async () => {
+    render(<SkillsDialog skills={[skill()]} onClose={() => {}} />);
+    const title = await screen.findByText("Skills");
+    const content = title.closest("[data-slot=dialog-content]");
+    expect(content?.className).toContain("max-w-3xl");
+  });
+
+  it("the truncation chain is bounded (min-w-0 on the wrapper, the scroll container, and the row — the text cannot escape the right edge)", async () => {
+    render(
+      <SkillsDialog
+        skills={[
+          skill({
+            name: "long-desc",
+            description: "x".repeat(400),
+            path: "/p/.agents/skills/long-desc/SKILL.md",
+            dir: "/p/.agents/skills/long-desc",
+          }),
+        ]}
+        onClose={() => {}}
+      />,
+    );
+    const desc = await screen.findByText("x".repeat(400));
+    // The leaf spans: `min-w-0` lets them shrink below their (nowrap)
+    // content width so `truncate` can clip them.
+    expect(desc.className).toContain("min-w-0");
+    expect(desc.className).toContain("truncate");
+    const name = screen.getByText("long-desc");
+    expect(name.className).toContain("min-w-0");
+    // AND the whole item chain between the dialog box and the spans must
+    // be shrinkable: the wrapper (a grid item of the dialog), the scroll
+    // container (a flex item of the wrapper), and the row (a flex item of
+    // the scroll container). Without `min-w-0` at EACH level, the
+    // `min-width: auto` floor (the min-content width) lets the nowrap
+    // text push every ancestor past the dialog's right edge.
+    const row = desc.closest("[role=button]");
+    expect(row?.className).toContain("min-w-0");
+    const scroll = row?.parentElement;
+    expect(scroll?.className).toContain("min-w-0");
+    expect(scroll?.className).toContain("overflow-y-auto");
+    // Right padding keeps the row content clear of the scrollbar (which
+    // sits in the container's right edge and would otherwise overlap the
+    // rows' right side).
+    expect(scroll?.className).toContain("pr-2");
+    const wrapper = scroll?.parentElement;
+    expect(wrapper?.className).toContain("min-w-0");
+  });
 });

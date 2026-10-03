@@ -407,6 +407,7 @@ async fn resuming_legacy_bare_uuid_session_preserves_id() {
         }),
         config_options: None,
         archived: false,
+        context_usage: None,
     };
     db.record_session(&info).unwrap();
     let sys_msg = ChatMessage {

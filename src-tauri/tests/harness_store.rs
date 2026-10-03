@@ -32,6 +32,7 @@ fn record_session(db: &Db, id: &str) {
         capabilities: json!({}),
         config_options: None,
         archived: false,
+        context_usage: None,
     })
     .unwrap();
 }

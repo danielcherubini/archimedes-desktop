@@ -5,32 +5,32 @@ import type { SessionConfigOption } from "../lib/tauri";
 
 /**
  * Regression test (perf): a live session mounts the config selects in the
- * composer header with pi's FULL model catalog (~600 options). Radix keeps
- * closed-select items mounted into a detached DocumentFragment (Collection
- * registration), so every re-render of `SessionConfigSelect` re-renders
- * ~600 invisible `SelectItem`s (~8 fibers each) — with `draft` state in
+ * composer header with pi's FULL model catalog (~600 options). The model
+ * option is a DIALOG (`ModelPicker`) — its catalog rows are only mounted
+ * while the dialog is open (a closed Radix `Select` would keep ~600 items
+ * mounted into a detached DocumentFragment — `Collection` registration —
+ * re-rendering them on EVERY parent render; with `draft` state in
  * `ChatStream`, that happened on EVERY KEYSTROKE, costing ~140ms each and
- * making typing lag a full minute behind (measured live: 33.5k dev-timer
- * calls per commit, tree 2,135 → 7,052 fibers on connect).
+ * making typing lag a full minute behind — the dialog form makes that
+ * cost zero at rest).
  *
  * The invariant: when the parent re-renders with a referentially-stable
- * `option` and `onSet` (the composer's typing path), the items must NOT
- * re-render. `SessionConfigSelect` must be memoized, and `onSet` must be
- * a stable `(optionId, value)` callback (not a per-option closure minted
- * per render, which defeats memo).
+ * `option` and `onSet` (the composer's typing path), the model option's
+ * subtree (`ModelPicker`) must NOT re-render. `SessionConfigSelect` must
+ * be memoized, and `onSet` must be a stable `(optionId, value)` callback
+ * (not a per-option closure minted per render, which defeats memo).
  */
 
-let itemRenders = 0;
-vi.mock("../components/ui/select", async (importOriginal) => {
+let pickerRenders = 0;
+vi.mock("./ModelPicker", async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import("../components/ui/select")>();
+    await importOriginal<typeof import("./ModelPicker")>();
   return {
-    ...actual,
-    SelectItem: function ProbeSelectItem(
-      props: React.ComponentProps<typeof actual.SelectItem>,
+    default: function ProbeModelPicker(
+      props: React.ComponentProps<typeof actual.default>,
     ) {
-      itemRenders += 1;
-      return createElement(actual.SelectItem, props);
+      pickerRenders += 1;
+      return createElement(actual.default, props);
     },
   };
 });
@@ -84,10 +84,10 @@ function KeystrokeParent({ option }: { option: SessionConfigOption }) {
 }
 
 describe("SessionConfigSelect memoization", () => {
-  it("does not re-render its items when the parent re-renders (typing)", async () => {
-    itemRenders = 0;
+  it("does not re-render the model picker when the parent re-renders (typing)", async () => {
+    pickerRenders = 0;
     const utils = render(<KeystrokeParent option={mockOption} />);
-    expect(itemRenders).toBe(3); // initial mount: one per option
+    expect(pickerRenders).toBe(1); // initial mount
 
     // Simulate keystrokes: parent state changes → parent re-renders with
     // the SAME option reference and an equivalent onSet.
@@ -96,16 +96,16 @@ describe("SessionConfigSelect memoization", () => {
       fireEvent.click(utils.getByText("type"));
     }
 
-    // The items must not have re-rendered beyond the initial mount.
-    expect(itemRenders).toBe(3);
+    // The model picker must not have re-rendered beyond the initial mount.
+    expect(pickerRenders).toBe(1);
   });
 
   it("still re-renders when the option object changes (config applied)", async () => {
-    itemRenders = 0;
+    pickerRenders = 0;
     const utils = render(
       <KeystrokeParent option={{ ...mockOption, currentValue: "acme/beta" }} />,
     );
-    expect(itemRenders).toBe(3);
+    expect(pickerRenders).toBe(1);
 
     // A NEW option object (the store replaces configOptions on apply):
     utils.rerender(
@@ -114,7 +114,8 @@ describe("SessionConfigSelect memoization", () => {
       />,
     );
 
-    // Items re-render: memo must not swallow real config updates.
-    expect(itemRenders).toBeGreaterThan(3);
+    // The model picker re-renders: memo must not swallow real config
+    // updates.
+    expect(pickerRenders).toBeGreaterThan(1);
   });
 });

@@ -45,6 +45,8 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import ModelPicker from "@/components/ModelPicker";
+import { modelItemsFromCatalog } from "@/components/ModelPickerDialog";
 import {
   Dialog,
   DialogContent,
@@ -68,7 +70,12 @@ import {
   SettingsGroupCard,
   SettingsRow,
   SettingsSidebarButton,
+  humanizeVariant,
 } from "./primitives";
+import { BrailleLoader } from "@/components/ui/braille-loader";
+import { brailleLoaderVariants } from "@/lib/braille-loader";
+import { cn } from "@/components/lib/utils";
+import { useSettings } from "@/store/settings";
 
 type Section = "general" | "appearance" | "providers" | "subagents" | "mcp";
 
@@ -193,6 +200,64 @@ function FontSizeInput({
       <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-ui-sm text-foreground-subtlest">
         px
       </span>
+    </div>
+  );
+}
+
+/**
+ * The thinking-spinner picker (the `Appearance` section): a `4`-column
+ * radiogroup grid of the FULL `braille-loader` gallery — every variant as
+ * a LIVE `BrailleLoader` preview (an animated 2×N braille block) + its
+ * humanized name. A cell picks its variant immediately (the page's
+ * immediate-save pattern). The `aria-label` is the humanized name (it
+ * wins over the cell's content for naming — the visible label stays a
+ * plain visual duplicate).
+ */
+function SpinnerStylePicker({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: string;
+  onChange: (variant: string) => void;
+  ariaLabel?: string;
+}): ReactElement {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel ?? "Thinking spinner"}
+      className="grid grid-cols-4 gap-1.5"
+    >
+      {brailleLoaderVariants.map((variant) => {
+        const selected = value === variant;
+        const name = humanizeVariant(variant);
+        return (
+          <button
+            key={variant}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            aria-label={name}
+            onClick={() => onChange(variant)}
+            className={cn(
+              "flex flex-col items-center gap-1 rounded-md border px-2 py-1.5 transition-colors",
+              selected
+                ? "border-primary bg-primary/10"
+                : "border-border hover:bg-muted",
+            )}
+          >
+            <BrailleLoader
+              variant={variant}
+              speed="normal"
+              fontSize={14}
+              label={name}
+            />
+            <span className="text-[10px] leading-none text-foreground-subtle">
+              {name}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -806,7 +871,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   useEffect(() => {
     // The page's single source of truth: the settings document.
     getSettings()
-      .then(setSettings)
+      .then((settings) => {
+        setSettings(settings);
+        // Keep the app-wide store in sync (the working-indicator spinner
+        // style reads it at runtime — the boot path seeds it too).
+        useSettings.getState().setSettings(settings);
+      })
       .catch(() => {});
     listModels()
       .then(setModels)
@@ -868,6 +938,9 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     if (settings === null) return;
     const next = { ...settings, ...patch };
     setSettings(next);
+    // The app-wide store (the working indicator reads `spinnerStyle` from
+    // it — a settings change must take effect without a reload).
+    useSettings.getState().setSettings(next);
     void saveSettings(next); // the complete document
     themeCleanupRef.current?.(); // drop the previous theme listener
     themeCleanupRef.current = applySettingsToDocument(next); // live theme/font
@@ -1014,27 +1087,28 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
         label="Default model"
         description="The model new sessions start with (the system default when unset)"
         control={
-          <Select
+          // The SHARED `ModelPicker` (the one component every model picker
+          // uses — a trigger opening the fuzzy-searched, alphabetical
+          // dialog; the catalog is too long for a Radix dropdown). The
+          // items are the SHARED derivation (the row name is the FULL
+          // `provider/id` value; the provider cue is the provider's
+          // display name — `tama` → `Tama` from the configured providers)
+          // + the "System default" row (value `""` → `defaultModel: null`).
+          <ModelPicker
+            label="Default model"
             value={settings.defaultModel ?? ""}
-            onValueChange={(value) =>
+            placeholder="System default"
+            items={[
+              ...modelItemsFromCatalog(
+                models.map((model) => `${model.provider}/${model.id}`),
+                settings.providers,
+              ),
+              { value: "", name: "System default" },
+            ]}
+            onSelect={(value) =>
               update({ defaultModel: value === "" ? null : value })
             }
-          >
-            <SelectTrigger aria-label="Default model" className="w-64">
-              <SelectValue placeholder="System default" />
-            </SelectTrigger>
-            <SelectContent>
-              {models.map((model) => (
-                <SelectItem
-                  key={`${model.provider}/${model.id}`}
-                  value={`${model.provider}/${model.id}`}
-                >
-                  {model.provider}/{model.id}
-                </SelectItem>
-              ))}
-              <SelectItem value="">System default</SelectItem>
-            </SelectContent>
-          </Select>
+          />
         }
       />
       <SettingsRow
@@ -1142,12 +1216,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
         label="UI font"
         control={
           <Select
-            value={settings.font.uiFamily ?? ""}
+            value={settings.font.uiFamily ?? "default"}
             onValueChange={(value) =>
               update({
                 font: {
                   ...settings.font,
-                  uiFamily: value === "" ? null : value,
+                  uiFamily: value === "default" ? null : value,
                 },
               })
             }
@@ -1156,11 +1230,28 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="">System (default)</SelectItem>
+              {/* The `"default"` sentinel (saved as `null`) is the APP
+                  DEFAULT — Noto Sans for the UI font (the `index.css`
+                  `--font-sans` stack resolves to it first, with the
+                  system tail as the offline fallback). A sentinel value
+                  (NOT `""`): Radix's `SelectValue` renders nothing for
+                  an empty-string value, so the trigger would go blank
+                  when the default is selected. */}
+              <SelectItem value="default">Default (Noto Sans)</SelectItem>
               <SelectItem value="ui-serif, Georgia, serif">Serif</SelectItem>
               <SelectItem value="ui-monospace, SFMono-Regular, Menlo, monospace">
                 Monospace
               </SelectItem>
+              {/* Web fonts (the `index.html` Google Fonts link — the
+                  saved value is the QUOTED CSS family name:
+                  `applySettingsFont` splices it into the `--font-sans`
+                  stack, where an unquoted multi-word name would not be a
+                  valid family). The stack's tail (system + CJK
+                  fallbacks) still applies when a web font is
+                  unavailable, e.g. offline. */}
+              <SelectItem value='"Noto Sans"'>Noto Sans</SelectItem>
+              <SelectItem value='"Fira Sans"'>Fira Sans</SelectItem>
+              <SelectItem value='"Martel Sans"'>Martel Sans</SelectItem>
             </SelectContent>
           </Select>
         }
@@ -1169,12 +1260,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
         label="Code font"
         control={
           <Select
-            value={settings.font.codeFamily ?? ""}
+            value={settings.font.codeFamily ?? "default"}
             onValueChange={(value) =>
               update({
                 font: {
                   ...settings.font,
-                  codeFamily: value === "" ? null : value,
+                  codeFamily: value === "default" ? null : value,
                 },
               })
             }
@@ -1183,14 +1274,34 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="">System (default)</SelectItem>
-              <SelectItem value="JetBrains Mono">JetBrains Mono</SelectItem>
-              <SelectItem value="Fira Code">Fira Code</SelectItem>
-              <SelectItem value="Cascadia Code">Cascadia Code</SelectItem>
+              {/* The `"default"` sentinel (saved as `null`) is the APP
+                  DEFAULT — Fira Code for the code font (the `index.css`
+                  `--font-mono` stack resolves to it first, with the
+                  system + CJK tail as the offline fallback; a sentinel
+                  value, NOT `""` — see the UI font's note). The
+                  multi-word values are the QUOTED CSS family names (the
+                  same convention as the UI font's web-font options —
+                  `applySettingsFont` splices the value into the
+                  `--font-mono` stack). */}
+              <SelectItem value="default">Default (Fira Code)</SelectItem>
+              <SelectItem value='"JetBrains Mono"'>JetBrains Mono</SelectItem>
+              <SelectItem value='"Fira Code"'>Fira Code</SelectItem>
+              <SelectItem value='"Cascadia Code"'>Cascadia Code</SelectItem>
               <SelectItem value="Menlo">Menlo</SelectItem>
               <SelectItem value="Consolas">Consolas</SelectItem>
             </SelectContent>
           </Select>
+        }
+      />
+      <SettingsRow
+        label="Thinking spinner"
+        description="The animation the chat's top working indicator runs while the agent is busy"
+        controlLayout="wide"
+        control={
+          <SpinnerStylePicker
+            value={settings.spinnerStyle ?? "typing"}
+            onChange={(spinnerStyle) => update({ spinnerStyle })}
+          />
         }
       />
     </SettingsGroupCard>
@@ -1309,9 +1420,30 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
             label={def.name}
             description={`${def.description || "No description"} · file: ${def.model ?? "— (inherits parent model)"}`}
             control={
-              <Select
+              // The SHARED `ModelPicker` (ADR 0023): the catalog's models
+              // (the shared derivation — the row name is the FULL
+              // `provider/id` value; the provider cue is the display name)
+              // + the "File value (no override)" row (picking it DELETES
+              // the key) + a stale stored override as its own DISABLED
+              // row (a key no longer in the catalog — the
+              // `storedLevelOutsideUnion` pattern).
+              <ModelPicker
+                label={`Subagent model for ${def.name}`}
                 value={storedOverride ?? ""}
-                onValueChange={(value) => {
+                placeholder="File value (no override)"
+                items={[
+                  ...modelItemsFromCatalog(
+                    models.map((model) => `${model.provider}/${model.id}`),
+                    settings.providers,
+                  ),
+                  { value: "", name: "File value (no override)" },
+                  ...(staleOverride !== null
+                    ? [
+                        { value: staleOverride, name: staleOverride, disabled: true },
+                      ]
+                    : []),
+                ]}
+                onSelect={(value) => {
                   const subagentModels = { ...settings.subagentModels };
                   // (ADR 0023 review) Drop EVERY key that is a case-variant
                   // of this agent's name (not just the exact `def.name`
@@ -1325,30 +1457,7 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
                   if (value !== "") subagentModels[def.name] = value;
                   update({ subagentModels });
                 }}
-              >
-                <SelectTrigger
-                  aria-label={`Subagent model for ${def.name}`}
-                  className="w-64"
-                >
-                  <SelectValue placeholder="File value (no override)" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="">File value (no override)</SelectItem>
-                  {models.map((model) => (
-                    <SelectItem
-                      key={`${model.provider}/${model.id}`}
-                      value={`${model.provider}/${model.id}`}
-                    >
-                      {model.provider}/{model.id}
-                    </SelectItem>
-                  ))}
-                  {staleOverride !== null && (
-                    <SelectItem value={staleOverride} disabled>
-                      {staleOverride}
-                    </SelectItem>
-                  )}
-                </SelectContent>
-              </Select>
+              />
             }
           />
         );

@@ -116,6 +116,7 @@ async fn build_harness(
         capabilities: json!({}),
         config_options: None,
         archived: false,
+        context_usage: None,
     })
     .unwrap();
     let store = SessionStore::new(db.clone());

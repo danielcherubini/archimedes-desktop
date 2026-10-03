@@ -102,7 +102,8 @@ pub fn run() {
             commands::spaces::space_for_path,
             commands::spaces::set_space_trusted,
             commands::skills::list_skills,
-            commands::clipboard::read_clipboard_image
+            commands::clipboard::read_clipboard_image,
+            commands::files::read_file_bytes
         ])
         .setup(|app| {
             // The on-disk dirs are named `archimedes` (NOT the bundle

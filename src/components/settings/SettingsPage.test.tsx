@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import SettingsPage from "./SettingsPage";
 import {
   authMcpServer,
@@ -10,6 +10,8 @@ import {
   testMcpServer,
   type AppSettings,
 } from "@/lib/tauri";
+import { brailleLoaderVariants } from "@/lib/braille-loader";
+import { humanizeVariant } from "./primitives";
 
 // The page's single source of truth (the `getSettings` fixture): a full
 // `AppSettings` document — dark theme, font defaults, one provider, one
@@ -37,6 +39,7 @@ const baseSettings: AppSettings = {
   font: { sizePx: 14, uiFamily: null, codeFamily: null },
   defaultThinkingLevels: {},
   subagentModels: {},
+  spinnerStyle: null,
 };
 
 vi.mock("../../lib/tauri", async () => {
@@ -68,6 +71,7 @@ vi.mock("../../lib/tauri", async () => {
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
       subagentModels: {},
+      spinnerStyle: null,
     }),
     // The discovered agent definitions (ADR 0023 — the Subagents section's
     // data source): empty by default (the tests override per case).
@@ -213,6 +217,81 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     expect(saved.font).toEqual(baseSettings.font);
   });
 
+  it("the UI font picker offers Noto Sans, Fira Sans, and Martel Sans (immediate save of the quoted family)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const trigger = await screen.findByRole("combobox", { name: "UI font" });
+    fireEvent.click(trigger);
+    // The three web-font families are offered (alongside the existing
+    // System / Serif / Monospace options).
+    for (const name of ["Noto Sans", "Fira Sans", "Martel Sans"]) {
+      expect(screen.getByRole("option", { name })).toBeTruthy();
+    }
+    // Pick one: the saved `uiFamily` is the QUOTED CSS family name
+    // (`applySettingsFont` splices it into the `--font-sans` stack — an
+    // unquoted multi-word name would not be a valid CSS family there).
+    fireEvent.click(screen.getByRole("option", { name: "Fira Sans" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.font.uiFamily).toBe('"Fira Sans"');
+  });
+
+  it("the font pickers' default option is the app default (Noto Sans for UI, Fira Code for Code)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    // The `""` (null) option is the APP DEFAULT — Noto Sans for the UI
+    // font, Fira Code for the code font (the `index.css` stacks resolve
+    // to them first, with the system tail as the offline fallback).
+    // (One select at a time: an open Radix Select `aria-hidden`s the rest
+    // of the document, so the other trigger is unreachable until it
+    // closes.)
+    const uiTrigger = await screen.findByRole("combobox", { name: "UI font" });
+    fireEvent.click(uiTrigger); // open
+    expect(
+      screen.getByRole("option", { name: "Default (Noto Sans)" }),
+    ).toBeTruthy();
+    fireEvent.keyDown(uiTrigger, { key: "Escape" }); // close (Radix's escape)
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let Radix un-`aria-hide` the document
+    const codeTrigger = await screen.findByRole("combobox", {
+      name: "Code font",
+    });
+    fireEvent.click(codeTrigger); // open
+    expect(
+      screen.getByRole("option", { name: "Default (Fira Code)" }),
+    ).toBeTruthy();
+  });
+
+  it("selecting a default option shows its label in the trigger (not empty — Radix renders nothing for an empty-string value)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const uiTrigger = await screen.findByRole("combobox", { name: "UI font" });
+    // A fresh `null` family: the default option is selected — the trigger
+    // shows its label (with the `""` value it would show nothing — Radix
+    // treats an empty value as "no value").
+    expect(
+      uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
+    ).toBe("Default (Noto Sans)");
+    // Pick a web font, then go BACK to the default: the label comes back
+    // (and the saved document maps the sentinel to `null`).
+    fireEvent.click(uiTrigger);
+    fireEvent.click(screen.getByRole("option", { name: "Fira Sans" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(
+      uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
+    ).toBe("Fira Sans");
+    fireEvent.click(uiTrigger);
+    fireEvent.click(screen.getByRole("option", { name: "Default (Noto Sans)" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
+    expect(
+      uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
+    ).toBe("Default (Noto Sans)");
+    const saved = vi.mocked(saveSettings).mock.calls[1][0] as AppSettings;
+    expect(saved.font.uiFamily).toBeNull();
+  });
+
   it("a_provider_field_commits_on_blur_and_refreshes_discovery", async () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -339,24 +418,40 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     );
   });
 
-  it("the_default_model_select_lists_the_catalog_and_system_default", async () => {
+  it("the_default_model_picker_dialog_lists_the_catalog_and_system_default", async () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
-    const trigger = screen.getByRole("combobox", { name: "Default model" });
+    // The model pickers are DIALOGS (the catalog is too long for a Radix
+    // dropdown) — the trigger is a button, not a combobox.
+    const trigger = screen.getByRole("button", { name: "Default model" });
     fireEvent.click(trigger);
-    // The catalog entry (`{provider}/{id}`) + the "System default" option.
-    expect(screen.getByRole("option", { name: "tama/Qwen3.8" })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "System default" })).toBeTruthy();
+    // The catalog entry (the `provider/id` name + the provider's
+    // display-name cue — `tama` → `Tama` from the configured providers)
+    // + the "System default" row.
+    expect(screen.getByText(/tama\/Qwen3\.8/)).toBeTruthy();
+    expect(screen.getByText(/Tama/)).toBeTruthy();
+    // "System default" appears TWICE — the trigger's placeholder AND the
+    // dialog's row — so the row is picked scoped to the dialog.
+    const dialog = within(
+      document.querySelector("[data-slot=dialog-content]") as HTMLElement,
+    );
+    expect(dialog.getByText("System default")).toBeTruthy();
     // Choosing the model saves the composed key.
-    fireEvent.click(screen.getByRole("option", { name: "tama/Qwen3.8" }));
+    fireEvent.click(screen.getByText(/tama\/Qwen3\.8/));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ defaultModel: "tama/Qwen3.8" }),
       ),
     );
-    // Choosing "System default" saves `defaultModel: null`.
+    // Choosing "System default" saves `defaultModel: null`. Re-capture the
+    // dialog content — Radix REMOUNTS it on the second open (the first
+    // selection closed the dialog and unmounted the old content node, so
+    // the reference captured above is detached and inert).
     fireEvent.click(trigger);
-    fireEvent.click(screen.getByRole("option", { name: "System default" }));
+    const reopenedDialog = within(
+      document.querySelector("[data-slot=dialog-content]") as HTMLElement,
+    );
+    fireEvent.click(reopenedDialog.getByText("System default"));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ defaultModel: null }),
@@ -743,13 +838,14 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     expect(
       screen.getByText(/No description · file: — \(inherits parent model\)/),
     ).toBeTruthy();
-    // Both selects default to "File value (no override)" (the placeholder —
-    // no override stored).
-    const scoutTrigger = screen.getByRole("combobox", {
+    // Both triggers default to "File value (no override)" (the
+    // placeholder — no override stored). The model pickers are DIALOGS
+    // (the triggers are buttons, not comboboxes).
+    const scoutTrigger = screen.getByRole("button", {
       name: "Subagent model for scout",
     });
     expect(scoutTrigger.textContent).toContain("File value (no override)");
-    const builderTrigger = screen.getByRole("combobox", {
+    const builderTrigger = screen.getByRole("button", {
       name: "Subagent model for builder",
     });
     expect(builderTrigger.textContent).toContain("File value (no override)");
@@ -771,18 +867,24 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for scout",
     });
     // The trigger displays the stored value, not the placeholder.
     expect(trigger.textContent).toContain("gone/m1");
     expect(trigger.textContent).not.toContain("File value (no override)");
     fireEvent.click(trigger);
-    // The raw stored value is offered (alongside the catalog) — and it is
-    // the SELECTED option; disabled (it is not a live catalog model).
-    const stale = await screen.findByRole("option", { name: "gone/m1" });
-    expect(stale.getAttribute("data-state")).toBe("checked");
-    expect(stale.getAttribute("aria-disabled")).toBe("true");
+    // The raw stored value is offered (alongside the catalog) as its own
+    // DISABLED row (it is not a live catalog model) — clicking it does
+    // nothing (the `storedLevelOutsideUnion` pattern).
+    const dialog = document.querySelector(
+      "[data-slot=dialog-content]",
+    ) as HTMLElement;
+    const stale = dialog.querySelector("[aria-disabled=true]");
+    expect(stale).toBeTruthy();
+    expect(stale?.textContent).toContain("gone/m1");
+    fireEvent.click(stale!);
+    expect(saveSettings).not.toHaveBeenCalled();
   });
 
   it("selecting_a_model_saves_the_subagent_models_entry", async () => {
@@ -792,12 +894,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for scout",
     });
     fireEvent.click(trigger);
     // Pick a catalog model (the `listModels` fixture's first model).
-    fireEvent.click(await screen.findByRole("option", { name: "tama/Qwen3.8" }));
+    fireEvent.click(await screen.findByText("tama/Qwen3.8"));
     // Immediate save of the COMPLETE document: `subagentModels` gains the
     // entry; every other field is the loaded document, unchanged.
     await waitFor(() =>
@@ -822,14 +924,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for scout",
     });
     expect(trigger.textContent).toContain("p/m1");
     fireEvent.click(trigger);
-    fireEvent.click(
-      await screen.findByRole("option", { name: "File value (no override)" }),
-    );
+    fireEvent.click(await screen.findByText("File value (no override)"));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ subagentModels: {} }),
@@ -897,18 +997,22 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for scout",
     });
     // The trigger displays the stored value, not the placeholder.
     expect(trigger.textContent).toContain("gone/m1");
     expect(trigger.textContent).not.toContain("File value (no override)");
     fireEvent.click(trigger);
-    // The raw stored value is offered (alongside the catalog) — and it is
-    // the SELECTED option; disabled (it is not a live catalog model).
-    const stale = await screen.findByRole("option", { name: "gone/m1" });
-    expect(stale.getAttribute("data-state")).toBe("checked");
-    expect(stale.getAttribute("aria-disabled")).toBe("true");
+    // The raw stored value is offered (alongside the catalog) as its own
+    // DISABLED row (the case-insensitive lookup found it — the
+    // `storedLevelOutsideUnion` pattern).
+    const dialog = document.querySelector(
+      "[data-slot=dialog-content]",
+    ) as HTMLElement;
+    const stale = dialog.querySelector("[aria-disabled=true]");
+    expect(stale).toBeTruthy();
+    expect(stale?.textContent).toContain("gone/m1");
   });
 
   it("a_case_variant_key_is_not_treated_as_an_orphan", async () => {
@@ -933,7 +1037,7 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     ).toBeNull();
     // The def's row shows the stored value (the case-insensitive lookup
     // finds it — an exact-case lookup would show the placeholder).
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for ghost",
     });
     expect(trigger.textContent).toContain("p/m1");
@@ -956,12 +1060,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for scout",
     });
     // Pick a different catalog model.
     fireEvent.click(trigger);
-    fireEvent.click(await screen.findByRole("option", { name: "openai/GPT-5" }));
+    fireEvent.click(await screen.findByText("openai/GPT-5"));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ subagentModels: { scout: "openai/GPT-5" } }),
@@ -999,7 +1103,7 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     // The def's row shows the PLACEHOLDER (the ASCII-only fold does not
     // match the non-ASCII pair — mirroring the backend, which ignores the
     // key), NOT the stored value (a `toLowerCase()` fold would show it).
-    const trigger = await screen.findByRole("combobox", {
+    const trigger = await screen.findByRole("button", {
       name: "Subagent model for é-claude",
     });
     expect(trigger.textContent).toContain("File value (no override)");
@@ -1172,5 +1276,45 @@ describe("SettingsPage (the known-providers picker + the provider api field — 
     // The row is rendered (the name field) — and there is no "Get key" link.
     await screen.findByDisplayValue("Tama");
     expect(screen.queryByRole("link", { name: "Get key" })).toBeNull();
+  });
+});
+
+describe("Appearance: thinking spinner", () => {
+  it("offers every braille variant as a live preview (the default typing is preselected)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    // Every variant in the gallery is offered, named by its humanized name
+    // (the picker's `aria-label`), with a live `BrailleLoader` preview inside.
+    for (const variant of brailleLoaderVariants) {
+      expect(
+        screen.getByRole("radio", { name: humanizeVariant(variant) }),
+      ).toBeTruthy();
+    }
+    // The default (`typing` — the fixture's `spinnerStyle` is null) is
+    // preselected; the others are not.
+    const typing = screen.getByRole("radio", {
+      name: humanizeVariant("typing"),
+    }) as HTMLButtonElement;
+    expect(typing.getAttribute("aria-checked")).toBe("true");
+    const pendulum = screen.getByRole("radio", {
+      name: humanizeVariant("pendulum"),
+    }) as HTMLButtonElement;
+    expect(pendulum.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("saves the picked spinner style (immediate save, complete document)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    fireEvent.click(
+      screen.getByRole("radio", { name: humanizeVariant("pendulum") }),
+    );
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.spinnerStyle).toBe("pendulum");
+    // The complete document (the other fields intact).
+    expect(saved.theme).toBe("dark");
+    expect(saved.font).toEqual(baseSettings.font);
   });
 });

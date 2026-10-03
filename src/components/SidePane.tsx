@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { basenameOfPath } from "../lib/paths";
 import { useSessions } from "../store/sessions";
 import { getSidePaneCollapsed, setSidePaneCollapsed, subscribeSidePane } from "../lib/sidePaneState";
 import TodoBoardPanel, { useMainOpenTodoCount } from "./TodoBoardPanel";
@@ -41,16 +42,19 @@ function initialWidth(): number {
  *   The logic is EDGE-TRIGGERED (a `prevVisible` ref): a MANUAL
  *   collapse/expand while `visible` is unchanged is respected — a count
  *   change without the edge never flips the flag.
- * - **Collapse mechanism: the frame's `width: 0` + `overflow: hidden` —
- *   NOT `display: none`, NOT a transform, NOT unmount.** The content
+ * - **Collapse mechanism: the frame's `width: 0` + `overflow: hidden`
+ *   — NOT `display: none`, NOT a transform, NOT unmount.** The content
  *   stays mounted and `fixed` overlays escape `overflow` clipping, so a
  *   collapsed pane never hides a pending `SudoConfirmModal`/
  *   `SudoPasswordModal` (rendered by `SubagentModals` at the frame root).
- *   The collapsed flag is shared with the header toggle (Task 6) via
- *   `sidePaneState`: the module seeds the flag from `localStorage` at
- *   import (it is the single persistence owner) — `SidePane` READS it
- *   via `useSyncExternalStore` and WRITES it only from the auto
- *   open/close edge (the toggle writes it itself).
+ *   The collapse control lives in the CHROME BAR (the top menubar — the
+ *   old footer toggle moved up), so no rail is needed: the pane just
+ *   vanishes, and the chrome bar's button (always visible) re-expands
+ *   it. The collapsed flag is shared via `sidePaneState`: the module
+ *   seeds the flag from `localStorage` at import (it is the single
+ *   persistence owner) — `SidePane` READS it via `useSyncExternalStore`
+ *   and WRITES it only from the auto open/close edge (the chrome bar's
+ *   button writes it itself).
  * - **Resize:** a 4px drag handle on the frame's left edge (a `w-1`
  *   `cursor-col-resize` div, transparent hit area — a 2px
  *   `bg-foreground-subtlest/50` line shows on hover/while dragging). The
@@ -67,8 +71,11 @@ function initialWidth(): number {
  */
 export default function SidePane() {
   const [width, setWidthState] = useState(initialWidth);
-  // The shared collapsed flag (the header toggle consumes the same
-  // module — the module seeds it from localStorage at import).
+  // The shared collapsed flag (the module seeds it from localStorage at
+  // import). The collapse control itself lives in the CHROME BAR (the
+  // top menubar — the old footer toggle moved up); this component only
+  // reads the flag for its width (0 while collapsed — the chrome bar's
+  // button is the re-expand control, so no rail is needed).
   const collapsed = useSyncExternalStore(
     subscribeSidePane,
     getSidePaneCollapsed,
@@ -156,6 +163,39 @@ export default function SidePane() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
   const mainTodoCount = useMainOpenTodoCount(activeSessionId);
 
+  // The session title (the top section — the old chat header's title moved
+  // here, the header is gone): the first `user` message truncated to ~80
+  // chars (the SAME derivation the header + the sidebar rows use), else
+  // the Space's base name (the active session's `cwd` — live, stored, OR
+  // archived membership; `basenameOfPath` of it — a session whose cwd is
+  // no known Space still shows its folder's base name).
+  const activeMessages = useSessions((s) =>
+    s.activeSessionId ? s.messages[s.activeSessionId] : undefined,
+  );
+  const activeCwd = useSessions((s) => {
+    if (!s.activeSessionId) return undefined;
+    const live = s.sessions.find((x) => x.sessionId === s.activeSessionId);
+    return (
+      live?.cwd ??
+      s.historySessions.find((x) => x.sessionId === s.activeSessionId)?.cwd ??
+      s.archivedSessions.find((x) => x.sessionId === s.activeSessionId)?.cwd
+    );
+  });
+  // (`find` does not narrow its result — the `kind` check on the found
+  // value, THEN the `text` access, is the ChatStream pattern.)
+  const firstUserMessage = activeMessages?.find((m) => m.kind === "user");
+  const firstUserText =
+    firstUserMessage && firstUserMessage.text !== ""
+      ? firstUserMessage.text
+      : undefined;
+  const sessionTitle = firstUserText
+    ? firstUserText.length > 80
+      ? firstUserText.slice(0, 80)
+      : firstUserText
+    : activeCwd
+      ? basenameOfPath(activeCwd)
+      : null;
+
   // The auto open/close (the "popup" rule — see the component doc): the
   // frame follows `visible` EDGE-TRIGGERED (the `prevVisible` ref — a
   // manual collapse/expand while `visible` is unchanged is respected: a
@@ -172,29 +212,54 @@ export default function SidePane() {
   }, [visible]);
 
   return (
-    // Collapse = `width: 0` + `overflow: hidden` (the content stays mounted;
-    // `fixed` overlays escape the clipping).
+    // Collapse = `width: 0` + `overflow: hidden` (the content stays
+    // mounted, clipped; the `fixed` overlays escape the clipping). The
+    // collapse control lives in the chrome bar (the top menubar), so no
+    // rail is needed — the pane just vanishes.
     <div
       style={{ width: collapsed ? 0 : width }}
       className="relative m-1 flex shrink-0 flex-col overflow-hidden rounded-xl bg-background-alt"
     >
       {/* The 4px drag handle (left edge): transparent hit area, a 2px
-          `bg-foreground-subtlest/50` line on hover / while dragging. */}
-      <div
-        ref={handleRef}
-        className="absolute inset-y-0 left-0 w-1 cursor-col-resize"
-        onPointerDown={onPointerDown}
-      >
+          `bg-foreground-subtlest/50` line on hover / while dragging.
+          Hidden while collapsed (resizing a width-0 pane is moot). */}
+      {!collapsed && (
         <div
-          className={`h-full w-0.5 bg-foreground-subtlest/50 ${
-            dragging ? "opacity-100" : "opacity-0 hover:opacity-100"
-          }`}
-        />
-      </div>
-      {/* The STATUS PANEL (the ZCode `ConversationStatusPanel` treatment):
-          the data-gated sections stacked in one content area (no tabs). */}
+          ref={handleRef}
+          className="absolute inset-y-0 left-0 w-1 cursor-col-resize"
+          onPointerDown={onPointerDown}
+        >
+          <div
+            className={`h-full w-0.5 bg-foreground-subtlest/50 ${
+              dragging ? "opacity-100" : "opacity-0 hover:opacity-100"
+            }`}
+          />
+        </div>
+      )}
+      {/* The STATUS PANEL (the ZCode `ConversationStatusPanel`
+          treatment): the data-gated sections stacked in one content
+          area (no tabs). ALWAYS MOUNTED — collapse clips it (the 40px
+          rail + `overflow: hidden`), it is NOT unmounted (the local UI
+          state — section open/closed, scroll — survives a collapse). */}
       <div className="flex-1 overflow-y-auto p-3">
         <div className="flex flex-col gap-4">
+          {/* The session title (the old header's title — the header is
+              gone, the title lives here): the first `user` message
+              truncated to ~80 chars, else the Space's base name. The
+              same gradient-fade mask the header used (background-agnostic). */}
+          {sessionTitle !== null && (
+            <div
+              className="min-w-0 text-ui-base font-medium text-foreground"
+              style={{
+                maskImage:
+                  "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+                WebkitMaskImage:
+                  "linear-gradient(to right, black calc(100% - 1.5rem), transparent)",
+              }}
+            >
+              {sessionTitle}
+            </div>
+          )}
           {/* The Todos section (data-gated by `TodoBoardPanel` — renders
               `null` while there are no open todos). */}
           <TodoBoardPanel sessionId={activeSessionId} />

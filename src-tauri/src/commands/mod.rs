@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod clipboard;
+pub mod files;
 pub mod history;
 pub mod sessions;
 pub mod settings;

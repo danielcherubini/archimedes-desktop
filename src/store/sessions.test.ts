@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applySessionUpdate,
   autoSelectActive,
@@ -11,7 +11,7 @@ import {
   type Message,
 } from "./sessions";
 import { useSubagents } from "./subagents";
-import { loadHistory, setSessionArchived } from "../lib/tauri";
+import { loadHistory, setSessionArchived, setSpaceTrusted, deleteSpace } from "../lib/tauri";
 import type {
   CloseReasonStr,
   MessageRow,
@@ -36,6 +36,8 @@ vi.mock("../lib/tauri", async () => {
     // jsdom — no global Tauri mock exists).
     setSessionArchived: vi.fn().mockResolvedValue(true),
     deleteSession: vi.fn().mockResolvedValue(undefined),
+    deleteSpace: vi.fn().mockResolvedValue(undefined),
+    setSpaceTrusted: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -760,6 +762,147 @@ describe("discardSessionMessages (ephemeral subagent cleanup)", () => {
   });
 });
 
+describe("contextUsage (the context-percentage state)", () => {
+  // The store is global — reset the maps the previous test may have left
+  // behind (and the `afterAll` cleans up AFTER this block, so the next
+  // block's assumption of a fresh store holds).
+  beforeEach(() => {
+    useSessions.setState({ contextUsage: {}, messages: {} });
+  });
+  afterAll(() => {
+    useSessions.setState({ contextUsage: {}, messages: {} });
+  });
+
+  it("applySessionUpdates stores a context_usage_update frame per session", () => {
+    useSessions
+      .getState()
+      .applySessionUpdates([
+        {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "context_usage_update",
+            usedTokens: 12000,
+            windowTokens: 128000,
+          },
+        },
+      ]);
+    expect(useSessions.getState().contextUsage["s1"]).toEqual({
+      used: 12000,
+      window: 128000,
+    });
+  });
+
+  it("a later frame replaces the earlier one (last-wins)", () => {
+    useSessions.getState().applySessionUpdates([
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 12000,
+          windowTokens: 128000,
+        },
+      },
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 9000,
+          windowTokens: 128000,
+        },
+      },
+    ]);
+    expect(useSessions.getState().contextUsage["s1"]).toEqual({
+      used: 9000,
+      window: 128000,
+    });
+  });
+
+  it("one frame per session does not clobber another session's entry", () => {
+    useSessions.getState().applySessionUpdates([
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 12000,
+          windowTokens: 128000,
+        },
+      },
+      {
+        sessionId: "s2",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 3000,
+          windowTokens: 64000,
+        },
+      },
+    ]);
+    expect(useSessions.getState().contextUsage["s1"]).toEqual({
+      used: 12000,
+      window: 128000,
+    });
+    expect(useSessions.getState().contextUsage["s2"]).toEqual({
+      used: 3000,
+      window: 64000,
+    });
+  });
+
+  it("a context_usage_update frame does not touch the session's messages", () => {
+    useSessions.setState({
+      messages: { s1: [{ kind: "agent-text", messageId: "m1", text: "hi", at: 1 }] },
+    });
+    const before = useSessions.getState().messages["s1"];
+    useSessions.getState().applySessionUpdates([
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 12000,
+          windowTokens: 128000,
+        },
+      },
+    ]);
+    expect(useSessions.getState().messages["s1"]).toBe(before);
+  });
+
+  it("handleSessionClosed KEEPS the session's config options + context usage (a pause, not a discard)", () => {
+    useSessions.getState().applySessionUpdates([
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              category: "model",
+              currentValue: "tama/m1",
+              options: [{ value: "tama/m1", name: "m1" }],
+            },
+          ],
+        },
+      },
+      {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "context_usage_update",
+          usedTokens: 12000,
+          windowTokens: 128000,
+        },
+      },
+    ]);
+    useSessions.getState().handleSessionClosed("s1", "user");
+    // A close is a PAUSE: the last known values STAY (the stored session's
+    // bottom bar is populated — the selectors render disabled; a resume's
+    // `config_option_update` / `context_usage_update` frames refresh them).
+    expect(useSessions.getState().contextUsage["s1"]).toEqual({
+      used: 12000,
+      window: 128000,
+    });
+    expect(useSessions.getState().configOptions["s1"]?.[0]?.id).toBe("model");
+  });
+});
+
 describe("user message with image attachments", () => {
   it("(a) stores a user message with image attachments", () => {
     useSessions.getState().addUserMessage("s1", "hi", [{ name: "a.png", mimeType: "image/png", sizeBytes: 3, data: "QUJD" }]);
@@ -1011,13 +1154,6 @@ describe("configOptions state", () => {
     ]);
   });
 
-  it("clears a session's configOptions on close", () => {
-    useSessions.getState().applyConfigOptions("s1", [
-      { id: "model", name: "Model", type: "select", currentValue: "gpt-4" },
-    ]);
-    useSessions.getState().handleSessionClosed("s1", "user");
-    expect("s1" in useSessions.getState().configOptions).toBe(false);
-  });
 });
 
 describe("applySessionUpdates (batch)", () => {
@@ -1556,5 +1692,344 @@ describe("spaceViewFor — archivedSessionIds (view membership only)", () => {
     expect(archivedOnly.archivedSessionIds).toEqual(["arch-a"]);
     expect(archivedOnly.storedSessionIds).toEqual([]);
     expect(archivedOnly.lastReason).toBe("agent-exited");
+  });
+});
+
+describe("activeSpacePath (the selected Space — the top tabs' state)", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      archivedSessions: [],
+      activeSessionId: null,
+      spaces: [],
+      activeSpacePath: null,
+      closeReasons: {},
+      messages: {},
+      configOptions: {},
+    });
+  });
+
+  const space = (path: string): SpaceRow => ({
+    path,
+    createdAt: 0,
+    lastOpenedAt: 0,
+    trusted: false,
+  });
+
+  it("boot (setSpaces, nothing active): the auto-selected session's space becomes active; no sessions → the most recent space", () => {
+    // A stored session in /a (the input order is newest-first).
+    useSessions.getState().setSpaces([space("/a"), space("/b")]);
+    // No sessions at all → the most recent space (the FIRST row —
+    // `list_spaces` order is `lastOpenedAt` desc).
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+    expect(useSessions.getState().activeSessionId).toBeNull();
+
+    useSessions.setState({ spaces: [], activeSpacePath: null });
+    useSessions.getState().setHistorySessions([
+      { ...info("h1", "/a"), archived: false },
+      { ...info("h2", "/b"), archived: false },
+    ]);
+    useSessions.getState().setSpaces([space("/a"), space("/b")]);
+    // `autoSelectActive` lands on the most recent space's newest session
+    // (the /a session — first space, first stored session).
+    expect(useSessions.getState().activeSessionId).toBe("h1");
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+  });
+
+  it("openSession follows the session's space (live or stored)", () => {
+    useSessions.setState({
+      spaces: [space("/a"), space("/b")],
+      activeSpacePath: "/a",
+    });
+    useSessions.getState().addSession(info("live-1", "/a"));
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+    useSessions.getState().setHistorySessions([
+      { ...info("hist-1", "/b"), archived: false },
+    ]);
+    useSessions.getState().openSession("hist-1");
+    expect(useSessions.getState().activeSessionId).toBe("hist-1");
+    expect(useSessions.getState().activeSpacePath).toBe("/b");
+  });
+
+  it("openSession for a session whose cwd is NO space leaves activeSpacePath alone", () => {
+    useSessions.setState({
+      spaces: [space("/a")],
+      activeSpacePath: "/a",
+    });
+    useSessions.getState().setHistorySessions([
+      { ...info("legacy-1", "/not-a-space"), archived: false },
+    ]);
+    useSessions.getState().openSession("legacy-1");
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+  });
+
+  it("selectSpace: live session preferred, then the newest stored, then nothing", () => {
+    useSessions.setState({
+      spaces: [space("/a"), space("/b")],
+      activeSpacePath: "/a",
+    });
+    // /b holds a live + a stored session: the live wins.
+    useSessions.getState().addSession(info("live-1", "/b"));
+    useSessions.getState().setHistorySessions([
+      { ...info("hist-1", "/b"), archived: false },
+    ]);
+    useSessions.getState().selectSpace("/b");
+    expect(useSessions.getState().activeSpacePath).toBe("/b");
+    expect(useSessions.getState().activeSessionId).toBe("live-1");
+
+    // No live in /b: the NEWEST stored (input order — first wins).
+    useSessions.getState().handleSessionClosed("live-1", "user");
+    useSessions.getState().selectSpace("/b");
+    expect(useSessions.getState().activeSessionId).toBe("hist-1");
+
+    // An empty space: no session (the chat's empty state).
+    useSessions.getState().selectSpace("/a");
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+    expect(useSessions.getState().activeSessionId).toBeNull();
+  });
+
+  it("selectSpace is a no-op for an unknown path", () => {
+    useSessions.setState({
+      spaces: [space("/a")],
+      activeSpacePath: "/a",
+    });
+    useSessions.getState().selectSpace("/nowhere");
+    expect(useSessions.getState().activeSpacePath).toBe("/a");
+  });
+
+  it("the start flow (addSession + addSpace) makes the new space active", () => {
+    useSessions.setState({
+      spaces: [space("/a")],
+      activeSpacePath: "/a",
+    });
+    // The start flow: `addSession` (the fresh session) + `addSpace`
+    // (the space row upsert) — the new space becomes the active one.
+    useSessions.getState().addSession(info("live-1", "/new"));
+    useSessions.getState().addSpace("/new");
+    expect(useSessions.getState().activeSessionId).toBe("live-1");
+    expect(useSessions.getState().activeSpacePath).toBe("/new");
+  });
+
+  it("removing the active space falls back to the first remaining space (or null)", async () => {
+    useSessions.setState({
+      spaces: [space("/a"), space("/b")],
+      activeSpacePath: "/a",
+    });
+    // `removeSpace` awaits the backend command (the mock resolves).
+    await useSessions.getState().removeSpace("/a");
+    expect(useSessions.getState().activeSpacePath).toBe("/b");
+    await useSessions.getState().removeSpace("/b");
+    expect(useSessions.getState().activeSpacePath).toBeNull();
+  });
+});
+
+describe("setSpaceTrusted (the trust flag — the sidebar's shield UI is gone; the behavior lives here)", () => {
+  beforeEach(() => {
+    useSessions.setState({
+      sessions: [],
+      historySessions: [],
+      archivedSessions: [],
+      activeSessionId: null,
+      activeSpacePath: null,
+      spaces: [
+        { path: "/tmp/alpha", createdAt: 0, lastOpenedAt: 0, trusted: false },
+        { path: "/tmp/beta", createdAt: 0, lastOpenedAt: 0, trusted: true },
+      ],
+      closeReasons: {},
+      messages: {},
+      configOptions: {},
+    });
+    // Reset the Tauri mocks (clears any `mockImplementationOnce` queues
+    // left by an earlier test in this file — the mock is module-scoped).
+    vi.mocked(setSpaceTrusted).mockReset();
+    vi.mocked(setSpaceTrusted).mockResolvedValue(undefined);
+    vi.mocked(deleteSpace).mockReset();
+    vi.mocked(deleteSpace).mockResolvedValue(undefined);
+  });
+
+  it("flips the flag optimistically and calls the set_space_trusted wrapper", async () => {
+    const toggling = useSessions.getState().setSpaceTrusted("/tmp/alpha", true);
+    // Optimistic: the store flipped BEFORE the (async) command resolves —
+    // the spaces store has no live refresh, so the flag must not wait for
+    // a round-trip.
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/alpha")!.trusted,
+    ).toBe(true);
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenCalledWith("/tmp/alpha", true);
+    await toggling;
+  });
+
+  it("rolls the flag back to the previous value when the command rejects", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(setSpaceTrusted).mockRejectedValueOnce(new Error("boom"));
+    const toggling = useSessions.getState().setSpaceTrusted("/tmp/beta", false);
+    // Optimistic flip first (beta trusted → untrusted)...
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
+    ).toBe(false);
+    // ...then rolled back once the command rejects.
+    await toggling;
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
+    ).toBe(true);
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to set trusted for /tmp/beta:",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("serializes rapid trust toggles for a space (the second command runs only after the first settles)", async () => {
+    // The first command stays pending on a deferred promise: without a
+    // per-path queue, the second click's command would be issued
+    // immediately (two overlapping Tauri invokes could commit in either
+    // order and the DB could end on the OPPOSITE value from the
+    // optimistic UI).
+    let resolveFirst!: () => void;
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(() => Promise.resolve());
+    // `/tmp/gamma` is a FRESH path (no earlier test queued a command
+    // for it): the first command is issued synchronously.
+    useSessions.getState().setSpaces([
+      { path: "/tmp/gamma", createdAt: 0, lastOpenedAt: 0, trusted: false },
+    ]);
+    // Toggle trust on...
+    const first = useSessions.getState().setSpaceTrusted("/tmp/gamma", true);
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenCalledTimes(1);
+    // ...then immediately off (the optimistic flip re-labeled the UI).
+    const second = useSessions.getState().setSpaceTrusted("/tmp/gamma", false);
+    // The second command is NOT issued until the first settles.
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenCalledTimes(1);
+    resolveFirst();
+    await first;
+    await second;
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenNthCalledWith(1, "/tmp/gamma", true);
+    expect(vi.mocked(setSpaceTrusted)).toHaveBeenNthCalledWith(2, "/tmp/gamma", false);
+    // The final state ends on the last click's value.
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/gamma")!.trusted,
+    ).toBe(false);
+  });
+
+  it("settles on the DB-committed value when BOTH of two rapid toggles reject (not the first click's optimistic value)", async () => {
+    // Seed through `setSpaces` (the production load path) so the store's
+    // committed-trusted baseline is seeded from the DB rows like in
+    // production. `delta` is a fresh path (no baseline entry from an
+    // earlier test) committed as `trusted: false`.
+    const now = Date.now();
+    useSessions.getState().setSpaces([
+      { path: "/tmp/delta", createdAt: now, lastOpenedAt: now, trusted: false },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Both commands reject, on deferred promises so the two rollbacks
+    // land in click order: the first click's rollback first, the
+    // second's LAST — the last rollback is what the UI settles on.
+    let rejectFirst!: (err: Error) => void;
+    let rejectSecond!: (err: Error) => void;
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectFirst = reject;
+        }),
+    );
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectSecond = reject;
+        }),
+    );
+    // Click 1 (false → true): the optimistic flip lands before the
+    // command settles.
+    const click1 = useSessions.getState().setSpaceTrusted("/tmp/delta", true);
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(true);
+    // Click 2 (true → false) while click 1's command is still pending:
+    // the per-path queue defers the second command.
+    const click2 = useSessions.getState().setSpaceTrusted("/tmp/delta", false);
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(false);
+    // Reject click 1's command: its rollback lands first, and the queue
+    // then issues click 2's (still pending) command — in a microtask
+    // that runs AFTER `await click1`'s continuation, so wait for it.
+    rejectFirst(new Error("boom1"));
+    await click1;
+    await vi.waitFor(() => {
+      expect(typeof rejectSecond).toBe("function");
+    });
+    // Reject click 2's command: its rollback lands LAST — the final
+    // value is the DB-committed baseline (false), NOT the first
+    // click's optimistic value (true).
+    rejectSecond(new Error("boom2"));
+    await click2;
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
+    ).toBe(false);
+    consoleError.mockRestore();
+  });
+
+  it("does NOT leave a stale committed-trusted baseline after a remove (a late in-flight toggle success must not re-insert the pruned entry)", async () => {
+    // Seed through `setSpaces` (the production load path) so the store's
+    // committed-trusted baseline is seeded from the DB rows: `epsilon`
+    // is committed as `trusted: false`.
+    const now = Date.now();
+    useSessions.getState().setSpaces([
+      { path: "/tmp/epsilon", createdAt: now, lastOpenedAt: now, trusted: false },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    // A toggle in flight on a deferred command...
+    let resolveToggle!: () => void;
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveToggle = resolve;
+        }),
+    );
+    const toggling = useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
+    // ...and a removal while it is in flight (deferred delete): the
+    // store prunes the path's baseline + queue once the delete settles.
+    let resolveDelete!: () => void;
+    vi.mocked(deleteSpace).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+    const removing = useSessions.getState().removeSpace("/tmp/epsilon");
+    resolveDelete();
+    await removing;
+    // The in-flight toggle's command succeeds AFTER the prune: its
+    // success handler must NOT re-insert a baseline entry for the
+    // removed path (it would survive the `addSpace` guard and poison a
+    // fresh re-add).
+    resolveToggle();
+    await toggling;
+    // Re-add the path: a fresh DB row is committed as `trusted: false`,
+    // so the (pruned) baseline must re-seed to false.
+    useSessions.getState().addSpace("/tmp/epsilon");
+    // A failed toggle must roll back to the FRESH baseline (false), not
+    // a stale in-flight value (true).
+    let rejectToggle!: (err: Error) => void;
+    vi.mocked(setSpaceTrusted).mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectToggle = reject;
+        }),
+    );
+    const toggle2 = useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
+    rejectToggle(new Error("boom"));
+    await toggle2;
+    expect(
+      useSessions.getState().spaces.find((s) => s.path === "/tmp/epsilon")!.trusted,
+    ).toBe(false);
+    consoleError.mockRestore();
   });
 });

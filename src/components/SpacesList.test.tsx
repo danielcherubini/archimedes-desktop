@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { closeSession, deleteSession, deleteSpace, listSkills, setSessionArchived, setSpaceTrusted, startSession } from "../lib/tauri";
+import { deleteSession, listSkills, setSessionArchived, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useInteractive } from "../store/interactive";
+import { setLeftPaneCollapsed } from "../lib/leftPaneState";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import SpacesList from "./SpacesList";
 
@@ -36,7 +37,6 @@ vi.mock("../lib/tauri", async () => {
     respondPermission: vi.fn(),
     respondInteractiveRequest: vi.fn(),
     loadHistory: vi.fn().mockResolvedValue([]),
-    closeSession: vi.fn().mockRejectedValue(new Error("boom")),
     setSpaceTrusted: vi.fn().mockResolvedValue(undefined),
     deleteSpace: vi.fn().mockResolvedValue(undefined),
     listSkills: vi.fn().mockResolvedValue([
@@ -55,9 +55,6 @@ vi.mock("../lib/tauri", async () => {
 });
 
 const mockedStartSession = vi.mocked(startSession);
-const mockedCloseSession = vi.mocked(closeSession);
-const mockedSetSpaceTrusted = vi.mocked(setSpaceTrusted);
-const mockedDeleteSpace = vi.mocked(deleteSpace);
 const mockedListSkills = vi.mocked(listSkills);
 const mockedDeleteSession = vi.mocked(deleteSession);
 
@@ -84,6 +81,9 @@ function seed(): void {
       { sessionId: "h2", cwd: "/tmp/beta", capabilities: {}, archived: false },
     ],
     activeSessionId: "s1",
+    // The selected space (the top tabs' state): `alpha` — the active
+    // session's space (the sidebar lists THIS space's sessions).
+    activeSpacePath: "/tmp/alpha",
     closeReasons: {},
     messages: {
       s1: [{ kind: "user", text: "Fix the login bug", at: now - 10_000 }],
@@ -113,6 +113,12 @@ beforeEach(() => {
 // cache — keyed by the `seed()` fixture's `cwd` — makes a later test's
 // fresh `listSkills` mock moot).
 beforeEach(clearSkillCatalogCache);
+// The left-pane collapsed flag is module-scoped: reset it between tests
+// (the module is the single persistence owner — `setLeftPaneCollapsed`
+// writes localStorage itself).
+beforeEach(() => {
+  setLeftPaneCollapsed(false);
+});
 
 describe("SpacesList", () => {
   it("renders the two action buttons with their labels and kbd hints", () => {
@@ -131,19 +137,18 @@ describe("SpacesList", () => {
     expect(screen.getByText("New space")).toBeTruthy();
   });
 
-  it("opens the Open Space dialog from the New Session button when no session is active", () => {
-    useSessions.setState({ activeSessionId: null });
+  it("opens the Open Space dialog from the New Session button when no space is selected", () => {
+    useSessions.setState({ activeSpacePath: null });
     render(<SpacesList />);
     fireEvent.click(screen.getByRole("button", { name: /New Session/ }));
     expect(screen.getByText("New space")).toBeTruthy();
   });
 
-  it("opens the Open Space dialog from the New Session button for an orphaned active session (a legacy session that belongs to no current Space)", () => {
+  it("starts a new session in the SELECTED space (not the active session's space)", async () => {
     // The active session's cwd (`/tmp/gamma`) matches NO space in the
-    // fixture, so `activeView` is `undefined` even though
-    // `activeSessionId` is non-null: the button must open the Open Space
-    // dialog instead of silently no-oping (the hook no-ops on an
-    // undefined view).
+    // fixture — but the SELECTED space is `/tmp/beta` (the tabs' state
+    // is independent of the active session): the button must start in
+    // the selected space, not the orphan's cwd (and not the dialog).
     useSessions.setState({
       sessions: [
         {
@@ -154,287 +159,15 @@ describe("SpacesList", () => {
         },
       ],
       activeSessionId: "s-orphan",
+      activeSpacePath: "/tmp/beta",
     });
     render(<SpacesList />);
     fireEvent.click(screen.getByRole("button", { name: /New Session/ }));
-    expect(screen.getByText("New space")).toBeTruthy();
-  });
-
-  it("renders a space group with its folder icon and base name; the chevron collapses the rows", () => {
-    const { container } = render(<SpacesList />);
-    expect(container.querySelector(".lucide-folder")).not.toBeNull();
-    expect(screen.getByText("alpha")).toBeTruthy();
-    // `beta` appears twice: the group header's base name + the `h2` row's
-    // fallback title (no loaded messages → the space's base name).
-    expect(screen.getAllByText("beta")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: /Collapse alpha/ }));
-    expect(screen.queryByText("Fix the login bug")).toBeNull();
-    expect(screen.queryByText("Refactor the parser")).toBeNull();
-    // Re-expand.
-    fireEvent.click(screen.getByRole("button", { name: /Expand alpha/ }));
-    expect(screen.getByText("Fix the login bug")).toBeTruthy();
-  });
-
-  it("starts a session in a space via the group's + button", async () => {
-    render(<SpacesList />);
-    fireEvent.click(
-      screen.getByRole("button", { name: /New session in beta/ }),
-    );
     await waitFor(() =>
       expect(mockedStartSession).toHaveBeenCalledWith("/tmp/beta"),
     );
   });
 
-  it("renders a muted Shield for an untrusted space and a success-colored ShieldCheck for a trusted space", () => {
-    render(<SpacesList />);
-    // `alpha` (untrusted): the muted `Shield` (no check variant).
-    const untrusted = screen.getByRole("button", { name: "Trust alpha" });
-    expect(untrusted.querySelector(".lucide-shield")).not.toBeNull();
-    // `getAttribute("class")` (not `className` — an SVG element's
-    // `className` is an `SVGAnimatedString` in jsdom, not a string).
-    expect(untrusted.querySelector(".lucide-shield")!.getAttribute("class")).toContain(
-      "text-foreground-subtlest",
-    );
-    expect(untrusted.querySelector(".lucide-shield-check")).toBeNull();
-    // `beta` (trusted): the success-colored `ShieldCheck`.
-    const trusted = screen.getByRole("button", { name: "Stop trusting beta" });
-    expect(trusted.querySelector(".lucide-shield-check")).not.toBeNull();
-    expect(trusted.querySelector(".lucide-shield-check")!.getAttribute("class")).toContain(
-      "text-success",
-    );
-  });
-
-  it("flips the space's trusted flag optimistically and calls the set_space_trusted wrapper", () => {
-    render(<SpacesList />);
-    fireEvent.click(screen.getByRole("button", { name: "Trust alpha" }));
-    // Optimistic: the store flipped BEFORE the (async) command resolves —
-    // the spaces store has no live refresh, so the flag must not wait for
-    // a round-trip.
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/alpha")!.trusted,
-    ).toBe(true);
-    expect(mockedSetSpaceTrusted).toHaveBeenCalledWith("/tmp/alpha", true);
-  });
-
-  it("rolls the trusted flag back to the previous value when the command rejects", async () => {
-    mockedSetSpaceTrusted.mockRejectedValueOnce(new Error("boom"));
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    render(<SpacesList />);
-    fireEvent.click(screen.getByRole("button", { name: "Stop trusting beta" }));
-    // Optimistic flip first (beta trusted → untrusted)...
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
-    ).toBe(false);
-    // ...then rolled back once the command rejects.
-    await waitFor(() =>
-      expect(
-        useSessions.getState().spaces.find((s) => s.path === "/tmp/beta")!.trusted,
-      ).toBe(true),
-    );
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to set trusted for /tmp/beta:",
-      expect.anything(),
-    );
-    consoleError.mockRestore();
-  });
-
-  it("serializes rapid trust toggles for a space (the second command runs only after the first settles)", async () => {
-    // The first command stays pending on a deferred promise: without a
-    // per-path queue, the second click's command would be issued
-    // immediately (two overlapping Tauri invokes could commit in either
-    // order and the DB could end on the OPPOSITE value from the
-    // optimistic UI).
-    let resolveFirst!: () => void;
-    const first = new Promise<void>((resolve) => {
-      resolveFirst = resolve;
-    });
-    mockedSetSpaceTrusted.mockImplementationOnce(() => first);
-    mockedSetSpaceTrusted.mockImplementationOnce(() => Promise.resolve());
-    render(<SpacesList />);
-    // Toggle trust on...
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Trust alpha" }));
-    });
-    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(1);
-    // ...then immediately off (the optimistic flip re-labeled the button).
-    await act(async () => {
-      fireEvent.click(
-        screen.getByRole("button", { name: "Stop trusting alpha" }),
-      );
-    });
-    // The second command is NOT issued until the first settles.
-    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(1);
-    await act(async () => {
-      resolveFirst();
-    });
-    await waitFor(() =>
-      expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(2),
-    );
-    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(1, "/tmp/alpha", true);
-    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(2, "/tmp/alpha", false);
-    // The final UI state ends on the last click's value.
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/alpha")!.trusted,
-    ).toBe(false);
-  });
-
-  it("settles on the DB-committed value when BOTH of two rapid toggles reject (not the first click's optimistic value)", async () => {
-    // Seed through `setSpaces` (the production load path) so the store's
-    // committed-trusted baseline is seeded from the DB rows like in
-    // production. `delta` is a fresh path (no baseline entry from an
-    // earlier test) committed as `trusted: false`.
-    const now = Date.now();
-    useSessions.getState().setSpaces([
-      { path: "/tmp/delta", createdAt: now, lastOpenedAt: now, trusted: false },
-    ]);
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    // Both commands reject, on deferred promises so the two rollbacks
-    // land in click order: the first click's rollback first, the
-    // second's LAST — the last rollback is what the UI settles on.
-    let rejectFirst!: (err: Error) => void;
-    let rejectSecond!: (err: Error) => void;
-    mockedSetSpaceTrusted.mockImplementationOnce(
-      () =>
-        new Promise<void>((_, reject) => {
-          rejectFirst = reject;
-        }),
-    );
-    mockedSetSpaceTrusted.mockImplementationOnce(
-      () =>
-        new Promise<void>((_, reject) => {
-          rejectSecond = reject;
-        }),
-    );
-    render(<SpacesList />);
-    // Click 1 (false → true): the optimistic flip lands before the
-    // command settles.
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Trust delta" }));
-    });
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
-    ).toBe(true);
-    // Click 2 (true → false) while click 1's command is still pending:
-    // the per-path queue defers the second command.
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Stop trusting delta" }));
-    });
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
-    ).toBe(false);
-    // Reject click 1's command: its rollback lands first, and the queue
-    // then issues click 2's (still pending) command.
-    await act(async () => {
-      rejectFirst(new Error("boom"));
-    });
-    // Reject click 2's command LAST: its rollback settles the UI.
-    await act(async () => {
-      rejectSecond(new Error("boom"));
-    });
-    // The UI settles on the DB-committed value (false) — NOT the first
-    // click's optimistic value (true): inferring the second rollback
-    // target from the live UI value (the first click's optimistic flip,
-    // which is NOT the committed value while a toggle is in flight) would
-    // settle on the wrong side.
-    expect(
-      useSessions.getState().spaces.find((s) => s.path === "/tmp/delta")!.trusted,
-    ).toBe(false);
-    expect(mockedSetSpaceTrusted).toHaveBeenCalledTimes(2);
-    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(1, "/tmp/delta", true);
-    expect(mockedSetSpaceTrusted).toHaveBeenNthCalledWith(2, "/tmp/delta", false);
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to set trusted for /tmp/delta:",
-      expect.anything(),
-    );
-    consoleError.mockRestore();
-  });
-
-  it("does NOT leave a stale committed-trusted baseline after a remove (a late in-flight toggle success must not re-insert the pruned entry)", async () => {
-    // Seed through `setSpaces` (the production load path) so the store's
-    // committed-trusted baseline is seeded from the DB rows: `epsilon`
-    // is committed as `trusted: false`.
-    const now = Date.now();
-    useSessions.getState().setSpaces([
-      { path: "/tmp/epsilon", createdAt: now, lastOpenedAt: now, trusted: false },
-    ]);
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    // A toggle in flight on a deferred command...
-    let resolveToggle!: () => void;
-    mockedSetSpaceTrusted.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveToggle = resolve;
-        }),
-    );
-    await act(async () => {
-      useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
-    });
-    // ...and a removal while it is in flight (deferred delete): the
-    // store prunes the path's baseline + queue once the delete settles.
-    let resolveDelete!: () => void;
-    mockedDeleteSpace.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveDelete = resolve;
-        }),
-    );
-    const removing = useSessions.getState().removeSpace("/tmp/epsilon");
-    await act(async () => {
-      resolveDelete();
-    });
-    await act(async () => {
-      await removing;
-    });
-    // The in-flight toggle's command succeeds AFTER the prune: its
-    // success handler must NOT re-insert a baseline entry for the
-    // removed path (it would survive the `addSpace` guard and poison a
-    // fresh re-add).
-    await act(async () => {
-      resolveToggle();
-    });
-    // Re-add the path: a fresh DB row is committed as `trusted: false`,
-    // so the (pruned) baseline must re-seed to false.
-    await act(async () => {
-      useSessions.getState().addSpace("/tmp/epsilon");
-    });
-    // A failed toggle must roll back to the FRESH baseline (false), not
-    // a stale in-flight value (true).
-    let rejectToggle!: (err: Error) => void;
-    mockedSetSpaceTrusted.mockImplementationOnce(
-      () =>
-        new Promise<void>((_, reject) => {
-          rejectToggle = reject;
-        }),
-    );
-    await act(async () => {
-      useSessions.getState().setSpaceTrusted("/tmp/epsilon", true);
-    });
-    await act(async () => {
-      rejectToggle(new Error("boom"));
-    });
-    expect(
-      useSessions
-        .getState()
-        .spaces.find((s) => s.path === "/tmp/epsilon")!.trusted,
-    ).toBe(false);
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to set trusted for /tmp/epsilon:",
-      expect.anything(),
-    );
-    consoleError.mockRestore();
-  });
-
-  it("renders a live session row with its title, a spinner while in-turn, and its relative time", () => {
-    render(<SpacesList />);
-    const row = screen
-      .getByText("Fix the login bug")
-      .closest('[role="button"]');
-    expect(row).not.toBeNull();
-    // The `spinner` primitive (a `LoaderIcon`).
-    expect(row!.querySelector('[role="status"]')).not.toBeNull();
-    // Last message ~10s ago → `now`.
-    expect(row!.textContent).toContain("now");
-  });
 
   it("renders no spinner for a stored session row, with its relative time", () => {
     render(<SpacesList />);
@@ -448,16 +181,23 @@ describe("SpacesList", () => {
   });
 
   it("renders an empty time slot (no time text) for a session with no loaded messages", () => {
+    // A stored session in the ACTIVE space (`/tmp/alpha`) that was not
+    // opened this boot: no loaded messages → the title falls back to
+    // the space's base name (`alpha`) and the time slot is empty.
+    useSessions.setState({
+      historySessions: [
+        { sessionId: "h1", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+        { sessionId: "h3", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+      ],
+    });
     render(<SpacesList />);
-    // `h2` was not opened this boot: no loaded messages → the title falls
-    // back to the space's base name (`beta` — the group header + the row
-    // title, both `beta`) and the time slot is empty.
-    const betas = screen.getAllByText("beta");
-    expect(betas).toHaveLength(2);
-    const row = betas[1].closest('[role="button"]');
+    const alphas = screen.getAllByText("alpha");
+    // `h3`'s row (the third `alpha` — `s1`'s + `h1`'s rows have loaded
+    // messages, `h3`'s does not → its title is the base name).
+    const row = alphas[alphas.length - 1].closest('[role="button"]');
     expect(row).not.toBeNull();
     // Title only — no time text.
-    expect(row!.textContent).toBe("beta");
+    expect(row!.textContent).toBe("alpha");
   });
 
   it("renders the Waiting pill (not the relative time) for a session with a pending permission prompt", () => {
@@ -520,18 +260,6 @@ describe("SpacesList", () => {
     expect(title.className).toContain("overflow-hidden");
     expect(title.className).toContain("whitespace-nowrap");
     expect(title.className).toContain("min-w-0");
-  });
-
-  it("logs a console error when Pause fails to close the session", async () => {
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    render(<SpacesList />);
-    fireEvent.click(screen.getByRole("button", { name: /Pause/ }));
-    await waitFor(() => expect(mockedCloseSession).toHaveBeenCalledWith("s1"));
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to pause session:",
-      expect.anything(),
-    );
-    consoleError.mockRestore();
   });
 
   it("ignores ⌘N / Ctrl+O while the target is an input or a dialog", async () => {
@@ -615,23 +343,6 @@ describe("SpacesList", () => {
     expect(mockedListSkills).toHaveBeenCalledTimes(1);
   });
 
-  it("the_gear_icon_opens_settings", () => {
-    const onOpenSettings = vi.fn();
-    render(<SpacesList onOpenSettings={onOpenSettings} />);
-    // The footer's gear icon (bottom right, the `SpaceGroup` hover-action
-    // button pattern) exists and fires the callback.
-    const gear = screen.getByRole("button", { name: "Settings" });
-    expect(gear).toBeTruthy();
-    fireEvent.click(gear);
-    expect(onOpenSettings).toHaveBeenCalledTimes(1);
-    // Without the prop (the existing tests' shape) the button still
-    // renders (the optional prop is guarded with `onOpenSettings?.()`).
-    const second = render(<SpacesList />);
-    expect(
-      second.container.querySelector('button[aria-label="Settings"]'),
-    ).not.toBeNull();
-  });
-
   it("the_skills_modal_shows_the_empty_state_when_there_are_no_skills", async () => {
     // `clearAllMocks` PRESERVES the factory's 1-skill implementation, so
     // override it here. Declared LAST so the override cannot leak into
@@ -690,13 +401,14 @@ describe("SpacesList (archive, ADR 0016)", () => {
     expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith("h1", true);
   });
 
-  it("a live row offers Pause, not Archive", () => {
+  it("a live row offers no hover action (the pause concept is gone — the time slot is always shown)", () => {
     render(<SpacesList />);
-    // `s1` is live: the hover action is the Pause button (unchanged).
+    // `s1` is live: no hover action at all (the Pause button is gone —
+    // the session is simply never paused from the UI).
+    expect(screen.queryByRole("button", { name: /Pause/ })).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Archive Fix the login bug" }),
     ).toBeNull();
-    expect(screen.getByRole("button", { name: /Pause/ })).toBeTruthy();
   });
 
   it("the Archived section is collapsed by default and lists archived sessions", () => {
@@ -860,5 +572,94 @@ describe("SpacesList (archive, ADR 0016)", () => {
       useSessions.getState().archivedSessions.some((s) => s.sessionId === "a1"),
     ).toBe(true);
     consoleError.mockRestore();
+  });
+
+  // -- The `...` menu (moved from the tab bar to the `Sessions` header,
+  // -- right-aligned, next to the word `Sessions`) --
+
+  it("the `...` menu in the Sessions header starts a session in the ACTIVE space", async () => {
+    const { startSession } = await import("../lib/tauri");
+    // The seed's active space is `/tmp/alpha`.
+    render(<SpacesList />);
+    // The menu sits in the `Sessions` header row (right of the label).
+    const header = screen.getByText("Sessions").parentElement!;
+    expect(
+      header.querySelector('[aria-label="Session actions"]'),
+    ).toBeTruthy();
+    // Radix opens on `pointerDown` (`click` does not open the menu in
+    // jsdom).
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }));
+    // NO Resume / NO Pause (the pause concept is gone — the old header's
+    // dropdown invariant now applies to this menu): the menu holds ONLY
+    // the item below.
+    expect(screen.queryByRole("menuitem", { name: /Resume/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /Pause/ })).toBeNull();
+    // Selection: `Enter` on the item (Radix's keyboard selection model).
+    fireEvent.keyDown(
+      screen.getByRole("menuitem", { name: "New Session in this Space" }),
+      { key: "Enter" },
+    );
+    await waitFor(() =>
+      expect(vi.mocked(startSession)).toHaveBeenCalledWith("/tmp/alpha"),
+    );
+  });
+
+  // -- The collapse button + the gear MOVED to the chrome bar (the top
+  // -- menubar — the old footer controls are gone; the chrome bar's
+  // -- buttons consume the same shared flags) --
+
+  it("holds NO collapse button (it moved to the chrome bar) but keeps the gear in the footer", () => {
+    const { container } = render(<SpacesList />);
+    expect(screen.queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Expand sidebar" })).toBeNull();
+    // The gear (the settings entry point) stays in the footer — only the
+    // collapse button moved up. It is the frame's last child (the footer
+    // — bottom right).
+    const gear = screen.getByRole("button", { name: "Settings" });
+    expect((container.firstChild as HTMLElement).lastElementChild!.contains(gear)).toBe(true);
+  });
+
+  it("the_gear_icon_opens_settings", () => {
+    const onOpenSettings = vi.fn();
+    render(<SpacesList onOpenSettings={onOpenSettings} />);
+    // The footer's gear icon (bottom right) exists and fires the
+    // callback.
+    const gear = screen.getByRole("button", { name: "Settings" });
+    fireEvent.click(gear);
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("collapses to width 0 (the content stays mounted, clipped — the chrome bar's button is the re-expand control)", () => {
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    const { container } = render(<SpacesList />);
+    const frame = container.firstChild as HTMLElement;
+    expect(frame.style.width).toBe("0px");
+    // The content (the `Sessions` label) is clipped (width 0 +
+    // `overflow: hidden`) — NOT unmounted (the list's local state
+    // survives a collapse; the `fixed` dialogs escape the clipping).
+    expect(screen.getByText("Sessions")).toBeTruthy();
+    // Expanding via the shared flag restores the full frame.
+    act(() => {
+      setLeftPaneCollapsed(false);
+    });
+    expect(frame.style.width).toBe("260px");
+  });
+
+  it("holds NO bg-warning dot (the dot moved to the chrome bar's collapse button)", () => {
+    useSessions.setState({
+      sessions: [
+        { sessionId: "s1", cwd: "/tmp/alpha", capabilities: {}, archived: false },
+      ],
+      activeSessionId: "s1",
+    });
+    usePermissions.setState({
+      prompts: {
+        s1: [{ requestId: "r1", toolTitle: "bash", options: [] }],
+      },
+    });
+    const { container } = render(<SpacesList />);
+    expect(container.querySelector(".bg-warning")).toBeNull();
   });
 });

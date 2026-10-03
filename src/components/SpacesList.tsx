@@ -1,27 +1,23 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import {
   ArchiveIcon,
   ArchiveXIcon,
   ChevronDownIcon,
   ChevronRightIcon,
-  FolderIcon,
   FolderOpenIcon,
   MessageCirclePlusIcon,
-  PauseIcon,
-  PlusIcon,
-  ShieldCheckIcon,
-  ShieldIcon,
-  SparklesIcon,
+  MoreHorizontalIcon,
   SettingsIcon,
+  SparklesIcon,
   Trash2Icon,
 } from "lucide-react";
-import { closeSession, type SessionInfo } from "../lib/tauri";
+import { type SessionInfo } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
+import { getLeftPaneCollapsed, LEFT_PANE_WIDTH, subscribeLeftPane } from "../lib/leftPaneState";
 import {
   useSessions,
   spaceViewFor,
   type Message,
-  type SpaceView,
 } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useInteractive } from "../store/interactive";
@@ -32,6 +28,13 @@ import SkillsDialog from "./SkillsDialog";
 import DeleteSessionDialog from "./DeleteSessionDialog";
 import { Spinner } from "./ui/spinner";
 import { Kbd } from "./ui/kbd";
+import { Button } from "./ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 
 /**
  * The relative time of a session's last activity, derived ONLY from the
@@ -73,7 +76,8 @@ export default function SpacesList({
 }: {
   // Optional — the gear icon (the footer's bottom-right entry point into
   // the settings page) only fires the callback when the parent supplies
-  // one; the button itself always renders.
+  // one; the button itself always renders. (The collapse button moved to
+  // the chrome bar — the gear stays here.)
   onOpenSettings?: () => void;
 }) {
   const spaces = useSessions((s) => s.spaces);
@@ -82,6 +86,7 @@ export default function SpacesList({
   const archivedSessions = useSessions((s) => s.archivedSessions);
   const closeReasons = useSessions((s) => s.closeReasons);
   const activeSessionId = useSessions((s) => s.activeSessionId);
+  const activeSpacePath = useSessions((s) => s.activeSpacePath);
   const openSession = useSessions((s) => s.openSession);
   const deleteSession = useSessions((s) => s.deleteSession);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -101,36 +106,20 @@ export default function SpacesList({
       ),
     [spaces, sessions, historySessions, closeReasons, archivedSessions],
   );
-  // The view owning `activeSessionId` (the same `view` `ChatStream`
-  // computes): the active session's Space, matched by live, stored, OR
-  // archived membership (`archivedSessionIds` is view-membership-only —
-  // an archived session is never rendered in the Space group, so a
-  // space whose only sessions are archived still resolves its `view`;
-  // ⌘N / New Session while an archived session is active routes to
-  // THAT space, not the Open Space dialog). `undefined` when nothing is
-  // active.
-  const activeView =
-    activeSessionId === null
-      ? undefined
-      : views.find(
-          (v) =>
-            v.liveSessionId === activeSessionId ||
-            v.storedSessionIds.includes(activeSessionId) ||
-            v.archivedSessionIds.includes(activeSessionId),
-        );
+  // The ACTIVE SPACE's view (the `⌘N` / `New Session` button's target —
+  // the selected space, NOT the active session's space: the tabs are the
+  // space switch, and a new conversation starts in the selected space).
+  // `undefined` while no space is selected (no spaces yet, or the last
+  // one was removed) — the button routes that case to the Open Space
+  // dialog. (The `useStartNewConversation` hook no-ops on an undefined
+  // view, so the routing is the only behavior that matters here.)
+  const activeView = views.find((v) => v.path === activeSpacePath);
   const newSession = useStartNewConversation(activeView);
 
-  // The active Space's path for the skill catalog: a Session's `cwd` IS
-  // the Space's folder (CONTEXT.md). Live sessions first, then stored,
-  // then ARCHIVED (an archived-only active session must still resolve
-  // its Space — otherwise the catalog silently degrades to user-level
-  // skills); `null` when nothing is active.
-  const activeSession = sessions.find((s) => s.sessionId === activeSessionId);
-  const activeHistory = activeSession
-    ? undefined
-    : historySessions.find((s) => s.sessionId === activeSessionId) ??
-      archivedSessions.find((s) => s.sessionId === activeSessionId);
-  const activeSpacePath = activeSession?.cwd ?? activeHistory?.cwd ?? null;
+  // The active space's path for the skill catalog (a Session's `cwd` IS
+  // the Space's folder — CONTEXT.md): the SELECTED space (the tab), or
+  // `null` when none is selected (the catalog degrades to user-level
+  // skills — the hook's `null` handling).
   const skills = useSkillCatalog(activeSpacePath);
 
   // The session awaiting delete confirmation (the ONLY destructive
@@ -149,16 +138,26 @@ export default function SpacesList({
       )
     : "";
 
+  // The shared collapsed flag (the module seeds it from localStorage at
+  // import). The collapse control itself lives in the CHROME BAR (the
+  // top menubar — the old footer button moved up); this component only
+  // reads the flag for its width (0 while collapsed — the chrome bar's
+  // button is the re-expand control, so no rail is needed).
+  const collapsed = useSyncExternalStore(
+    subscribeLeftPane,
+    getLeftPaneCollapsed,
+  );
+
   // `handleOpenSpace` is stable forever; `handleNewSession` is stable only
   // while `activeSessionId` and `newSession` are — but `useStartNewConversation`
   // returns a FRESH object every render, so the keydown effect below
   // re-subscribes on EVERY render. That is one cheap listener swap per
   // render, and the `e.target` guard makes the churn harmless.
   const handleNewSession = useCallback(() => {
-    // No matching Space view — either no active session, or an active
-    // session that belongs to NO current Space (e.g. a legacy session
-    // whose cwd is no longer a Space): open the Open Space dialog
-    // instead (the hook itself no-ops on an undefined view).
+    // No space selected (no spaces yet, or the last one was removed), or
+    // the selected space has no view (a legacy cwd that is no longer a
+    // Space): open the Open Space dialog instead (the hook itself no-ops
+    // on an undefined view).
     if (activeView === undefined) {
       setDialogOpen(true);
       return;
@@ -198,17 +197,15 @@ export default function SpacesList({
   }, [handleNewSession, handleOpenSpace]);
 
   return (
-    <aside className="flex w-[260px] shrink-0 flex-col bg-sidebar">
-      <div className="flex flex-col gap-2 border-b border-border/50 p-3">
-        <button
-          type="button"
-          onClick={handleNewSession}
-          className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-ui-base hover:bg-surface-hover"
-        >
-          <MessageCirclePlusIcon className="size-4" />
-          <span className="flex-1 text-left">New Session</span>
-          <Kbd className="text-foreground-subtlest">⌘N</Kbd>
-        </button>
+    // Collapse = `width: 0` + `overflow: hidden` (the content stays
+    // mounted, clipped; the `fixed` dialogs escape the clipping). The
+    // collapse control lives in the chrome bar (the top menubar), so no
+    // rail is needed — the pane just vanishes.
+    <aside
+      style={{ width: collapsed ? 0 : LEFT_PANE_WIDTH }}
+      className="flex shrink-0 flex-col overflow-hidden bg-sidebar"
+    >
+      <div className="flex flex-col gap-2 p-3">
         <button
           type="button"
           onClick={handleOpenSpace}
@@ -220,6 +217,15 @@ export default function SpacesList({
         </button>
         <button
           type="button"
+          onClick={handleNewSession}
+          className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-ui-base hover:bg-surface-hover"
+        >
+          <MessageCirclePlusIcon className="size-4" />
+          <span className="flex-1 text-left">New Session</span>
+          <Kbd className="text-foreground-subtlest">⌘N</Kbd>
+        </button>
+        <button
+          type="button"
           onClick={() => setSkillsOpen(true)}
           className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-ui-base hover:bg-surface-hover"
         >
@@ -227,23 +233,63 @@ export default function SpacesList({
           <span className="flex-1 text-left">Skills</span>
         </button>
       </div>
-      <p className="px-2.5 py-2 text-ui-base text-foreground-subtlest">
-        Sessions
-      </p>
+      {/* The Sessions header: the label + the `...` menu (the old tab
+          bar's `...` menu moved here — right-aligned, next to the word
+          `Sessions`). */}
+      <div className="flex items-center justify-between px-2.5 py-2">
+        <span className="text-ui-base text-foreground-subtlest">Sessions</span>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Session actions"
+              title={newSession.error ?? undefined}
+            >
+              <MoreHorizontalIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem
+              onSelect={() => void newSession.startNewConversation()}
+            >
+              New Session in this Space
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
       <div className="flex-1 overflow-y-auto">
         {views.length === 0 && (
           <p className="p-3 text-ui-sm text-foreground-subtlest">
             No spaces yet. Open a folder to get started.
           </p>
         )}
-        {views.map((view) => (
-          <SpaceGroup
-            key={view.path}
-            view={view}
-            activeSessionId={activeSessionId}
-            onOpen={openSession}
-          />
-        ))}
+        {/* The ACTIVE space's sessions (the Spaces are the top TABS —
+            the sidebar is sessions-only: no group headers, no folder
+            icons, no `+`, no trust shield, no collapse chevrons — the
+            list just scrolls). Live session first, then stored (input
+            order — do NOT re-sort). */}
+        {activeView && (
+          <div className="flex flex-col gap-0.5">
+            {activeView.liveSessionId !== null && (
+              <SessionRow
+                sessionId={activeView.liveSessionId}
+                spaceName={activeView.title !== "" ? activeView.title : activeView.path}
+                active={activeSessionId === activeView.liveSessionId}
+                onOpen={openSession}
+              />
+            )}
+            {activeView.storedSessionIds.map((id) => (
+              <SessionRow
+                key={id}
+                sessionId={id}
+                spaceName={activeView.title !== "" ? activeView.title : activeView.path}
+                active={activeSessionId === id}
+                onOpen={openSession}
+              />
+            ))}
+          </div>
+        )}
         <ArchivedSection
           activeSessionId={activeSessionId}
           onOpen={openSession}
@@ -274,8 +320,10 @@ export default function SpacesList({
       )}
       {/* The footer (the ZCode `WorkspaceSidebarFooter` position — bottom
           right): the gear icon opens the settings page as a full
-          content-area view (the parent swaps the workspace out). */}
-      <div className="flex justify-end border-t border-border/50 p-2">
+          content-area view (the parent swaps the workspace out). The
+          collapse button moved to the chrome bar (the top menubar) — the
+          footer is the gear only. */}
+      <div className="flex justify-end p-2">
         <button
           type="button"
           aria-label="Settings"
@@ -290,95 +338,6 @@ export default function SpacesList({
 }
 
 /**
- * One collapsible Space group: folder icon + base name, a `+` hover-action
- * (new Session in this Space — the same hook, pinned to this view) and a
- * chevron toggling the group's visibility in local `useState` (default
- * open).
- */
-function SpaceGroup({
-  view,
-  activeSessionId,
-  onOpen,
-}: {
-  view: SpaceView;
-  activeSessionId: string | null;
-  onOpen: (sessionId: string) => void;
-}) {
-  const [open, setOpen] = useState(true);
-  const newSession = useStartNewConversation(view);
-  const setSpaceTrusted = useSessions((s) => s.setSpaceTrusted);
-  const name = view.title !== "" ? view.title : view.path;
-  return (
-    <div className="px-2.5 py-1">
-      <div className="group flex items-center gap-1">
-        <FolderIcon className="size-4 shrink-0 text-foreground-subtlest" />
-        <span className="flex-1 truncate text-ui-base text-foreground-subtlest group-hover:text-foreground-subtle">
-          {name}
-        </span>
-        <button
-          type="button"
-          aria-label={`New session in ${name}`}
-          onClick={() => void newSession.startNewConversation()}
-          className="rounded-md size-6 hover:bg-surface-hover"
-        >
-          <PlusIcon className="size-4" />
-        </button>
-        <button
-          type="button"
-          aria-label={view.trusted ? `Stop trusting ${name}` : `Trust ${name}`}
-          title={
-            view.trusted
-              ? "Stop trusting this Space"
-              : "Trust this Space — skip permission prompts for bash/edit/write"
-          }
-          onClick={() => setSpaceTrusted(view.path, !view.trusted)}
-          className="rounded-md size-6 hover:bg-surface-hover"
-        >
-          {view.trusted ? (
-            <ShieldCheckIcon className="size-4 text-success" />
-          ) : (
-            <ShieldIcon className="size-4 text-foreground-subtlest" />
-          )}
-        </button>
-        <button
-          type="button"
-          aria-label={open ? `Collapse ${name}` : `Expand ${name}`}
-          onClick={() => setOpen(!open)}
-          className="rounded-md size-6 hover:bg-surface-hover"
-        >
-          {open ? (
-            <ChevronDownIcon className="size-4" />
-          ) : (
-            <ChevronRightIcon className="size-4" />
-          )}
-        </button>
-      </div>
-      {open && (
-        <div className="mt-1 flex flex-col gap-0.5">
-          {view.liveSessionId !== null && (
-            <SessionRow
-              sessionId={view.liveSessionId}
-              spaceName={name}
-              active={activeSessionId === view.liveSessionId}
-              onOpen={onOpen}
-            />
-          )}
-          {view.storedSessionIds.map((id) => (
-            <SessionRow
-              key={id}
-              sessionId={id}
-              spaceName={name}
-              active={activeSessionId === id}
-              onOpen={onOpen}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/**
  * One session row: leading 16px slot (live + in-turn → the circular
  * `LoaderIcon` spinner, else an empty placeholder), the title with a
  * gradient-fade mask (applied to the text ITSELF — background-agnostic, so
@@ -388,8 +347,8 @@ function SpaceGroup({
  * attention pill (a pending permission prompt OR a pending interactive
  * `ask`/`confirm`/`password` request — `password` included: a pending sudo
  * password shows no "Waiting" cue anywhere else) — swapped on row hover
- * for a Pause button (live sessions, the existing `closeSession` path) or
- * an Archive button (stored sessions, reversible — no confirm).
+ * for an Archive button (stored sessions, reversible — no confirm; live
+ * rows have no hover action — the pause concept is gone).
  */
 function SessionRow({
   sessionId,
@@ -459,30 +418,14 @@ function SessionRow({
         {title}
       </span>
       {isLive ? (
-        <>
-          <span className="group-hover:hidden">{rightSlot}</span>
-          <button
-            type="button"
-            title="Pause"
-            aria-label={`Pause ${title}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              void closeSession(sessionId).catch((err) => {
-                // `close_session` failures are logged (this path touches no
-                // error state).
-                console.error("Failed to pause session:", err);
-              });
-            }}
-            className="hidden size-6 items-center justify-center rounded-md group-hover:flex hover:bg-surface-hover"
-          >
-            <PauseIcon className="size-4" />
-          </button>
-        </>
+        // Live row: NO hover action (the pause concept is gone — the
+        // session is never paused from the UI). The time/pill slot is
+        // always shown.
+        rightSlot
       ) : (
         // Stored row: the time/pill slot swaps for an Archive hover
-        // button (the same pattern as the live row's Pause — archive is
-        // reversible, so it needs no confirm). The slot still renders
-        // when NOT hovering.
+        // button (archive is reversible, so it needs no confirm). The
+        // slot still renders when NOT hovering.
         <>
           <span className="group-hover:hidden">{rightSlot}</span>
           <button

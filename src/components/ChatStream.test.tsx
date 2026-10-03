@@ -6,15 +6,36 @@ import {
   setSessionConfigOption,
   resumeSession,
   readClipboardImage,
+  readFileBytes,
   cancelSession,
   listSkills,
 } from "../lib/tauri";
+import { open as openFilePicker } from "@tauri-apps/plugin-dialog";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import { useSessions } from "../store/sessions";
 import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSubagents } from "../store/subagents";
-import { getSidePaneCollapsed, setSidePaneCollapsed } from "../lib/sidePaneState";
+import { useSettings } from "../store/settings";
+import { generateFrames, getVariantGridSize } from "../lib/braille-loader";
+import type { AppSettings } from "../lib/tauri";
+import { setSidePaneCollapsed } from "../lib/sidePaneState";
+
+/** A full settings fixture (the spinner-style tests seed the store with it). */
+const SETTINGS_FIXTURE: AppSettings = {
+  theme: "dark",
+  paneLayout: {},
+  defaultTrustNewSpaces: false,
+  defaultModel: null,
+  defaultThinkingLevel: null,
+  enabledTools: [],
+  providers: [],
+  mcpServers: {},
+  font: { sizePx: 14, uiFamily: null, codeFamily: null },
+  defaultThinkingLevels: {},
+  subagentModels: {},
+  spinnerStyle: null,
+};
 
 // jsdom exposes a non-callable `window.matchMedia` (the `"matchMedia" in
 // window` guard in the `BrailleLoader`'s `usePrefersReducedMotion` passes,
@@ -70,6 +91,7 @@ vi.mock("../lib/tauri", async () => {
     respondInteractiveRequest: vi.fn().mockResolvedValue(undefined),
     setSessionConfigOption: vi.fn().mockResolvedValue([]),
     readClipboardImage: vi.fn().mockResolvedValue(null),
+    readFileBytes: vi.fn().mockResolvedValue(null),
     cancelSession: vi.fn().mockResolvedValue(undefined),
     loadHistory: vi.fn().mockResolvedValue([]),
     listSkills: vi.fn().mockResolvedValue([
@@ -92,6 +114,12 @@ vi.mock("../lib/tauri", async () => {
     ]),
   };
 });
+
+// The native file picker (the `+` button's `open` — the real module would
+// `invoke` Tauri's dialog plugin, which doesn't exist in jsdom).
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn().mockResolvedValue(null),
+}));
 
 /**
  * Seed a live session (fresh transcript) in the sessions store.
@@ -210,8 +238,8 @@ function pasteToComposer(
 }
 
 function dropOnComposer(files: File[]): void {
-  // `getByRole("textbox")`, NOT `getByPlaceholderText(/Ask/i)` — the placeholder
-  // changes with session state (e.g. "Agent is working…" when locked).
+  // `getByRole("textbox")` (the placeholder is the single static
+  // "Ask for follow-up changes" — state-independent).
   const target = screen.getByRole("textbox");
   fireEvent.drop(target, { dataTransfer: { files } });
 }
@@ -277,6 +305,7 @@ beforeEach(() => {
   }
   useInteractive.getState().dismissSession("sub1");
   usePermissions.getState().dismissSessionPrompts("sub1");
+  useSettings.setState({ settings: null, loaded: false });
 });
 
 describe("ChatStream", () => {
@@ -284,7 +313,7 @@ describe("ChatStream", () => {
     render(<ChatStream />);
     expect(
       screen.getByText(
-        "No active session — open a Space from the list on the left",
+        "No active session — open a Space from the tabs above",
       ),
     ).toBeTruthy();
   });
@@ -299,7 +328,7 @@ describe("ChatStream", () => {
     render(<ChatStream />);
     expect(
       screen.getByText(
-        "No active session — open a Space from the list on the left",
+        "No active session — open a Space from the tabs above",
       ),
     ).toBeTruthy();
     act(() => {
@@ -312,16 +341,6 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     expect(screen.getByText("Send a prompt to start")).toBeTruthy();
-  });
-
-  it("derives the header title from the first user message (truncated)", () => {
-    seedLiveSession();
-    const long = "a".repeat(120);
-    useSessions.getState().addUserMessage("s1", long);
-    render(<ChatStream />);
-    // The header shows the first 80 chars; the stream shows the full text.
-    expect(screen.getByText(long.slice(0, 80))).toBeTruthy();
-    expect(screen.getByText(long)).toBeTruthy();
   });
 
   it("renders the working indicator (BrailleLoader) when inTurn with no interactive state", () => {
@@ -341,8 +360,9 @@ describe("ChatStream", () => {
     useSessions.getState().beginTurn(sessionId);
     
     render(<ChatStream />);
-    // Verify "Thinking" label
-    expect(screen.getByText("Thinking")).toBeTruthy();
+    // Verify the "Thinking" label (scoped to the transcript's gradient text —
+    // the composer's thinking stub shows a "Thinking" placeholder too).
+    expect(screen.getByText("Thinking", { selector: ".animated-gradient-text" })).toBeTruthy();
     
     // Complete the turn
     act(() => {
@@ -382,6 +402,92 @@ describe("ChatStream", () => {
     await flush();
     expect(screen.getByText("Waiting for your input…")).toBeTruthy();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("pins the working indicator above the composer (below the messages, outside the scroll region)", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hi");
+    useSessions.getState().beginTurn("s1");
+    const { container } = render(<ChatStream />);
+    const scroll = container.querySelector(".overflow-y-auto");
+    const indicator = container.querySelector(
+      '[data-testid="working-indicator"]',
+    );
+    expect(indicator).toBeTruthy();
+    // Pinned: NOT inside the scroll region…
+    expect(indicator?.closest(".overflow-y-auto")).toBeNull();
+    // No border under the row (the faint separator is gone — the row is
+    // bare against the composer below it), and no dim filler line after
+    // the quip (the row is just the spinner + the quip).
+    expect(indicator?.className).not.toContain("border-b");
+    expect(indicator?.querySelector(".bg-foreground-subtlest")).toBeNull();
+    // Pulled a few px down toward the composer (the row hugs the input
+    // box — the gap between them is the composer's `m-3` minus the
+    // row's `-mb-2`).
+    expect(indicator?.className).toContain("-mb-2");
+    // …and BELOW it (right above the composer — NOT at the top of the
+    // page): the indicator follows the scroll region in DOM order.
+    expect(
+      scroll!.compareDocumentPosition(indicator!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("pins the 'Waiting for your input…' line above the composer too", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hi");
+    useInteractive.getState().applyState("s1", { state: "blocked" });
+    const { container } = render(<ChatStream />);
+    const scroll = container.querySelector(".overflow-y-auto");
+    const indicator = container.querySelector(
+      '[data-testid="working-indicator"]',
+    );
+    expect(indicator).toBeTruthy();
+    expect(indicator?.textContent).toContain("Waiting for your input…");
+    expect(indicator?.closest(".overflow-y-auto")).toBeNull();
+    expect(
+      scroll!.compareDocumentPosition(indicator!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("runs the configured spinner style (the settings store's spinnerStyle)", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hi");
+    useSessions.getState().beginTurn("s1");
+    useSettings.getState().setSettings({
+      ...SETTINGS_FIXTURE,
+      spinnerStyle: "pendulum",
+    });
+    const { container } = render(<ChatStream />);
+    const span = container.querySelector(
+      '[data-testid="working-indicator"] span[aria-hidden="true"]',
+    );
+    // The initial frame of the configured variant (the `BrailleLoader`
+    // renders `frames[0]` before its interval ticks).
+    const [w, h] = getVariantGridSize("pendulum");
+    expect(span?.textContent).toBe(generateFrames("pendulum", w, h).frames[0]);
+  });
+
+  it("falls back to the typing spinner when no spinnerStyle is set", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hi");
+    useSessions.getState().beginTurn("s1");
+    const { container } = render(<ChatStream />);
+    const span = container.querySelector(
+      '[data-testid="working-indicator"] span[aria-hidden="true"]',
+    );
+    const [w, h] = getVariantGridSize("typing");
+    expect(span?.textContent).toBe(generateFrames("typing", w, h).frames[0]);
+  });
+
+  it("hides the working indicator when idle (no inTurn, no agentState)", () => {
+    seedLiveSession();
+    useSessions.getState().addUserMessage("s1", "hi");
+    const { container } = render(<ChatStream />);
+    expect(
+      container.querySelector('[data-testid="working-indicator"]'),
+    ).toBeNull();
   });
 
   it("renders a FileSummaryCard with the turn's diff totals", () => {
@@ -432,19 +538,6 @@ describe("ChatStream", () => {
     expect(screen.queryByText("−1")).toBeNull();
   });
 
-  it("toggles the side pane (aria-pressed follows the shared flag)", () => {
-    seedLiveSession();
-    render(<ChatStream />);
-    const toggle = screen.getByRole("button", { name: "Toggle side pane" });
-    // The pane is open (the flag is false) → aria-pressed=true.
-    expect(toggle.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(toggle);
-    // The shared flag flipped…
-    expect(getSidePaneCollapsed()).toBe(true);
-    // …and the button's aria-pressed follows.
-    expect(toggle.getAttribute("aria-pressed")).toBe("false");
-  });
-
   it("renders the composer shell (rounded-2xl, bg-input, border + border-input-border)", () => {
     seedLiveSession();
     const { container } = render(<ChatStream />);
@@ -457,10 +550,22 @@ describe("ChatStream", () => {
     expect(shell!.className).toMatch(/(^|\s)border(\s|$)/);
   });
 
-  it("shows the ZCode placeholder 'Ask anything…' for a fresh live session (no history)", () => {
+  it("the root main carries min-h-0 (a vertical flex item must be allowed to shrink — the transcript scrolls internally, not the window)", () => {
+    seedLiveSession();
+    const { container } = render(<ChatStream />);
+    const main = container.querySelector("main");
+    expect(main).toBeTruthy();
+    // The `main` is a `flex-1` item of the center column (a `flex-col`):
+    // without `min-h-0` the item's `min-height: auto` keeps it at the
+    // transcript's height — it overflows the window (the composer is
+    // pushed off-screen) and the inner `overflow-y-auto` div never scrolls.
+    expect(main!.className).toContain("min-h-0");
+  });
+
+  it("shows the SINGLE placeholder 'Ask for follow-up changes' for a fresh live session (no history — the state if/else is gone)", () => {
     seedLiveSession();
     render(<ChatStream />);
-    expect(screen.getByPlaceholderText("Ask anything…")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
   });
 
   it("shows the ZCode placeholder 'Ask for follow-up changes' for a live session WITH history", () => {
@@ -487,25 +592,39 @@ describe("ChatStream", () => {
     expect(sendButton.className).not.toContain("rounded-full");
   });
 
-  it("shows the composer placeholder 'Agent is working…' for a live working session", () => {
+  it("keeps the SINGLE placeholder for a live working session (the 'Agent is working…' if/else is gone — the working indicator carries the state)", () => {
     seedLiveSession();
     useSessions.getState().beginTurn("s1");
     render(<ChatStream />);
-    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
   });
 
-  it("shows the composer placeholder 'Resume this session to send' for a stored resumable session", () => {
+  it("shows the SAME placeholder for a stored resumable session (no pause concept shown)", () => {
     seedStoredSession({ loadSession: true });
     render(<ChatStream />);
+    // The stored session looks normal: the SAME single placeholder (the
+    // auto-resume on send is silent — the pause/resume concept is not
+    // shown).
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
     expect(
-      screen.getByPlaceholderText("Resume this session to send"),
+      screen.queryByPlaceholderText("Resume this session to send"),
+    ).toBeNull();
+  });
+
+  it("shows the normal follow-up placeholder for a stored resumable session with messages", () => {
+    seedStoredSession({ loadSession: true });
+    useSessions.getState().addUserMessage("s1", "hi");
+    render(<ChatStream />);
+    // Identical to a live session with messages — no "Resume" wording.
+    expect(
+      screen.getByPlaceholderText("Ask for follow-up changes"),
     ).toBeTruthy();
   });
 
-  it("shows the composer placeholder 'This session is closed' for a history-only session", () => {
+  it("shows the SAME placeholder for a history-only (closed) session (the 'This session is closed' if/else is gone)", () => {
     seedStoredSession();
     render(<ChatStream />);
-    expect(screen.getByPlaceholderText("This session is closed")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
   });
 
   // --- Auto-resume: a RESUMABLE stored session gets an enabled composer that
@@ -525,16 +644,44 @@ describe("ChatStream", () => {
     expect(sendButton.hasAttribute("disabled")).toBe(false);
   });
 
-  it("keeps the composer disabled for a non-resumable stored session", () => {
+  it("keeps the SEND disabled for a non-resumable stored session (a dead session can't receive a prompt — the harness rejects it)", () => {
     seedStoredSession(); // capabilities {} — no `loadSession`
     render(<ChatStream />);
+    // The textarea stays editable (you can DRAFT — it just can't be SENT:
+    // a non-resumable session has no agent process to deliver to, and the
+    // harness's `send_prompt` rejects a prompt for an unknown session).
     const textarea = screen.getByRole("textbox");
-    expect(textarea.hasAttribute("disabled")).toBe(true);
-    // The Send button stays disabled too (no draft can even be typed — a
-    // disabled textarea can't be changed; the capability gate fails closed).
+    expect(textarea.hasAttribute("disabled")).toBe(false);
     expect(
       screen.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
     ).toBe(true);
+  });
+
+  it("renders the composer's bottom row for a closed (history-only) session (the context bar + model/thinking selects — the `isLive` gates are gone)", () => {
+    seedStoredSession();
+    const { container } = render(<ChatStream />);
+    const composer = container.querySelector(".rounded-2xl")!;
+    // The context bar renders (an empty 0% track — the session's context is
+    // dropped on close and re-emits on resume; the label waits for data).
+    const bar = composer.querySelector(
+      '[data-testid="context-usage-bar"]',
+    ) as HTMLElement;
+    expect(bar).toBeTruthy();
+    const progress = bar.querySelector(
+      '[role="progressbar"][aria-label="Context used"]',
+    ) as HTMLElement;
+    expect(progress.getAttribute("aria-valuenow")).toBe("0");
+    expect(bar.querySelector('[data-testid="context-usage"]')).toBeNull();
+    // The model/thinking selects render as DISABLED stubs (the config
+    // options are dropped on close — no data to show; the identity stays).
+    const model = composer.querySelector('[aria-label="Model"]') as HTMLElement;
+    expect(model).toBeTruthy();
+    expect(model.hasAttribute("disabled")).toBe(true);
+    const thinking = composer.querySelector(
+      '[aria-label="Thinking"]',
+    ) as HTMLElement;
+    expect(thinking).toBeTruthy();
+    expect(thinking.hasAttribute("disabled")).toBe(true);
   });
 
   it("send in a resumable stored session auto-resumes it, then sends", async () => {
@@ -575,121 +722,32 @@ describe("ChatStream", () => {
   // --- Task 5 (ADR 0016): the manual Resume affordances are GONE — the
   // banner is purely informational and the first send auto-resumes. ---
 
-  it("a resumable stored session renders an informational banner with no Resume button", () => {
+  it("a resumable stored session renders NO banner and no Resume button (it looks normal)", () => {
     seedStoredSession({ loadSession: true });
     render(<ChatStream />);
-    // The banner is text ONLY — no Resume button (the first send resumes).
+    // The pause concept is not shown: no stored/resume banner, no
+    // history-only banner, no Resume button — the first send auto-resumes
+    // silently.
     expect(
-      screen.getByText("This session is stored. Sending a message resumes it."),
-    ).toBeTruthy();
+      screen.queryByText(
+        "This session is stored. Sending a message resumes it.",
+      ),
+    ).toBeNull();
+    expect(screen.queryByText(/History only/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
   });
 
-  it("the header dropdown has no Resume item", () => {
-    seedStoredSession({ loadSession: true });
-    render(<ChatStream />);
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: "Session actions" }),
-    );
-    // A stored session has no Pause either — the ONLY item is
-    // "New Session in this Space".
-    expect(
-      screen.getByRole("menuitem", { name: "New Session in this Space" }),
-    ).toBeTruthy();
-    expect(screen.queryByRole("menuitem", { name: "Resume" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Pause" })).toBeNull();
-  });
-
-  it("the conversation selector lists the active archived session", () => {
-    seedArchivedSession();
-    render(<ChatStream />);
-    // A space whose ONLY session is archived still renders its space bar
-    // + conversation selector, and the archived session appears as the
-    // `Archived` option (without it the `Select` has zero items and its
-    // `value` matches nothing — an empty trigger + empty dropdown).
-    expect(screen.getByText("Archived")).toBeTruthy();
-  });
-
-  it("renders ONE option (Live) for a sticky-archived live session (no duplicate Live+Archived entry)", () => {
-    // STICKY state (the store's `resumeSession` deliberately leaves a
-    // resumed archived session in `archivedSessions` while it's live):
-    // the id is in BOTH `sessions` and `archivedSessions`.
-    useSessions.setState({
-      activeSessionId: "s9",
-      sessions: [
-        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
-      ],
-      spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
-      historySessions: [],
-      archivedSessions: [
-        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
-      ],
-      messages: { s9: [] },
-      inTurn: {},
-      stopReasons: {},
-      closeReasons: {},
-      configOptions: {},
-    });
-    render(<ChatStream />);
-    // Open the conversation selector: the sticky session must appear
-    // exactly ONCE — as `Live` (it's live). A duplicate `Archived` entry
-    // with the same `key`/`value` would be a React duplicate-key warning
-    // and an ambiguous `SelectValue` match.
-    fireEvent.click(screen.getByRole("combobox", { name: "Conversation" }));
-    expect(screen.getAllByRole("option")).toHaveLength(1);
-    expect(screen.getByRole("option", { name: "Live" })).toBeTruthy();
-    expect(screen.queryByRole("option", { name: "Archived" })).toBeNull();
-  });
-
-  it("labels a sticky-archived live session 'Live' when the space holds a second (more recent) live session", () => {
-    // Multi-live space (the one-live cap is lifted): the sticky
-    // session (s9) is live — in BOTH `sessions` and `archivedSessions` —
-    // but is NOT `view.liveSessionId` because the OTHER live session (s1)
-    // is more recent (last in `sessions`). Its selector entry must be
-    // labeled `Live` (it IS live), not `Archived`.
-    useSessions.setState({
-      activeSessionId: "s9",
-      sessions: [
-        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: false },
-        { sessionId: "s1", cwd: "/home/u/arch", capabilities: {}, archived: false },
-      ],
-      spaces: [{ path: "/home/u/arch", createdAt: 1, lastOpenedAt: 1, trusted: false }],
-      historySessions: [],
-      archivedSessions: [
-        { sessionId: "s9", cwd: "/home/u/arch", capabilities: { loadSession: true }, archived: true },
-      ],
-      messages: { s9: [], s1: [] },
-      inTurn: {},
-      stopReasons: {},
-      closeReasons: {},
-      configOptions: {},
-    });
-    render(<ChatStream />);
-    // The trigger shows the ACTIVE session's label: it must be `Live` (the
-    // session IS live), not `Archived`.
-    expect(
-      screen.getByRole("combobox", { name: "Conversation" }).textContent,
-    ).toBe("Live");
-    fireEvent.click(screen.getByRole("combobox", { name: "Conversation" }));
-    // Both live sessions are options (2 total — the active session appears
-    // exactly ONCE, not duplicated). The active session's entry (AFTER the
-    // view's live session s1 — it is not `view.liveSessionId`) must be
-    // labeled `Live` (it IS live), not `Archived`.
-    const options = screen.getAllByRole("option");
-    expect(options).toHaveLength(2);
-    expect(options[1].textContent).toBe("Live");
-    expect(screen.queryByRole("option", { name: "Archived" })).toBeNull();
-  });
-
-  it("an archived-only session renders the stored banner and an enabled composer, and first send resumes", async () => {
+  it("an archived-only session renders no banner and an enabled composer, and first send resumes", async () => {
     seedArchivedSession({ loadSession: true, promptCapabilities: { image: true } });
     render(<ChatStream />);
     // The `historySession` selector searches BOTH stored lists, so an
-    // archived-only session gets the stored banner AND an enabled
-    // composer (not "This session is closed").
+    // archived-only session gets an enabled composer (not "This session
+    // is closed") and NO banner (the pause concept is not shown).
     expect(
-      screen.getByText("This session is stored. Sending a message resumes it."),
-    ).toBeTruthy();
+      screen.queryByText(
+        "This session is stored. Sending a message resumes it.",
+      ),
+    ).toBeNull();
     const textarea = screen.getByRole("textbox");
     expect(textarea.hasAttribute("disabled")).toBe(false);
     fireEvent.change(textarea, {
@@ -732,24 +790,26 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Ask anything…");
+    const textarea = screen.getByRole("textbox");
     // Empty draft → disabled.
     expect(sendButton.hasAttribute("disabled")).toBe(true);
     // Non-empty draft, idle → enabled.
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
-    // inTurn (working) → disabled again — the textarea too.
+    // inTurn (working) → send disabled again (the textarea stays EDITABLE
+    // — you can draft while the agent works; Enter no-ops via `send()`'
+    // `composerLocked` guard, the draft is kept for when the turn ends).
     await act(async () => {
       useSessions.getState().beginTurn("s1");
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
-    expect(textarea.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(false);
   });
 
   it("calls sendPrompt when Enter is pressed with a draft", () => {
     seedLiveSession();
     render(<ChatStream />);
-    const textarea = screen.getByPlaceholderText("Ask anything…");
+    const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "hello" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).toHaveBeenCalledWith("s1", "hello");
@@ -823,84 +883,49 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Ask anything…");
+    const textarea = screen.getByRole("textbox");
     // Idle → enabled (sanity).
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
     // The interactive agentState says working (the `state` push races `turnCompleted`, or
-    // the state latches after a turn) → the composer is dead: button AND
-    // textarea disabled, Enter no-ops.
+    // the state latches after a turn) → the send is dead: button disabled,
+    // the textarea stays editable (the draft is kept; Enter no-ops).
     await act(async () => {
       useInteractive.getState().applyState("s1", { state: "working" });
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
-    expect(textarea.hasAttribute("disabled")).toBe(true);
-    // The placeholder pins the working copy (the `working` mismatch does
-    // not leave the idle copy behind).
-    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    // The placeholder is the single idle copy (the `working` mismatch does
+    // not leave a stale copy behind — the working indicator carries the
+    // state).
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
-  it("disables the send button, the textarea, and no-ops Enter while the interactive agentState is blocked (mid-turn awaiting a request response)", async () => {
+  it("disables the send button and no-ops Enter while the interactive agentState is blocked (mid-turn awaiting a request response)", async () => {
     seedLiveSession();
     render(<ChatStream />);
     const sendButton = screen.getByRole("button", { name: "Send" });
-    const textarea = screen.getByPlaceholderText("Ask anything…");
+    const textarea = screen.getByRole("textbox");
     // Idle → enabled (sanity: `blocked` has NOT been pushed yet).
     fireEvent.change(textarea, { target: { value: "hi" } });
     expect(sendButton.hasAttribute("disabled")).toBe(false);
     expect(textarea.hasAttribute("disabled")).toBe(false);
     // `inTurn` is true (a `blocked` agent is mid-turn — it is awaiting a
     // request response, so `inTurn` alone used to lock the composer) +
-    // the interactive agentState says blocked → the composer is dead for the whole
-    // wait: button AND textarea disabled, Enter no-ops (no
-    // double-send, no clobbered turn bookkeeping).
+    // the interactive agentState says blocked → the send is dead for the whole
+    // wait: button disabled (the textarea stays editable — the draft is
+    // kept; Enter no-ops, no double-send, no clobbered turn bookkeeping).
     await act(async () => {
       useSessions.getState().beginTurn("s1");
       useInteractive.getState().applyState("s1", { state: "blocked" });
     });
     expect(sendButton.hasAttribute("disabled")).toBe(true);
-    expect(textarea.hasAttribute("disabled")).toBe(true);
-    expect(screen.getByPlaceholderText("Agent is working…")).toBeTruthy();
+    expect(textarea.hasAttribute("disabled")).toBe(false);
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).not.toHaveBeenCalled();
-  });
-
-  it("shows the bg-warning toggle dot for a pending SUBAGENT request (the pane's pill is clipped when collapsed — the dot is the cue)", () => {
-    seedLiveSession();
-    useSubagents.getState().addSession({
-      sessionId: "sub1",
-      parentSessionId: "s1",
-      agentName: "reviewer",
-      task: "review the diff",
-      status: "running",
-    });
-    useInteractive.getState().addRequest("sub1", {
-      requestId: "r1",
-      method: "ask",
-      source: "subagent:reviewer",
-      params: { question: "which library?" },
-    });
-    render(<ChatStream />);
-    const toggle = screen.getByRole("button", { name: "Toggle side pane" });
-    // The subagent session id is never the ACTIVE session — the dot
-    // counts the subagent's pending request via the shared hook.
-    expect(toggle.querySelector(".bg-warning")).toBeTruthy();
-  });
-
-  it("does NOT show the toggle dot when there are no pending requests (active or subagent)", () => {
-    seedLiveSession();
-    useSubagents.getState().addSession({
-      sessionId: "sub1",
-      parentSessionId: "s1",
-      agentName: "reviewer",
-      task: "review the diff",
-      status: "running",
-    });
-    render(<ChatStream />);
-    const toggle = screen.getByRole("button", { name: "Toggle side pane" });
-    expect(toggle.querySelector(".bg-warning")).toBeNull();
   });
 
   it("keeps the composer LOCKED when the interactive agentState is idle but the store is inTurn", () => {
@@ -912,11 +937,12 @@ describe("ChatStream", () => {
     // A stale `idle` from the previous turn must not unlock the composer
     // while a turn is in flight (`inTurn` is the ground truth — the store
     // does not reset `agentState` on `turnCompleted`, a store follow-up):
-    // the placeholder says working, the controls are disabled, and Enter
-    // no-ops. The working indicator shows (the turn IS in flight).
-    const textarea = screen.getByPlaceholderText("Agent is working…");
+    // the send is disabled and Enter no-ops (the textarea stays editable
+    // — the draft is kept). The working indicator shows (the turn IS in
+    // flight).
+    const textarea = screen.getByRole("textbox");
     expect(sendButton.hasAttribute("disabled")).toBe(true);
-    expect(textarea.hasAttribute("disabled")).toBe(true);
+    expect(textarea.hasAttribute("disabled")).toBe(false);
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(sendPrompt).not.toHaveBeenCalled();
     expect(screen.queryByRole("status")).toBeTruthy();
@@ -964,15 +990,304 @@ describe("ChatStream", () => {
     });
     const { container } = render(<ChatStream />);
     // ZCode's composer carries the model/thought controls in its toolbar
-    // (left of the send button) — the header does NOT.
+    // (left of the send button).
     const composer = container.querySelector(".rounded-2xl")!;
     expect(composer.querySelector('[aria-label="Model"]')).toBeTruthy();
     expect(composer.querySelector('[aria-label="Thinking"]')).toBeTruthy();
-    const header = container.querySelector(".h-12")!;
-    expect(header.querySelector('[aria-label="Model"]')).toBeNull();
-    expect(header.querySelector('[aria-label="Thinking"]')).toBeNull();
-    expect(screen.getByText("acme/Alpha")).toBeTruthy();
+    expect(screen.getByText("acme/alpha")).toBeTruthy();
     expect(screen.getByText("Medium")).toBeTruthy();
+  });
+
+  // --- The context bar (the dynamic percentage — a progress bar spanning
+  // from the `+` button to the model selector, the reference UI's
+  // `🧠 [====bar====] 61%` look). ---
+
+  it("renders a dynamic context bar in the composer when the usage is known", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 53760, window: 128000 } },
+    });
+    const { container } = render(<ChatStream />);
+    // 53760 / 128000 = 42% — inside the composer (NOT the header).
+    const composer = container.querySelector(".rounded-2xl")!;
+    const group = composer.querySelector(
+      '[data-testid="context-usage-bar"]',
+    ) as HTMLElement | null;
+    expect(group).toBeTruthy();
+    const bar = group!.querySelector(
+      '[role="progressbar"][aria-label="Context used"]',
+    ) as HTMLElement | null;
+    expect(bar).toBeTruthy();
+    expect(bar!.getAttribute("aria-valuemin")).toBe("0");
+    expect(bar!.getAttribute("aria-valuemax")).toBe("100");
+    expect(bar!.getAttribute("aria-valuenow")).toBe("42");
+    // The fill's width follows the percentage, and 42% (< 50%) is the
+    // green band (the label follows the fill's color).
+    const fill = bar!.firstElementChild as HTMLElement;
+    expect(fill.style.width).toBe("42%");
+    expect(fill.className).toContain("bg-success");
+    expect(fill.className).not.toContain("bg-yellow-500");
+    // The label sits at the bar's right edge (the reference UI's `61%`).
+    const labelEl = group!.querySelector('[data-testid="context-usage"]') as HTMLElement;
+    expect(labelEl.textContent).toBe("42%");
+    expect(labelEl.className).toContain("text-success");
+    // The brain icon cues the bar (the reference UI's `🧠` placement).
+    expect(group!.querySelector('[data-testid="context-bar-icon"]')).toBeTruthy();
+    // The tooltip carries the token counts (the percentage alone is opaque).
+    expect(
+      group!.querySelector('[data-testid="context-usage"]')!.getAttribute("title"),
+    ).toBe("42% of context used (53,760 / 128,000 tokens)");
+  });
+
+  it("a yellow-band context percentage (50–69%) renders the fill in yellow", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 78080, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const group = screen.getByTestId("context-usage-bar");
+    const bar = group.querySelector(
+      '[role="progressbar"][aria-label="Context used"]',
+    ) as HTMLElement;
+    expect(bar.getAttribute("aria-valuenow")).toBe("61");
+    // 61% is the yellow band (50–69%): yellow (NOT green, NOT orange),
+    // and the label follows the fill's color.
+    const fill = bar.firstElementChild as HTMLElement;
+    expect(fill.className).toContain("bg-yellow-500");
+    expect(fill.className).not.toContain("bg-success");
+    expect(fill.className).not.toContain("bg-orange-500");
+    const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
+    expect(label.textContent).toBe("61%");
+    expect(label.className).toContain("text-yellow-500");
+  });
+
+  it("a mid context percentage (70–89%) escalates the fill to orange", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 96000, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const group = screen.getByTestId("context-usage-bar");
+    const bar = group.querySelector(
+      '[role="progressbar"][aria-label="Context used"]',
+    ) as HTMLElement;
+    expect(bar.getAttribute("aria-valuenow")).toBe("75");
+    // 75% is the orange band (70–89%): orange (NOT yellow, NOT red),
+    // and the label follows the fill's color.
+    const fill = bar.firstElementChild as HTMLElement;
+    expect(fill.className).toContain("bg-orange-500");
+    expect(fill.className).not.toContain("bg-yellow-500");
+    expect(fill.className).not.toContain("bg-destructive");
+    const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
+    expect(label.textContent).toBe("75%");
+    expect(label.className).toContain("text-orange-500");
+  });
+
+  it("a high context percentage (>= 90%) escalates the fill to the destructive color", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 115200, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const group = screen.getByTestId("context-usage-bar");
+    const bar = group.querySelector(
+      '[role="progressbar"][aria-label="Context used"]',
+    ) as HTMLElement;
+    expect(bar.getAttribute("aria-valuenow")).toBe("90");
+    // 90% is the red band (90–100%): the destructive red (the label
+    // follows the fill's color).
+    const fill = bar.firstElementChild as HTMLElement;
+    expect(fill.className).toContain("bg-destructive");
+    expect(fill.className).not.toContain("bg-orange-500");
+    const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
+    expect(label.textContent).toBe("90%");
+    expect(label.className).toContain("text-destructive");
+  });
+
+  it("renders an empty context bar (no label) when the usage is unknown", () => {
+    seedLiveSession();
+    useSessions.setState({ contextUsage: {} });
+    render(<ChatStream />);
+    // The bar renders from the start (layout stability — the fill appears
+    // as the session grows) but the label waits for the first frame.
+    const bar = screen.getByRole("progressbar", { name: "Context used" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("0");
+    const fill = bar.firstElementChild as HTMLElement;
+    expect(fill.style.width).toBe("0%");
+    expect(bar.querySelector('[data-testid="context-usage"]')).toBeNull();
+  });
+
+  it("renders the context bar for a stored session as an empty 0% track (the context is dropped on close and re-emits on resume)", () => {
+    seedStoredSession();
+    render(<ChatStream />);
+    // The bar is ALWAYS rendered (the `isLive` gate is gone): a stored
+    // session's context is dropped on close — the track is the empty 0%
+    // fill (the label waits for the resume to re-emit the usage).
+    const bar = screen.getByRole("progressbar", { name: "Context used" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("0");
+    expect(screen.queryByTestId("context-usage")).toBeNull();
+  });
+
+  it("renders the bottom bar POPULATED for a stored session (config options + context usage from the session row — the selectors are disabled)", () => {
+    // The `list_sessions` shape: the row carries `configOptions` (the
+    // stored `model` / `thinkingLevel` synthesized) + `contextUsage` (the
+    // last known usage — persisted on every `context_usage_update` frame).
+    useSessions.setState({
+      activeSessionId: "s1",
+      sessions: [],
+      spaces: [{ path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false }],
+      historySessions: [
+        {
+          sessionId: "s1",
+          cwd: "/home/u/proj",
+          capabilities: { loadSession: true },
+          archived: false,
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "tama/m1",
+              options: [{ value: "tama/m1", name: "m1" }],
+            },
+            {
+              id: "thought_level",
+              name: "Thinking",
+              category: "thought_level",
+              type: "select",
+              currentValue: "high",
+              options: [{ value: "high", name: "High" }],
+            },
+          ],
+          contextUsage: { used: 53760, window: 128000 },
+        },
+      ],
+      messages: { s1: [] },
+      inTurn: {},
+      stopReasons: {},
+      closeReasons: {},
+      configOptions: {},
+      contextUsage: {},
+    });
+    render(<ChatStream />);
+    // The context bar is FILLED from the row's usage (53760 / 128000 ≈
+    // 42% — the green band).
+    const bar = screen.getByRole("progressbar", { name: "Context used" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("42");
+    expect(screen.getByTestId("context-usage").textContent).toBe("42%");
+    // The model selector is POPULATED with the stored model's name, but
+    // DISABLED (a stored session can't set config — no agent process to
+    // deliver `set_config_option` to).
+    const model = screen.getByRole("button", { name: "Model" });
+    expect(model.hasAttribute("disabled")).toBe(true);
+    expect(model.textContent).toContain("tama/m1");
+    // The thinking selector is POPULATED with the stored level + disabled.
+    const thinking = screen.getByRole("combobox");
+    expect(thinking.hasAttribute("disabled")).toBe(true);
+    expect(thinking.textContent).toContain("High");
+  });
+
+  it("a stored session's live config options win over the row's (the store's map is fresher — the last frame before the close)", () => {
+    // The store's map has a FRESHER value (the session was live in this
+    // app session, closed, and the store kept its last known config — the
+    // `handleSessionClosed` no longer drops it); the row's value is the
+    // DB's (persisted on the same frame — same value, but the store's
+    // map is the primary source).
+    seedStoredSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "tama/m2",
+            options: [{ value: "tama/m2", name: "m2" }],
+          },
+        ],
+      },
+      contextUsage: { s1: { used: 100000, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const model = screen.getByRole("button", { name: "Model" });
+    expect(model.textContent).toContain("tama/m2");
+    const bar = screen.getByRole("progressbar", { name: "Context used" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("78"); // 100000/128000 ≈ 78%
+  });
+
+  // --- The `+` attach button (the native file picker) ---
+
+  it("renders an enabled `+` (Attach files) button for a live image-capable session", () => {
+    seedLiveSessionWithImages();
+    render(<ChatStream />);
+    const button = screen.getByRole("button", { name: "Attach files" });
+    expect(button.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("the `+` button is disabled when the agent does not advertise image support (fail-closed)", () => {
+    seedLiveSession(); // capabilities: {} — no `promptCapabilities.image`
+    render(<ChatStream />);
+    const button = screen.getByRole("button", { name: "Attach files" });
+    expect(button.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("the `+` button is disabled while a turn is in flight (the composer is locked)", () => {
+    seedLiveSessionWithImages();
+    useSessions.setState({ inTurn: { s1: true } });
+    render(<ChatStream />);
+    const button = screen.getByRole("button", { name: "Attach files" });
+    expect(button.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("clicking `+` opens the file picker and stages the picked image", async () => {
+    seedLiveSessionWithImages();
+    vi.mocked(openFilePicker).mockResolvedValueOnce([
+      "/home/u/pics/shot.png",
+    ]);
+    vi.mocked(readFileBytes).mockResolvedValueOnce([
+      0x89, 0x50, 0x4e, 0x47, 1, 2, 3,
+    ]);
+    render(<ChatStream />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    // The picker opens (the dialog's image filter — the backend re-validates
+    // the extension, the frontend re-validates the MIME on staging).
+    expect(vi.mocked(openFilePicker)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(openFilePicker).mock.calls[0][0]).toMatchObject({
+      multiple: true,
+    });
+    // The picked file is staged as an attachment (the thumbnail appears —
+    // the bytes were read via `read_file_bytes` and the MIME inferred from
+    // the extension).
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove image attachment" }),
+      ).toBeTruthy(),
+    );
+    expect(vi.mocked(readFileBytes)).toHaveBeenCalledWith(
+      "/home/u/pics/shot.png",
+    );
+  });
+
+  it("a cancelled picker (null) stages nothing", async () => {
+    seedLiveSessionWithImages();
+    vi.mocked(openFilePicker).mockResolvedValueOnce(null);
+    render(<ChatStream />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    await waitFor(() => expect(vi.mocked(openFilePicker)).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: "Remove image attachment" })).toBeNull();
+    expect(vi.mocked(readFileBytes)).not.toHaveBeenCalled();
+  });
+
+  it("a picker selection of a non-image path is skipped (the read returns null)", async () => {
+    seedLiveSessionWithImages();
+    vi.mocked(openFilePicker).mockResolvedValueOnce([
+      "/home/u/pics/notes.txt",
+    ]);
+    vi.mocked(readFileBytes).mockResolvedValueOnce(null);
+    render(<ChatStream />);
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    await waitFor(() => expect(vi.mocked(readFileBytes)).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Remove image attachment" })).toBeNull();
   });
 
   it("choosing a model item invokes setSessionConfigOption", async () => {
@@ -994,8 +1309,10 @@ describe("ChatStream", () => {
       },
     });
     render(<ChatStream />);
-    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
-    fireEvent.click(screen.getByRole("option", { name: "acme/Beta" }));
+    // The model picker is a DIALOG (the trigger is a button — the catalog
+    // is too long for a Radix dropdown).
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    fireEvent.click(screen.getByText("acme/beta"));
     expect(setSessionConfigOption).toHaveBeenCalledWith("s1", "model", "acme/beta");
   });
 
@@ -1294,11 +1611,11 @@ describe("ChatStream", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-s.png");
   });
 
-  it("placeholder advertises paste when the agent supports images", () => {
+  it("shows the single placeholder for an image-capable fresh session (the capability if/else is gone)", () => {
     seedLiveSessionWithImages();
     render(<ChatStream />);
     expect(
-      screen.getByPlaceholderText("Ask anything — or paste an image…"),
+      screen.getByPlaceholderText("Ask for follow-up changes"),
     ).toBeTruthy();
   });
 
@@ -1311,8 +1628,8 @@ describe("ChatStream", () => {
     // NOT intercepted (default text paste falls through) and no thumbnail.
     expect(intercepted).toBe(true);
     expect(screen.queryByAltText("s.png")).toBeNull();
-    // The plain placeholder (the paste hint is capability-gated too).
-    expect(screen.getByPlaceholderText("Ask anything…")).toBeTruthy();
+    // The single placeholder (the paste hint if/else is gone).
+    expect(screen.getByPlaceholderText("Ask for follow-up changes")).toBeTruthy();
   });
 
   it("switching sessions clears staged attachments", async () => {

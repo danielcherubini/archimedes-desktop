@@ -26,6 +26,7 @@ fn sample_session() -> SessionInfo {
         }),
         config_options: None,
         archived: false,
+        context_usage: None,
     }
 }
 
@@ -380,6 +381,7 @@ fn open_backfills_space_rows_from_existing_sessions() {
         }),
         config_options: None,
         archived: false,
+        context_usage: None,
     };
 
     let db1 = Db::open(&db_path).expect("db should open");

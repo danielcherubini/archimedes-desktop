@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/app-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The UI-font web fonts (Settings → Appearance → UI font: Noto Sans /
+         Fira Sans / Martel Sans; Code font: Fira Code — the app default):
+         the @font-face rules register the families; `font-display: swap`
+         keeps text visible in the stack's system tail while a font loads
+         (and when it can't load at all, e.g. offline). -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&family=Martel+Sans:wght@400;500;600;700&family=Fira+Code:wght@400;500;600;700&display=swap"
+    />
     <title>Archimedes Desktop</title>
   </head>
 

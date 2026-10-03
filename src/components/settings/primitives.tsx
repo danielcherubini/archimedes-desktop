@@ -138,3 +138,15 @@ export function SettingsSidebarButton({
     </TooltipProvider>
   );
 }
+
+/**
+ * Humanize a braille variant name for display (`wave-rows` → `Wave rows`):
+ * the spinner picker's cell labels + accessible names (the reference
+ * settings UI's `capitalize` port, over the hyphen-split words).
+ */
+export function humanizeVariant(variant: string): string {
+  return variant
+    .split("-")
+    .map((word) => word[0]?.toUpperCase() + word.slice(1))
+    .join(" ");
+}

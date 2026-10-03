@@ -55,6 +55,8 @@ export interface SessionInfo {
   configOptions?: SessionConfigOption[];
   /** The desktop's archived flag (ADR 0016): `true` hides the session from its Space group into the Archived section (the transcript is kept). Always present over IPC. */
   archived: boolean;
+  /** The session's last known context usage (the `context_usage_update` frame's values — the provider's `input_tokens` vs the model's window). Persisted on the `sessions` row on every frame, so a CLOSED session's context survives (the store drops the entry on close — the row is the source of truth for the stored session's context bar). `undefined` until the first frame. */
+  contextUsage?: { used: number; window: number };
 }
 
 /** A space bookkeeping row (camelCase over IPC). */
@@ -132,7 +134,7 @@ export type ToolCallContent =
   | { type: "diff"; path: string; oldText?: string | null; newText: string };
 
 /**
- * A `session/update` notification body. The five update types the desktop
+ * A `session/update` notification body. The six update types the desktop
  * handles are modelled; anything else (unknown/future types) falls through
  * to the reducer's `default` branch and is ignored (forward-compat).
  *
@@ -168,7 +170,14 @@ export type AcpSessionUpdate =
       rawOutput?: unknown;
       content?: ToolCallContent[];
     }
-  | { sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] };
+  | { sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] }
+  | {
+      sessionUpdate: "context_usage_update";
+      /** The session's current context size (tokens — the provider-reported prompt size, or the post-compaction / resume re-estimate). */
+      usedTokens: number;
+      /** The session model's context window (tokens). */
+      windowTokens: number;
+    };
 
 export interface SessionUpdatePayload {
   sessionId: string;
@@ -382,6 +391,8 @@ export interface AppSettings {
   defaultThinkingLevels: Record<string, string>;
   /** (ADR 0023) Per-agent subagent model overrides: agent name → model key. */
   subagentModels: Record<string, string>;
+  /** The working-indicator spinner style (a `braille-loader` variant name, e.g. `"typing"` / `"pendulum"`); `null` = the `typing` default. */
+  spinnerStyle: string | null;
 }
 
 /** The effective catalog's model (the Default-model select + provider discovery status). */
@@ -476,6 +487,18 @@ export async function setSessionConfigOption(
  */
 export async function readClipboardImage(): Promise<number[] | null> {
   return invoke<number[] | null>("read_clipboard_image");
+}
+
+/**
+ * A picked file's bytes (the `+` file picker's read — the webview cannot
+ * read an arbitrary local path itself; a dialog selection is a PATH, not
+ * a `File`). `null` when the file is not a supported image (the picker's
+ * allowlist — the frontend skips it silently); a rejected Promise when
+ * the file cannot be read (e.g. over the 10 MiB cap — the composer shows
+ * it on its error line).
+ */
+export async function readFileBytes(path: string): Promise<number[] | null> {
+  return invoke<number[] | null>("read_file_bytes", { path });
 }
 
 // ---------------------------------------------------------------------------

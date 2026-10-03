@@ -506,6 +506,13 @@ interface SessionsState {
   /** Unarchive a session (`archivedSessions` → `historySessions` + `set_session_archived`). */
   unarchiveSession: (sessionId: string) => Promise<void>;
   activeSessionId: string | null;
+  /**
+   * The selected Space's path — the top tabs' state (a Space is a tab,
+   * like a browser tab): the sidebar's Sessions list shows this space's
+   * sessions, and `⌘N` / `New Session` start in it. `null` when no space
+   * is selected (no spaces yet, or the last one was removed).
+   */
+  activeSpacePath: string | null;
   /** Space bookkeeping rows (from `list_spaces` on boot; upserted by `addSpace`). */
   spaces: SpaceRow[];
   /**
@@ -518,6 +525,14 @@ interface SessionsState {
   messages: Record<string, Message[]>;
   /** Config options per session id. */
   configOptions: Record<string, SessionConfigOption[]>;
+  /**
+   * The session's context usage per session id (the composer's
+   * context-percentage display — from `context_usage_update` frames the
+   * harness emits: the current context size vs the model's window).
+   * `undefined` until the first frame (a fresh session, or a stored
+   * session that isn't live).
+   */
+  contextUsage: Record<string, { used: number; window: number } | undefined>;
   /** Whether a prompt turn is in flight for a session. */
   inTurn: Record<string, boolean>;
   /** Last stop reason reported for a session's turn. */
@@ -525,6 +540,14 @@ interface SessionsState {
 
   addSession: (info: SessionInfo) => void;
   setActiveSession: (sessionId: string | null) => void;
+  /**
+   * Select a Space (the tab click): it becomes `activeSpacePath` and its
+   * most recent session opens — a LIVE session first (the most-recently
+   * started one, the one-live-cap-lifted rule), then the newest stored
+   * (input order — do NOT re-sort), then NOTHING (an empty space lands
+   * on the chat's empty state). A no-op for an unknown path.
+   */
+  selectSpace: (path: string) => void;
   /**
    * Boot: replace the spaces list (from `list_spaces`, `lastOpenedAt`-desc).
    * If nothing is active yet, select via `autoSelectActive` (the most recent
@@ -600,10 +623,12 @@ export const useSessions = create<SessionsState>((set, get) => ({
   historySessions: [],
   archivedSessions: [],
   activeSessionId: null,
+  activeSpacePath: null,
   spaces: [],
   closeReasons: {},
   messages: {},
   configOptions: {},
+  contextUsage: {},
   inTurn: {},
   stopReasons: {},
 
@@ -646,7 +671,27 @@ export const useSessions = create<SessionsState>((set, get) => ({
       state.activeSessionId === null
         ? autoSelectActive(rows, state.sessions, state.historySessions)
         : state.activeSessionId;
-    set({ spaces: rows, activeSessionId: selectedId });
+    // The selected session's space (matched by `cwd` — the session's `cwd`
+    // IS the Space's folder); when nothing is selected, the most recent
+    // space (the FIRST row — `list_spaces` order is `lastOpenedAt` desc).
+    const owner =
+      selectedId === null
+        ? null
+        : rows.find((s) => {
+            const live = state.sessions.find(
+              (x) => x.sessionId === selectedId,
+            );
+            const stored =
+              state.historySessions.find(
+                (x) => x.sessionId === selectedId,
+              ) ?? state.archivedSessions.find((x) => x.sessionId === selectedId);
+            return (live?.cwd ?? stored?.cwd) === s.path;
+          }) ?? null;
+    set({
+      spaces: rows,
+      activeSessionId: selectedId,
+      activeSpacePath: owner ? owner.path : rows[0]?.path ?? null,
+    });
     // Seed the committed-trusted baseline from the DB rows: every path
     // now has a known-committed value, so a rollback target is never
     // inferred from a possibly-optimistic UI value.
@@ -671,8 +716,26 @@ export const useSessions = create<SessionsState>((set, get) => ({
             s.path === path ? { ...s, lastOpenedAt: now } : s,
           )
         : [...state.spaces, { path, createdAt: now, lastOpenedAt: now, trusted: false }];
-      return { spaces };
+      // The start flow (the dialog / `⌘N`) lands on the new space: it
+      // becomes the selected one (the tab bar highlights it).
+      return { spaces, activeSpacePath: path };
     });
+  },
+
+  selectSpace: (path) => {
+    const state = get();
+    if (!state.spaces.some((s) => s.path === path)) return;
+    // Live first (the most-recently-started one — the one-live-cap-lifted
+    // rule), then the newest stored (input order — do NOT re-sort), then
+    // nothing (an empty space → the chat's empty state).
+    const live = mostRecentLiveInSpace(state.sessions, path)?.sessionId ?? null;
+    const stored =
+      state.historySessions.find((s) => s.cwd === path)?.sessionId ?? null;
+    const id = live ?? stored;
+    set({ activeSpacePath: path, activeSessionId: id });
+    // Load the opened session's transcript (a no-op when already loaded —
+    // `openSession` self-guards a mid-flight switch too).
+    if (id) get().openSession(id);
   },
 
   removeSpace: async (path) => {
@@ -682,7 +745,14 @@ export const useSessions = create<SessionsState>((set, get) => ({
     // removed one.
     inFlightToggles.delete(path);
     committedTrusted.delete(path);
-    set((state) => ({ spaces: state.spaces.filter((s) => s.path !== path) }));
+    set((state) => ({
+      spaces: state.spaces.filter((s) => s.path !== path),
+      // The removed space was the selected one: fall back to the first
+      // remaining space (input order — `lastOpenedAt` desc) or `null`.
+      ...(state.activeSpacePath === path
+        ? { activeSpacePath: state.spaces.filter((s) => s.path !== path)[0]?.path ?? null }
+        : {}),
+    }));
   },
 
   setSpaceTrusted: (path, trusted) => {
@@ -837,8 +907,23 @@ export const useSessions = create<SessionsState>((set, get) => ({
   },
 
   openSession: (sessionId) => {
-    set({ activeSessionId: sessionId });
-    if (get().messages[sessionId]) return; // already loaded
+    // The opened session's space (matched by `cwd` — live, stored, OR
+    // archived membership) becomes the selected one (the tab bar follows
+    // the session); a session whose cwd is no Space (a legacy row) leaves
+    // the selection alone.
+    const state = get();
+    const owner = state.spaces.find((s) => {
+      const live = state.sessions.find((x) => x.sessionId === sessionId);
+      const stored =
+        state.historySessions.find((x) => x.sessionId === sessionId) ??
+        state.archivedSessions.find((x) => x.sessionId === sessionId);
+      return (live?.cwd ?? stored?.cwd) === s.path;
+    });
+    set({
+      activeSessionId: sessionId,
+      ...(owner ? { activeSpacePath: owner.path } : {}),
+    });
+    if (state.messages[sessionId]) return; // already loaded
     void (async () => {
       try {
         const rows = await loadHistory(sessionId);
@@ -998,12 +1083,21 @@ export const useSessions = create<SessionsState>((set, get) => ({
         configOptions = { ...state.configOptions, [sessionId]: update.configOptions };
       }
 
+      let contextUsage = state.contextUsage;
+      if (update.sessionUpdate === "context_usage_update") {
+        contextUsage = {
+          ...state.contextUsage,
+          [sessionId]: { used: update.usedTokens, window: update.windowTokens },
+        };
+      }
+
       return {
         messages: {
           ...state.messages,
           [sessionId]: messages,
         },
         configOptions,
+        contextUsage,
       };
     }),
 
@@ -1033,6 +1127,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
       let messagesChanged = false;
       let configOptions = state.configOptions;
       let configChanged = false;
+      let contextUsage = state.contextUsage;
+      let contextChanged = false;
       for (const sessionId of order) {
         const sessionUpdates = bySession.get(sessionId)!;
         let sessionMessages = messages[sessionId] ?? [];
@@ -1045,6 +1141,16 @@ export const useSessions = create<SessionsState>((set, get) => ({
             configOptions = { ...configOptions, [sessionId]: update.configOptions };
             configChanged = true;
           }
+          // Last-wins within the batch: a later frame in the same batch
+          // replaces the earlier one (the compaction re-estimate lands
+          // after the pre-compaction `Usage` frames).
+          if (update.sessionUpdate === "context_usage_update") {
+            contextUsage = {
+              ...contextUsage,
+              [sessionId]: { used: update.usedTokens, window: update.windowTokens },
+            };
+            contextChanged = true;
+          }
         }
         if (sessionChanged) {
           if (!messagesChanged) messages = { ...messages };
@@ -1053,11 +1159,12 @@ export const useSessions = create<SessionsState>((set, get) => ({
         }
       }
 
-      if (!messagesChanged && !configChanged) return state;
+      if (!messagesChanged && !configChanged && !contextChanged) return state;
       return {
         ...state,
         ...(messagesChanged ? { messages } : {}),
         ...(configChanged ? { configOptions } : {}),
+        ...(contextChanged ? { contextUsage } : {}),
       };
     }),
 
@@ -1068,7 +1175,6 @@ export const useSessions = create<SessionsState>((set, get) => ({
       .getState()
       .sessions.find((s) => s.sessionId === sessionId);
     set((state) => {
-      const { [sessionId]: _goneConfig, ...restConfig } = state.configOptions;
       return {
         sessions: state.sessions.filter((s) => s.sessionId !== sessionId),
         // The session remains in the database: it moves to the history
@@ -1091,11 +1197,18 @@ export const useSessions = create<SessionsState>((set, get) => ({
         activeSessionId: state.activeSessionId,
         // Merge-only: a close reason outlives its event (never delete keys).
         closeReasons: { ...state.closeReasons, [sessionId]: reason },
+        // The config options + context usage STAY (a pause, not a
+        // discard): the last known values populate the stored session's
+        // bottom bar — the selectors render disabled; a resume's
+        // `config_option_update` / `context_usage_update` frames refresh
+        // them. (The row's own `configOptions` / `contextUsage` — the Rust
+        // `list_sessions` shape, persisted on every frame — is the
+        // fallback when the store's map has no entry: a session never
+        // live in this app session.)
         messages: {
           ...state.messages,
           [sessionId]: finalizeSessionMessages(state.messages[sessionId] ?? []),
         },
-        configOptions: restConfig,
         inTurn: { ...state.inTurn, [sessionId]: false },
       };
     });

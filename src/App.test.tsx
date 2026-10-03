@@ -1,6 +1,8 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import App from "./App";
+import { getLeftPaneCollapsed, setLeftPaneCollapsed } from "./lib/leftPaneState";
+import { getSidePaneCollapsed, setSidePaneCollapsed } from "./lib/sidePaneState";
 
 // Mock the Tauri IPC layer (the `importActual` pattern from
 // `NewSpaceDialog.test.tsx`): the boot `useEffect` loads `listSessions` /
@@ -26,8 +28,11 @@ vi.mock("./lib/tauri", async () => {
       defaultThinkingLevel: null,
       enabledTools: [],
       providers: [],
+      mcpServers: {},
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
+      subagentModels: {},
+      spinnerStyle: null,
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),
@@ -72,6 +77,138 @@ beforeAll(() => {
 });
 
 describe("App (the gear icon + settings view swap)", () => {
+  // The pane collapsed flags are module-scoped: reset them between tests.
+  beforeEach(() => {
+    setLeftPaneCollapsed(false);
+    setSidePaneCollapsed(false);
+  });
+
+  it("the header shows the app icon (app-icon-large) and NO 'Archimedes' text (the word was removed — icon only)", () => {
+    render(<App />);
+    // The top-left header-bar icon (the label is gone — icon only).
+    const icon = screen.getByAltText("Archimedes");
+    expect(icon.getAttribute("src")).toBe("/app-icon-large.png");
+    expect(screen.queryByText("Archimedes")).toBeNull();
+  });
+
+  it("the chrome bar is the drag region (the whole bar — draggable + double-click to maximize; the inner buttons stay interactive)", () => {
+    render(<App />);
+    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
+    // The attribute on the CONTAINER with the value "deep": Tauri's
+    // drag-region script honors a BARE attribute only on the element a
+    // mousedown lands on DIRECTLY (a click on a child of a bare-attribute
+    // element does NOT drag — the bar's logo segment / tab spacer would
+    // be dead zones). "deep" extends the region to the whole subtree: the
+    // bar's empty areas drag the window (double-click maximizes) while the
+    // inner buttons/tabs (interactive elements without the attribute) still
+    // block it and stay clickable.
+    expect(chrome.getAttribute("data-tauri-drag-region")).toBe("deep");
+  });
+
+  it("renders the Space tabs in the top chrome bar (browser-style — NOT in the center column)", () => {
+    render(<App />);
+    const tabs = screen.getByTestId("space-tabs");
+    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
+    // The tabs are a direct child of the chrome bar (the top row) — the
+    // old position was the center column's top row (above the chat).
+    expect(chrome.contains(tabs)).toBe(true);
+    expect(tabs.parentElement).toBe(chrome);
+    // …and the content row (the second child) does NOT contain them.
+    const content = document.querySelector('[data-testid="content-row"]')!;
+    expect(content.contains(tabs)).toBe(false);
+  });
+
+  it("the chrome bar's logo segment follows the sidebar's width (the tabs start where the center column begins)", () => {
+    render(<App />);
+    const logo = screen.getByAltText("Archimedes").parentElement!;
+    // Expanded sidebar (260px): the logo segment is 260px wide — the
+    // tabs start at the center column's left edge.
+    expect(logo.style.width).toBe("260px");
+    // Collapsed sidebar (width 0 — the chrome bar's button is the
+    // re-expand control, so no rail is needed): the segment follows
+    // (0px — the icon is clipped away with it).
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    expect(logo.style.width).toBe("0px");
+  });
+
+  it("the chrome bar holds the left collapse button LEFT of the tabs (the tabs shift right to accommodate it) — and NO gear (the gear stays in the sidebar footer)", () => {
+    render(<App />);
+    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
+    const collapse = screen.getByRole("button", { name: "Collapse sidebar" });
+    const tabs = screen.getByTestId("space-tabs");
+    // The collapse button is a direct child of the chrome bar, LEFT of
+    // the tabs (the tabs shift right to accommodate it).
+    const children = [...chrome.children];
+    expect(children.indexOf(collapse)).toBeGreaterThan(-1);
+    expect(children.indexOf(collapse)).toBeLessThan(children.indexOf(tabs));
+    // The gear is NOT in the chrome bar (it stays in the sidebar footer
+    // — only the collapse buttons moved up). The sidebar's footer gear
+    // IS rendered (a different button in the content row).
+    expect(chrome.querySelectorAll('[aria-label="Settings"]').length).toBe(0);
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
+  });
+
+  it("the chrome bar's left collapse button flips the shared left-pane flag", () => {
+    render(<App />);
+    const collapse = screen.getByRole("button", { name: "Collapse sidebar" });
+    expect(collapse.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(collapse);
+    expect(getLeftPaneCollapsed()).toBe(true);
+    expect(collapse.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("the chrome bar holds the right collapse button RIGHT of the tabs (the rightmost area, before the window controls) and flips the shared flag", () => {
+    render(<App />);
+    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
+    const collapse = screen.getByRole("button", { name: "Toggle side pane" });
+    const tabs = screen.getByTestId("space-tabs");
+    // The right collapse button is a direct child of the chrome bar,
+    // positioned AFTER the tabs (the tab bar's rightmost area — before
+    // the window controls).
+    const children = [...chrome.children];
+    expect(children.indexOf(collapse)).toBeGreaterThan(-1);
+    expect(children.indexOf(collapse)).toBeGreaterThan(children.indexOf(tabs));
+    fireEvent.click(collapse);
+    expect(getSidePaneCollapsed()).toBe(true);
+  });
+
+  it("the settings view renders NO tabs and NO collapse buttons in the chrome bar (the logo segment spans full width)", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.queryByTestId("space-tabs")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Toggle side pane" })).toBeNull();
+    const logo = screen.getByAltText("Archimedes").parentElement!;
+    // No inline width — the segment is `flex-1` (full width, the old
+    // chrome-bar behavior), icon only (the word was removed).
+    expect(logo.style.width).toBe("");
+    expect(screen.queryByText("Archimedes")).toBeNull();
+  });
+
+  it("the tabs start 1px right of the sidebar's right edge (the center column's left edge — the chrome bar's left padding lives INSIDE the logo segment, not before it)", () => {
+    render(<App />);
+    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
+    const tabs = screen.getByTestId("space-tabs");
+    // The chrome bar has NO left padding (a `pl-*` here would offset the
+    // logo segment — and the tabs after it — right of the sidebar's
+    // 260px edge): the 12px icon margin lives INSIDE the logo segment.
+    expect(chrome.className).not.toContain("pl-");
+    expect(chrome.className).not.toContain("px-");
+    const logo = screen.getByAltText("Archimedes").parentElement!;
+    expect(logo.className).toContain("pl-3");
+    // …and the tabs container has a 1px left offset (`pl-px` — the user's
+    // "1px too far left" nudge: the first tab sits 1px right of the
+    // segment's edge = the center column's left edge) and NO larger left
+    // padding (a `pl-1`/`pl-2`/… would push it further right).
+    expect(tabs.className).toContain("pl-px");
+    expect(tabs.className).not.toContain("pl-1");
+    expect(tabs.className).not.toContain("pl-2");
+    expect(tabs.className).not.toContain("pl-3");
+    expect(tabs.className).not.toContain("px-");
+  });
+
   it("the_gear_icon_swaps_to_the_settings_view", () => {
     render(<App />);
     // The workspace is visible (the `SpacesList`'s "Sessions" heading).

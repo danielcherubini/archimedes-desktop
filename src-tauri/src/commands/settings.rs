@@ -55,10 +55,14 @@ pub struct FontSettings {
     /// UI font size in px (default 14).
     #[serde(default = "default_font_size")]
     pub size_px: u32,
-    /// `None` = the design system's pinned sans stack.
+    /// `None` = the design system's pinned sans stack (the app default —
+    /// the `index.css` stack resolves to `"Noto Sans"` first, with the
+    /// system tail as the offline fallback).
     #[serde(default)]
     pub ui_family: Option<String>,
-    /// `None` = the design system's pinned mono stack.
+    /// `None` = the design system's pinned mono stack (the app default —
+    /// the `index.css` stack resolves to `"Fira Code"` first, with the
+    /// system tail as the offline fallback).
     #[serde(default)]
     pub code_family: Option<String>,
 }
@@ -123,6 +127,13 @@ pub struct Settings {
     /// to an empty map (no migration).
     #[serde(default)]
     pub subagent_models: HashMap<String, String>,
+    /// The working-indicator spinner style (the `braille-loader` variant name,
+    /// e.g. `"typing"` / `"pendulum"`): the animation the chat's top working
+    /// indicator runs while the agent is busy. `None` = the frontend's
+    /// `typing` default (a pre-feature file — `#[serde(default)]`, no
+    /// migration).
+    #[serde(default)]
+    pub spinner_style: Option<String>,
 }
 
 impl Default for Settings {
@@ -139,6 +150,7 @@ impl Default for Settings {
             font: FontSettings::default(),
             default_thinking_levels: HashMap::new(),
             subagent_models: HashMap::new(),
+            spinner_style: None,
         }
     }
 }
@@ -150,8 +162,13 @@ impl Default for FontSettings {
     fn default() -> Self {
         Self {
             size_px: default_font_size(),
-            ui_family: None,
-            code_family: None,
+            // The app default (a fresh settings file): Noto Sans for the
+            // UI, Fira Code for code — both the `index.html` Google Fonts
+            // families (the quoted CSS family names the frontend's
+            // `applySettingsFont` splices into the `--font-sans` /
+            // `--font-mono` stacks).
+            ui_family: Some("\"Noto Sans\"".to_string()),
+            code_family: Some("\"Fira Code\"".to_string()),
         }
     }
 }
@@ -626,6 +643,26 @@ mod tests {
         assert!(settings.mcp_servers.is_empty());
         assert_eq!(settings.font, FontSettings::default());
         assert!(settings.subagent_models.is_empty());
+        assert_eq!(settings.spinner_style, None);
+    }
+
+    #[test]
+    fn spinner_style_defaults_to_none_and_round_trips() {
+        // A pre-feature file (no `spinnerStyle`) parses to `None` (the
+        // frontend falls back to the `typing` default); an explicit choice
+        // survives a round trip in camelCase.
+        assert_eq!(Settings::default().spinner_style, None);
+        let settings = Settings {
+            spinner_style: Some("pendulum".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"spinnerStyle\""),
+            "missing spinnerStyle in {json}"
+        );
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.spinner_style, Some("pendulum".to_string()));
     }
 
     #[test]
@@ -751,6 +788,17 @@ mod tests {
     }
 
     #[test]
+    fn font_settings_default_is_noto_sans_ui_and_fira_code_code() {
+        // The app default (a fresh settings file): Noto Sans for the UI and
+        // Fira Code for code — both the `index.html` Google Fonts families
+        // (the quoted CSS family names the frontend's `applySettingsFont`
+        // splices into the `--font-sans` / `--font-mono` stacks).
+        let font = FontSettings::default();
+        assert_eq!(font.ui_family, Some("\"Noto Sans\"".to_string()));
+        assert_eq!(font.code_family, Some("\"Fira Code\"".to_string()));
+    }
+
+    #[test]
     fn provider_config_api_defaults_to_openai_completions() {
         // (ADR 0024) A pre-feature `settings.json` (NO `api` field) parses
         // to `api == "openai-completions"` (the serde default — no
@@ -826,6 +874,7 @@ mod tests {
                 "scout".to_string(),
                 "tama/m-1".to_string(),
             )]),
+            spinner_style: Some("marquee".to_string()),
         };
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
@@ -839,6 +888,7 @@ mod tests {
             "\"sizePx\"",
             "\"defaultThinkingLevels\"",
             "\"subagentModels\"",
+            "\"spinnerStyle\"",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }

@@ -5,8 +5,12 @@ import { MinusIcon, SquareIcon, XIcon } from "lucide-react";
  * Frameless window controls. The window is created `decorations: false`
  * (see tauri.conf.json), so the native titlebar — and its close / minimize /
  * maximize buttons — is gone. These replace it. The surrounding top bar in
- * App.tsx carries `data-tauri-drag-region` for moving the window; the buttons
- * live OUTSIDE that region so a click on them never starts a drag.
+ * App.tsx is the drag region (`data-tauri-drag-region="deep"` on the
+ * container — "deep" extends the region to the whole subtree, since a bare
+ * attribute only drags from the element clicked DIRECTLY): the bar's empty
+ * areas drag the window (double-click maximizes) while these buttons
+ * (interactive elements without the attribute) still block it and stay
+ * clickable.
  */
 export default function WindowControls() {
   const win = getCurrentWindow();
