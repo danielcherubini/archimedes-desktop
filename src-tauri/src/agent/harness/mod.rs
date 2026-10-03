@@ -23,9 +23,9 @@ pub use prompt::{
     build_child_system_message, build_main_prompt, load_project_context, PromptContext,
 };
 pub use provider::{
-    ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest,
-    OpenAiCompatibleProvider, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta,
-    ToolSpec, Usage,
+    build_provider, AnthropicProvider, ChatMessage, ChatRole, FinishReason, MessageContent,
+    ModelOptions, ModelRequest, OpenAiCompatibleProvider, OpenAiResponsesProvider, Provider,
+    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
 };
 pub(crate) use r#loop::tool_specs;
 pub use r#loop::{AgentLoop, ControlCmd, Prompt, SudoDeps};

@@ -21,6 +21,7 @@ import {
   authMcpServer,
   getSettings,
   listAgentDefinitions,
+  listKnownProviders,
   listModels,
   listTools,
   saveSettings,
@@ -30,6 +31,7 @@ import {
   type McpServerEntry,
   type ModelDto,
   type ProviderConfig,
+  type KnownProvider,
 } from "@/lib/tauri";
 import {
   AlertDialog,
@@ -76,6 +78,20 @@ function slugify(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+/** The wire APIs the harness speaks (ADR 0024 — the provider row's `api` select). */
+const WIRE_APIS = [
+  "openai-completions",
+  "anthropic-messages",
+  "openai-responses",
+] as const;
+
+/** The wire's human label (the provider row's `api` select + the picker's option labels). */
+function apiLabel(api: string): string {
+  if (api === "anthropic-messages") return "Anthropic";
+  if (api === "openai-responses") return "OpenAI Responses";
+  return "OpenAI-compatible";
 }
 
 /** A slug de-duped against the taken ids (a `-2` / `-3` suffix). */
@@ -600,12 +616,14 @@ function McpDialog({
 }
 
 /**
- * One provider row: a labeled 2×2 grid (Name / Base URL / API key (masked,
- * an eye toggle) / the discovery status + a refresh + a remove) — the
- * `SettingsRow`'s label+control shape can't host three text fields (they
- * overflow the fixed 280px control column and get clipped by the card's
- * `overflow-hidden`), so the row is a full-width `border-t` block (the
- * `SettingsRow`'s `px-4 py-3` / `first:border-t-0` pattern).
+ * One provider row: a labeled field grid (Name / Base URL / API key
+ * (masked, an eye toggle) / the discovery status + a refresh + a remove;
+ * a third row: the wire `api` select + a "Get key" link when the row has
+ * a `keyUrl`) — the `SettingsRow`'s label+control shape can't host three
+ * text fields (they overflow the fixed 280px control column and get
+ * clipped by the card's `overflow-hidden`), so the row is a full-width
+ * `border-t` block (the `SettingsRow`'s `px-4 py-3` / `first:border-t-0`
+ * pattern).
  */
 function ProviderRow({
   provider,
@@ -661,26 +679,55 @@ function ProviderRow({
           />
         </Field>
         <Field label="API key">
-          <div className="relative">
-            <TextField
-              value={provider.apiKey}
-              placeholder="No key (local gateway)"
-              ariaLabel="API key"
-              type={showKey ? "text" : "password"}
-              className="w-full pr-8"
-              onCommit={(apiKey) => onCommitField({ apiKey })}
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={showKey ? "Hide API key" : "Show API key"}
-              className="absolute top-1/2 right-1.5 -translate-y-1/2"
-              onClick={() => setShowKey((v) => !v)}
-            >
-              {showKey ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
-            </Button>
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <TextField
+                value={provider.apiKey}
+                placeholder="No key (local gateway)"
+                ariaLabel="API key"
+                type={showKey ? "text" : "password"}
+                className="w-full pr-8"
+                onCommit={(apiKey) => onCommitField({ apiKey })}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={showKey ? "Hide API key" : "Show API key"}
+                className="absolute top-1/2 right-1.5 -translate-y-1/2"
+                onClick={() => setShowKey((v) => !v)}
+              >
+                {showKey ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
+              </Button>
+            </div>
+            {provider.keyUrl ? (
+              <a
+                href={provider.keyUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-ui-base text-foreground-subtle hover:underline"
+              >
+                Get key
+              </a>
+            ) : null}
           </div>
+        </Field>
+        <Field label="API">
+          <Select
+            value={provider.api}
+            onValueChange={(value) => onCommitField({ api: value })}
+          >
+            <SelectTrigger aria-label="API" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {WIRE_APIS.map((api) => (
+                <SelectItem key={api} value={api}>
+                  {apiLabel(api)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </Field>
         <div className="flex items-center justify-end gap-2">
           <SettingsBadge>{status}</SettingsBadge>
@@ -737,6 +784,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [section, setSection] = useState<Section>("general");
   const [models, setModels] = useState<ModelDto[]>([]);
+  // The known-providers catalog (ADR 0024 — the Providers section's picker
+  // data source; `[]` = not loaded / the load failed).
+  const [knownProviders, setKnownProviders] = useState<KnownProvider[]>([]);
+  // The picker's selected template id ("" = nothing selected — the
+  // placeholder; the Add button is disabled until one is picked).
+  const [selectedKnown, setSelectedKnown] = useState("");
   // The user-level discovered agent definitions (ADR 0023 — the Subagents
   // section's data source; `null` until the first list lands).
   const [agentDefs, setAgentDefs] = useState<AgentDefinitionDto[] | null>(null);
@@ -764,6 +817,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     listTools()
       .then(setTools)
       .catch(() => {});
+    listKnownProviders()
+      .then(setKnownProviders)
+      .catch((error) => {
+        console.error("loading the known-providers catalog failed", error);
+        setKnownProviders([]);
+      });
     return () => {
       themeCleanupRef.current?.();
     };
@@ -870,19 +929,35 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   };
 
   /**
-   * Add provider: append an empty editable row with a placeholder id
-   * (`provider-N` — a name commit derives the real id from the name,
-   * de-duped with a `-2` / `-3` suffix).
+   * Add provider: append an editable row. No template → an empty row with
+   * a placeholder id (`provider-N` — a name commit derives the real id
+   * from the name, de-duped with a `-2` / `-3` suffix). A template (the
+   * known-providers picker, ADR 0024) → a pre-filled row (name / base URL
+   * / wire / key URL; the key is ALWAYS empty — the user pastes it; the id
+   * is the template name's slug, de-duped the same way).
    */
-  const addProvider = (name = "") => {
+  const addProvider = (template?: {
+    name?: string;
+    baseUrl?: string;
+    api?: string;
+    keyUrl?: string;
+  }) => {
     if (settings === null) return;
+    const name = template?.name ?? "";
     const slug = slugify(name);
     const base = slug !== "" ? slug : `provider-${settings.providers.length + 1}`;
     const existing = new Set(settings.providers.map((p) => p.id));
     update({
       providers: [
         ...settings.providers,
-        { id: uniqueSlug(base, existing), name: "", baseUrl: "", apiKey: "" },
+        {
+          id: uniqueSlug(base, existing),
+          name,
+          baseUrl: template?.baseUrl ?? "",
+          apiKey: "",
+          api: template?.api ?? "openai-completions",
+          keyUrl: template?.keyUrl ?? null,
+        },
       ],
     });
   };
@@ -1141,7 +1216,47 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
           ))
         )}
       </SettingsGroupCard>
-      <Button onClick={() => addProvider()}>Add provider</Button>
+      <div className="flex items-center gap-2">
+        {/* (ADR 0024) The known-providers picker: a `Select` of the 20
+            catalog templates (the label is `name — apiLabel(api)`) + an
+            Add button that appends the template as a pre-filled row
+            (the user's list stays the sole model source). */}
+        <Select value={selectedKnown} onValueChange={setSelectedKnown}>
+          <SelectTrigger aria-label="Known provider" className="w-64">
+            <SelectValue placeholder="Add a known provider…" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="" disabled>
+              Add a known provider…
+            </SelectItem>
+            {knownProviders.map((template) => (
+              <SelectItem key={template.id} value={template.id}>
+                {`${template.name} — ${apiLabel(template.api)}`}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
+          disabled={selectedKnown === ""}
+          onClick={() => {
+            const template = knownProviders.find(
+              (t) => t.id === selectedKnown,
+            );
+            if (template) {
+              addProvider({
+                name: template.name,
+                baseUrl: template.baseUrl,
+                api: template.api,
+                keyUrl: template.keyUrl,
+              });
+            }
+            setSelectedKnown("");
+          }}
+        >
+          Add
+        </Button>
+        <Button onClick={() => addProvider()}>Add provider</Button>
+      </div>
     </div>
   );
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 import SettingsPage from "./SettingsPage";
 import {
   authMcpServer,
@@ -22,7 +22,14 @@ const baseSettings: AppSettings = {
   defaultThinkingLevel: null,
   enabledTools: [],
   providers: [
-    { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
+    {
+      id: "tama",
+      name: "Tama",
+      baseUrl: "https://tama.wizards.town/v1",
+      apiKey: "k",
+      api: "openai-completions",
+      keyUrl: null,
+    },
   ],
   mcpServers: {
     tama: { url: "https://tama/mcp" },
@@ -46,7 +53,14 @@ vi.mock("../../lib/tauri", async () => {
       defaultThinkingLevel: null,
       enabledTools: [],
       providers: [
-        { id: "tama", name: "Tama", baseUrl: "https://tama.wizards.town/v1", apiKey: "k" },
+        {
+          id: "tama",
+          name: "Tama",
+          baseUrl: "https://tama.wizards.town/v1",
+          apiKey: "k",
+          api: "openai-completions",
+          keyUrl: null,
+        },
       ],
       mcpServers: {
         tama: { url: "https://tama/mcp" },
@@ -78,6 +92,32 @@ vi.mock("../../lib/tauri", async () => {
         supportsThinking: true,
         thinkingLevels: ["medium", "high", "xhigh"],
       },
+    ]),
+    // The known-providers catalog (ADR 0024 — the Providers section's
+    // picker's data source): the 20 ZCode builtin templates (the camelCase
+    // `KnownProviderDto` wire shape). Inlined (the factory hoisting rule —
+    // see the `getSettings` note above).
+    listKnownProviders: vi.fn().mockResolvedValue([
+      { id: "zai", name: "Z.ai", baseUrl: "https://api.z.ai/api/anthropic", api: "anthropic-messages", keyUrl: "https://z.ai/manage-apikey/apikey-list" },
+      { id: "zai-api", name: "Z.ai API", baseUrl: "https://api.z.ai/api/paas/v4", api: "openai-completions", keyUrl: "https://z.ai/manage-apikey/apikey-list" },
+      { id: "bigmodel", name: "BigModel", baseUrl: "https://open.bigmodel.cn/api/anthropic", api: "anthropic-messages", keyUrl: "https://bigmodel.cn/coding-plan/personal/overview" },
+      { id: "bigmodel-api", name: "BigModel API", baseUrl: "https://open.bigmodel.cn/api/paas/v4", api: "openai-completions", keyUrl: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys" },
+      { id: "kimi", name: "Kimi", baseUrl: "https://api.moonshot.cn/anthropic", api: "anthropic-messages", keyUrl: "https://platform.kimi.com/console/api-keys" },
+      { id: "minimax", name: "MiniMax", baseUrl: "https://api.minimaxi.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.minimaxi.com/console/access?tab=api-keys" },
+      { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.deepseek.com/api_keys" },
+      { id: "alibaba-cn", name: "Alibaba Cloud (China)", baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic", api: "anthropic-messages", keyUrl: "https://bailian.console.aliyun.com/cn-beijing?tab=model" },
+      { id: "alibaba-intl", name: "Alibaba Cloud (Global)", baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", api: "openai-completions", keyUrl: "https://modelstudio.console.aliyun.com/ap-southeast-1?tab=dashboard" },
+      { id: "xiaomi-mimo", name: "Xiaomi MiMo", baseUrl: "https://api.xiaomimimo.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.xiaomimimo.com/" },
+      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", api: "openai-responses", keyUrl: "https://platform.openai.com/api-keys" },
+      { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", api: "anthropic-messages", keyUrl: "https://console.anthropic.com/settings/keys" },
+      { id: "xai", name: "xAI", baseUrl: "https://api.x.ai/v1", api: "openai-responses", keyUrl: "https://console.x.ai" },
+      { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api", api: "anthropic-messages", keyUrl: "https://openrouter.ai/keys" },
+      { id: "opencode-go-chat", name: "OpenCode Go (Chat)", baseUrl: "https://opencode.ai/zen/go/v1", api: "openai-completions", keyUrl: "https://opencode.ai/auth" },
+      { id: "opencode-go-anthropic", name: "OpenCode Go (Anthropic)", baseUrl: "https://opencode.ai/zen/go/v1", api: "anthropic-messages", keyUrl: "https://opencode.ai/auth" },
+      { id: "opencode-go-responses", name: "OpenCode Go (Responses)", baseUrl: "https://opencode.ai/zen/go/v1", api: "openai-responses", keyUrl: "https://opencode.ai/auth" },
+      { id: "opencode-zen-chat", name: "OpenCode Zen (Chat)", baseUrl: "https://opencode.ai/zen/v1", api: "openai-completions", keyUrl: "https://opencode.ai/auth" },
+      { id: "opencode-zen-anthropic", name: "OpenCode Zen (Anthropic)", baseUrl: "https://opencode.ai/zen/v1", api: "anthropic-messages", keyUrl: "https://opencode.ai/auth" },
+      { id: "opencode-zen-responses", name: "OpenCode Zen (Responses)", baseUrl: "https://opencode.ai/zen/v1", api: "openai-responses", keyUrl: "https://opencode.ai/auth" },
     ]),
     // The native harness's tool names (the enabled-tools checkbox list).
     listTools: vi.fn().mockResolvedValue(["bash", "read", "write", "edit", "subagent"]),
@@ -969,5 +1009,168 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     expect(
       screen.getByText("No longer discovered (stale override)"),
     ).toBeTruthy();
+  });
+});
+
+describe("SettingsPage (the known-providers picker + the provider api field — ADR 0024)", () => {
+  it("picker_renders_the_20_known_providers", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    // Radix `Select` options render only when the popover is OPEN.
+    const trigger = screen.getByRole("combobox", { name: "Known provider" });
+    fireEvent.click(trigger);
+    // The 20 catalog entries + the leading (disabled) placeholder.
+    const options = await screen.findAllByRole("option");
+    expect(options).toHaveLength(21);
+    expect(options[0].textContent).toBe("Add a known provider…");
+    // The label is `name — apiLabel(api)` (the wire's human label).
+    expect(screen.getByRole("option", { name: "Anthropic — Anthropic" })).toBeTruthy();
+    expect(
+      screen.getByRole("option", { name: "OpenAI — OpenAI Responses" }),
+    ).toBeTruthy();
+  });
+
+  it("picker_adds_a_prefilled_row", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const trigger = screen.getByRole("combobox", { name: "Known provider" });
+    // Pick the `anthropic` template.
+    fireEvent.click(trigger);
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Anthropic — Anthropic" }),
+    );
+    // The Add button is enabled (a template is selected) → the pre-filled
+    // row (name / base URL / wire / key URL, EMPTY key — the user pastes
+    // the key) is saved via the normal `update` path (immediate save); the
+    // id is the slug of the template's name.
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providers: expect.arrayContaining([
+            expect.objectContaining({
+              id: "anthropic",
+              name: "Anthropic",
+              baseUrl: "https://api.anthropic.com/v1",
+              api: "anthropic-messages",
+              apiKey: "",
+              keyUrl: "https://console.anthropic.com/settings/keys",
+            }),
+          ]),
+        }),
+      ),
+    );
+    // The picker resets to the placeholder.
+    expect(trigger.textContent).toContain("Add a known provider…");
+  });
+
+  it("add_provider_button_still_adds_an_empty_row", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    // The existing `Add provider` button (no picker selection): an empty
+    // row with the wire defaults (`openai-completions` / `keyUrl: null`).
+    fireEvent.click(screen.getByRole("button", { name: "Add provider" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providers: expect.arrayContaining([
+            expect.objectContaining({
+              name: "",
+              baseUrl: "",
+              apiKey: "",
+              api: "openai-completions",
+              keyUrl: null,
+            }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("provider_row_api_select_commits_api", async () => {
+    // A row on the `openai-completions` wire (the default).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      providers: [
+        {
+          id: "tama",
+          name: "Tama",
+          baseUrl: "https://tama.wizards.town/v1",
+          apiKey: "k",
+          api: "openai-completions",
+          keyUrl: null,
+        },
+      ],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    // Switch the wire to `anthropic-messages` (the three-wire select).
+    const trigger = await screen.findByRole("combobox", { name: "API" });
+    fireEvent.click(trigger);
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Anthropic" }),
+    );
+    // Immediate save (the `commitProviderField` pattern — the patch is a
+    // `Partial<ProviderConfig>`).
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providers: expect.arrayContaining([
+            expect.objectContaining({ api: "anthropic-messages" }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("provider_row_get_key_link_renders_when_key_url_set", async () => {
+    // A row with a `keyUrl` (a template's key-management page): the
+    // "Get key" link beside the API key field.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      providers: [
+        {
+          id: "anthropic",
+          name: "Anthropic",
+          baseUrl: "https://api.anthropic.com/v1",
+          apiKey: "",
+          api: "anthropic-messages",
+          keyUrl: "https://x",
+        },
+      ],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const link = await screen.findByRole("link", { name: "Get key" });
+    expect(link.getAttribute("href")).toBe("https://x");
+
+    // A row with `keyUrl: null` (a hand-typed provider): NO "Get key" link.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      providers: [
+        {
+          id: "tama",
+          name: "Tama",
+          baseUrl: "https://tama.wizards.town/v1",
+          apiKey: "k",
+          api: "openai-completions",
+          keyUrl: null,
+        },
+      ],
+    });
+    // Drop the first render (two renders would leave two "Providers"
+    // sidebar buttons — the `go` helper's `getByRole` would be ambiguous).
+    cleanup();
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    // The row is rendered (the name field) — and there is no "Get key" link.
+    await screen.findByDisplayValue("Tama");
+    expect(screen.queryByRole("link", { name: "Get key" })).toBeNull();
   });
 });

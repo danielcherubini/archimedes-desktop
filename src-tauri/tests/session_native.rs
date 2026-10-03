@@ -256,7 +256,7 @@ async fn native_session_end_to_end() {
     assert_eq!(info.capabilities["model"], "test/m1");
 
     // (2) The synthesized `config_options` (the existing shape — the
-    // frontend is unchanged): a model selector (the `openai_compatible()`
+    // frontend is unchanged): a model selector (the `selectable()`
     // ids `"<provider>/<id>"`) + a thought_level selector (the model's
     // `thinking_levels`; the built-in's default `high`).
     let options = info

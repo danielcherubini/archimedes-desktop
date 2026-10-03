@@ -33,6 +33,19 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Plaintext (empty = local gateway, no key).
     pub api_key: String,
+    /// The wire API (ADR 0024): `"openai-completions"` (the default — a
+    /// pre-feature file parses to it, no migration) / `"anthropic-messages"`
+    /// / `"openai-responses"`.
+    #[serde(default = "default_provider_api")]
+    pub api: String,
+    /// The key-management page URL (set by the known-providers picker — the
+    /// row's "Get key" link; `None` for a hand-typed provider).
+    #[serde(default)]
+    pub key_url: Option<String>,
+}
+
+fn default_provider_api() -> String {
+    "openai-completions".to_string()
 }
 
 /// Font settings for the UI.
@@ -275,6 +288,204 @@ pub async fn list_tools() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// A known provider template (the built-in catalog — the Settings'
+/// known-providers picker's data source; ADR 0024). Seeded from the
+/// ZCode builtin provider catalog (`config/provider/zcode-builtin.json`
+/// `templateRules` — base URLs / key URLs / wire APIs VERBATIM; ids +
+/// display names ADAPTED (see the `KNOWN_PROVIDERS` comment).
+pub struct KnownProvider {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub base_url: &'static str,
+    pub api: &'static str,
+    pub key_url: &'static str,
+}
+
+pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
+    // (the 20 entries — seeded from the ZCode catalog: base URLs / key
+    // URLs / wire apis VERBATIM from `templateRules`; ids + display names
+    // ADAPTED — ZCode `zai-standard-api` → `zai-api`, `moonshot-kimi` →
+    // `kimi`, `qwen-alibaba-model-studio-cn`/`-intl` → `alibaba-cn`/`-intl`,
+    // `opencode-*-messages` → `opencode-*-anthropic`, names simplified
+    // (`Z.ai Coding Plan` → `Z.ai`, `BigModel Coding Plan` → `BigModel`);
+    // the order is the ZCode catalog's order with the six OpenCode entries
+    // regrouped: go-chat, go-anthropic, go-responses, zen-chat,
+    // zen-anthropic, zen-responses)
+    KnownProvider {
+        id: "zai",
+        name: "Z.ai",
+        base_url: "https://api.z.ai/api/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://z.ai/manage-apikey/apikey-list",
+    },
+    KnownProvider {
+        id: "zai-api",
+        name: "Z.ai API",
+        base_url: "https://api.z.ai/api/paas/v4",
+        api: "openai-completions",
+        key_url: "https://z.ai/manage-apikey/apikey-list",
+    },
+    KnownProvider {
+        id: "bigmodel",
+        name: "BigModel",
+        base_url: "https://open.bigmodel.cn/api/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://bigmodel.cn/coding-plan/personal/overview",
+    },
+    KnownProvider {
+        id: "bigmodel-api",
+        name: "BigModel API",
+        base_url: "https://open.bigmodel.cn/api/paas/v4",
+        api: "openai-completions",
+        key_url: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+    },
+    KnownProvider {
+        id: "kimi",
+        name: "Kimi",
+        base_url: "https://api.moonshot.cn/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://platform.kimi.com/console/api-keys",
+    },
+    KnownProvider {
+        id: "minimax",
+        name: "MiniMax",
+        base_url: "https://api.minimaxi.com/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://platform.minimaxi.com/console/access?tab=api-keys",
+    },
+    KnownProvider {
+        id: "deepseek",
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://platform.deepseek.com/api_keys",
+    },
+    KnownProvider {
+        id: "alibaba-cn",
+        name: "Alibaba Cloud (China)",
+        base_url: "https://dashscope.aliyuncs.com/apps/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://bailian.console.aliyun.com/cn-beijing?tab=model",
+    },
+    KnownProvider {
+        id: "alibaba-intl",
+        name: "Alibaba Cloud (Global)",
+        base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api: "openai-completions",
+        key_url: "https://modelstudio.console.aliyun.com/ap-southeast-1?tab=dashboard",
+    },
+    KnownProvider {
+        id: "xiaomi-mimo",
+        name: "Xiaomi MiMo",
+        base_url: "https://api.xiaomimimo.com/anthropic",
+        api: "anthropic-messages",
+        key_url: "https://platform.xiaomimimo.com/",
+    },
+    KnownProvider {
+        id: "openai",
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        api: "openai-responses",
+        key_url: "https://platform.openai.com/api-keys",
+    },
+    KnownProvider {
+        id: "anthropic",
+        name: "Anthropic",
+        base_url: "https://api.anthropic.com/v1",
+        api: "anthropic-messages",
+        key_url: "https://console.anthropic.com/settings/keys",
+    },
+    KnownProvider {
+        id: "xai",
+        name: "xAI",
+        base_url: "https://api.x.ai/v1",
+        api: "openai-responses",
+        key_url: "https://console.x.ai",
+    },
+    KnownProvider {
+        id: "openrouter",
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api",
+        api: "anthropic-messages",
+        key_url: "https://openrouter.ai/keys",
+    },
+    KnownProvider {
+        id: "opencode-go-chat",
+        name: "OpenCode Go (Chat)",
+        base_url: "https://opencode.ai/zen/go/v1",
+        api: "openai-completions",
+        key_url: "https://opencode.ai/auth",
+    },
+    KnownProvider {
+        id: "opencode-go-anthropic",
+        name: "OpenCode Go (Anthropic)",
+        base_url: "https://opencode.ai/zen/go/v1",
+        api: "anthropic-messages",
+        key_url: "https://opencode.ai/auth",
+    },
+    KnownProvider {
+        id: "opencode-go-responses",
+        name: "OpenCode Go (Responses)",
+        base_url: "https://opencode.ai/zen/go/v1",
+        api: "openai-responses",
+        key_url: "https://opencode.ai/auth",
+    },
+    KnownProvider {
+        id: "opencode-zen-chat",
+        name: "OpenCode Zen (Chat)",
+        base_url: "https://opencode.ai/zen/v1",
+        api: "openai-completions",
+        key_url: "https://opencode.ai/auth",
+    },
+    KnownProvider {
+        id: "opencode-zen-anthropic",
+        name: "OpenCode Zen (Anthropic)",
+        base_url: "https://opencode.ai/zen/v1",
+        api: "anthropic-messages",
+        key_url: "https://opencode.ai/auth",
+    },
+    KnownProvider {
+        id: "opencode-zen-responses",
+        name: "OpenCode Zen (Responses)",
+        base_url: "https://opencode.ai/zen/v1",
+        api: "openai-responses",
+        key_url: "https://opencode.ai/auth",
+    },
+];
+
+/// The camelCase wire shape (the `KnownProvider` itself is NOT renamed —
+/// a DTO, the `ModelDto` pattern). Wire-out-only by design (no
+/// `Deserialize` — the command only returns it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownProviderDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api: String,
+    pub key_url: String,
+}
+
+impl From<&KnownProvider> for KnownProviderDto {
+    fn from(k: &KnownProvider) -> Self {
+        Self {
+            id: k.id.into(),
+            name: k.name.into(),
+            base_url: k.base_url.into(),
+            api: k.api.into(),
+            key_url: k.key_url.into(),
+        }
+    }
+}
+
+/// The known-providers catalog (the Settings' picker's data source —
+/// ADR 0024). STATELESS (no `tauri::State` param — the `list_tools`
+/// pattern: the command needs no state).
+#[tauri::command]
+pub async fn list_known_providers() -> Result<Vec<KnownProviderDto>, String> {
+    Ok(KNOWN_PROVIDERS.iter().map(KnownProviderDto::from).collect())
+}
+
 /// Test ONE MCP server definition (the Settings page's Test action, ADR
 /// 0019): a one-shot bounded connect + `tools/list`. `Ok` = the tool
 /// count; `Err` = the error text (surfaced verbatim in the row — a
@@ -319,6 +530,72 @@ mod tests {
                 "missing {name} in {names:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn list_known_providers_returns_the_20_templates() {
+        // The command is stateless (no `tauri::State` param — the `list_tools`
+        // pattern), so it is called directly.
+        let providers = list_known_providers()
+            .await
+            .expect("the catalog is built-in");
+        assert_eq!(
+            providers.len(),
+            20,
+            "the ZCode builtin catalog has 20 templates"
+        );
+        // Every `api` is a harness wire API (ADR 0024).
+        for p in &providers {
+            assert!(
+                matches!(
+                    p.api.as_str(),
+                    "openai-completions" | "anthropic-messages" | "openai-responses"
+                ),
+                "unknown wire api {:?} for {:?}",
+                p.api,
+                p.id
+            );
+            assert!(
+                p.base_url.starts_with("https://"),
+                "a builtin template is https: {:?}",
+                p.base_url
+            );
+            assert!(
+                !p.key_url.is_empty(),
+                "every template has a key URL: {:?}",
+                p.id
+            );
+        }
+        // The `id`s are unique.
+        let mut ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "duplicate provider id in {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn list_known_providers_templates_match_the_zcode_catalog() {
+        // Spot-checks: the ZCode catalog's values (base URLs / key URLs /
+        // wire apis VERBATIM from `templateRules`).
+        let providers = list_known_providers().await.unwrap();
+        let by_id: HashMap<String, &KnownProviderDto> =
+            providers.iter().map(|p| (p.id.clone(), p)).collect();
+        let anthropic = &by_id["anthropic"];
+        assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(anthropic.api, "anthropic-messages");
+        let openai = &by_id["openai"];
+        assert_eq!(openai.api, "openai-responses");
+        let zai = &by_id["zai"];
+        assert_eq!(zai.base_url, "https://api.z.ai/api/anthropic");
+        let deepseek = &by_id["deepseek"];
+        assert_eq!(deepseek.base_url, "https://api.deepseek.com/anthropic");
+        let alibaba_intl = &by_id["alibaba-intl"];
+        assert_eq!(
+            alibaba_intl.base_url,
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(alibaba_intl.api, "openai-completions");
     }
 
     #[test]
@@ -474,6 +751,42 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_api_defaults_to_openai_completions() {
+        // (ADR 0024) A pre-feature `settings.json` (NO `api` field) parses
+        // to `api == "openai-completions"` (the serde default — no
+        // migration) + `key_url == None`.
+        let config: ProviderConfig =
+            serde_json::from_str(r#"{"id":"p","name":"P","baseUrl":"https://x/v1","apiKey":"k"}"#)
+                .unwrap();
+        assert_eq!(config.api, "openai-completions");
+        assert_eq!(config.key_url, None);
+    }
+
+    #[test]
+    fn provider_config_api_and_key_url_round_trip() {
+        // (ADR 0024) A populated `api` + `keyUrl` round-trips camelCase.
+        let config = ProviderConfig {
+            id: "anthropic".to_string(),
+            name: "Anthropic".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: "k".to_string(),
+            api: "anthropic-messages".to_string(),
+            key_url: Some("https://keys.example".to_string()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("\"api\":\"anthropic-messages\""),
+            "got {json}"
+        );
+        assert!(
+            json.contains("\"keyUrl\":\"https://keys.example\""),
+            "got {json}"
+        );
+        let back: ProviderConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, config);
+    }
+
+    #[test]
     fn settings_round_trip_with_the_new_fields() {
         let settings = Settings {
             theme: "system".to_string(),
@@ -487,6 +800,8 @@ mod tests {
                 name: "My Gateway".to_string(),
                 base_url: "http://localhost:8080/v1".to_string(),
                 api_key: String::new(),
+                api: "openai-completions".into(),
+                key_url: None,
             }],
             font: FontSettings {
                 size_px: 18,

@@ -48,6 +48,11 @@ thiserror = "2"
 # (default features off) avoids a system-OpenSSL build dependency;
 # `stream` provides `bytes_stream`, `json` the request body.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+# `url` (already a transitive `reqwest` dep — no new crate): parsing the
+# base URL's PATH for the Anthropic-wire `/v1` normalization (ADR 0024 —
+# mirroring ZCode's `normalizeAnthropicBaseURL`, which operates on the
+# URL path, NOT the full string, so a query string is not corrupted).
+url = "2"
 # `BoxStream` (the `Provider`'s returned stream) + `StreamExt` (consuming
 # it in the `AgentLoop`, Task 6) — `futures-core` alone has `BoxStream`
 # but no `.next()`, so the full `futures-util` is needed.

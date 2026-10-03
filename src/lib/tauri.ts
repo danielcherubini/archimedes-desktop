@@ -314,6 +314,19 @@ export interface ProviderConfig {
   name: string;
   baseUrl: string;
   apiKey: string;
+  /** The wire API (ADR 0024): `"openai-completions"` (default) / `"anthropic-messages"` / `"openai-responses"`. */
+  api: string;
+  /** The key-management page URL (set by the known-providers picker — the row's "Get key" link; `null` / absent for a hand-typed provider). */
+  keyUrl?: string | null;
+}
+
+/** A known provider template (the built-in catalog — the Settings' known-providers picker's data source; the Rust `KnownProviderDto`'s camelCase wire shape, ADR 0024). */
+export interface KnownProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  api: string;
+  keyUrl: string;
 }
 
 /**
@@ -510,6 +523,11 @@ export async function listModels(forceRefresh?: string): Promise<ModelDto[]> {
 /** The native harness's tool names, sorted (the Settings page's enabled-tools checkbox list). */
 export async function listTools(): Promise<string[]> {
   return invoke<string[]>("list_tools");
+}
+
+/** The known-providers catalog (the Settings' picker's data source — ADR 0024). */
+export async function listKnownProviders(): Promise<KnownProvider[]> {
+  return invoke<KnownProvider[]>("list_known_providers");
 }
 
 /** The user-level discovered agent definitions (the Settings page's Subagents section — ADR 0023). */

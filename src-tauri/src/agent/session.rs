@@ -41,8 +41,8 @@ use tokio::sync::{oneshot, watch, Mutex};
 use crate::agent::errors::SessionError;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::{
-    build_main_prompt, discover_models, merge_catalog, AgentLoop, ControlCmd, Model, ModelCatalog,
-    OpenAiCompatibleProvider, Prompt, PromptContext, Provider, ProviderDiscovery, RetryPolicy,
+    build_main_prompt, build_provider, discover_models, merge_catalog, AgentLoop, ControlCmd,
+    Model, ModelCatalog, Prompt, PromptContext, Provider, ProviderDiscovery, RetryPolicy,
     SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
 };
 use crate::agent::interactive::{
@@ -881,9 +881,9 @@ impl SessionDriver {
 
 /// A factory that builds a `Provider` from a `Model` (the native path's
 /// provider seam — `SessionManager::provider_factory`; the production
-/// default is `OpenAiCompatibleProvider`, a test sets a mock before
-/// `start_session`). `pub` so `subagent.rs`'s `NativeDeps` can carry
-/// one (the native dispatch builds the `Provider` through it).
+/// default dispatches on `Model.api` (`build_provider`, ADR 0024), a test
+/// sets a mock before `start_session`). `pub` so `subagent.rs`'s `NativeDeps`
+/// can carry one (the native dispatch builds the `Provider` through it).
 pub type ProviderFactory = Arc<dyn Fn(&Model) -> Box<dyn Provider> + Send + Sync>;
 
 /// The effective-catalog supplier: the BASE catalog + the user's providers
@@ -928,7 +928,7 @@ impl EffectiveCatalog {
             let bypass = Some(provider.id.as_str()) == force_refresh;
             if !entry.attempted || bypass {
                 entry.attempted = true;
-                match discover_models(&provider.base_url, &provider.api_key).await {
+                match discover_models(&provider.base_url, &provider.api_key, &provider.api).await {
                     Ok(models) => entry.models = models,
                     Err(_) => entry.models.clear(),
                 }
@@ -937,7 +937,8 @@ impl EffectiveCatalog {
             // `base_url` / `api_key`; `context_window` falls back to
             // `DEFAULT_CONTEXT_WINDOW` (a user model has no static metadata);
             // the thinking fields map straight from the `DiscoveredMeta`
-            // (`None` → `vec![]` / `false`); v1 is OpenAI-compatible only.
+            // (`None` → `vec![]` / `false`); the provider's `api` decides
+            // the wire (ADR 0024).
             for (id, meta) in &entry.models {
                 user_models.push(Model {
                     id: id.clone(),
@@ -950,7 +951,7 @@ impl EffectiveCatalog {
                     supports_tools: true,
                     supports_thinking: meta.supports_thinking.unwrap_or(false),
                     thinking_levels: meta.thinking_levels.clone().unwrap_or_default(),
-                    api: Some("openai-completions".to_string()),
+                    api: Some(provider.api.clone()),
                 });
             }
         }
@@ -986,9 +987,10 @@ pub struct SessionManager {
     /// over the base (see `effective_catalog` / `EffectiveCatalog`).
     catalog: ModelCatalog,
     /// The provider factory seam (reviewer-corrected Major #21): the native
-    /// path builds the `Provider` through it (the production default is
-    /// `OpenAiCompatibleProvider`; a test sets a mock BEFORE `start_session`),
-    /// so `start_session` never constructs the provider inline.
+    /// path builds the `Provider` through it (the production default
+    /// dispatches on `Model.api` (`build_provider`, ADR 0024); a test sets
+    /// a mock BEFORE `start_session`), so `start_session` never constructs
+    /// the provider inline.
     provider_factory: ProviderFactory,
     /// The per-provider live-discovery cache (the `GET /v1/models` result —
     /// the OpenAI endpoint "supplies everything"; the `pi-provider-litellm`
@@ -1017,14 +1019,10 @@ impl SessionManager {
             // via `set_catalog`.
             catalog: ModelCatalog::default(),
             // The provider factory seam (reviewer-corrected Major #21 —
-            // the production default; a test sets a mock via
+            // the production default dispatches on `Model.api`
+            // (`build_provider`, ADR 0024); a test sets a mock via
             // `set_provider_factory` BEFORE `start_session`).
-            provider_factory: Arc::new(|m: &Model| {
-                Box::new(OpenAiCompatibleProvider {
-                    base_url: m.base_url.clone(),
-                    api_key: m.api_key.clone(),
-                }) as Box<dyn Provider>
-            }),
+            provider_factory: Arc::new(|m: &Model| build_provider(m)),
             discovery_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -1045,7 +1043,8 @@ impl SessionManager {
 
     /// Inject the provider factory (reviewer-corrected Major #21 — the
     /// native path builds the `Provider` through it; the production default
-    /// is `OpenAiCompatibleProvider`). Set BEFORE `start_session`.
+    /// dispatches on `Model.api` (`build_provider`, ADR 0024)).
+    /// Set BEFORE `start_session`.
     pub fn set_provider_factory(
         &mut self,
         f: impl Fn(&Model) -> Box<dyn Provider> + Send + Sync + 'static,
@@ -1073,7 +1072,13 @@ impl SessionManager {
             entry.attempted = true;
             // Best-effort: a failure (unreachable endpoint, non-2xx) leaves
             // `models` empty → the static metadata is kept (no retry).
-            if let Ok(models) = discover_models(&model.base_url, &model.api_key).await {
+            if let Ok(models) = discover_models(
+                &model.base_url,
+                &model.api_key,
+                model.api.as_deref().unwrap_or("openai-completions"),
+            )
+            .await
+            {
                 entry.models = models;
             }
         }
@@ -1330,7 +1335,7 @@ impl SessionManager {
         let catalog = self.effective_catalog(None).await;
         // The model: the resolution chain (the `Settings.default_model`
         // (a fresh `load_settings` read) → the catalog's `default_model`
-        // → the v1-selectable (`openai_compatible`) set — an unresolvable
+        // → the selectable set — an unresolvable
         // key at any rung falls through to the next rung). A resume
         // overrides it with the stored model (see `resume_native_session`).
         let settings = load_settings(&self.config_dir);
@@ -1401,8 +1406,8 @@ impl SessionManager {
         // consumes it.
         let (settle_tx, settle_rx) = watch::channel(0u64);
         // The `Provider` (the `provider_factory` seam — reviewer-corrected
-        // Major #21: the production default is `OpenAiCompatibleProvider`,
-        // a test sets a mock BEFORE `start_session`).
+        // Major #21: the production default dispatches on `Model.api`
+        // (`build_provider`, ADR 0024), a test sets a mock BEFORE `start_session`).
         let provider = (self.provider_factory)(&model);
         let mut loop_ = AgentLoop::new(
             session_id.clone(),
@@ -2064,7 +2069,7 @@ fn remembered_thinking_level(levels: &HashMap<String, String>, model: &Model) ->
 
 /// Resolve a native session's model (the `Settings.default_model` composed
 /// key — a fresh `load_settings` read → the catalog; the catalog's
-/// `default_model` → the v1-selectable (`openai_compatible`) set). Each rung
+/// `default_model` → the selectable set). Each rung
 /// is tried IN ORDER: an UNRESOLVABLE key at any rung falls through to the
 /// NEXT rung (only when both rungs are absent/unresolvable does it fall to
 /// the set) — a stale configured default degrades rather than a hard error.
@@ -2084,7 +2089,7 @@ fn resolve_native_model(
         }
     }
     catalog
-        .openai_compatible()
+        .selectable()
         .first()
         .copied()
         .cloned()
@@ -2116,7 +2121,7 @@ fn native_capabilities(model: &Model, thinking_level: Option<&str>) -> Value {
 /// selectors) from the `ModelCatalog` (the existing `synthesize_config_options`
 /// shape — the frontend is unchanged; a new `get_models` command driving a
 /// native-only picker would be a UI change, so there is none): model options
-/// are the `openai_compatible()` ids (`"<provider>/<id>"`); the thinking level
+/// are the `selectable()` ids (`"<provider>/<id>"`); the thinking level
 /// is the current model's `thinking_levels` (absent → no selector).
 fn synthesize_catalog_config_options(
     catalog: &ModelCatalog,
@@ -2125,7 +2130,7 @@ fn synthesize_catalog_config_options(
 ) -> Option<Vec<Value>> {
     let mut out: Vec<Value> = Vec::new();
     let options: Vec<Value> = catalog
-        .openai_compatible()
+        .selectable()
         .iter()
         .map(|m| {
             json!({
@@ -3153,7 +3158,7 @@ mod session_tests {
 
     // ── Native-backend tests (the in-process `AgentLoop` — a NATIVE
     // registry entry + a mock `provider_factory` seam; the production
-    // default is `OpenAiCompatibleProvider`) ──
+    // default dispatches on `Model.api` (`build_provider`, ADR 0024)) ──
 
     /// The native test catalog (a single `fake/m1` OpenAI-compatible
     /// model — `set_config_option` + `resolve_native_model` resolve it
@@ -3221,7 +3226,7 @@ mod session_tests {
 
     /// A full `Model` literal for the `resolve_native_model` chain test
     /// (`base_url` EMPTY so `refresh_model_metadata` is a no-op — no
-    /// network; `openai-completions` so the model is v1-selectable).
+    /// network; `openai-completions` so the model is selectable).
     fn chain_test_model(provider: &str, id: &str) -> Model {
         Model {
             id: id.to_string(),
@@ -3687,8 +3692,8 @@ mod session_tests {
 
     /// (settings chain) the native model resolution chain: the
     /// `Settings.default_model` (a fresh `load_settings` read) > the
-    /// catalog's `default_model` > the v1-selectable (`openai_compatible`)
-    /// set. An UNRESOLVABLE key at any rung falls through to the NEXT rung.
+    /// catalog's `default_model` > the selectable set. An UNRESOLVABLE key
+    /// at any rung falls through to the NEXT rung.
     #[tokio::test]
     async fn the_native_model_chain_settings_default_wins_over_the_catalog_default() {
         let catalog = ModelCatalog {
@@ -3724,7 +3729,7 @@ mod session_tests {
 
         // Phase 2: settings `gone/m1` (NOT in the catalog) → the
         // unresolvable settings key falls through to the CATALOG DEFAULT
-        // rung (not straight to the v1-selectable set).
+        // rung (not straight to the selectable set).
         write_settings_default_model(&dir, Some("gone/m1"));
         let db = open_db(&dir);
         let mut manager = SessionManager::new(dir.clone());
@@ -3846,11 +3851,13 @@ mod session_tests {
 
     /// Write a `settings.json` with a single user provider (the
     /// `effective_catalog` tests — the desktop-owned provider store, ADR
-    /// 0014; the camelCase wire shape).
-    fn write_settings_provider(dir: &Path, id: &str, base_url: &str) {
+    /// 0014; the camelCase wire shape). `api` is the provider's wire API
+    /// (ADR 0024 — a pre-feature fixture omits the field, which parses to
+    /// `"openai-completions"` via the serde default).
+    fn write_settings_provider_api(dir: &Path, id: &str, base_url: &str, api: &str) {
         let settings = serde_json::json!({
             "providers": [
-                { "id": id, "name": id, "baseUrl": base_url, "apiKey": "k" }
+                { "id": id, "name": id, "baseUrl": base_url, "apiKey": "k", "api": api }
             ]
         });
         std::fs::write(
@@ -3858,6 +3865,13 @@ mod session_tests {
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
+    }
+
+    /// Write a `settings.json` with a single user provider (the pre-feature
+    /// wire shape — NO `api` field; the serde default gives
+    /// `"openai-completions"`).
+    fn write_settings_provider(dir: &Path, id: &str, base_url: &str) {
+        write_settings_provider_api(dir, id, base_url, "openai-completions")
     }
 
     /// A full `Model` literal (the `provider` / `base_url` are
@@ -3918,6 +3932,40 @@ mod session_tests {
         assert_eq!(user[0].context_window, DEFAULT_CONTEXT_WINDOW);
         // The seeded model coexists (no id clash).
         assert!(effective.models.iter().any(|m| m.provider == "other"));
+        server.abort();
+    }
+
+    /// (ADR 0024) A provider with `api: "anthropic-messages"` yields an
+    /// effective-catalog model with `api: Some("anthropic-messages")` (the
+    /// provider's `api` decides the wire — the `SessionManager`'s default
+    /// factory dispatches on it; the pre-feature fixtures default to
+    /// `openai-completions` via the serde default, asserted in
+    /// `effective_catalog_discovers_a_user_provider`).
+    #[tokio::test]
+    async fn resolve_uses_the_provider_api() {
+        let dir = temp_config_dir();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            crate::test_support::raw_json_server(listener, 200, r#"{"data":[{"id":"m/1"}]}"#, None)
+                .await;
+        write_settings_provider_api(
+            &dir,
+            "anthropic",
+            &format!("http://{addr}/v1"),
+            "anthropic-messages",
+        );
+        let manager = SessionManager::new(dir);
+        let effective = manager.effective_catalog(None).await;
+        let user: Vec<&Model> = effective
+            .models
+            .iter()
+            .filter(|m| m.provider == "anthropic")
+            .collect();
+        assert_eq!(user.len(), 1, "the discovered model is in the catalog");
+        // The provider's `api` decides the wire (NOT a hard-coded
+        // `openai-completions`).
+        assert_eq!(user[0].api.as_deref(), Some("anthropic-messages"));
         server.abort();
     }
 

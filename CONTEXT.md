@@ -44,6 +44,14 @@ _Avoid_: Agent config, agent preset, subagent preset
 A per-agent model override in the app's settings (`settings.json` `subagentModels`: agent name → model key) — layered between the explicit `subagent` tool `model` param and the **Agent definition**'s frontmatter (explicit > override > frontmatter > parent model — ADR 0023); a stale override degrades to the frontmatter layer (never fails the dispatch); the agent's markdown file is never modified.
 _Avoid_: Agent config, model preset, subagent default model
 
+**Provider**:
+A user-managed model endpoint in the app's settings (`settings.json` `providers`: `{ id, name, baseUrl, apiKey, api, keyUrl? }`) — the desktop's SOLE model source (ADR 0014): each provider's models are discovered live from its endpoint (`GET /models`, per-wire), and its `api` field selects the wire the harness speaks (`openai-completions` (default) / `anthropic-messages` / `openai-responses` — ADR 0024). The base model catalog is empty; a provider that discovers 0 models still shadows the base for its id (a no-op with a single source).
+_Avoid_: Connection, model source, LLM endpoint
+
+**Known provider**:
+A built-in provider template in the desktop's known-providers catalog (a Rust constant seeded from the ZCode builtin provider catalog, ADR 0024) — `name` + `base URL` + `wire API` + `key-management URL`, offered in the Settings' Providers section as a picker. Picking a template adds a PRE-FILLED **Provider** row (empty API key — the user pastes the key); the template itself is not a provider (it stores no key and discovers nothing). The user's provider list remains the sole model source.
+_Avoid_: Built-in provider (that would read as a model source), provider preset, provider template (the user-facing term is "known provider")
+
 **Permission prompt**:
 The Client's UI response to the native harness's in-process **permission gate** (the `permission-request` event before every mutating tool — ADR 0010) — the user approves or denies a tool call.
 _Avoid_: Approval dialog, consent prompt, confirm
