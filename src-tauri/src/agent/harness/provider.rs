@@ -2194,9 +2194,11 @@ pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Prov
             base_url: m.base_url.clone(),
             api_key: m.api_key.clone(),
         }),
-        // `openai-completions` / `None` / unknown — the current default
-        // (an unknown API is unselectable in practice, but a hand-built
-        // `Model` with a weird `api` still gets a working client).
+        // `openai-completions` / `litellm` / `None` / unknown — the
+        // current default (an unknown API is unselectable in practice,
+        // but a hand-built `Model` with a weird `api` still gets a
+        // working client). `litellm` is a DISCOVERY mode, not a wire —
+        // its completion wire IS `openai-completions` (ADR 0026).
         _ => Box::new(OpenAiCompatibleProvider {
             base_url: m.base_url.clone(),
             api_key: m.api_key.clone(),
@@ -4388,8 +4390,8 @@ mod tests {
     }
 
     /// A recorded mock HTTP server: LOOP-accepts (one request per
-    /// connection — the `build_provider` dispatch test performs THREE
-    /// dispatches, so a single-accept server would hang the 2nd/3rd),
+    /// connection — the `build_provider` dispatch test performs FOUR
+    /// dispatches, so a single-accept server would hang the 2nd/3rd/4th),
     /// reads each request's headers until `\r\n\r\n` (+ the
     /// `Content-Length` body), records the `PATH` line + the
     /// `authorization` / `x-api-key` header presence, and replies the
@@ -4450,7 +4452,7 @@ mod tests {
                     have = data.len();
                 }
                 // The wire-appropriate minimal 200 SSE body (the `PATH`
-                // decides the wire — one server, three dispatches).
+                // decides the wire — one server, four dispatches).
                 let body = if path.contains("/messages") {
                     // Anthropic: a `message_start` + `message_delta` pair.
                     "event: message_start\r\n\
@@ -4493,10 +4495,13 @@ mod tests {
     /// `openai-responses` model on `OpenAiResponsesProvider` (`POST
     /// /responses`, an `authorization` header), and a `None`-api model
     /// on `OpenAiCompatibleProvider` (`POST /chat/completions`, an
-    /// `authorization` header — the current default). Each stream is
-    /// collected to completion (the recorded mock server replies the
+    /// `authorization` header — the current default), and a `litellm`
+    /// model on `OpenAiCompatibleProvider` too (`POST /chat/completions`,
+    /// an `authorization` header — ADR 0026: `litellm` is a DISCOVERY
+    /// mode, its wire is `openai-completions`). Each stream is collected
+    /// to completion (the recorded mock server replies the
     /// wire-appropriate minimal 200 SSE body; the loop-accept server
-    /// handles the THREE dispatches — one request per connection).
+    /// handles the FOUR dispatches — one request per connection).
     #[tokio::test]
     async fn build_provider_dispatches_on_the_api() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4592,6 +4597,37 @@ mod tests {
             has_auth,
             "the openai-compatible wire sends `authorization` ({path:?})"
         );
+
+        // (4) (ADR 0026) `litellm` → the OpenAI arm: `POST /chat/completions` +
+        // `authorization` (it is a discovery mode, NOT a fourth wire).
+        let provider = build_provider(&model(&base_url, Some("litellm")));
+        let events: Vec<ProviderEvent> = provider
+            .complete(&req)
+            .await
+            .expect("the request sends")
+            .collect()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Done(FinishReason::Stop))),
+            "the litellm (openai-compatible) stream completes: {events:?}"
+        );
+        let (path, has_auth, has_x_api_key) =
+            rx.recv().await.expect("the server recorded the request");
+        assert!(
+            path.starts_with("post ") && path.contains("/chat/completions"),
+            "got {path:?}"
+        );
+        assert!(
+            has_auth,
+            "the litellm api uses the openai-compatible wire: `authorization` ({path:?})"
+        );
+        assert!(
+            !has_x_api_key,
+            "the litellm api uses the openai-compatible wire: NO `x-api-key` ({path:?})"
+        );
+
         // The loop-accept server never exits on its own — abort it (an
         // `await` would hang on the `accept()` loop).
         server.abort();

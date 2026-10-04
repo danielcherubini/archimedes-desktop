@@ -1229,6 +1229,43 @@ describe("SettingsPage (the known-providers picker + the provider api field — 
         }),
       ),
     );
+
+    // Switch the wire again — to `litellm` (the discovery mode, ADR 0026).
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("option", { name: "LiteLLM" }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providers: expect.arrayContaining([
+            expect.objectContaining({ api: "litellm" }),
+          ]),
+        }),
+      ),
+    );
+  });
+
+  it("provider_row_api_select_offers_litellm", async () => {
+    // A row on the `openai-completions` wire (the default) — the select
+    // must offer the `litellm` api as a fourth option.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      providers: [
+        {
+          id: "tama",
+          name: "Tama",
+          baseUrl: "https://tama.wizards.town/v1",
+          apiKey: "k",
+          api: "openai-completions",
+          keyUrl: null,
+        },
+      ],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const trigger = await screen.findByRole("combobox", { name: "API" });
+    fireEvent.click(trigger);
+    await screen.findByRole("option", { name: "LiteLLM" }); // the await is the assertion (throws if absent)
   });
 
   it("provider_row_get_key_link_renders_when_key_url_set", async () => {

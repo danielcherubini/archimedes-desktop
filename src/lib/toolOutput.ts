@@ -142,6 +142,7 @@ export function formatCost(cost: number): string {
 export const THINKING_GLYPHS: Record<string, string> = {
   off: "○",
   minimal: "○",
+  none: "○", // LiteLLM verbatim vocabulary — a thinking-OFF level
   low: "◔",
   medium: "◑",
   high: "◕",

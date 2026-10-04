@@ -509,6 +509,9 @@ describe("subagent metadata and activity formatting helpers", () => {
     expect(formatThinkingIndicator("minimal")).toBe("○ minimal");
     expect(formatThinkingIndicator("xhigh")).toBe("● xhigh");
     expect(formatThinkingIndicator("max")).toBe("● max");
+    // `none` (the LiteLLM verbatim vocabulary) is a thinking-OFF level —
+    // the same glyph as `off` / `minimal`, not the mid fallback.
+    expect(formatThinkingIndicator("none")).toBe("○ none");
     expect(formatThinkingIndicator(undefined)).toBeUndefined();
   });
 

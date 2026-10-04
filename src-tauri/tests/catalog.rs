@@ -31,6 +31,7 @@ fn selectable_filters_to_the_three_wires_subset() {
                 Some("openai-completions"),
             ),
             model("gemini-2.5-flash", "google", Some("google-generative-ai")),
+            model("lit/1", "llm", Some("litellm")),
             model("Unknown-Model", "tama", None),
         ],
         default_model: Some("Qwen/Qwen3.8-27B".to_string()),
@@ -39,12 +40,15 @@ fn selectable_filters_to_the_three_wires_subset() {
 
     let selectable = catalog.selectable();
     let ids: Vec<&str> = selectable.iter().map(|m| m.id.as_str()).collect();
-    // The two `api: "openai-completions"` models — NOT the
-    // `google-generative-ai` model, NOT the metadata-less default model
-    // (an unknown `api` is not one of the three the harness speaks).
-    assert_eq!(selectable.len(), 2);
+    // The two `api: "openai-completions"` models + the `api: "litellm"`
+    // discovery-mode model (ADR 0026 — its wire is `openai-completions`) —
+    // NOT the `google-generative-ai` model, NOT the metadata-less default
+    // model (an unknown `api` is not one of the three wires the harness
+    // speaks + the `litellm` discovery mode).
+    assert_eq!(selectable.len(), 3);
     assert!(ids.contains(&"Qwen/Qwen3.8-27B"));
     assert!(ids.contains(&"moonshotai/kimi-k3"));
+    assert!(ids.contains(&"lit/1"));
     assert!(!ids.contains(&"gemini-2.5-flash"));
     assert!(!ids.contains(&"Unknown-Model"));
 }

@@ -35,7 +35,8 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// The wire API (ADR 0024): `"openai-completions"` (the default — a
     /// pre-feature file parses to it, no migration) / `"anthropic-messages"`
-    /// / `"openai-responses"`.
+    /// / `"openai-responses"` / `"litellm"` (discovery via `GET /model/info`,
+    /// wire = openai-completions — ADR 0026).
     #[serde(default = "default_provider_api")]
     pub api: String,
     /// The key-management page URL (set by the known-providers picker — the

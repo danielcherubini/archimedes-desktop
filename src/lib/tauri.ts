@@ -342,7 +342,7 @@ export interface ProviderConfig {
   name: string;
   baseUrl: string;
   apiKey: string;
-  /** The wire API (ADR 0024): `"openai-completions"` (default) / `"anthropic-messages"` / `"openai-responses"`. */
+  /** The wire API (ADR 0024): `"openai-completions"` (default) / `"anthropic-messages"` / `"openai-responses"` / `"litellm"` (discovery via `GET /model/info`, wire = openai-completions — ADR 0026). */
   api: string;
   /** The key-management page URL (set by the known-providers picker — the row's "Get key" link; `null` / absent for a hand-typed provider). */
   keyUrl?: string | null;

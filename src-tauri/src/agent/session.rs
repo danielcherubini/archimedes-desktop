@@ -4121,6 +4121,44 @@ mod session_tests {
         server.abort();
     }
 
+    /// (ADR 0026) A provider with `api: "litellm"` yields an effective-catalog
+    /// model with `api: Some("litellm")` (the provider's `api` decides the wire
+    /// — and the wire for `litellm` is `openai-completions`, Task 3/ADR 0026).
+    #[tokio::test]
+    async fn resolve_uses_the_litellm_provider_api() {
+        let dir = temp_config_dir();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The `litellm` discovery arm hits `{base}/model/info` — serve the
+        // LiteLLM shape (the test_support `raw_json_server` is the 4-arg
+        // `counter: Option<…>` variant; pass `None`).
+        let server = crate::test_support::raw_json_server(
+            listener,
+            200,
+            r#"{"data":[{"model_name":"lit/1","model_info":{"max_input_tokens":262144,"reasoning_effort_levels":["none","low"],"supports_reasoning":true}}]}"#,
+            None,
+        )
+        .await;
+        write_settings_provider_api(&dir, "llm", &format!("http://{addr}/v1"), "litellm");
+        let manager = SessionManager::new(dir);
+        let effective = manager.effective_catalog(None).await;
+        let user: Vec<&Model> = effective
+            .models
+            .iter()
+            .filter(|m| m.provider == "llm")
+            .collect();
+        assert_eq!(user.len(), 1, "the discovered model is in the catalog");
+        // The provider's `api` is stamped verbatim (NOT `openai-completions`).
+        assert_eq!(user[0].api.as_deref(), Some("litellm"));
+        // ... and the metadata mapped (the discovery arm actually ran):
+        assert_eq!(user[0].context_window, 262144);
+        assert_eq!(
+            user[0].thinking_levels,
+            vec!["none".to_string(), "low".to_string()]
+        );
+        server.abort();
+    }
+
     /// (ADR 0014) A provider whose discovery FAILS (unreachable endpoint)
     /// still SHADOWS the seeded models for its id (a transient failure
     /// must not resurrect stale seeded models under the same id).

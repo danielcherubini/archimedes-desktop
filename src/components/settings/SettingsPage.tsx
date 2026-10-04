@@ -87,17 +87,19 @@ function slugify(name: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-/** The wire APIs the harness speaks (ADR 0024 — the provider row's `api` select). */
-const WIRE_APIS = [
+/** The endpoint APIs a provider row can speak (ADR 0024 + 0026: the wire the harness speaks, or a discovery mode — `litellm` routes discovery to `GET /model/info` on the openai-completions wire). */
+const API_VALUES = [
   "openai-completions",
   "anthropic-messages",
   "openai-responses",
+  "litellm",
 ] as const;
 
-/** The wire's human label (the provider row's `api` select + the picker's option labels). */
+/** The api's human label (the provider row's `api` select + the picker's option labels). */
 function apiLabel(api: string): string {
   if (api === "anthropic-messages") return "Anthropic";
   if (api === "openai-responses") return "OpenAI Responses";
+  if (api === "litellm") return "LiteLLM";
   return "OpenAI-compatible";
 }
 
@@ -786,7 +788,7 @@ function ProviderRow({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {WIRE_APIS.map((api) => (
+              {API_VALUES.map((api) => (
                 <SelectItem key={api} value={api}>
                   {apiLabel(api)}
                 </SelectItem>

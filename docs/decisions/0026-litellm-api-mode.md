@@ -20,9 +20,9 @@ LiteLLM-proxy-backed providers (e.g. `llm.wizards.town`) advertise their models,
 **Consequences**
 
 - **`settings.json` `providers[].api` gains `"litellm"`** (no migration — a new value on an existing `String` field with a serde default).
-- **`discover_models` gains a `"litellm"` arm**: `GET {base_url}/model/info`, Bearer auth (empty key → no header), parsing `data[].model_name` / `model_info.{max_input_tokens, reasoning_effort_levels, supports_reasoning, supports_function_calling, input_cost_per_token, output_cost_per_token}`.
+- **`discover_models` gains a `"litellm"` arm**: `GET {base_url}/model/info`, Bearer auth (empty key → no header), parsing `data[].model_name` / `model_info.{max_input_tokens (+ max_output_tokens fallback), reasoning_effort_levels, supports_reasoning}`; `supports_function_calling`, the cost fields, and `default_reasoning_effort` are deliberately ignored for v1 (the `cost_per_mtok_*` seam stays at the documented 0.0).
 - **`build_provider` routes `"litellm"` to the default (OpenAI) arm** — the arm that looks like it "should" build a LiteLLM-specific client; this is intentional (the wire IS OpenAI-compatible).
 - **`ModelCatalog::selectable()` accepts `"litellm"`** (fourth value in the match).
 - **The Settings' API select gains a "LiteLLM" option** (no known-provider template is added — LiteLLM base URLs differ per deployment, so a pre-filled template has no canonical base URL).
-- **`default_reasoning_effort` is parsed but NOT wired into the level-resolution chain** — the existing chain (remembered → settings default) is untouched; a fresh LiteLLM session starts with no thinking level (the proxy's default applies server-side).
+- **`default_reasoning_effort` is NOT parsed (v1)**: the level-resolution chain is untouched, a fresh LiteLLM session starts with no thinking level (the proxy's server-side default applies).
 - **A user's existing `openai-completions` row against a LiteLLM proxy keeps working** (discovers via `/models`); switching its `api` to `litellm` (the UI select is editable) upgrades discovery to `/model/info` (thinking levels + capabilities + cost).
