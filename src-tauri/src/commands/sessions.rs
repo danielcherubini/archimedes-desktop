@@ -11,8 +11,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::agent::{
-    EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager, StopReason,
-    SubagentSessionManager,
+    EventSink, ImagePayload, PermissionOutcome, SessionInfo, SessionManager, StalledInfo,
+    StopReason,
 };
 
 /// `EventSink` backed by `AppHandle::emit`.
@@ -66,30 +66,26 @@ pub async fn close_session(
 /// `request_id` is the `id` of the agent's `extension_ui_request` dialog
 /// (the one carried in the `permission-request` event). If the prompt is
 /// no longer pending, this is a no-op.
+///
+/// The ADR 0025 Task 5 re-plumb: a SINGLE `state` (the `SessionManager`
+/// routes through the `WorkerManager`'s `handle_for` — a MAIN session's
+/// handle is in the `workers` map, a SUBAGENT session's handle in the
+/// `drives` map — the `SubagentSessionManager`'s `respond_*` methods are
+/// deleted: the child's pending maps live in its Worker).
 #[tauri::command]
 pub async fn respond_permission(
     state: State<'_, Arc<SessionManager>>,
-    subagent_state: State<'_, Arc<SubagentSessionManager>>,
     session_id: String,
     request_id: String,
     outcome: PermissionOutcome,
 ) -> Result<(), crate::agent::SessionError> {
-    // Main manager first; a miss (no entry) routes to the subagent manager
-    // (the subagent's own listener's map — the `session_id` is the
-    // subagent's id). The existing "silent no-op when gone" semantics
-    // stay: a miss on both managers is a no-op (success either way) — but
-    // it is LOGGED (a double-miss is a routing/id mismatch, and a silent
-    // success would make it invisible). `||` short-circuits: the subagent
-    // lookup runs only when the main manager missed.
-    let main_hit = state
-        .respond_permission(&session_id, &request_id, outcome.clone())
+    let hit = state
+        .respond_permission(&session_id, &request_id, outcome)
         .await?;
-    let sub_hit = main_hit
-        || subagent_state
-            .respond_permission(&session_id, &request_id, outcome)
-            .await;
-    if !sub_hit {
-        eprintln!("respond_permission: no pending entry for session {session_id} request {request_id} (main and subagent managers)");
+    if !hit {
+        eprintln!(
+            "respond_permission: no pending entry for session {session_id} request {request_id}"
+        );
     }
     Ok(())
 }
@@ -102,30 +98,23 @@ pub async fn respond_permission(
 /// `confirm`, `{confirmed}`; for `password`, `{password}`); the desktop
 /// writes `{v:1, type:"response", id, result}`. If the request is no longer
 /// pending, this is a no-op.
+///
+/// The ADR 0025 Task 5 re-plumb: a SINGLE `state` (the `SessionManager`
+/// routes through the `WorkerManager`'s `handle_for` — main AND subagent
+/// sessions both resolve; the `SubagentSessionManager`'s `respond_*`
+/// methods are deleted: the child's pending maps live in its Worker).
 #[tauri::command]
 pub async fn respond_interactive_request(
     state: State<'_, Arc<SessionManager>>,
-    subagent_state: State<'_, Arc<SubagentSessionManager>>,
     session_id: String,
     request_id: String,
     result: Value,
 ) -> Result<(), crate::agent::SessionError> {
-    // Main manager first; a miss (no entry) routes to the subagent manager
-    // (the subagent's own listener's map — the `session_id` is the
-    // subagent's id). The existing "silent no-op when gone" semantics
-    // stay: a miss on both managers is a no-op (success either way) — but
-    // it is LOGGED (a double-miss is a routing/id mismatch, and a silent
-    // success would make it invisible). `||` short-circuits: the subagent
-    // lookup runs only when the main manager missed.
-    let main_hit = state
-        .respond_interactive_request(&session_id, &request_id, result.clone())
+    let hit = state
+        .respond_interactive_request(&session_id, &request_id, result)
         .await?;
-    let sub_hit = main_hit
-        || subagent_state
-            .respond_interactive_request(&session_id, &request_id, result)
-            .await;
-    if !sub_hit {
-        eprintln!("respond_interactive_request: no pending entry for session {session_id} request {request_id} (main and subagent managers)");
+    if !hit {
+        eprintln!("respond_interactive_request: no pending entry for session {session_id} request {request_id}");
     }
     Ok(())
 }
@@ -175,4 +164,18 @@ pub async fn cancel_session(
     session_id: String,
 ) -> Result<(), crate::agent::SessionError> {
     state.cancel_session(&session_id).await
+}
+
+/// The stalled-session query (the frontend's banner query — ADR 0025):
+/// a Worker crash marks the session STALLED (the Supervisor's `stalled`
+/// registry); the `session-stalled` event is the PUSH, this is the PULL
+/// (the frontend reads the state from the event + this query). `Ok(None)`
+/// when the session is not stalled (a query miss is a success — the
+/// frontend's banner simply has nothing to show).
+#[tauri::command]
+pub async fn get_stalled_info(
+    state: State<'_, Arc<SessionManager>>,
+    session_id: String,
+) -> Result<Option<StalledInfo>, String> {
+    Ok(state.stalled_info(&session_id))
 }

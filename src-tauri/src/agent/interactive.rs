@@ -1172,15 +1172,15 @@ mod tests {
     /// An `EventSink` that captures emissions (the test double for
     /// `TauriSink`).
     #[derive(Default)]
-    struct CapturingSink(StdMutex<Vec<(String, Value)>>);
+    struct InteractiveTestSink(StdMutex<Vec<(String, Value)>>);
 
-    impl EventSink for CapturingSink {
+    impl EventSink for InteractiveTestSink {
         fn emit(&self, event: &str, payload: Value) {
             self.0.lock().unwrap().push((event.to_string(), payload));
         }
     }
 
-    impl CapturingSink {
+    impl InteractiveTestSink {
         fn events_named(&self, name: &str) -> Vec<Value> {
             self.0
                 .lock()
@@ -1428,13 +1428,13 @@ mod tests {
         PendingSudo,
         Arc<Mutex<HashMap<String, CachedPassword>>>,
         Arc<watch::Sender<bool>>,
-        Arc<CapturingSink>,
+        Arc<InteractiveTestSink>,
     ) {
         let pending_sudo: PendingSudo = Arc::new(Mutex::new(HashMap::new()));
         let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (close_tx, _close_rx) = watch::channel(false);
-        let sink = Arc::new(CapturingSink::default());
+        let sink = Arc::new(InteractiveTestSink::default());
         let _ = &runner;
         (pending_sudo, sudo_password, Arc::new(close_tx), sink)
     }
@@ -1442,7 +1442,7 @@ mod tests {
     #[tokio::test]
     async fn todo_update_write_emits_the_push_and_returns_the_stored_todos() {
         let store = Arc::new(TodoStore::new());
-        let sink = Arc::new(CapturingSink::default());
+        let sink = Arc::new(InteractiveTestSink::default());
         let params = json!({
             "operation": "write",
             "todoList": [
@@ -1493,7 +1493,7 @@ mod tests {
                 description: None,
             }],
         );
-        let sink = Arc::new(CapturingSink::default());
+        let sink = Arc::new(InteractiveTestSink::default());
         let response = run_todo(json!({ "operation": "write" }), store.clone(), sink.clone()).await;
         let result = &response["result"];
         // The suite's text + flag (`tool.ts:89-94`).
@@ -1513,7 +1513,7 @@ mod tests {
     #[tokio::test]
     async fn todo_update_write_with_an_empty_content_item_fails_validation() {
         let store = Arc::new(TodoStore::new());
-        let sink = Arc::new(CapturingSink::default());
+        let sink = Arc::new(InteractiveTestSink::default());
         let response = run_todo(
             json!({
                 "operation": "write",
@@ -1556,7 +1556,7 @@ mod tests {
             },
         ];
         store.set("sid1", items.clone());
-        let sink = Arc::new(CapturingSink::default());
+        let sink = Arc::new(InteractiveTestSink::default());
         let response = run_todo(json!({ "operation": "read" }), store, sink.clone()).await;
         let result = &response["result"];
         // The suite's read text: `JSON.stringify(todos, null, 2)`.
@@ -2577,7 +2577,7 @@ mod tests {
     /// send silently failing). The `SudoPromptCleanup` drop guard does it.
     #[tokio::test]
     async fn a_dropped_sudo_flow_cleans_up_its_pending_entry_and_closes_the_modal() {
-        let capturing = Arc::new(CapturingSink::default());
+        let capturing = Arc::new(InteractiveTestSink::default());
         let pending_sudo: PendingSudo = Arc::new(Mutex::new(HashMap::new()));
         let sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>> =
             Arc::new(Mutex::new(HashMap::new()));

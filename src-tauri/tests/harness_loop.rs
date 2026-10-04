@@ -118,7 +118,7 @@ fn temp_cwd() -> PathBuf {
 
 struct Harness {
     prompt_tx: mpsc::Sender<Prompt>,
-    events_rx: mpsc::Receiver<RpcEvent>,
+    events_rx: mpsc::UnboundedReceiver<RpcEvent>,
     sink_rx: mpsc::UnboundedReceiver<(String, Value)>,
     pending: PendingPermissions,
     store: SessionStore,
@@ -144,12 +144,13 @@ async fn build_harness(
         config_options: None,
         archived: false,
         context_usage: None,
+        is_subagent: false,
     })
     .unwrap();
     let store = SessionStore::new(db.clone());
     let (sink_tx, sink_rx) = mpsc::unbounded_channel();
     let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-    let (events_tx, events_rx) = mpsc::channel(256);
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
     let pending: PendingPermissions = Arc::new(TokioMutex::new(std::collections::HashMap::new()));
     let pending_bridge: PendingInteractive =
@@ -170,7 +171,7 @@ async fn build_harness(
             compaction,
             ..Default::default()
         },
-        store.clone(),
+        Arc::new(store.clone()),
         events_tx,
         cancel,
         turn_cancel,
@@ -179,7 +180,7 @@ async fn build_harness(
         prompt_rx,
         pending.clone(),
         pending_bridge,
-        None, // trust_db (untrusted → the gate prompts)
+        None, // trust (untrusted → the gate prompts)
         sink,
         Arc::new(TodoStore::new()),
         None, // subagent (not exercised)
@@ -201,7 +202,7 @@ async fn build_harness(
 }
 
 /// Collect the loop's `RpcEvent`s until `agent_settled`.
-async fn collect_until_settled(rx: &mut mpsc::Receiver<RpcEvent>) -> Vec<RpcEvent> {
+async fn collect_until_settled(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<RpcEvent> {
     let mut events = Vec::new();
     while let Some(ev) = rx.recv().await {
         let settled = matches!(ev, RpcEvent::agent_settled);

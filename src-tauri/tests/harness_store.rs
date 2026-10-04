@@ -33,6 +33,7 @@ fn record_session(db: &Db, id: &str) {
         config_options: None,
         archived: false,
         context_usage: None,
+        is_subagent: false,
     })
     .unwrap();
 }

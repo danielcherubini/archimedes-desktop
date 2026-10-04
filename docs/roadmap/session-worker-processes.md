@@ -618,20 +618,20 @@ The `SessionManager` (`src-tauri/src/agent/session.rs`) today drives native sess
 7. **`commands/spaces.rs` — `set_space_trusted` (the Spaces-UI mid-session trust toggle).** The command body gains: after the `db` write, send `Config { trusted: Some(value), … }` to every RUNNING Worker in the affected Space (the `WorkerManager` exposes a `send_config_to_space(cwd, trusted)` helper — read the current command and the `WorkerManager` registry and wire it). (The `trust-space` permission-outcome path — the `respond_permission` `db` write + the Worker's `StaticTrustSource` flip — is Task 1/2/step-1; this is the SEPARATE Spaces-UI toggle path. The mid-session toggle for a session in ANOTHER space is unaffected.)
 
 **Steps:**
-- [ ] Write failing tests in `tests/ipc.rs` (NEW file — the `tauri::test` mock runtime + the `setup_dirs` seam extended with the injectable `WorkerFactory` (the `test_support` pattern — read `test_support.rs`'s `ENV_LOCK` + the existing seam conventions)): (a) `start_session` spawns the `fake_worker` (assert via a `test_support` hook that observes the `WorkerManager`'s registry — a new `test_support` accessor), a `send_prompt` yields the canned `SinkFrame`s on the Tauri sink (the test's event collector — the UI contract) AND writes the `messages`/`native_messages` rows (assert via the test's `Db` — the store frames applied by the `TranscriptPersister`) AND the raw `RpcEvent` stream is NOT forwarded to the Tauri sink (no `session-update` duplication — assert the sink saw the `session-update` `SinkFrame` exactly once per loop `emit`); (b) a `"__crash__"` prompt → the `session-stalled` event fires + the in-flight `send_prompt` resolves (the composer-unlock assertion) + the session resumes via `resume_session` (a fresh `fake_worker` attached); (c) `respond_permission` relays to the `fake_worker` (the `__permission__` flow completes — the tool-execution events arrive) AND the `trust-space` outcome writes `spaces.trusted = 1` (assert via the test's `Db`) AND the Worker's `StaticTrustSource` flip is observable (a second `__permission__`-style prompt on the same session is auto-approved — the `fake_worker`'s `__permission__` mode can be extended to skip the prompt when the `Start` `trusted` flag is `true`… the `fake_worker` reads `trusted` from `Start` — assert the second dispatch's `Start`-independent behavior via the `Config` the test sends, OR keep the assertion at the `db` write + the Task-2 unit test that already covers the flip — pick the minimal non-redundant assertion); (d) a `SinkFrame` (`interactive-event` todo payload) re-emits on the Tauri sink with the same event name + payload VERBATIM; (e) a clean `close_session` → `session-closed` (the `ClosedReason` `User` payload) + the in-flight `send_prompt` resolves `Cancelled`; (f) `set_space_trusted` sends a `Config { trusted }` to the space's running `fake_worker` (assert the worker received it — the `fake_worker` logs/echoes `config` frames).
-- [ ] Rewrite `tests/session_native.rs` against the re-plumbed `SessionManager` (the `WorkerFactory` seam + `fake_worker`/wiremock — the start/prompt/resume/`load_messages` coverage preserved; the `set_provider_factory`-based tests are DELETED, replaced by their worker-mediated equivalents).
-- [ ] Run `cargo test -p archimedes --test ipc` + `cargo test -p archimedes --test session_native` — confirm the new/rewritten tests FAIL (the commands still drive the in-process driver).
-- [ ] Implement (the order: `persist` + `db` schema → `session.rs` re-plumb → `commands` re-route → `lib.rs` wiring → `commands/spaces.rs`).
-- [ ] Run `cargo test` — ALL tests pass.
-- [ ] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt`.
-- [ ] Commit: `feat(supervisor): main sessions run in Worker processes — the in-process native driver is deleted (ADR 0025)`
+- [x] Write failing tests in `tests/ipc.rs` (NEW file — the `tauri::test` mock runtime + the `setup_dirs` seam extended with the injectable `WorkerFactory` (the `test_support` pattern — read `test_support.rs`'s `ENV_LOCK` + the existing seam conventions)): (a) `start_session` spawns the `fake_worker` (assert via a `test_support` hook that observes the `WorkerManager`'s registry — a new `test_support` accessor), a `send_prompt` yields the canned `SinkFrame`s on the Tauri sink (the test's event collector — the UI contract) AND writes the `messages`/`native_messages` rows (assert via the test's `Db` — the store frames applied by the `TranscriptPersister`) AND the raw `RpcEvent` stream is NOT forwarded to the Tauri sink (no `session-update` duplication — assert the sink saw the `session-update` `SinkFrame` exactly once per loop `emit`); (b) a `"__crash__"` prompt → the `session-stalled` event fires + the in-flight `send_prompt` resolves (the composer-unlock assertion) + the session resumes via `resume_session` (a fresh `fake_worker` attached); (c) `respond_permission` relays to the `fake_worker` (the `__permission__` flow completes — the tool-execution events arrive) AND the `trust-space` outcome writes `spaces.trusted = 1` (assert via the test's `Db`) AND the Worker's `StaticTrustSource` flip is observable (a second `__permission__`-style prompt on the same session is auto-approved — the `fake_worker`'s `__permission__` mode can be extended to skip the prompt when the `Start` `trusted` flag is `true`… the `fake_worker` reads `trusted` from `Start` — assert the second dispatch's `Start`-independent behavior via the `Config` the test sends, OR keep the assertion at the `db` write + the Task-2 unit test that already covers the flip — pick the minimal non-redundant assertion); (d) a `SinkFrame` (`interactive-event` todo payload) re-emits on the Tauri sink with the same event name + payload VERBATIM; (e) a clean `close_session` → `session-closed` (the `ClosedReason` `User` payload) + the in-flight `send_prompt` resolves `Cancelled`; (f) `set_space_trusted` sends a `Config { trusted }` to the space's running `fake_worker` (assert the worker received it — the `fake_worker` logs/echoes `config` frames).
+- [x] Rewrite `tests/session_native.rs` against the re-plumbed `SessionManager` (the `WorkerFactory` seam + `fake_worker`/wiremock — the start/prompt/resume/`load_messages` coverage preserved; the `set_provider_factory`-based tests are DELETED, replaced by their worker-mediated equivalents).
+- [x] Run `cargo test -p archimedes --test ipc` + `cargo test -p archimedes --test session_native` — confirm the new/rewritten tests FAIL (the commands still drive the in-process driver).
+- [x] Implement (the order: `persist` + `db` schema → `session.rs` re-plumb → `commands` re-route → `lib.rs` wiring → `commands/spaces.rs`).
+- [x] Run `cargo test` — ALL tests pass.
+- [x] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt`.
+- [x] Commit: `feat(supervisor): main sessions run in Worker processes — the in-process native driver is deleted (ADR 0025)`
 
 **Acceptance criteria:**
-- [ ] `start_session`/`resume_session` spawn a Worker; the `AgentLoop` runs ONLY in the Worker (no in-process `AgentLoop` construction in the `SessionManager` — a `rg "AgentLoop::new" src-tauri/src/agent/session.rs` returns nothing).
-- [ ] A session's events reach the Tauri sink via the `SinkFrame` re-emit (the frontend contract unchanged — verbatim, no duplication — the raw `RpcEvent` stream is bookkeeping-only) AND the store frames are persisted to `messages`/`native_messages`/`sessions.context_usage_json` (the idempotent upserts — a complete transcript: system + user + assistant + tool-role rows + compaction rewrites).
-- [ ] A Worker crash → the `session-stalled` event + the in-flight `send_prompt` resolves + the session is resumable (fresh Worker + re-hydrate from `native_messages`); a clean `close` → `session-closed` + `pending_turn` → `Cancelled`.
-- [ ] `respond_permission`/`respond_interactive_request` resolve the Worker's pending gates (the `fake_worker` `__permission__` flow) AND the `trust-space` outcome persists `spaces.trusted`; `set_space_trusted` pushes a `Config { trusted }` to running Workers.
-- [ ] The in-process native session driver is deleted (no dual-mode path); `tests/session_native.rs` rewritten and green.
+- [x] `start_session`/`resume_session` spawn a Worker; the `AgentLoop` runs ONLY in the Worker (no in-process `AgentLoop` construction in the `SessionManager` — a `rg "AgentLoop::new" src-tauri/src/agent/session.rs` returns nothing).
+- [x] A session's events reach the Tauri sink via the `SinkFrame` re-emit (the frontend contract unchanged — verbatim, no duplication — the raw `RpcEvent` stream is bookkeeping-only) AND the store frames are persisted to `messages`/`native_messages`/`sessions.context_usage_json` (the idempotent upserts — a complete transcript: system + user + assistant + tool-role rows + compaction rewrites).
+- [x] A Worker crash → the `session-stalled` event + the in-flight `send_prompt` resolves + the session is resumable (fresh Worker + re-hydrate from `native_messages`); a clean `close` → `session-closed` + `pending_turn` → `Cancelled`.
+- [x] `respond_permission`/`respond_interactive_request` resolve the Worker's pending gates (the `fake_worker` `__permission__` flow) AND the `trust-space` outcome persists `spaces.trusted`; `set_space_trusted` pushes a `Config { trusted }` to running Workers.
+- [x] The in-process native session driver is deleted (no dual-mode path); `tests/session_native.rs` rewritten and green.
 
 ---
 
@@ -666,19 +666,19 @@ The `SubagentSessionManager` (`src-tauri/src/agent/subagent.rs`) today dispatche
 4. **The test rewrites** (per the disposition): the `loop.rs` in-file subagent tests (line 4189+) — the real-dispatch tests rewritten against a `WorkerManager` with a `WorkerFactory` spawning `target/debug/fake_worker` (the manifest-dir path convention — `mcp/stdio.rs:323`); the `SubagentWait`-mechanics tests rewritten against the `MockDispatcher`. The `tests/harness_dispatch_native.rs`/`tests/harness_subagent_dispatch.rs` rewrites — the same seam. The tests to preserve (the acceptance contract): a successful dispatch resolves `Completed` with the captured final text (`SubagentCapture`); a crash resolves `Failed` with the exit code in the error; `settle_timeout` resolves the timeout outcome; the `SubagentCancel` aborts the dispatch; the model/launch resolution (the ADR 0020/0023 layering — now Supervisor-side, tested via the `WorkerManager`'s `dispatch_subagent` with canned settings/agent-definitions); the recursion guard (a subagent's `enabled_tools` minus `subagent`/`list_agents`); the `SubagentWait` select mechanics (the `MockDispatcher` — the outcome vs turn-cancel race).
 
 **Steps:**
-- [ ] Write the rewritten `subagent.rs` in-file tests + the `loop.rs` in-file subagent test rewrites + the `tests/harness_dispatch_native.rs`/`tests/harness_subagent_dispatch.rs` rewrites first (against the re-plumbed `dispatch_native` + the `fake_worker`/`MockDispatcher` seams) — confirm they FAIL (the old in-process driver is still in place).
-- [ ] Implement the re-plumb (step 1) — delete the throwaway-DB machinery as you go (the build must stay green: delete only what the re-plumb stops using); the `commands/sessions.rs` routing (step 2); the `lib.rs` call site (step 3).
-- [ ] Run `cargo test` — ALL tests pass; `rg "open_throwaway_db|TempFileGuard|CapturingSink" src-tauri/src` returns nothing (deleted); the `loop.rs` in-file `SubagentWait`-mechanics tests pass via the `MockDispatcher` (the rewritten tests).
-- [ ] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt`.
-- [ ] Commit: `feat(supervisor): subagents run in Worker processes — throwaway-DB machinery deleted, transcripts persist as ephemeral rows (ADR 0025)`
+- [x] Write the rewritten `subagent.rs` in-file tests + the `loop.rs` in-file subagent test rewrites + the `tests/harness_dispatch_native.rs`/`tests/harness_subagent_dispatch.rs` rewrites first (against the re-plumbed `dispatch_native` + the `fake_worker`/`MockDispatcher` seams) — confirm they FAIL (the old in-process driver is still in place).
+- [x] Implement the re-plumb (step 1) — delete the throwaway-DB machinery as you go (the build must stay green: delete only what the re-plumb stops using); the `commands/sessions.rs` routing (step 2); the `lib.rs` call site (step 3).
+- [x] Run `cargo test` — ALL tests pass; `rg "open_throwaway_db|TempFileGuard|CapturingSink" src-tauri/src` returns nothing (deleted); the `loop.rs` in-file `SubagentWait`-mechanics tests pass via the `MockDispatcher` (the rewritten tests).
+- [x] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt`.
+- [x] Commit: `feat(supervisor): subagents run in Worker processes — throwaway-DB machinery deleted, transcripts persist as ephemeral rows (ADR 0025)`
 
 **Acceptance criteria:**
-- [ ] `dispatch_native` (via the `WorkerManager`) spawns a subagent Worker per dispatch; no in-process child `AgentLoop` is built (a `rg "AgentLoop::new" src-tauri/src/agent/subagent.rs` returns nothing).
-- [ ] `SubagentOutcome` semantics preserved: `Completed { output }` (the `SubagentCapture`'s final text — the `SinkFrame` `agent_message_chunk` source), `Failed { error }` (crash = the exit code in the message), the `settle_timeout` outcome.
-- [ ] The throwaway-DB machinery is deleted (`open_throwaway_db`/`TempFileGuard`/`CapturingSink` gone).
-- [ ] Subagent transcripts persist as `is_subagent = 1` rows (hidden from `list_sessions`, `load_history` works, never archived) — including the child's seq-0 system-message row (the `system_prompt` envelope field, Task 3's `build_child_system_message` computation).
-- [ ] The subagent's progress still renders in the Client (the Tauri event contract unchanged — the subagent Worker's `SinkFrame`s relayed to the `TauriSink` under the subagent's session id, exactly as the current in-process child's frames did) + the `subagent-session-started`/`subagent-closed` lifecycle events (Task 3).
-- [ ] The `respond_*` commands route through the `WorkerManager` (main + subagent sessions both resolve); the `trust-space`/permission semantics for subagent Workers are unchanged.
+- [x] `dispatch_native` (via the `WorkerManager`) spawns a subagent Worker per dispatch; no in-process child `AgentLoop` is built (a `rg "AgentLoop::new" src-tauri/src/agent/subagent.rs` returns nothing).
+- [x] `SubagentOutcome` semantics preserved: `Completed { output }` (the `SubagentCapture`'s final text — the `SinkFrame` `agent_message_chunk` source), `Failed { error }` (crash = the exit code in the message), the `settle_timeout` outcome.
+- [x] The throwaway-DB machinery is deleted (`open_throwaway_db`/`TempFileGuard`/`CapturingSink` gone).
+- [x] Subagent transcripts persist as `is_subagent = 1` rows (hidden from `list_sessions`, `load_history` works, never archived) — including the child's seq-0 system-message row (the `system_prompt` envelope field, Task 3's `build_child_system_message` computation).
+- [x] The subagent's progress still renders in the Client (the Tauri event contract unchanged — the subagent Worker's `SinkFrame`s relayed to the `TauriSink` under the subagent's session id, exactly as the current in-process child's frames did) + the `subagent-session-started`/`subagent-closed` lifecycle events (Task 3).
+- [x] The `respond_*` commands route through the `WorkerManager` (main + subagent sessions both resolve); the `trust-space`/permission semantics for subagent Workers are unchanged.
 
 ---
 
@@ -704,19 +704,19 @@ The user-visible half of ADR 0025: a crashed session shows a banner (not a silen
 4. **The Supervisor panic hook** — `lib.rs` `run()`: `crashlog::install_panic_hook("supervisor")` as the first line (the Task-2 hook; the tag `"supervisor"`). The Supervisor's own crash still kills the app (it IS the app) — but now a `crash-<ts>-supervisor.log` exists, and the Workers exit cleanly on stdin EOF (Task 2's `run_worker` — the `worker_smoke` test's EOF case proves it).
 
 **Steps:**
-- [ ] Write the failing `SessionStalledBanner.test.tsx`: the banner renders when the store is stalled (assert the text + the `Resume` button); the `Resume` click calls `resume_session` (the existing test-mock pattern for Tauri commands — read a sibling test); the crash-log line renders + calls `openPath` when present; the banner is hidden when not stalled.
-- [ ] Run `pnpm test` — confirm the new test FAILS.
-- [ ] Implement the banner + the store field + the `tauri.ts` typings + the container wiring.
-- [ ] Run `pnpm test` + `pnpm build` — pass.
-- [ ] Write failing Rust tests: `debuglog` — with the debug flag on (the test's init seam), a `log` call writes a line to a temp file; the rotation renames at the size threshold; with the flag off, `log` is a no-op (no file created).
-- [ ] Run `cargo test` — pass.
-- [ ] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt` + `pnpm test` + `pnpm build`.
-- [ ] Commit: `feat(observability): stalled-session banner + crash logs + ARCHIMEDES_DEBUG protocol log (ADR 0025)`
+- [x] Write the failing `SessionStalledBanner.test.tsx`: the banner renders when the store is stalled (assert the text + the `Resume` button); the `Resume` click calls `resume_session` (the existing test-mock pattern for Tauri commands — read a sibling test); the crash-log line renders + calls `openPath` when present; the banner is hidden when not stalled.
+- [x] Run `pnpm test` — confirm the new test FAILS.
+- [x] Implement the banner + the store field + the `tauri.ts` typings + the container wiring.
+- [x] Run `pnpm test` + `pnpm build` — pass.
+- [x] Write failing Rust tests: `debuglog` — with the debug flag on (the test's init seam), a `log` call writes a line to a temp file; the rotation renames at the size threshold; with the flag off, `log` is a no-op (no file created).
+- [x] Run `cargo test` — pass.
+- [x] Run `cargo clippy --all-targets` (0 warnings) + `cargo fmt` + `pnpm test` + `pnpm build`.
+- [x] Commit: `feat(observability): stalled-session banner + crash logs + ARCHIMEDES_DEBUG protocol log (ADR 0025)`
 
 **Acceptance criteria:**
-- [ ] A crashed session shows the banner (text per the spec) with a working `Resume` (the Task-4 path) and the crash-log link when a log exists.
-- [ ] `ARCHIMEDES_DEBUG=1` → `supervisor.log` captures the lifecycle + IPC lines (truncated, rotated at 5 MB); unset → no file.
-- [ ] A Supervisor panic writes `crash-<ts>-supervisor.log`; its Workers exit cleanly on EOF.
+- [x] A crashed session shows the banner (text per the spec) with a working `Resume` (the Task-4 path) and the crash-log link when a log exists.
+- [x] `ARCHIMEDES_DEBUG=1` → `supervisor.log` captures the lifecycle + IPC lines (truncated, rotated at 5 MB); unset → no file.
+- [x] A Supervisor panic writes `crash-<ts>-supervisor.log`; its Workers exit cleanly on EOF.
 
 ---
 
@@ -744,18 +744,18 @@ The proof that the architecture works as a whole: a REAL `archimedes` binary (no
    - `pnpm build` (repo root) — green.
 
 **Steps:**
-- [ ] Write `tests/worker_e2e.rs` (the four tests above).
-- [ ] Run `cargo test -p archimedes --test worker_e2e` — confirm they FAIL (the full loop isn't wired end-to-end yet — or they pass partially if Tasks 2-6 already cover fragments; the e2e's assertions on the COMPLETE transcript + the subagent dispatch + the crash path are what's new).
-- [ ] Fix any production bugs the e2e exposes (each fix: its own failing test first, then the fix, then a commit).
-- [ ] Run the full validation sweep (all five commands) — all green.
-- [ ] Commit: `test: end-to-end Worker integration (real binary + canned provider) — ADR 0025 validation sweep green`
+- [x] Write `tests/worker_e2e.rs` (the four tests above).
+- [x] Run `cargo test -p archimedes --test worker_e2e` — confirm they FAIL (the full loop isn't wired end-to-end yet — or they pass partially if Tasks 2-6 already cover fragments; the e2e's assertions on the COMPLETE transcript + the subagent dispatch + the crash path are what's new).
+- [x] Fix any production bugs the e2e exposes (each fix: its own failing test first, then the fix, then a commit).
+- [x] Run the full validation sweep (all five commands) — all green.
+- [x] Commit: `test: end-to-end Worker integration (real binary + canned provider) — ADR 0025 validation sweep green`
 
 **Acceptance criteria:**
-- [ ] The e2e test drives a REAL `archimedes --worker` through a full turn (mock provider SSE → tool call → final answer) with the events + the COMPLETE persisted transcript asserted (system + user + assistant + tool-role rows — a resume of the session would work) + the `SinkFrame` UI contract + the clean-exit bookkeeping.
-- [ ] The permission round-trip works with the real Worker (the real `AgentLoop` permission gate, the fail-closed `StaticTrustSource`, the full gate payload verbatim).
-- [ ] The crash path degrades cleanly (`on_crash` + the crash log with a non-empty backtrace + the persisted rows intact).
-- [ ] The subagent dispatch works end-to-end with real Workers (the `SubagentDispatch` → `dispatch_subagent` → subagent Worker → `SubagentResult` flow, the `system_prompt` envelope field, the `subagent-session-started`/`subagent-closed` lifecycle events, the ephemeral `is_subagent = 1` row).
-- [ ] All five validation commands green (AGENTS.md branch-ready).
+- [x] The e2e test drives a REAL `archimedes --worker` through a full turn (mock provider SSE → tool call → final answer) with the events + the COMPLETE persisted transcript asserted (system + user + assistant + tool-role rows — a resume of the session would work) + the `SinkFrame` UI contract + the clean-exit bookkeeping.
+- [x] The permission round-trip works with the real Worker (the real `AgentLoop` permission gate, the fail-closed `StaticTrustSource`, the full gate payload verbatim).
+- [x] The crash path degrades cleanly (`on_crash` + the crash log with a non-empty backtrace + the persisted rows intact).
+- [x] The subagent dispatch works end-to-end with real Workers (the `SubagentDispatch` → `dispatch_subagent` → subagent Worker → `SubagentResult` flow, the `system_prompt` envelope field, the `subagent-session-started`/`subagent-closed` lifecycle events, the ephemeral `is_subagent = 1` row).
+- [x] All five validation commands green (AGENTS.md branch-ready).
 
 ---
 

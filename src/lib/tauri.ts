@@ -189,6 +189,25 @@ export interface SessionClosedPayload {
   reason: CloseReasonStr;
 }
 
+/**
+ * The `session-stalled` event payload (a Worker crash, ADR 0025 Task 4 —
+ * the `StalledInfo` shape + the session id, camelCase over the wire). The
+ * frontend's banner reads it; the `getStalledInfo` command is the PULL
+ * form (the same `StalledInfo`, no `sessionId` — the command's parameter).
+ */
+export interface StalledInfo {
+  /** Unix milliseconds (the crash time). */
+  at: number;
+  /** The newest `crash-<ts>-worker*.log` path (FROZEN at crash time — best-effort attribution); `null` when none is found. */
+  crashLog: string | null;
+}
+
+export interface StalledPayload {
+  sessionId: string;
+  at: number;
+  crashLog: string | null;
+}
+
 export interface PermissionRequestPayload {
   sessionId: string;
   requestId: string;
@@ -613,6 +632,25 @@ export function listenSessionClosed(
   callback: (payload: SessionClosedPayload) => void,
 ): Promise<UnlistenFn> {
   return listen<SessionClosedPayload>("session-closed", (event) =>
+    callback(event.payload),
+  );
+}
+
+/**
+ * A session's stalled state (the `get_stalled_info` command — the PULL
+ * form of the `session-stalled` push; `null` when the session is not
+ * stalled / unknown).
+ */
+export async function getStalledInfo(
+  sessionId: string,
+): Promise<StalledInfo | null> {
+  return invoke<StalledInfo | null>("get_stalled_info", { sessionId });
+}
+
+export function listenSessionStalled(
+  callback: (payload: StalledPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<StalledPayload>("session-stalled", (event) =>
     callback(event.payload),
   );
 }

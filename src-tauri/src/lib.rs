@@ -11,18 +11,53 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
-use crate::agent::{EventSink, SessionManager, SubagentSessionManager};
+use crate::agent::worker::client::WorkerHandle;
+use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
+use crate::agent::{crashlog, debuglog, EventSink, SessionManager, SubagentSessionManager};
 use crate::storage::Db;
 
-/// The shared app setup: the session manager (settings-driven native
-/// sessions) + the persistence database in `app_data_dir/archimedes.db`.
+/// The production `WorkerFactory` (the `current_exe()` Worker — the
+/// `--worker` mode of this same binary; the `WorkerHandle`'s spawn
+/// passes the flag). Tests inject the `fake_worker` fixture instead
+/// (the `setup_dirs_with_factory` seam).
+struct ProductionWorkerFactory;
+
+impl WorkerFactory for ProductionWorkerFactory {
+    fn spawn(&self) -> Result<WorkerHandle, crate::agent::worker::client::WorkerError> {
+        let exe = std::env::current_exe().expect("the current exe (the Worker binary)");
+        WorkerHandle::spawn(exe.as_path())
+    }
+}
+
+/// The shared app setup (the `test_support` seam): the session manager
+/// (settings-driven native sessions), the persistence database in
+/// `app_data_dir/archimedes.db`, and the `WorkerManager` (ADR 0025 — the
+/// session's `AgentLoop` runs in the Worker; the `SessionManager` is the
+/// Supervisor-side coordinator).
 ///
 /// Factored out of [`run`] so the real command surface can be exercised in
-/// tests without a GUI (see `tests/ipc.rs`).
+/// tests without a GUI (see `tests/ipc.rs`). The `WorkerFactory` is the
+/// PRODUCTION one (`current_exe()`); the test variant is
+/// [`setup_dirs_with_factory`] (the injectable factory — the `test_support`
+/// pattern).
 pub fn setup_dirs<R: tauri::Runtime>(
     app: &tauri::App<R>,
     config_dir: PathBuf,
     app_data_dir: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    setup_dirs_with_factory(app, config_dir, app_data_dir, None)
+}
+
+/// The `setup_dirs` seam (the `test_support` pattern — the injectable
+/// `WorkerFactory`): `None` = the production factory (`current_exe()`);
+/// `Some(factory)` = the test factory (the `fake_worker` fixture — the
+/// `tests/ipc.rs` headless command-surface test). Everything else is
+/// IDENTICAL to [`setup_dirs`].
+pub fn setup_dirs_with_factory<R: tauri::Runtime>(
+    app: &tauri::App<R>,
+    config_dir: PathBuf,
+    app_data_dir: PathBuf,
+    worker_factory: Option<Arc<dyn WorkerFactory>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The session manager is settings-driven (the config dir is the
     // `settings.json` home — the desktop is native-only: there is no agent
@@ -34,18 +69,15 @@ pub fn setup_dirs<R: tauri::Runtime>(
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     );
     manager.attach_db(db.clone());
-    // The subagent manager (its own `SessionDriver`, built in `new()` —
-    // one idle thread, negligible). Injected into the main manager (the
-    // main session's `task` tool dispatches through it); the injection
-    // order breaks the apparent cycle: the subagent manager needs nothing
-    // from the main manager; only the main manager's `SessionDriver`
-    // `subagent` field points at it.
-    let subagent_manager = Arc::new(
-        // The trust db is threaded (ADR 0010 — subagent Sessions inherit
-        // Space trust; the subagent's driver `db` stays `None` — ephemeral).
-        SubagentSessionManager::new(Some(db.clone())),
-    );
-    manager.set_subagent_manager(subagent_manager.clone());
+    // The subagent manager (the ADR 0025 Task 5 re-plumb — the
+    // in-process subagent machinery is GONE: the dispatch runs in a
+    // WORKER via the `WorkerManager`'s `dispatch_subagent` flow — the
+    // `WorkerManager` is forwarded by `attach_worker_manager` (the
+    // `set_worker_manager` + the child-cwd registrar); the manager is NO
+    // LONGER managed Tauri state (the `respond_*` commands route through
+    // the `SessionManager`'s `WorkerManager` `handle_for` — a subagent
+    // session's handle is in the `drives` map)).
+    manager.set_subagent_manager(Arc::new(SubagentSessionManager::new()));
     // The event sink (TauriSink) is managed state so commands — and the
     // headless IPC test — can obtain it without an `AppHandle` parameter.
     //
@@ -57,21 +89,71 @@ pub fn setup_dirs<R: tauri::Runtime>(
     // (`Arc::<dyn EventSink>::new` doesn't compile because `dyn EventSink`
     // is unsized, so the coercion is spelled as an annotated binding.)
     let sink: Arc<dyn EventSink> = Arc::new(commands::sessions::TauriSink(app.handle().clone()));
-    app.manage(sink);
+    app.manage(sink.clone());
+    // The router's `SinkFrame` re-emit target (the `setup_dirs` late-wire
+    // — set BEFORE the `WorkerManager`'s callbacks can fire).
+    manager.set_sink(sink.clone());
+    // The `WorkerManager` (ADR 0025 — the session's `AgentLoop` runs in
+    // the Worker): the LATE-WIRE (the `SessionManager` ↔ `WorkerManager`
+    // construction cycle — the `WorkerManager`'s `on_event` / `on_crash`
+    // callbacks need the `SessionManager`'s router / crash handler, and
+    // the `SessionManager` needs the `WorkerManager` to send prompts):
+    // the callbacks capture the `Arc<SessionManager>` (the `attach_*`
+    // methods are `&self` — the `OnceLock` `set` needs no exclusive
+    // access), then `attach_worker_manager` hands the `WorkerManager`
+    // to the `SessionManager` after both are built.
+    let manager = Arc::new(manager);
+    let wm = {
+        let m = manager.clone();
+        let m2 = manager.clone();
+        let sink_for = sink.clone();
+        Arc::new(WorkerManager::new(
+            worker_factory.unwrap_or_else(|| Arc::new(ProductionWorkerFactory)),
+            Arc::new(move |session_id, code| m.handle_crash(&session_id, code)),
+            Arc::new(move |session_id, is_subagent, evt| {
+                m2.route_event(&session_id, is_subagent, evt)
+            }),
+            // The parent-scope sink lookup (the subagent UI lifecycle
+            // events — the single shared `TauriSink`).
+            Arc::new(move |_| Some(sink_for.clone())),
+        ))
+    };
+    manager.attach_worker_manager(wm.clone());
+    // The `WorkerManager` is managed state (the `set_space_trusted`
+    // command's running-Workers `Config` push + the `test_support`
+    // registry accessor).
+    app.manage(wm);
     // The manager is `Sync` (its mutable state is `Arc<Mutex<…>>`
     // internally), so it is shared directly without an outer lock.
-    app.manage(Arc::new(manager));
-    // The subagent manager is `Send + Sync` (same reasoning — its mutable
-    // state is `Arc<Mutex<…>>` internally), so it is managed directly too
-    // (the `respond_*` commands resolve it as state).
-    app.manage(subagent_manager);
+    app.manage(manager);
     app.manage(db);
     Ok(())
 }
 
+/// The Worker mode (ADR 0025): a fresh tokio runtime + the stdio JSONL
+/// worker (`agent::worker::run_worker_inner`). Checked BEFORE Tauri
+/// init in `main` — the Tauri runtime never starts in a Worker.
+pub fn run_worker() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the worker tokio runtime");
+    runtime.block_on(agent::worker::run_worker_inner());
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // The Supervisor's crash hook (ADR 0025 Task 6 — the Task-2 shared
+    // hook, tag `"supervisor"`): a Supervisor panic STILL kills the app
+    // (it IS the app — the `release` profile's `panic = "unwind"` only
+    // protects the WORKERS), but a `crash-<ts>-supervisor.log` now
+    // exists; the live Workers exit cleanly on the stdin EOF (the
+    // `worker_smoke` test's EOF case). The `ARCHIMEDES_DEBUG` init
+    // reads the var ONCE (the cached check — `log` is a free no-op when
+    // unset).
+    crashlog::install_panic_hook("supervisor");
+    debuglog::init_from_env();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -85,6 +167,7 @@ pub fn run() {
             commands::sessions::resume_session,
             commands::sessions::set_session_config_option,
             commands::sessions::cancel_session,
+            commands::sessions::get_stalled_info,
             commands::history::list_sessions,
             commands::history::load_history,
             commands::history::delete_session,
@@ -129,6 +212,27 @@ pub fn run() {
             setup_dirs(app, config_dir, app_data_dir)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // The `run` callback form (ADR 0025 — the `RunEvent` hook): on
+    // `Exit` (the event loop is exiting — the Tauri 2 name for the
+    // `Exited` event; the app is about to terminate), reap the live
+    // Workers (the graceful `close` + grace + `kill` — the Workers'
+    // stdin EOF → clean exit 0). The `reap_all` is async (the `close`
+    // + grace + `kill` select) — the `Exit` callback is NOT in a tokio
+    // context (the event loop is Tauri's own), so a fresh
+    // current-thread runtime drives it (a short-lived, bounded block —
+    // the process is exiting anyway).
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(wm) = handle.try_state::<Arc<WorkerManager>>() {
+                let wm = wm.inner().clone();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the exit reap runtime");
+                rt.block_on(wm.reap_all());
+            }
+        }
+    });
 }

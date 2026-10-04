@@ -537,6 +537,17 @@ interface SessionsState {
   inTurn: Record<string, boolean>;
   /** Last stop reason reported for a session's turn. */
   stopReasons: Record<string, StopReason>;
+  /**
+   * The stalled state per session id (a Worker crash — the
+   * `session-stalled` event, ADR 0025 Task 6): `null`/absent when the
+   * session is healthy. Set by `markStalled`; cleared by a successful
+   * `resumeSession` (the Supervisor re-spawned the Worker) and by
+   * `handleSessionClosed` (a closed session cannot be stalled — the
+   * banner would otherwise linger on the paused transcript).
+   */
+  stalled: Record<string, { at: number; crashLog: string | null } | undefined>;
+  /** Mark a session stalled (the `session-stalled` event — the `StalledInfo` shape: `at` + `crashLog`). */
+  markStalled: (sessionId: string, at: number, crashLog: string | null) => void;
 
   addSession: (info: SessionInfo) => void;
   setActiveSession: (sessionId: string | null) => void;
@@ -631,6 +642,12 @@ export const useSessions = create<SessionsState>((set, get) => ({
   contextUsage: {},
   inTurn: {},
   stopReasons: {},
+  stalled: {},
+
+  markStalled: (sessionId, at, crashLog) =>
+    set((state) => ({
+      stalled: { ...state.stalled, [sessionId]: { at, crashLog } },
+    })),
 
   addSession: (info) =>
     set((state) => ({
@@ -981,6 +998,10 @@ export const useSessions = create<SessionsState>((set, get) => ({
         (s) => s.sessionId !== sessionId,
       ),
       activeSessionId: st.activeSessionId ?? sessionId,
+      // A successful resume clears the stalled state (the Supervisor
+      // re-spawned the Worker — the banner hides; the `session-stalled`
+      // bookkeeping is backend-side, this is the frontend's view).
+      stalled: { ...st.stalled, [sessionId]: undefined },
       configOptions: info.configOptions
         ? { ...st.configOptions, [sessionId]: info.configOptions }
         : st.configOptions,
@@ -1210,6 +1231,9 @@ export const useSessions = create<SessionsState>((set, get) => ({
           [sessionId]: finalizeSessionMessages(state.messages[sessionId] ?? []),
         },
         inTurn: { ...state.inTurn, [sessionId]: false },
+        // A closed session cannot be stalled (the banner would linger on
+        // the paused transcript — a close supersedes the crash).
+        stalled: { ...state.stalled, [sessionId]: undefined },
       };
     });
   },

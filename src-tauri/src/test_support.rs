@@ -15,6 +15,32 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     std::sync::Mutex::lock(&ENV_LOCK).unwrap_or_else(|p| p.into_inner())
 }
 
+/// The app's managed `WorkerManager` (the registry view — the accessor
+/// for the headless IPC test: a `start_session` spawns a Worker (assert
+/// via `test_is_attached` / `test_session_count`); a `detach` / `reap_all`
+/// removes it). `None` when the app did not manage one (the `setup_dirs`
+/// seam did not run).
+pub fn worker_manager<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+) -> Option<std::sync::Arc<crate::agent::worker::manager::WorkerManager>> {
+    use tauri::Manager;
+    handle
+        .try_state::<std::sync::Arc<crate::agent::worker::manager::WorkerManager>>()
+        .map(|s| s.inner().clone())
+}
+
+/// The app's managed `Db` (the accessor for the headless IPC test — the
+/// `TranscriptPersister`'s rows are asserted through it). `None` when the
+/// app did not manage one.
+pub fn db<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+) -> Option<std::sync::Arc<crate::storage::Db>> {
+    use tauri::Manager;
+    handle
+        .try_state::<std::sync::Arc<crate::storage::Db>>()
+        .map(|s| s.inner().clone())
+}
+
 /// Serve a fixed `GET` response for as many requests as arrive (until
 /// the `JoinHandle` is aborted); `counter` (when `Some`) is incremented
 /// per request (the cache tests count fetches). `status` + `body` mirror

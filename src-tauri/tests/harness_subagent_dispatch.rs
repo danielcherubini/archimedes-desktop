@@ -1,18 +1,20 @@
-//! End-to-end test for the NATIVE `subagent` tool (the native-native
-//! subagent): a NATIVE parent session (a mock `Provider` + the in-process
-//! `AgentLoop`) issues a `subagent` tool call → `dispatch_subagent` → the
-//! `SubagentSessionManager::dispatch_native` spawns an IN-PROCESS native
-//! child `AgentLoop` (NO external `pi` process, NO `WorkerRuntime`) → the
-//! child answers the task → the `ToolResult` carries the child's output
-//! into the parent's transcript.
+//! End-to-end test for the NATIVE `subagent` tool (the ADR 0025 Task 5
+//! re-plumb): a NATIVE parent session (a mock `Provider` + the in-process
+//! `AgentLoop`) issues a `subagent` tool call → `dispatch_subagent` →
+//! `SubagentSessionManager::dispatch_native` DELEGATES to the
+//! `WorkerManager`'s `dispatch_subagent` flow → a `fake_worker` child
+//! process runs the turn → the `ToolResult` carries the child's captured
+//! final text into the parent's transcript.
 //!
 //! This proves the native `subagent` tool EXECUTES end-to-end (not just
-//! displays): the parent's `subagent` call spawns an in-process native
-//! child, runs a turn, and captures the result — the whole flow through
-//! the in-process harness.
+//! displays): the parent's `subagent` call spawns a WORKER child, runs a
+//! turn, and captures the result — the whole flow through the
+//! `WorkerManager` (NO in-process driver — the throwaway-DB machinery is
+//! deleted).
 
 mod common;
-use common::{MockProvider, MockResponse, RecSink};
+use common::mock_provider::{MockProvider, MockResponse};
+use common::RecSink;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,24 +22,24 @@ use std::time::Duration;
 
 use archimedes_lib::agent::events::RpcEvent;
 use archimedes_lib::agent::harness::{
-    FinishReason, Model, ModelCatalog, ModelRequest, Prompt, Provider, ProviderError,
-    ProviderEvent, RetryPolicy, SessionStore, SudoDeps, ToolCall,
+    FinishReason, Model, ModelCatalog, Prompt, ProviderEvent, RetryPolicy, SessionStore, SudoDeps,
+    ToolCall,
 };
 use archimedes_lib::agent::interactive::PendingInteractive;
-use archimedes_lib::agent::subagent::{NativeDeps, SubagentSessionManager};
-use archimedes_lib::agent::{
-    EffectiveCatalog, EventSink, PendingPermissions, ProviderFactory, TodoStore,
-};
+use archimedes_lib::agent::subagent::SubagentSessionManager;
+use archimedes_lib::agent::worker::client::{WorkerError, WorkerHandle};
+use archimedes_lib::agent::worker::manager::{WorkerFactory, WorkerManager};
+use archimedes_lib::agent::worker::protocol::{StartEnv, StartMode};
+use archimedes_lib::agent::{EventSink, PendingPermissions, TodoStore};
 use archimedes_lib::storage::Db;
-use async_trait::async_trait;
-use futures_util::stream::BoxStream;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// The parent's `Model` (the `build_harness` model — the `dispatch_native`
-/// driver resolves the CHILD's model from the catalog by this key, so the
-/// catalog must contain it).
+/// delegation's `WorkerManager` flow resolves the CHILD's model from the
+/// parent's `StartEnv` catalog by this key, so the catalog must contain
+/// it).
 fn parent_model() -> Model {
     Model {
         id: "fake-model".to_string(),
@@ -54,56 +56,77 @@ fn parent_model() -> Model {
     }
 }
 
-/// A `Provider` wrapper (the factory closure returns a CONCRETE type —
-/// `Box<dyn Provider>` itself does not implement `Provider`).
-struct BoxedProvider(Arc<dyn Provider>);
+/// The `fake_worker` fixture factory (the `WorkerFactory` seam — the
+/// `CARGO_MANIFEST_DIR`/`target/debug` convention; `cargo test` builds
+/// the bin targets).
+struct FakeWorkerFactory;
 
-#[async_trait]
-impl Provider for BoxedProvider {
-    async fn complete(
-        &self,
-        req: &ModelRequest,
-    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        self.0.complete(req).await
+impl WorkerFactory for FakeWorkerFactory {
+    fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
+        WorkerHandle::spawn(&std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_worker"
+        )))
     }
 }
 
-/// Build a `SubagentSessionManager` wired with `NativeDeps` (a mock
-/// `provider_factory` — the child is an IN-PROCESS `AgentLoop`, NOT a
-/// `fake_pi` process + a short settle bound).
-fn make_manager(
-    config_dir: &std::path::Path,
+/// Build a `SubagentSessionManager` on a `WorkerManager` (the ADR 0025
+/// Task 5 re-plumb — the native dispatch runs in a `fake_worker`
+/// process): the parent `ns1` is `attach`ed with the given `catalog`
+/// (the `dispatch_subagent` flow resolves the child's `model` against
+/// it) + a short settle bound. The `sink_for` lookup returns the given
+/// sink for the parent (the `subagent-session-started` /
+/// `subagent-closed` UI lifecycle events are delivered on the PARENT's
+/// sink).
+async fn make_manager(
     catalog: ModelCatalog,
-    provider: Arc<dyn Provider>,
     settle_timeout: Duration,
+    sink: Arc<dyn EventSink>,
 ) -> Arc<SubagentSessionManager> {
-    let manager = Arc::new(SubagentSessionManager::new(None));
-    let factory: ProviderFactory =
-        Arc::new(move |_m: &Model| Box::new(BoxedProvider(provider.clone())));
-    manager.set_native_deps(NativeDeps {
-        provider_factory: factory,
-        catalog: EffectiveCatalog {
-            config_dir: config_dir.to_path_buf(),
-            cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            base: catalog,
-        },
-        todo_store: Arc::new(TodoStore::new()),
-        sudo: SudoDeps::default(),
-        settle_timeout,
-        trust_db: None,
-        config_dir: None,
-    });
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FakeWorkerFactory);
+    let wm = WorkerManager::new(
+        factory,
+        Arc::new(|_id: String, _code: Option<i32>| {}),
+        Arc::new(
+            |_id: String,
+             _is_subagent: bool,
+             _evt: archimedes_lib::agent::worker::client::WorkerInboundEvent| {},
+        ),
+        Arc::new(move |id: &str| (id == "ns1").then(|| sink.clone())),
+    )
+    .with_settle_timeout(settle_timeout);
+    let wm = Arc::new(wm);
+    let env = StartEnv::from_parts(
+        "ns1".to_string(),
+        "/tmp".to_string(),
+        StartMode::Fresh,
+        None,
+        catalog.models[0].clone(),
+        catalog,
+        None,
+        true,
+        None,
+        "/tmp".to_string(),
+        true,
+        None,
+    );
+    wm.attach("ns1", &env)
+        .await
+        .expect("the parent attach completes");
+    let manager = Arc::new(SubagentSessionManager::new());
+    manager.set_worker_manager(wm);
     manager
 }
 
-/// Build the native loop (a mock `Provider` + a temp `Db` + an OPTIONAL real
-/// `SubagentSessionManager` — the `subagent` tool spawns a real sub-session).
+/// Build the native loop (a mock `Provider` + a temp `Db` + an OPTIONAL
+/// `SubagentSessionManager` — the `subagent` tool dispatches through the
+/// `WorkerManager`'s `dispatch_subagent` flow).
 async fn build_harness(
     provider: MockProvider,
-    subagent_manager: Option<Arc<archimedes_lib::agent::SubagentSessionManager>>,
+    subagent_manager: Option<Arc<SubagentSessionManager>>,
 ) -> (
-    mpsc::Sender<archimedes_lib::agent::harness::Prompt>,
-    mpsc::Receiver<RpcEvent>,
+    mpsc::Sender<Prompt>,
+    mpsc::UnboundedReceiver<RpcEvent>,
     mpsc::UnboundedReceiver<(String, Value)>,
     SessionStore,
 ) {
@@ -117,12 +140,13 @@ async fn build_harness(
         config_options: None,
         archived: false,
         context_usage: None,
+        is_subagent: false,
     })
     .unwrap();
     let store = SessionStore::new(db.clone());
     let (sink_tx, sink_rx) = mpsc::unbounded_channel();
     let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-    let (events_tx, events_rx) = mpsc::channel(256);
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
     let pending: PendingPermissions = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let pending_bridge: PendingInteractive = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -137,7 +161,7 @@ async fn build_harness(
         model,
         Box::new(provider),
         Default::default(),
-        store.clone(),
+        Arc::new(store.clone()),
         events_tx,
         cancel,
         turn_cancel,
@@ -149,7 +173,11 @@ async fn build_harness(
         None,
         sink,
         Arc::new(TodoStore::new()),
-        subagent_manager,
+        subagent_manager.as_ref().map(|m| {
+            Arc::new(archimedes_lib::agent::harness::InProcessDispatcher::new(
+                m.clone(),
+            )) as Arc<dyn archimedes_lib::agent::harness::SubagentDispatcher>
+        }),
         SudoDeps::default(),
         RetryPolicy::default(),
         None, // config_dir (no desktop MCP layer in the test)
@@ -163,7 +191,7 @@ async fn build_harness(
 
 /// Wait up to `timeout` for a predicate over the collected `RpcEvent`s.
 async fn wait_for(
-    events: &mut mpsc::Receiver<RpcEvent>,
+    events: &mut mpsc::UnboundedReceiver<RpcEvent>,
     timeout: Duration,
     mut pred: impl FnMut(&[RpcEvent]) -> bool,
 ) -> Result<Vec<RpcEvent>, ()> {
@@ -206,45 +234,26 @@ fn extract_result_text(result: &Value) -> String {
 }
 
 /// (1) **end-to-end**: the native parent issues a `subagent` tool call →
-/// `dispatch_subagent` → `dispatch_native` spawns an IN-PROCESS native
-/// child `AgentLoop` (the manager is wired via `set_native_deps` with a
-/// mock `provider_factory` — NOT a `fake_pi` process; the `pi` registry
-/// entry's `command` points at a nonexistent path, so the pre-fix
-/// `dispatch` (which looks up `pi`) would fail to spawn: deterministic red,
-/// no real `pi` process) → the child answers the task (the mock provider's
-/// turn) → the `ToolResult` carries the MOCK CHILD's output into the
-/// parent's transcript (a `toolResult` message + the
-/// `subagent-session-started` / `subagent-closed` sink events — NOT a
-/// `fake_pi` "Hello", NOT an error).
+/// `dispatch_subagent` → `dispatch_native` DELEGATES to the
+/// `WorkerManager`'s `dispatch_subagent` flow → a `fake_worker` child
+/// process runs the turn (the `SubagentCapture` captures the child's
+/// final text) → the `ToolResult` carries the child's captured output
+/// into the parent's transcript (a `toolResult` message + the
+/// `subagent-session-started` / `subagent-closed` sink events).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the_result() {
-    // The config dir (the `settings.json` home — the effective catalog
-    // reads the `providers` entries from here; empty = the base catalog).
-    let config_dir =
-        std::env::temp_dir().join(format!("harness-subagent-cfg-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&config_dir).unwrap();
-
-    // The subagent manager (wired with `NativeDeps` — a mock
-    // `provider_factory`; the child is an IN-PROCESS `AgentLoop`). The
-    // catalog contains the parent's model (`fake/fake-model` — the
-    // `dispatch_native` driver resolves the child's model by that key).
-    let parent_model = parent_model();
+async fn native_subagent_tool_spawns_a_worker_child_and_captures_the_result() {
+    // The subagent manager (a `WorkerManager` with a `fake_worker`
+    // factory; the parent `ns1` is `attach`ed with a catalog containing
+    // the parent's model — the flow resolves the child's `model` by that
+    // key). The `sink_for` lookup delivers the lifecycle events on the
+    // test's `RecSink`.
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
     let catalog = ModelCatalog {
-        models: vec![parent_model.clone()],
+        models: vec![parent_model()],
         ..Default::default()
     };
-    // The MOCK CHILD's provider: one turn answering the task.
-    let child_provider: Arc<dyn Provider> =
-        Arc::new(MockProvider::new(vec![MockResponse::Stream(vec![
-            ProviderEvent::TextDelta("child output".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ])]));
-    let subagent_manager = make_manager(
-        &config_dir,
-        catalog,
-        child_provider,
-        Duration::from_secs(15),
-    );
+    let subagent_manager = make_manager(catalog, Duration::from_secs(30), sink.clone()).await;
 
     // The mock provider (the parent): a `subagent` tool call, then a final
     // message.
@@ -263,7 +272,7 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         ]),
     ]);
 
-    let (prompt_tx, mut events, mut sink, _store) =
+    let (prompt_tx, mut events, _sink, _store) =
         build_harness(provider, Some(subagent_manager)).await;
 
     let _ = prompt_tx
@@ -273,11 +282,11 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         })
         .await;
 
-    // The `subagent` tool EXECUTED (a `tool_execution_end` with the mock
-    // child's output — NOT a `fake_pi` "Hello", NOT an error: the child is
-    // the in-process mock `Provider`, so the spawn of a nonexistent binary
-    // can never have produced this result).
-    let evs = wait_for(&mut events, Duration::from_secs(20), |evs| {
+    // The `subagent` tool EXECUTED (a `tool_execution_end` with the
+    // child's captured final text — the `fake_worker`'s canned
+    // `"canned answer"`: the `SubagentCapture` over the child's
+    // `SinkFrame` `agent_message_chunk` stream).
+    let evs = wait_for(&mut events, Duration::from_secs(30), |evs| {
         evs.iter().any(|ev| {
             matches!(
                 ev,
@@ -291,9 +300,9 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
     .await
     .expect("the subagent tool should complete");
 
-    // The tool result carried the MOCK CHILD's output (the in-process
-    // `AgentLoop`'s turn — NOT a `fake_pi` "Hello": no external process
-    // was spawned).
+    // The tool result carried the WORKER CHILD's captured final text
+    // (the `fake_worker`'s canned `"canned answer"` — NOT an error, NOT
+    // a spawn failure).
     let tool_result = evs
         .iter()
         .find_map(|ev| match ev {
@@ -302,18 +311,14 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         })
         .expect("the tool_execution_end carries the result");
     assert!(
-        tool_result.contains("child output"),
-        "the mock child's output must be captured — got: {tool_result:?}"
-    );
-    assert!(
-        !tool_result.contains("Hello"),
-        "the child is in-process (the mock provider) — NOT a `fake_pi` process — got: {tool_result:?}"
+        tool_result.contains("canned answer"),
+        "the worker child's captured final text must be captured — got: {tool_result:?}"
     );
 
-    // The subagent session lifecycle fired (an in-process child spawned +
-    // closed).
+    // The subagent session lifecycle fired (a worker child spawned +
+    // closed — on the PARENT's sink).
     let mut sink_events: Vec<(String, Value)> = Vec::new();
-    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    let deadline = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(deadline);
     loop {
         let has_lifecycle = sink_events
@@ -324,7 +329,7 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
             break;
         }
         tokio::select! {
-            maybe = sink.recv() => match maybe {
+            maybe = sink_rx.recv() => match maybe {
                 Some(ev) => sink_events.push(ev),
                 None => break,
             },
@@ -335,10 +340,10 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         sink_events
             .iter()
             .any(|(e, _)| e == "subagent-session-started"),
-        "a subagent-session-started event must fire (an in-process child spawned)"
+        "a subagent-session-started event must fire (a worker child spawned)"
     );
     // The `subagent-session-started` event carries a real `sessionId` (a
-    // spawned child — not a spurious event).
+    // spawned child — not a spurious event) + the parent's id.
     let started = sink_events
         .iter()
         .find(|(e, _)| e == "subagent-session-started")
@@ -346,19 +351,22 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         .expect("the started event is present");
     let session_id = started
         .get("sessionId")
-        .or_else(|| started.get("session_id"))
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
         !session_id.is_empty(),
         "the subagent-session-started event must carry a real sessionId — got: {started:?}"
     );
+    assert_eq!(
+        started["parentSessionId"], "ns1",
+        "the started event carries the parent's id — got: {started:?}"
+    );
     assert!(
         sink_events.iter().any(|(e, _)| e == "subagent-closed"),
         "a subagent-closed event must fire (the child reaped)"
     );
-    // The `subagent-closed` event reports a COMPLETED child (the mock
-    // child's turn answered the task — not a spawn failure).
+    // The `subagent-closed` event reports a COMPLETED child (the
+    // `fake_worker`'s turn settled — not a spawn failure).
     let closed = sink_events
         .iter()
         .find(|(e, _)| e == "subagent-closed")
@@ -369,14 +377,14 @@ async fn native_subagent_tool_spawns_an_in_process_native_child_and_captures_the
         "the child completed the task — got: {closed:?}"
     );
     assert_eq!(
-        closed["metrics"]["output"], "child output",
-        "the closed event's metrics carry the mock child's output — got: {closed:?}"
+        closed["metrics"]["output"], "canned answer",
+        "the closed event's metrics carry the child's captured final text — got: {closed:?}"
     );
 }
 
-/// (2) **no manager**: when the `SubagentSessionManager` is absent (`None`),
-/// the `subagent` tool returns an error result (the dispatch is not
-/// available) — the tool does NOT panic or hang.
+/// (2) **no manager**: when the `SubagentSessionManager` is absent
+/// (`None`), the `subagent` tool returns an error result (the dispatch is
+/// not available) — the tool does NOT panic or hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_subagent_tool_without_a_manager_returns_an_error_result() {
     let provider = MockProvider::new(vec![

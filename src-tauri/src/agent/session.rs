@@ -1,60 +1,56 @@
-//! The native session layer: the in-process `AgentLoop` session core
-//! (ADR 0011) — drive the session lifecycle, the interactive channel, the
-//! subagent manager.
+//! The native session layer: the Supervisor-side session coordinator
+//! (ADR 0025) — a session's `AgentLoop` runs in its Worker process (a
+//! self-exec `archimedes --worker` child); the `SessionManager` is the
+//! Supervisor-side coordinator (spawn/reap via the `WorkerManager`, event
+//! routing, persistence via the `TranscriptPersister`, the `respond_*`
+//! relays, the stalled state). The in-process native driver is DELETED
+//! (no dual-mode fallback — ADR 0025).
 //!
-//! The heart of the design is the **driver-task mechanism**. The
-//! `AgentLoop` is long-lived (it lives for the session), so we never await
-//! it inline in [`SessionManager::start_session`] /
-//! [`Self::resume_session`]. Instead we spawn a *driver task* that owns a
-//! handle to the loop for the whole session: it blocks until the session
-//! closes, watching the loop's settle (the `agent_settled` watch — the
-//! RELIABLE settle signal) and tearing the session down on close.
-//! `close_session` (or a subagent cancel) flips a `watch` flag that makes
-//! the driver task return; the driver teardown cancels the loop's tokens
-//! and drains the session's pending requests.
+//! The `WorkerManager`'s `on_event` callback (wired in `lib.rs`) routes
+//! each Worker frame: the store frames → the `TranscriptPersister`
+//! (persistence only); the `SinkFrame`s → the `TauriSink` VERBATIM (the
+//! UI contract — re-emitted with the same event name + payload); the raw
+//! `RpcEvent` stream → internal bookkeeping only (the `agent_settled`
+//! settle detection + the `pending_turn` resolution — NEVER the UI, to
+//! avoid double-delivering the `session-update` frames); the
+//! `PermissionRequest` / `InteractiveRequest` frames → re-emitted on the
+//! `TauriSink` with the payload UNCHANGED (the frontend contract preserved
+//! by construction).
 //!
-//! The same driver is used for a new session and a resume (a fresh
-//! `AgentLoop` + `SessionStore::load_messages` — resume from the
-//! `native_messages` table; the stored row's `model` / `thinkingLevel`
-//! override the resolution chains).
+//! Multiple live sessions COEXIST: `start_session` / `resume_session` do
+//! NOT close other live sessions; a session is torn down only by an
+//! explicit `close_session` (a `detach` + the Worker's clean exit) or a
+//! crash (the `on_crash` callback marks the session STALLED — resumable).
 //!
-//! Multiple live sessions COEXIST (the one-live cap is lifted):
-//! `start_session` / `resume_session` do NOT close other live sessions; a
-//! session is torn down only by an explicit `close_session` or a subagent
-//! cancel.
-//!
-//! **The `session-update` contract is FROZEN** (ADR 0011): [`normalize`]
-//! maps the harness's `RpcEvent`s onto the exact JSON envelopes the
-//! frontend consumes (`agent_message_chunk` / `agent_thought_chunk` /
-//! `tool_call` / `tool_call_update` / `session_info_update` /
-//! `config_option_update`), so the frontend needs no changes.
+//! **The `session-update` contract is FROZEN** (ADR 0011): the `SinkFrame`
+//! re-emit delivers the exact JSON envelopes the frontend consumes
+//! (`agent_message_chunk` / `agent_thought_chunk` / `tool_call` /
+//! `tool_call_update` / `session_info_update` / `config_option_update`), so
+//! the frontend needs no changes.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::oneshot;
 
 use crate::agent::errors::SessionError;
 use crate::agent::events::RpcEvent;
+use crate::agent::harness::store::DisplayRow;
 use crate::agent::harness::{
-    build_main_prompt, build_provider, discover_models, merge_catalog, AgentLoop, ControlCmd,
-    Model, ModelCatalog, Prompt, PromptContext, Provider, ProviderDiscovery, RetryPolicy,
-    SessionStore, SudoDeps, DEFAULT_CONTEXT_WINDOW,
+    build_provider, discover_models, merge_catalog, Model, ModelCatalog, Provider,
+    ProviderDiscovery, SessionStore, DEFAULT_CONTEXT_WINDOW,
 };
-use crate::agent::interactive::{
-    self, CachedPassword, PendingInteractive, PendingSudo, SudoRunner,
-};
-use crate::agent::permission::{self, PendingPermissions};
-use crate::agent::todo::TodoStore;
+use crate::agent::permission::{self};
+use crate::agent::persist::TranscriptPersister;
 use crate::agent::tools::ImageRef;
+use crate::agent::worker::client::WorkerInboundEvent;
+use crate::agent::worker::manager::WorkerManager;
+use crate::agent::worker::protocol::{StartEnv, StartMode};
 use crate::commands::settings::{load_settings, write_settings};
 use crate::storage::Db;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 /// Sink for outbound events (session updates, session-closed, …).
 ///
@@ -90,9 +86,9 @@ impl ClosedReason {
 /// How a live session was (or was about to be) closed. `None` at
 /// teardown time means the agent process exited on its own.
 ///
-/// `pub(crate)`: the `ExternalClose` handle (the subagent cancel path) and
-/// `SubagentCancel` (subagent.rs) carry a `CloseKind` across the module
-/// boundary, so it must be visible to the whole crate.
+/// `pub(crate)`: the close reason rides the `SessionManager`'s live map
+/// across the module boundary (the `close_session` / `respond_*` paths),
+/// so it must be visible to the whole crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseKind {
     /// An explicit user close (`close_session` or a subagent cancel).
@@ -266,6 +262,13 @@ pub struct SessionInfo {
     /// session's context bar). `None` until the first frame (a fresh
     /// session with no usage yet).
     pub context_usage: Option<ContextUsage>,
+    /// The ephemeral-subagent flag (ADR 0025 §3): `true` for a subagent
+    /// session (its transcript persists as a HIDDEN `sessions` row —
+    /// `list_sessions` filters `is_subagent = 0`). `false` for a main
+    /// session. `#[serde(default)]` so stored rows pre-dating the column
+    /// (and the `Value::Null`-ish ephemeral envelope) deserialize `false`.
+    #[serde(default)]
+    pub is_subagent: bool,
 }
 
 /// A session's last known context usage (the `context_usage_update` frame's
@@ -282,54 +285,6 @@ pub struct ContextUsage {
     pub window: u64,
 }
 
-/// A live, in-memory session handle.
-///
-/// `session_id` and `cwd` are carried for diagnostics and for resume; they
-/// are not read by the prompt path.
-///
-/// `pub(crate)` + `pub(crate)` fields: `subagent.rs` reads `driver.sessions`
-/// entries (to clone the `cx` for the subagent's task prompt), so the
-/// struct and its fields are visible to the whole crate.
-#[allow(dead_code)]
-pub(crate) struct LiveSession {
-    /// The in-process `AgentLoop` handle — cheap clone, shared with the
-    /// driver task.
-    pub(crate) handle: NativeHandle,
-    pub(crate) session_id: String,
-    pub(crate) cwd: PathBuf,
-    /// Set to `true` to make the driver task's loop return, tearing the
-    /// session down (dropping the handle closes the child's stdin).
-    ///
-    /// For a subagent session this IS the `ExternalClose`'s sender (a cancel
-    /// flips it); for a main session it is the driver's internal flag.
-    pub(crate) close_tx: watch::Sender<bool>,
-    /// The close kind, decided by `close_session` (first-set-wins) and read
-    /// by the driver task once the loop returns. For a subagent session
-    /// this IS the `ExternalClose`'s kind.
-    pub(crate) close_kind: Arc<StdMutex<Option<CloseKind>>>,
-    pub(crate) thought_state: Arc<StdMutex<ThoughtState>>,
-    /// The in-flight turn's resolver: `send_prompt` stores a sender here
-    /// (last-wins), the driver resolves it on `agent_settled` (a
-    /// `cancel_requested` flag maps a late settle to `Cancelled`).
-    pub(crate) pending_turn: Arc<StdMutex<Option<oneshot::Sender<StopReason>>>>,
-    /// Set by `cancel_session` BEFORE the turn cancel
-    /// (`handle.cancel()`) is sent: a late `agent_settled` after the
-    /// cancel maps to `Cancelled`, not `EndTurn`.
-    pub(crate) cancel_requested: Arc<StdMutex<bool>>,
-    /// The most recent turn settle, watched by `SessionDriver::wait_for_settle`
-    /// (the subagent's prompt wait): the driver sends `(seq, reason)` on
-    /// `agent_settled`; the sequence number forces `changed()` to fire on
-    /// every settle (a watch coalesces equal values). The initial `(0, …)`
-    /// means "no settle yet"; a DROPPED sender (the driver task ended —
-    /// a teardown without a settle) resolves `changed()` too.
-    pub(crate) settle_rx: watch::Receiver<(u64, StopReason)>,
-    /// This driver's generation (assigned from the driver's counter at
-    /// registration): a SUPERSEDED driver (a resume overwrote this entry
-    /// under the same session id) must not clobber the replacement's
-    /// entry on teardown — the removal is guarded by this token.
-    pub(crate) generation: u64,
-}
-
 /// The native session's config state (the `set_config_option` re-synthesizer
 /// source — the loop's own `model` / `thinking_level` live INSIDE the spawned
 /// task, so the handle mirrors the applied config: `start_native_session`
@@ -340,138 +295,63 @@ pub(crate) struct NativeConfigState {
     pub(crate) thinking_level: Option<String>,
 }
 
+/// The Supervisor-side stalled-session bookkeeping (ADR 0025 Task 4 — a
+/// Worker crash marks the session STALLED; the frontend reads the state
+/// from the `session-stalled` event + the `stalled_info` query). There is
+/// no backend `SessionState` enum today (session state lives in the
+/// frontend store + ad-hoc flags) — the `stalled` registry is the
+/// backend's source of truth for the crash + the crash-log path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StalledInfo {
+    /// Unix milliseconds (the crash time).
+    pub at: i64,
+    /// The newest `crash-<ts>-worker*.log` in the data dir, globbed and
+    /// FROZEN at crash time (best-effort attribution across concurrent
+    /// sessions — crash logs are diagnostic, not load-bearing); `None`
+    /// when none is found.
+    pub crash_log: Option<PathBuf>,
+}
+
+/// A live, Worker-backed session (the Supervisor-side coordinator state —
+/// the in-process `NativeHandle` is gone for main sessions). The `AgentLoop`
+/// runs in the session's Worker; this struct holds the Supervisor's
+/// per-session bookkeeping: the `cwd` (the `respond_permission`
+/// `trust-space` write + the `session-closed` reason), the close kind
+/// (first-set-wins — `close_session` sets `User`), the in-flight turn's
+/// resolver (`send_prompt` stores a sender; the router resolves it on
+/// `agent_settled` / `Exited` / crash), the `cancel_requested` flag (a
+/// late settle maps to `Cancelled`), and the UNANSWERED request ids (the
+/// `PermissionRequest` / `InteractiveRequest` frames relayed MINUS the
+/// `*Response`s sent — the pending-modal cleanup on session end: a session
+/// ending with an open prompt must NOT leave a stuck modal).
+struct LiveWorkerSession {
+    cwd: PathBuf,
+    close_kind: Arc<StdMutex<Option<CloseKind>>>,
+    pending_turn: Arc<StdMutex<Option<oneshot::Sender<StopReason>>>>,
+    cancel_requested: Arc<StdMutex<bool>>,
+    pending_modal_ids: StdMutex<HashSet<String>>,
+}
+
+/// The resume context (the `establish_worker_session` `resume` parameter —
+/// the stored `session_id` + the resolved `model` + the stored `thinkingLevel`
+/// + the desktop's `archived` flag (ADR 0016) + the stored `context_usage`).
+struct ResumeCtx {
+    session_id: String,
+    model: Model,
+    stored_level: Option<String>,
+    archived: bool,
+    context_usage: Option<ContextUsage>,
+}
+
 /// A cheap, `'static`-safe handle to the native `AgentLoop` task:
 /// `prompt_tx` / `control_tx` clone
 /// the loop's channels and `cancel` is the loop's cancellation token. The
 /// loop's `RpcEvent` `Receiver` is NOT held here (a `tokio` mpsc `Receiver`
 /// is not `Clone`) — `drive_native_session` takes it by move (the driver
 /// task consumes it to watch `agent_settled`; the loop has ALREADY run the
-/// events through the `normalize` + `persist_update` pipeline in its
-/// `emit`).
-#[derive(Clone)]
-pub(crate) struct NativeHandle {
-    prompt_tx: mpsc::Sender<Prompt>,
-    control_tx: mpsc::Sender<ControlCmd>,
-    /// The SESSION teardown token (the loop's `run()` exits on it — a
-    /// `close_session` tears the loop down; the driver tears the session
-    /// down when the loop task ends).
-    cancel: CancellationToken,
-    /// The current TURN's cancel token (SHARED with the loop — the loop
-    /// arms a fresh one per prompt; a `cancel_session` Stop cancels the
-    /// CURRENT turn only — finding 8c).
-    turn_cancel: Arc<StdMutex<CancellationToken>>,
-    /// The session's config state (see `NativeConfigState`).
-    state: Arc<StdMutex<NativeConfigState>>,
-    /// The loop task's `AbortHandle` (set after `tokio::spawn` — a test-only
-    /// seam to kill the loop task DIRECTLY, without cancelling any token, so
-    /// the `settle_tx` sender drops with NO pending settle (a deterministic
-    /// `changed()` `Err` → the teardown resolves `pending_turn` `Cancelled`).
-    loop_task: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
-}
-
-impl NativeHandle {
-    fn new(
-        prompt_tx: mpsc::Sender<Prompt>,
-        control_tx: mpsc::Sender<ControlCmd>,
-        cancel: CancellationToken,
-        turn_cancel: Arc<StdMutex<CancellationToken>>,
-        model: Model,
-        thinking_level: Option<String>,
-    ) -> Self {
-        Self {
-            prompt_tx,
-            control_tx,
-            cancel,
-            turn_cancel,
-            state: Arc::new(StdMutex::new(NativeConfigState {
-                model,
-                thinking_level,
-            })),
-            loop_task: Arc::new(StdMutex::new(None)),
-        }
-    }
-
-    /// (test-only) Kill the loop task DIRECTLY (a `JoinHandle::abort` — the
-    /// task dies with NO token cancelled, so it emits NO final settle; the
-    /// `settle_tx` sender drops unseen → `changed()` returns `Err`
-    /// deterministically). Distinct from `close` (which cancels the turn +
-    /// session tokens and may let the loop settle first).
-    #[cfg(test)]
-    fn abort_loop_task(&self) {
-        if let Some(abort) = self.loop_task.lock().unwrap().clone() {
-            abort.abort();
-        }
-    }
-
-    /// Store the loop task's `AbortHandle` (called after `tokio::spawn`).
-    fn set_loop_task(&self, handle: tokio::task::AbortHandle) {
-        *self.loop_task.lock().unwrap() = Some(handle);
-    }
-
-    /// Queue a prompt (best-effort — a full / closed queue is dropped,
-    /// mirroring `AgentLoop::send_prompt`).
-    fn send_prompt(&self, text: &str, images: &[ImageRef]) -> bool {
-        self.prompt_tx
-            .try_send(Prompt {
-                text: text.to_string(),
-                images: images.to_vec(),
-            })
-            .is_ok()
-    }
-
-    /// Stop the in-flight turn (the `cancel_session` Stop — finding 8c:
-    /// the native Stop matches the external `abort`: the loop settles
-    /// the turn `Cancelled` and STAYS ALIVE — a new prompt reuses the
-    /// session; only a `close_session` (`close`) tears the loop down).
-    fn cancel(&self) {
-        self.turn_cancel
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .cancel();
-    }
-
-    /// Tear the loop down (the `close_session` teardown — the prompt
-    /// queue + the in-flight turn stop; the driver teardown cancels too
-    /// — idempotent).
-    fn close(&self) {
-        self.turn_cancel
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .cancel();
-        self.cancel.cancel();
-    }
-
-    /// The current config state (the `set_config_option` re-synthesizer).
-    fn config_state(&self) -> Arc<StdMutex<NativeConfigState>> {
-        self.state.clone()
-    }
-
-    /// The loop's control channel sender (the `set_config_option` native
-    /// branch queues `SetModel` / `SetThinkingLevel` through it — the loop
-    /// applies them via `set_model` / `set_thinking_level` when idle).
-    fn control_tx_clone(&self) -> mpsc::Sender<ControlCmd> {
-        self.control_tx.clone()
-    }
-}
-
 /// The subagent-close handle: the subagent cancel path (a subagent session
 /// passes it to `drive_native_session`; a main session passes `None`).
-///
-/// The dispatch worker task owns the `tx` + `kind` (it is handed to the
-/// caller as a [`SubagentCancel`]); the driver task keeps the `rx` and
-/// SELECTS on it in the block-until-close phase, and reads the `kind`
-/// (INSTEAD of its own internal kind) for the close reason (one kind,
-/// first-set-wins across the whole session). The `tx` is also handed to
-/// the subagent's `ask` waiters, so a cancel cancels the subagent's
-/// in-flight `ask` waiters via their `close_rx` arm.
-#[derive(Clone)]
-pub(crate) struct ExternalClose {
-    /// The close flag receiver the driver task selects on (the
-    /// `SubagentCancel` flips the sender; a cancel — or a session close —
-    /// aborts the in-flight dispatch + its in-flight `ask` waiters).
-    pub(crate) rx: watch::Receiver<bool>,
-}
-
 /// Per-session thinking-persistence state: the accumulated text of the
 /// OPEN segment, the segment's message key (or `None` when the last
 /// update was not a continuing thought chunk), and the next segment
@@ -512,46 +392,20 @@ pub struct TurnState {
     pub announced_tool_calls: HashSet<String>,
 }
 
-/// The shared session-driver state. `SessionManager` (main sessions) and
-/// `SubagentSessionManager` (worker runtime) each own one.
+/// The shared session-driver state. `SessionManager` (main sessions)
+/// owns one.
 ///
-/// Holds the live-session map, the pending-request maps, the establish
-/// timeout, and the per-manager policy knobs (persistence, the in-memory
-/// text/cost captures, and the subagent dispatch handle). `drive_session`
-/// (the shared driver) is a method on this struct.
+/// Holds the persistence + trust-db handles (the ADR 0022/0025 worker
+/// runtime — the in-process pending maps / todo / sudo / settle knobs
+/// are GONE with the in-process driver: the pending maps live in the
+/// session's Worker, the todo store in the Worker, the sudo flow in the
+/// Worker, the settle in the `WorkerManager`'s drive tasks).
 pub struct SessionDriver {
-    pub(crate) sessions: Arc<Mutex<HashMap<String, LiveSession>>>,
-    pub(crate) pending_permissions: PendingPermissions,
-    pub(crate) pending_bridge: PendingInteractive,
-    /// The shared todo store (Phase 2, Task 1 — the `todo_update`
-    /// handler's store; the main and subagent managers each get their
-    /// OWN store, mirroring how `pending_bridge` is split across the
-    /// two managers).
-    pub(crate) todo_store: Arc<TodoStore>,
-    /// The pending `sudo_exec` sub-prompt oneshots (Phase 2, Task 1 —
-    /// one entry per sub-prompt, keyed `"{sid}/{id}:confirm"` /
-    /// `"{sid}/{id}:password"`).
-    pub(crate) pending_sudo: PendingSudo,
-    /// The per-session sudo credential cache (Phase 2, Task 1 — the
-    /// suite's `credentialCache`: in-memory only, keyed by session id,
-    /// cleared in the driver-task teardown alongside the `pending_bridge`
-    /// prefix drain — mirroring the suite's cache cleared at every
-    /// session boundary). It MUST live in shared per-session state (the
-    /// `ConnCtx` is per-connection, rebuilt per frame — it cannot hold
-    /// the cache).
-    pub(crate) sudo_password: Arc<Mutex<HashMap<String, CachedPassword>>>,
-    /// The `sudo -S` execution seam (Phase 2, Task 1 — the real runner
-    /// in production; tests inject a fake via the `start_listener`
-    /// parameter).
-    pub(crate) runner: Arc<dyn SudoRunner>,
-    /// How long to wait for a turn to settle before reporting a failure. A
-    /// hung turn (a prompt that never settles) is torn down + reported
-    /// failed after this, so a subagent can't linger forever (the
-    /// zombie-subagent fix). Defaults to 30 minutes.
-    pub(crate) settle_timeout: Duration,
     /// Transcript persistence (main only; `None` for subagents —
-    /// ephemeral, not stored). Gates `persist_update` only; the trust
-    /// lookup is `trust_db` (below — main AND subagent).
+    /// ephemeral, not stored). The loop's persistence goes through the
+    /// `Store` seam (the `SessionStore` built from this db in
+    /// `build_native_session`); the trust lookup is `trust_db` (below —
+    /// main AND subagent).
     pub(crate) db: Option<Arc<Db>>,
     /// The trust lookup source (ADR 0010): the `space_trusted` lookup the
     /// permission gate uses to auto-confirm a TRUSTED Space's `confirm`.
@@ -560,353 +414,25 @@ pub struct SessionDriver {
     /// trust lookup for BOTH main and subagent Sessions (`None` = fail-
     /// closed: the gate prompts, today's flow).
     pub(crate) trust_db: Option<Arc<Db>>,
-    /// The subagent dispatch handle (main manager only — `Some`); `None`
-    /// for the subagent manager itself (subagents cannot dispatch
-    /// subagents — the tool is excluded from their spawn).
-    pub(crate) subagent: Option<Arc<crate::agent::subagent::SubagentSessionManager>>,
-    /// The live-session generation counter (monotonic; each
-    /// `drive_session` registration takes the next value — the teardown
-    /// guard).
-    pub(crate) generation_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionDriver {
-    /// Create a driver (a fresh sessions map, empty pending maps, no
-    /// persistence / trust db / subagent handle).
+    /// Create a driver (no persistence / trust db).
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            generation_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
-            pending_bridge: Arc::new(Mutex::new(HashMap::new())),
-            todo_store: Arc::new(TodoStore::new()),
-            pending_sudo: Arc::new(Mutex::new(HashMap::new())),
-            sudo_password: Arc::new(Mutex::new(HashMap::new())),
-            runner: Arc::new(interactive::RealSudoRunner),
-            settle_timeout: Duration::from_secs(30 * 60),
             db: None,
             trust_db: None,
-            subagent: None,
         }
-    }
-
-    /// Await the session's next turn settle (the driver's `agent_settled` watch).
-    ///
-    /// BOUNDED by `settle_timeout` (a hung turn can't linger forever — the
-    /// zombie-subagent fix): the wait ends on a settle AT OR AFTER the turn
-    /// being waited for (resolves `Ok(reason)` — the `cancel_requested` flag
-    /// already mapped a cancel to `Cancelled`), on a teardown (the driver
-    /// task ending DROPS the watch sender, which resolves `changed()` as
-    /// `Err` → `Err(UnknownSession)` — the session was torn down mid-turn),
-    /// or on the settle timeout (a hung turn →
-    /// `Err(SettleTimeout)` — the caller's cancel tears the session down).
-    ///
-    /// STALE-SETTLE GUARD: the wait is pinned to the channel's current
-    /// version (`mark_unchanged`) ONLY while a turn is IN FLIGHT (the
-    /// `pending_turn` slot is occupied — `send_prompt` sets it before the
-    /// dispatch and the driver clears it on `agent_settled`). With a turn
-    /// in flight, a recorded settle is a PREVIOUS turn's (stale) — the
-    /// mark makes `changed()` resolve only on a NEW settle. With NO turn
-    /// in flight (the caller's turn already settled — the subagent
-    /// dispatches a raw prompt, which does NOT occupy `pending_turn`, then
-    /// awaits the settle: a fast turn settles before the await), the mark
-    /// is SKIPPED: the clone inherits the stored receiver's initial version,
-    /// so `changed()` resolves immediately with the latest settle (the fast
-    /// turn's — not hung on a new settle that never comes).
-    pub async fn wait_for_settle(&self, session_id: &str) -> Result<StopReason, SessionError> {
-        let mut rx = {
-            let sessions = self.sessions.lock().await;
-            let live = sessions
-                .get(session_id)
-                .ok_or_else(|| SessionError::UnknownSession {
-                    id: session_id.to_string(),
-                })?;
-            // A `send_prompt` turn is in flight (the slot is occupied —
-            // set before the dispatch, cleared on `agent_settled`).
-            let turn_in_flight = live
-                .pending_turn
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_some();
-            let mut rx = live.settle_rx.clone();
-            // (finding 6) The `mark_unchanged` runs under the SAME
-            // `sessions` lock as the `pending_turn` snapshot (the race: a
-            // settle that lands between the snapshot and the mark would be
-            // marked seen and never resolve the wait — a 30-min spurious
-            // `SettleTimeout`). It is applied ONLY when a turn is in flight
-            // (a no-turn-in-flight `wait_for_settle` must resolve with the
-            // LATEST settle — the fast-turn contract — not be pinned to the
-            // current version). The driver's settle arm takes the slot +
-            // sends the watch under the same lock (watch send last), so the
-            // two critical sections are ordered: a settle that lands after
-            // the mark is a NEW version (resolves), and one that lands
-            // before empties the slot (no mark → resolve with the latest).
-            if turn_in_flight {
-                rx.mark_unchanged();
-            }
-            rx
-        };
-        // A bounded wait: a hung turn (no settle within `settle_timeout`)
-        // resolves `Err(SettleTimeout)`; a teardown (sender dropped — the
-        // session is gone) resolves `Err(UnknownSession)`; a settle
-        // resolves `Ok(reason)`.
-        match tokio::time::timeout(self.settle_timeout, rx.changed()).await {
-            Ok(Ok(_)) => {} // a settle was recorded (fall through)
-            Ok(Err(_)) => {
-                // The sender was dropped without a settle (the session was
-                // torn down mid-turn — it no longer exists).
-                return Err(SessionError::UnknownSession {
-                    id: session_id.to_string(),
-                });
-            }
-            Err(_elapsed) => {
-                // The settle timed out (a hung turn — the caller's cancel
-                // tears the session down; see the dispatch).
-                return Err(SessionError::SettleTimeout {
-                    detail: format!(
-                        "the turn did not settle within {}s",
-                        self.settle_timeout.as_secs()
-                    ),
-                });
-            }
-        }
-        let (seq, reason) = *rx.borrow();
-        if seq == 0 {
-            Err(SessionError::UnknownSession {
-                id: session_id.to_string(),
-            })
-        } else {
-            Ok(reason)
-        }
-    }
-
-    /// Shared driver for a NATIVE session (the in-process `AgentLoop`
-    /// variant).
-    ///
-    /// The loop task (spawned by the caller) emits `RpcEvent`s on
-    /// `events_rx` (moved in — a `tokio` mpsc `Receiver` is not `Clone`)
-    /// AND writes the settle watch on every `agent_settled` (finding 3 —
-    /// the RELIABLE settle: a full / slow `events` mpsc can drop the raw
-    /// event, but a watch send is never dropped). The loop has ALREADY
-    /// run the events through the `normalize` + `persist_update` pipeline
-    /// (its `emit`), so the driver does NOT re-normalize: it watches the
-    /// settle (the `pending_turn` + the `settle_tx` watch, populated
-    /// IDENTICALLY to the external path so `wait_for_settle` works
-    /// unchanged) and blocks until close (or the loop task ending — a
-    /// `close_session` / teardown).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn drive_native_session(
-        &self,
-        handle: NativeHandle,
-        events_rx: mpsc::Receiver<RpcEvent>,
-        loop_settle_rx: watch::Receiver<u64>,
-        cwd: PathBuf,
-        sink: &Arc<dyn EventSink>,
-        info: SessionInfo,
-    ) -> Result<SessionInfo, SessionError> {
-        let (close_tx, mut close_rx) = watch::channel(false);
-        let kind: Arc<StdMutex<Option<CloseKind>>> = Arc::new(StdMutex::new(None));
-        // The turn-settle watch (the external path's `settle_tx` — the
-        // initial `(0, …)` means "no settle yet").
-        let (settle_tx, settle_rx) = watch::channel((0u64, StopReason::EndTurn));
-        let sessions_arc = self.sessions.clone();
-        let pending_permissions_arc = self.pending_permissions.clone();
-        let pending_bridge_arc = self.pending_bridge.clone();
-        let pending_sudo_arc = self.pending_sudo.clone();
-        let sudo_password_arc = self.sudo_password.clone();
-        let todo_store_arc = self.todo_store.clone();
-        // The session's generation token (the teardown guard: a SUPERSEDED
-        // driver — a resume overwrote this entry under the same session id —
-        // must not clobber the replacement's entry).
-        let live_generation = self
-            .generation_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend = handle.clone();
-        let mut events_rx = events_rx;
-        // The loop's settle watch receiver (finding 3 — moved into the
-        // driver task; the `LiveSession`'s `settle_rx` above is the
-        // driver's OWN watch, which the driver task UPDATES on settle).
-        let mut loop_settle_rx = loop_settle_rx;
-        // Clones for the driver task (held by the task until AFTER its kind
-        // read below); the originals move into the `LiveSession` value.
-        let info_task = info.clone();
-        let kind_for_task = kind.clone();
-        let sink = sink.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    ev = events_rx.recv() => {
-                        if ev.is_none() {
-                            // The loop task ended (a close / teardown) —
-                            // tear the session down.
-                            break;
-                        }
-                        // The `events` mpsc is a LIVENESS signal only:
-                        // a full / slow channel can DROP an
-                        // `agent_settled` delivery (finding 3), so the
-                        // settle is NOT taken from it — the settle watch
-                        // arm below is the reliable one (a watch send is
-                        // never dropped).
-                    }
-                    // A settled turn (the loop's settle watch — RELIABLE:
-                        // a watch send is never dropped, so a full / slow
-                        // `events` mpsc cannot lose it, finding 3): resolves
-                        // the pending prompt (a `cancel_requested` flag maps
-                        // it to `Cancelled`) AND records the settle on the
-                        // watch (the subagent's prompt wait —
-                        // `wait_for_settle`), IDENTICALLY to the external
-                        // path.
-                    changed = loop_settle_rx.changed() => {
-                        // `changed()` `Err` = the loop's settle sender was
-                        // dropped (the loop task died) — NOT a settle. Skip
-                        // the settle processing: the `events_rx.recv() →
-                        // None` arm breaks the loop, and the teardown resolves
-                        // `pending_turn` with `Cancelled` (a mid-turn death
-                        // must not tell `send_prompt` "turn ended normally"
-                        // — pre-fix the `_ =` pattern treated the `Err` as a
-                        // settle and resolved `pending_turn` `EndTurn` + wrote
-                        // a duplicate `(seq, reason)` to the driver watch).
-                        if changed.is_err() {
-                            break;
-                        }
-                        // The settle count from the loop's watch (the loop's
-                        // `settle_count` atomic — the REAL count: a watch
-                        // coalesces two fast settles into ONE wake, so
-                        // counting wakes would undercount).
-                        let settle_seq = *loop_settle_rx.borrow();
-                        // (finding 6) The `pending_turn` take + the settle
-                        // watch send happen under ONE `sessions` lock, the
-                        // watch send LAST (the `wait_for_settle` race: a
-                        // watch send that lands between the waiter's
-                        // `pending_turn` snapshot and its `mark_unchanged`
-                        // would be marked seen and never resolve the wait;
-                        // taking the slot first, under the same lock, orders
-                        // the two critical sections). The `cancel_requested`
-                        // flag maps the settle to `Cancelled` (else `EndTurn`).
-                        let _reason = {
-                            let sessions = sessions_arc.lock().await;
-                            let reason = if let Some(live) = sessions.get(&info_task.session_id) {
-                                let cancelled = *live
-                                    .cancel_requested
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                if cancelled {
-                                    StopReason::Cancelled
-                                } else {
-                                    StopReason::EndTurn
-                                }
-                            } else {
-                                StopReason::EndTurn
-                            };
-                            if let Some(live) = sessions.get(&info_task.session_id) {
-                                if let Some(tx) = live
-                                    .pending_turn
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .take()
-                                {
-                                    let _ = tx.send(reason);
-                                }
-                            }
-                            let _ = settle_tx.send((settle_seq, reason));
-                            reason
-                        };
-                    }
-                    // The close flag (`close_session`).
-                    _ = close_rx.changed() => break,
-                }
-            }
-
-            // The session is over: tear the loop down (the prompt queue +
-            // the in-flight turn stop) and clean up the pending maps +
-            // emit `session-closed` (a native session runs in-process —
-            // there is no external machinery to tear down).
-            backend.cancel.cancel();
-            let kind = *kind_for_task.lock().unwrap_or_else(|p| p.into_inner());
-            let reason = match kind {
-                Some(CloseKind::User) => ClosedReason::User,
-                None => ClosedReason::AgentExited,
-            };
-            // Guard by the generation token (a SUPERSEDED driver must not
-            // clobber the replacement's entry). Resolve the pending turn
-            // (an in-flight `send_prompt` awaiting its `agent_settled`)
-            // with `Cancelled` BEFORE the session is removed (finding 3a —
-            // the session is over, so the turn will never settle; without
-            // this the `send_prompt`'s unbounded `rx.await` hangs forever
-            // — a close / cancel could not unblock the waiter).
-            {
-                let mut sessions = sessions_arc.lock().await;
-                if sessions
-                    .get(&info_task.session_id)
-                    .is_some_and(|l| l.generation == live_generation)
-                {
-                    if let Some(live) = sessions.get(&info_task.session_id) {
-                        if let Some(tx) = live
-                            .pending_turn
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .take()
-                        {
-                            let _ = tx.send(StopReason::Cancelled);
-                        }
-                    }
-                    sessions.remove(&info_task.session_id);
-                }
-            }
-            // Keys are `"{session_id}/{request_id}"` — match on the
-            // trailing-slash prefix so closing "s1" does not cancel the
-            // pending prompt of the longer session "s10".
-            let prefix = permission::session_key_prefix(&info_task.session_id);
-            pending_permissions_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&prefix));
-            let interactive_prefix = interactive::session_key_prefix(&info_task.session_id);
-            pending_bridge_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&interactive_prefix));
-            pending_sudo_arc
-                .lock()
-                .await
-                .retain(|key, _| !key.starts_with(&interactive_prefix));
-            sudo_password_arc.lock().await.remove(&info_task.session_id);
-            todo_store_arc.remove(&info_task.session_id);
-            sink.emit(
-                "session-closed",
-                json!({
-                    "sessionId": info_task.session_id,
-                    "reason": reason.as_str(),
-                }),
-            );
-        });
-
-        let live = LiveSession {
-            handle,
-            generation: live_generation,
-            session_id: info.session_id.clone(),
-            cwd,
-            close_tx: close_tx.clone(),
-            close_kind: kind,
-            thought_state: Arc::new(StdMutex::new(ThoughtState::default())),
-            pending_turn: Arc::new(StdMutex::new(None)),
-            cancel_requested: Arc::new(StdMutex::new(false)),
-            settle_rx,
-        };
-        self.sessions
-            .lock()
-            .await
-            .insert(live.session_id.clone(), live);
-
-        Ok(info)
     }
 }
 
 /// A factory that builds a `Provider` from a `Model` (the native path's
 /// provider seam — `SessionManager::provider_factory`; the production
 /// default dispatches on `Model.api` (`build_provider`, ADR 0024), a test
-/// sets a mock before `start_session`). `pub` so `subagent.rs`'s `NativeDeps`
-/// can carry one (the native dispatch builds the `Provider` through it).
+/// sets a mock before `start_session`). `pub` so a test can swap the
+/// seam (the native session builds the `Provider` through it; the
+/// subagent's Worker builds its own `Provider` from the `StartEnv`
+/// catalog).
 pub type ProviderFactory = Arc<dyn Fn(&Model) -> Box<dyn Provider> + Send + Sync>;
 
 /// The effective-catalog supplier: the BASE catalog + the user's providers
@@ -914,11 +440,11 @@ pub type ProviderFactory = Arc<dyn Fn(&Model) -> Box<dyn Provider> + Send + Sync
 /// /v1/models`, cached per-provider) — merged via `merge_catalog` (ADR
 /// 0014). `resolve` is the extracted core of the old
 /// `SessionManager::effective_catalog`: the `SessionManager` keeps a thin
-/// wrapper over it, and `NativeDeps` carries one so a named agent's `model:`
-/// frontmatter resolves against the EFFECTIVE catalog at dispatch time (NOT
-/// a startup snapshot — the base catalog is empty after the pi-config
-/// seeding removal, and a startup snapshot would never resolve a
-/// user-provider model).
+/// wrapper over it, and the subagent's `StartEnv` catalog is built from it
+/// so a named agent's `model:` frontmatter resolves against the EFFECTIVE
+/// catalog at dispatch time (NOT a startup snapshot — the base catalog is
+/// empty after the pi-config seeding removal, and a startup snapshot would
+/// never resolve a user-provider model).
 #[derive(Clone)]
 pub struct EffectiveCatalog {
     pub config_dir: PathBuf,
@@ -1022,6 +548,41 @@ pub struct SessionManager {
     /// absent model degrades to the static metadata (an empty base catalog
     /// contributes nothing — the effective catalog IS the providers list).
     discovery_cache: Arc<tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>>,
+    // ── The Worker-based bookkeeping (ADR 0025 Task 4) ──────────────
+    // The `AgentLoop` runs in the session's Worker; the `SessionManager`
+    // is the Supervisor-side coordinator. The late-wire pattern (the
+    // `SessionManager` ↔ `WorkerManager` construction cycle — the
+    // `WorkerManager`'s `on_event` / `on_crash` callbacks need the
+    // `SessionManager`'s router, and the `SessionManager` needs the
+    // `WorkerManager` to send prompts): the `OnceLock`s break the cycle
+    // (the `WorkerManager` is built with `OnceLock`-backed callbacks, the
+    // router is injected after both are built, then the `WorkerManager`
+    // is handed to the `SessionManager`).
+    /// The `WorkerManager` (the Worker registry) — `attach` / `detach` /
+    /// `send_prompt` / `send_config` / `send_abort` go through it.
+    worker_manager: Arc<OnceLock<Arc<WorkerManager>>>,
+    /// The `SubagentSessionManager` (the `dispatch_native` home — the
+    /// ADR 0025 Task 5 re-plumb: the native dispatch runs in a WORKER
+    /// via the `WorkerManager`'s `dispatch_subagent` flow; `None` until
+    /// `set_subagent_manager`).
+    subagent_manager: Arc<OnceLock<Arc<crate::agent::subagent::SubagentSessionManager>>>,
+    /// The UI sink (the `TauriSink` — the router re-emits the `SinkFrame`s
+    /// on it verbatim). Late-wired (the `setup_dirs` wiring).
+    sink: Arc<OnceLock<Arc<dyn EventSink>>>,
+    /// The store-frame applier (the Supervisor's sole-writer persistence).
+    /// Late-wired in `attach_db` (it needs the `Db`).
+    persister: Arc<OnceLock<Arc<TranscriptPersister>>>,
+    /// The per-session config state (the `set_config_option` re-synthesizer
+    /// source — the mirror's home moved from the `NativeHandle` here,
+    /// field-for-field: `start` / `resume` initialize it, `set_config_option`
+    /// updates it when a change is applied).
+    config_state: Arc<StdMutex<HashMap<String, NativeConfigState>>>,
+    /// The live, Worker-backed sessions (session_id → the coordinator state;
+    /// replaces the main-session `LiveSession` / `driver.sessions` ownership).
+    live: Arc<StdMutex<HashMap<String, LiveWorkerSession>>>,
+    /// The stalled sessions (session_id → `StalledInfo` — a Worker crash
+    /// marks the session stalled; the frontend reads it via `stalled_info`).
+    stalled: Arc<StdMutex<HashMap<String, StalledInfo>>>,
 }
 
 impl SessionManager {
@@ -1047,19 +608,69 @@ impl SessionManager {
             // `set_provider_factory` BEFORE `start_session`).
             provider_factory: Arc::new(|m: &Model| build_provider(m)),
             discovery_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            // The Worker-based bookkeeping (ADR 0025 Task 4) — the
+            // `OnceLock`s are late-wired in `setup_dirs` (the
+            // `SessionManager` ↔ `WorkerManager` cycle); the `StdMutex`
+            // maps are fresh.
+            worker_manager: Arc::new(OnceLock::new()),
+            subagent_manager: Arc::new(OnceLock::new()),
+            sink: Arc::new(OnceLock::new()),
+            persister: Arc::new(OnceLock::new()),
+            config_state: Arc::new(StdMutex::new(HashMap::new())),
+            live: Arc::new(StdMutex::new(HashMap::new())),
+            stalled: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Inject the `WorkerManager` (the late-wire — the `setup_dirs` wiring
+    /// builds the `WorkerManager` with callbacks pointing at THIS manager's
+    /// router, then hands it here). `&self` (the `OnceLock` `set` needs no
+    /// exclusive access) so the `Arc<SessionManager>` the `WorkerManager`
+    /// callbacks capture can already own the manager. Set BEFORE any
+    /// `start_session` / `send_prompt`. The ADR 0025 Task 5 re-plumb ALSO
+    /// forwards it to the `SubagentSessionManager` (`set_worker_manager` —
+    /// the `dispatch_native` delegation) and registers the child-cwd
+    /// registrar (the `dispatch_subagent` flow's `ensure_session_row` —
+    /// the ephemeral `sessions` row's `cwd` — the `StoreFrame` carries no
+    /// `cwd`). The registrar's closure reads the `persister` `OnceLock`
+    /// at CALL time (a dispatch runs after `attach_db`, so the persister
+    /// is set by then; an unset persister is a no-op).
+    pub fn attach_worker_manager(&self, wm: Arc<WorkerManager>) {
+        let _ = self.worker_manager.set(wm.clone());
+        if let Some(m) = self.subagent_manager.get() {
+            m.set_worker_manager(wm.clone());
+        }
+        let persister = self.persister.clone();
+        wm.set_cwd_registrar(Arc::new(move |session_id: &str, cwd: &str| {
+            if let Some(p) = persister.get() {
+                p.set_cwd(session_id, cwd);
+            }
+        }));
+    }
+
+    /// The `TranscriptPersister` (the `attach_worker_manager`'s
+    /// child-cwd registrar's target — the `dispatch_subagent` flow's
+    /// `ensure_session_row` creates the ephemeral `sessions` row with
+    /// the child's `cwd`). `None` before `attach_db`.
+    pub fn persister(&self) -> Option<Arc<TranscriptPersister>> {
+        self.persister.get().cloned()
+    }
+
+    /// Inject the UI sink (the `TauriSink` — the router re-emits the
+    /// `SinkFrame`s on it verbatim). Set BEFORE any `start_session`.
+    pub fn set_sink(&mut self, sink: Arc<dyn EventSink>) {
+        let _ = self.sink.set(sink);
     }
 
     /// Override the BASE model catalog (tests — the production base is
     /// empty; the effective catalog is the Settings' providers list + live
     /// discovery, merged over the base). Set BEFORE `start_session`.
     ///
-    /// CAVEAT (tests): a `NativeDeps` wired by `set_subagent_manager`
-    /// CLONES `self.catalog` into the subagent dispatch's
-    /// `EffectiveCatalog` base ONCE at wiring time — a LATER `set_catalog`
-    /// desynchronizes that base (the subagent dispatch keeps the old
-    /// base). Call `set_catalog` BEFORE `set_subagent_manager` (or
-    /// re-call `set_subagent_manager` afterwards).
+    /// CAVEAT (tests): a session's `StartEnv` catalog is FIXED at
+    /// `attach` time — a LATER `set_catalog` desynchronizes it (the
+    /// running session's subagent dispatch keeps the old base; the
+    /// subagent's model resolution runs against the PARENT's
+    /// `StartEnv` catalog). Call `set_catalog` BEFORE `start_session`.
     pub fn set_catalog(&mut self, catalog: ModelCatalog) {
         self.catalog = catalog;
     }
@@ -1132,8 +743,8 @@ impl SessionManager {
     /// discovery fails contributes 0 models but still shadows the base
     /// models for its id (ADR 0014 — via `merge_catalog`'s
     /// `shadowed_provider_ids`). Thin wrapper over
-    /// [`EffectiveCatalog::resolve`] (the `NativeDeps` supplier carries the
-    /// same core).
+    /// [`EffectiveCatalog::resolve`] (the subagent's resolution uses the
+    /// parent's `StartEnv` catalog, built from the same core).
     pub async fn effective_catalog(&self, force_refresh: Option<&str>) -> ModelCatalog {
         EffectiveCatalog {
             config_dir: self.config_dir.clone(),
@@ -1150,7 +761,11 @@ impl SessionManager {
     /// Persistence is a no-op without it.
     pub fn attach_db(&mut self, db: Arc<Db>) {
         self.driver.db = Some(db.clone());
-        self.driver.trust_db = Some(db);
+        self.driver.trust_db = Some(db.clone());
+        // The store-frame applier (the Supervisor's sole-writer persistence —
+        // it needs the `Db`). Late-wired here (the `Db` is attached after
+        // `new`).
+        let _ = self.persister.set(Arc::new(TranscriptPersister::new(db)));
     }
 
     /// Inject the subagent manager (main only — sets the driver's
@@ -1171,45 +786,32 @@ impl SessionManager {
     /// trusted Space inherits the parent's trust); it is `Some` whenever
     /// `db` is (both are set together by `attach_db`).
     pub fn set_subagent_manager(&mut self, m: Arc<crate::agent::subagent::SubagentSessionManager>) {
-        self.driver.subagent = Some(m.clone());
-        if let Some(_db) = &self.driver.db {
-            m.set_native_deps(crate::agent::subagent::NativeDeps {
-                provider_factory: self.provider_factory.clone(),
-                catalog: EffectiveCatalog {
-                    config_dir: self.config_dir.clone(),
-                    cache: self.discovery_cache.clone(),
-                    base: self.catalog.clone(),
-                },
-                todo_store: self.driver.todo_store.clone(),
-                sudo: SudoDeps {
-                    runner: self.driver.runner.clone(),
-                    pending_sudo: self.driver.pending_sudo.clone(),
-                    sudo_password: self.driver.sudo_password.clone(),
-                },
-                settle_timeout: self.driver.settle_timeout,
-                trust_db: self.driver.trust_db.clone(),
-                config_dir: Some(self.config_dir.clone()),
-            });
-        }
+        let _ = self.subagent_manager.set(m);
     }
 
     /// Reset the session's open thinking segment at a prompt boundary. The
     /// frontend's `addUserMessage` starts a new thinking block on a user
-    /// message, but `persist_update` never sees user messages (they are
-    /// recorded by the `send_prompt` paths, not the event normalizer) —
-    /// so the Rust accumulator must be reset here, not in `persist_update`.
+    /// `persist_update`-era rule: the normalizer never sees user messages
+    /// (they are recorded by the `send_prompt` paths, not the event
+    /// normalizer) — so the Rust accumulator must be reset here, not in
+    /// `compute_display_rows`.
     pub async fn begin_user_turn(&self, session_id: &str) {
-        if let Some(live) = self.driver.sessions.lock().await.get(session_id) {
-            live.thought_state
-                .lock()
-                .expect("thought state poisoned")
-                .open_key = None;
-        }
+        // (ADR 0025) The `thought_state` accumulator now lives in the
+        // Worker's `AgentLoop` (the display rows are computed in the
+        // Worker's `emit` and shipped as `DisplayUpsert` frames), so the
+        // Supervisor's `thought_state` reset is a no-op — the Worker
+        // resets its own accumulator at the prompt boundary. The method
+        // stays (the `send_prompt` path is unchanged); it is a no-op.
+        let _ = self
+            .live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id);
     }
 
-    /// Number of live sessions.
+    /// Number of live sessions (the Worker-backed `live` map).
     pub async fn session_count(&self) -> usize {
-        self.driver.sessions.lock().await.len()
+        self.live.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Record a session in the persistence layer (no-op without a database).
@@ -1258,23 +860,31 @@ impl SessionManager {
     /// The `config_options` are SYNTHESIZED from the `ModelCatalog` (the
     /// `synthesize_catalog_config_options` shape — the frontend is
     /// unchanged).
+    /// A FRESH session (ADR 0025): resolve the model (the `Settings.default_model`
+    /// → the catalog default — the resolution chain, never a hard error), build the
+    /// `StartEnv` (the `AgentLoop` runs in the Worker — Task 2's `build_loop` builds
+    /// it; the Supervisor only supplies the envelope), `attach` the Worker (a spawn
+    /// failure → the command returns an error — the visible session error, NO
+    /// in-process fallback), and record the session (the `capabilities_json` has NO
+    /// `piSessionFile` — resume is from the `native_messages` table, so
+    /// `loadSession` is `true`). The `config_options` are synthesized from the
+    /// `ModelCatalog` (the existing shape — the frontend is unchanged).
     async fn start_native_session(
         &self,
         cwd: PathBuf,
         sink: &Arc<dyn EventSink>,
     ) -> Result<SessionInfo, SessionError> {
-        let info = self.build_native_session(cwd, sink, None).await?;
-        self.record_session(&info);
-        Ok(info)
+        self.establish_worker_session(cwd, None, sink).await
     }
 
-    /// The native resume (the desktop is native-only): a fresh `AgentLoop`
-    /// and `SessionStore::load_messages` (resume from the `native_messages`
-    /// table). The model comes from the stored `capabilities.model` (a
-    /// stale / unknown key falls back to the resolution chain); the
-    /// thinking level from the stored `thinkingLevel` (the raw value —
-    /// the resolution chain (remembered → stored → settings) resolves in
-    /// `build_native_session`, after the model metadata refresh).
+    /// A RESUME (ADR 0025): the `native_messages` re-read (the
+    /// `SessionStore::load_messages` path — moved from harness to Supervisor) +
+    /// the `StartEnv { mode: Resume, transcript: Some(…) }` + `attach` (a fresh
+    /// Worker + re-hydrate — a `stalled` session's resume is this same path). The
+    /// model comes from the stored `capabilities.model` (a stale / unknown key
+    /// falls back to the resolution chain); the thinking level from the stored
+    /// `thinkingLevel` (the resolution chain (remembered → stored → settings)
+    /// resolves in `establish_worker_session`, after the model metadata refresh).
     async fn resume_native_session(
         &self,
         session_id: &str,
@@ -1284,12 +894,10 @@ impl SessionManager {
         let db = self.driver.db.clone().ok_or_else(|| {
             SessionError::Io("a native session requires an attached database".to_string())
         })?;
-        // The stored row must exist (a native session is recorded at start
-        // — `record_session`; a missing row is unresumable). KEEP THE
-        // WHOLE ROW: the resume carries the desktop's `archived` flag
-        // (ADR 0016 — the desktop is the source of truth; a resumed
-        // session may be re-archived later and the client's sticky view
-        // must agree with the DB).
+        // The stored row must exist (a native session is recorded at start —
+        // `record_session`; a missing row is unresumable). KEEP THE WHOLE ROW:
+        // the resume carries the desktop's `archived` flag (ADR 0016) + the
+        // stored `context_usage`.
         let row =
             db.session(session_id)
                 .ok()
@@ -1297,50 +905,208 @@ impl SessionManager {
                 .ok_or_else(|| SessionError::NotResumable {
                     id: session_id.to_string(),
                 })?;
-        let caps_json = row.capabilities_json;
-        let caps: Value = serde_json::from_str(&caps_json).unwrap_or(Value::Null);
-        // The model: the stored `model` (a composed key → the EFFECTIVE
-        // catalog — a user-provider model resolves); an absent / stale key
-        // falls back to the resolution chain (the settings default → the
-        // catalog default — never a hard error; the transcript still
-        // loads).
+        let caps: Value = serde_json::from_str(&row.capabilities_json).unwrap_or(Value::Null);
         let catalog = self.effective_catalog(None).await;
         let settings = load_settings(&self.config_dir);
         let model = caps
             .get("model")
             .and_then(Value::as_str)
             .and_then(|key| resolve_composed_model(&catalog, key))
-            .or_else(|| resolve_native_model(&catalog, &settings.default_model).ok());
-        let Some(model) = model else {
-            return Err(SessionError::Command {
+            .or_else(|| resolve_native_model(&catalog, &settings.default_model).ok())
+            .ok_or_else(|| SessionError::Command {
                 error: "no models available for the native session".to_string(),
-            });
-        };
-        // The raw STORED `thinkingLevel` (NO settings fallback — the
-        // resolution chain (remembered → stored → settings) resolves in
-        // `build_native_session`, after the model metadata refresh).
-        let thinking_level = caps
+            })?;
+        let stored_level = caps
             .get("thinkingLevel")
             .and_then(Value::as_str)
             .map(str::to_string);
-
-        let mut info = self
-            .build_native_session(cwd, sink, Some((session_id, model, thinking_level)))
-            .await?;
-        // The desktop's `archived` flag (ADR 0016): a native start mints a
-        // fresh session (`build_native_session` reports `false`); a resume
-        // carries the stored row's flag (the `record_session` re-record
-        // below never clears it — the `DO UPDATE` branch never touches
-        // `archived`).
-        info.archived = row.archived;
-        // The stored `context_usage` (the last known before the close —
-        // the row's `context_usage_json`; the `load_transcript`
-        // re-estimate's first frame refreshes it after the resume).
-        info.context_usage = row
+        let context_usage = row
             .context_usage_json
             .as_deref()
             .and_then(|s| serde_json::from_str::<ContextUsage>(s).ok());
+        self.establish_worker_session(
+            cwd,
+            Some(ResumeCtx {
+                session_id: session_id.to_string(),
+                model,
+                stored_level,
+                archived: row.archived,
+                context_usage,
+            }),
+            sink,
+        )
+        .await
+    }
+
+    /// Establish one Worker-backed session (shared by `start` / `resume`;
+    /// `resume` carries the stored `session_id` + the loaded transcript source —
+    /// `start` mints a fresh UUID and starts with an empty transcript). Resolves
+    /// the model + thinking level (the ADR 0015 chain), builds the `StartEnv`,
+    /// `attach`es the Worker (a spawn failure → an error — NO in-process fallback),
+    /// records the session, and stores the per-session coordinator state.
+    #[allow(clippy::too_many_arguments)]
+    async fn establish_worker_session(
+        &self,
+        cwd: PathBuf,
+        resume: Option<ResumeCtx>,
+        sink: &Arc<dyn EventSink>,
+    ) -> Result<SessionInfo, SessionError> {
+        // The `WorkerManager` (the late-wire — the `setup_dirs` wiring attached it
+        // before any `start_session` / `send_prompt`).
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let db = self.driver.db.clone().ok_or_else(|| {
+            SessionError::Io("a native session requires an attached database".to_string())
+        })?;
+        // The EFFECTIVE catalog (the base catalog + the user's providers, a fresh
+        // `load_settings` read; the per-provider `discovery_cache` makes the fetch
+        // cheap): the model resolution + the `StartEnv`'s `catalog`.
+        let catalog = self.effective_catalog(None).await;
+        let settings = load_settings(&self.config_dir);
+        let is_resume = resume.is_some();
+        let (session_id, model, stored_level, archived, context_usage) = match resume {
+            Some(ctx) => (
+                ctx.session_id,
+                ctx.model,
+                ctx.stored_level,
+                ctx.archived,
+                ctx.context_usage,
+            ),
+            None => (
+                mint_session_id(),
+                resolve_native_model(&catalog, &settings.default_model)?,
+                None,
+                false,
+                None,
+            ),
+        };
+        // (live `/v1/models` discovery) Best-effort refresh the model's metadata
+        // (the same as before; a failure degrades to the static metadata).
+        let model = self.refresh_model_metadata(&model).await;
+        // (ADR 0015) The effective thinking level (the same chain as before —
+        // remembered > stored > settings > `None`).
+        let thinking_level = remembered_thinking_level(&settings.default_thinking_levels, &model)
+            .or_else(|| {
+                stored_level
+                    .as_ref()
+                    .filter(|l| {
+                        model.thinking_levels.is_empty()
+                            || model.thinking_levels.iter().any(|t| t == *l)
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                settings
+                    .default_thinking_level
+                    .as_ref()
+                    .filter(|l| {
+                        model.thinking_levels.is_empty()
+                            || model.thinking_levels.iter().any(|t| t == *l)
+                    })
+                    .cloned()
+            });
+        // The `StartEnv` (the `AgentLoop` runs in the Worker — Task 2's
+        // `build_loop` builds it; the Supervisor supplies the envelope). A RESUME
+        // carries the `native_messages` re-read (the `SessionStore::load_messages`
+        // path — moved from harness to Supervisor); a FRESH session has no
+        // transcript (the Worker builds the main system prompt itself, seq 0).
+        let transcript = if is_resume {
+            let store = Arc::new(SessionStore::new(db.clone()));
+            // A corrupt transcript row must NOT silently load as an empty one
+            // (store.rs): the next persist would upsert over the stored rows
+            // (seq 0 = the system prompt, cascading to seq 1, 2, …), so a load
+            // failure fails the session start.
+            let messages = store
+                .load_messages(&session_id)
+                .map_err(|e| SessionError::Io(e.to_string()))?;
+            Some(messages)
+        } else {
+            None
+        };
+        let env = StartEnv::from_parts(
+            session_id.clone(),
+            cwd.display().to_string(),
+            if is_resume {
+                StartMode::Resume
+            } else {
+                StartMode::Fresh
+            },
+            transcript,
+            model.clone(),
+            catalog.clone(),
+            thinking_level.clone(),
+            db.space_trusted(&cwd).unwrap_or(false),
+            if settings.enabled_tools.is_empty() {
+                None
+            } else {
+                Some(settings.enabled_tools.clone())
+            },
+            self.config_dir.display().to_string(),
+            true, // `subagent_enabled` (main session — the Worker's `subagent` tool)
+            None, // `system_prompt` (main sessions: the Worker builds the main prompt)
+        );
+        // SPAWN the Worker (a spawn failure → the command returns an error — the
+        // visible session error, NO in-process fallback — ADR 0025).
+        wm.attach(&session_id, &env)
+            .await
+            .map_err(|e| SessionError::Command {
+                error: format!("spawn the session's Worker: {e}"),
+            })?;
+        // The `SessionInfo` (the `capabilities` envelope — the `native_capabilities`
+        // shape; the `config_options` synthesized from the EFFECTIVE catalog — the
+        // `StartEnv`'s `catalog` is the effective catalog). Block-scoped so the
+        // `MutexGuard` (and the `Arc` it borrows through) die BEFORE the `await`
+        // below (a `std::sync::MutexGuard` is not `Send`).
+        let info = SessionInfo {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            capabilities: native_capabilities(&env.model, env.thinking.as_deref()),
+            config_options: synthesize_catalog_config_options(
+                &env.catalog,
+                &env.model,
+                env.thinking.as_deref(),
+            ),
+            archived,
+            context_usage,
+            is_subagent: false,
+        };
+        // The `sessions` row (the FK source for the Worker's `native_messages`
+        // upserts — the `TranscriptPersister`'s `ensure_session_row` is a no-op
+        // for a main session; this records it up front) + the `persister`'s
+        // `cwd` map (the `ensure_session_row` source).
         self.record_session(&info);
+        if let Some(p) = self.persister.get() {
+            p.set_cwd(&session_id, &cwd.display().to_string());
+        }
+        // The per-session coordinator state (the config-state mirror — the
+        // `set_config_option` re-synthesizer source; the `live` entry — the
+        // `pending_turn` / `cancel_requested` / `close_kind` / `pending_modal_ids`).
+        self.config_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                session_id.clone(),
+                NativeConfigState {
+                    model: env.model.clone(),
+                    thinking_level: env.thinking.clone(),
+                },
+            );
+        let live = LiveWorkerSession {
+            cwd: cwd.clone(),
+            close_kind: Arc::new(StdMutex::new(None)),
+            pending_turn: Arc::new(StdMutex::new(None)),
+            cancel_requested: Arc::new(StdMutex::new(false)),
+            pending_modal_ids: StdMutex::new(HashSet::new()),
+        };
+        self.live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.clone(), live);
+        // The `sink` is threaded for the `config_option_update` re-synthesis
+        // (the `set_config_option` path); the router uses `self.sink` (the
+        // `setup_dirs` wiring) for the `SinkFrame` re-emit.
+        let _ = sink;
         Ok(info)
     }
 
@@ -1396,6 +1162,7 @@ impl SessionManager {
                         synthesize_catalog_config_options(&catalog, m, thinking_level.as_deref())
                     }),
                     archived: row.archived,
+                    is_subagent: row.is_subagent,
                     context_usage: row
                         .context_usage_json
                         .as_deref()
@@ -1403,237 +1170,6 @@ impl SessionManager {
                 }
             })
             .collect())
-    }
-
-    /// Build + spawn + drive one native session (shared by `start` /
-    /// `resume`; `resume` carries the stored `session_id` + the loaded
-    /// transcript source — `start` mints a fresh UUID and starts with an
-    /// empty transcript).
-    async fn build_native_session(
-        &self,
-        cwd: PathBuf,
-        sink: &Arc<dyn EventSink>,
-        resume: Option<(&str, Model, Option<String>)>,
-    ) -> Result<SessionInfo, SessionError> {
-        let db = self.driver.db.clone().ok_or_else(|| {
-            SessionError::Io("a native session requires an attached database".to_string())
-        })?;
-        // The EFFECTIVE catalog (the base catalog + the user's providers,
-        // a fresh `load_settings` read; the per-provider `discovery_cache`
-        // makes the fetch cheap): the model resolution, the `AgentLoop`'s
-        // catalog, and the synthesized config options all run against it
-        // (a user-provider model is selectable + switchable in-session).
-        let catalog = self.effective_catalog(None).await;
-        // The model: the resolution chain (the `Settings.default_model`
-        // (a fresh `load_settings` read) → the catalog's `default_model`
-        // → the selectable set — an unresolvable
-        // key at any rung falls through to the next rung). A resume
-        // overrides it with the stored model (see `resume_native_session`).
-        let settings = load_settings(&self.config_dir);
-        let is_resume = resume.is_some();
-        // The resume carries the raw STORED `thinkingLevel` (NO settings
-        // fallback — the resolution chain (remembered → stored → settings)
-        // resolves BELOW, after the model metadata refresh); the start arm
-        // has no stored level.
-        let (session_id, model, stored_level) = match resume {
-            Some((id, model, level)) => (id.to_string(), model.clone(), level),
-            None => (
-                mint_session_id(),
-                resolve_native_model(&catalog, &settings.default_model)?,
-                None,
-            ),
-        };
-        // (live `/v1/models` discovery) Best-effort refresh the model's
-        // metadata from the provider's live endpoint (the OpenAI endpoint
-        // "supplies everything" — the `pi-provider-litellm` `fetchModels`
-        // pattern). Bounded + cached per-provider; a failure degrades to
-        // the static metadata (the base catalog's entry — absent for a
-        // user-provider model, which keeps the discovered value).
-        let model = self.refresh_model_metadata(&model).await;
-        // (ADR 0015) The effective thinking level: the remembered (VALIDATED
-        // against the model's live `thinking_levels`) > the stored (LENIENT
-        // — non-empty levels must be a member; empty levels apply as-is, the
-        // pre-change behavior) > the `Settings.default_thinking_level`
-        // (VALIDATED like the stored rung — the Settings UI offers the UNION
-        // of ALL models' levels, so a settings default may not be a member of
-        // THIS model's set: a non-member is DROPPED)
-        // > `None` (the model's own default). Validated against the
-        // POST-refresh model (the live `thinking_levels` are the freshest).
-        let thinking_level = remembered_thinking_level(&settings.default_thinking_levels, &model)
-            .or_else(|| {
-                stored_level
-                    .as_ref()
-                    .filter(|l| {
-                        model.thinking_levels.is_empty()
-                            || model.thinking_levels.iter().any(|t| t == *l)
-                    })
-                    .cloned()
-            })
-            .or_else(|| {
-                settings
-                    .default_thinking_level
-                    .as_ref()
-                    .filter(|l| {
-                        model.thinking_levels.is_empty()
-                            || model.thinking_levels.iter().any(|t| t == *l)
-                    })
-                    .cloned()
-            });
-
-        let store = SessionStore::new(db.clone());
-        let (events_tx, events_rx) = mpsc::channel(256);
-        let (prompt_tx, prompt_rx) = mpsc::channel(8);
-        let cancel = CancellationToken::new();
-        // The TURN cancel (finding 8c): SHARED with the handle — the loop
-        // arms a fresh token per prompt; a `cancel_session` Stop cancels
-        // the CURRENT turn only (the session stays alive, matching the
-        // external `abort`), a `close_session` (`handle.close`) tears the
-        // loop down (the `cancel` token).
-        let turn_cancel: Arc<StdMutex<CancellationToken>> =
-            Arc::new(StdMutex::new(CancellationToken::new()));
-        // The settle watch (finding 3): the loop writes it on every
-        // `agent_settled` (a watch send is NEVER dropped — a full / slow
-        // `events` mpsc cannot lose the settle); the driver's settle arm
-        // consumes it.
-        let (settle_tx, settle_rx) = watch::channel(0u64);
-        // The `Provider` (the `provider_factory` seam — reviewer-corrected
-        // Major #21: the production default dispatches on `Model.api`
-        // (`build_provider`, ADR 0024), a test sets a mock BEFORE `start_session`).
-        let provider = (self.provider_factory)(&model);
-        let mut loop_ = AgentLoop::new(
-            session_id.clone(),
-            cwd.clone(),
-            model.clone(),
-            provider,
-            catalog.clone(),
-            store.clone(),
-            events_tx,
-            cancel.clone(),
-            turn_cancel.clone(),
-            settle_tx,
-            prompt_tx.clone(),
-            prompt_rx,
-            self.driver.pending_permissions.clone(),
-            self.driver.pending_bridge.clone(),
-            self.driver.trust_db.clone(),
-            sink.clone(),
-            self.driver.todo_store.clone(),
-            self.driver.subagent.clone(),
-            SudoDeps {
-                runner: self.driver.runner.clone(),
-                pending_sudo: self.driver.pending_sudo.clone(),
-                sudo_password: self.driver.sudo_password.clone(),
-            },
-            RetryPolicy::new(),
-            Some(self.config_dir.clone()),
-        );
-        // The `Settings.enabled_tools` (`[]` = all — finding 13b: a disabled
-        // tool is a tool-result error, NOT executed). The `[]` = all
-        // convention maps to `None` (all); a non-empty set is `Some(v)`
-        // (exactly `v`).
-        loop_.set_enabled_tools(if settings.enabled_tools.is_empty() {
-            None
-        } else {
-            Some(settings.enabled_tools.clone())
-        });
-        // The default thinking level (the settings'; a resume overrides it
-        // with the stored `thinkingLevel`).
-        if let Some(level) = &thinking_level {
-            loop_.set_thinking_level(Some(level.clone()));
-        }
-        // (MOVED UP) the handle — the `info` block below reads
-        // `handle.config_state()`.
-        let handle = NativeHandle::new(
-            prompt_tx,
-            loop_.control_tx.clone(),
-            cancel,
-            turn_cancel,
-            model.clone(),
-            thinking_level.clone(),
-        );
-        // The `SessionInfo` (the `capabilities_json` has NO `piSessionFile` —
-        // resume is from the `native_messages` table; the `config_options`
-        // are SYNTHESIZED from the `ModelCatalog` in the existing shape —
-        // the frontend is unchanged). Block-scoped so the `MutexGuard`
-        // (and the `Arc` it borrows through) die BEFORE the `await` below
-        // (a `std::sync::MutexGuard` is not `Send` — the Tauri command's
-        // future must be `Send`).
-        let info = {
-            let state_guard = handle.config_state();
-            let state = state_guard.lock().unwrap();
-            SessionInfo {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
-                capabilities: native_capabilities(&state.model, state.thinking_level.as_deref()),
-                config_options: synthesize_catalog_config_options(
-                    &catalog,
-                    &state.model,
-                    state.thinking_level.as_deref(),
-                ),
-                // A native START mints a fresh session (ADR 0016); a
-                // resume overrides `archived` with the stored row's flag
-                // (`resume_native_session`).
-                archived: false,
-                // A fresh session has no known usage yet (`None` — the
-                // `load_transcript` re-estimate's first frame fills it in;
-                // a resume's stored usage is applied in
-                // `resume_native_session`).
-                context_usage: None,
-            }
-        };
-        // (NEW) The `sessions` row BEFORE the seq-0 persist (the FK fix):
-        // `native_messages.session_id` references `sessions(id)`
-        // (`PRAGMA foreign_keys = ON`) — the caller's `record_session`
-        // runs AFTER `build_native_session` returns, so the seq-0 persist
-        // below would hit an FK violation and be silently dropped without
-        // this early record (the caller's `record_session` stays — an
-        // idempotent refresh).
-        self.record_session(&info);
-        // (NEW) The system prompt (ADR 0017) — NEW sessions only: a
-        // resume replays the stored transcript verbatim (the
-        // `load_transcript` below restores the system message at index 0;
-        // NO rebuild — a changed `AGENTS.md` applies from the next new
-        // session). Built from the `advertised_specs` (the `<tools>`
-        // section matches the `tools[]` API param) + the discovered skills
-        // (ADR 0013) + the global context dir `~/.pi/agent` (best-effort:
-        // no home dir → no global file).
-        if !is_resume {
-            let agent_dir = crate::skills::home_dir()
-                .map(|h| h.join(".pi/agent"))
-                .unwrap_or_default();
-            let skills = crate::skills::discover_skills(Some(&cwd));
-            let specs = loop_.advertised_specs();
-            let prompt = build_main_prompt(&PromptContext {
-                cwd: &cwd,
-                agent_dir: &agent_dir,
-                tools: &specs,
-                skills: &skills,
-            });
-            loop_.prepend_system(prompt);
-        }
-        // A RESUME: `load_messages` restores the stored provider transcript
-        // (the `native_messages` table) BEFORE the first model call (the
-        // `Compactor` is re-estimated on the loaded context).
-        if is_resume {
-            // A corrupt transcript row must NOT silently load as an empty
-            // one (store.rs): the next persist would upsert over the
-            // stored rows (seq 0 = the system prompt, cascading to seq
-            // 1, 2, …), so a load failure fails the session start.
-            let messages = store
-                .load_messages(&session_id)
-                .map_err(|e| SessionError::Io(e.to_string()))?;
-            loop_.load_transcript(messages);
-        }
-        // SPAWN the loop task (in-process — no subprocess).
-        let loop_handle = tokio::spawn(loop_.run());
-        // The test-only seam: store the `AbortHandle` so a test can kill the
-        // loop task DIRECTLY (no token cancel → no settle → deterministic
-        // `changed()` `Err`).
-        handle.set_loop_task(loop_handle.abort_handle());
-        self.driver
-            .drive_native_session(handle, events_rx, settle_rx, cwd, sink, info.clone())
-            .await?;
-        Ok(info)
     }
 
     /// Start a native session: canonicalize the cwd, then delegate to
@@ -1712,22 +1248,20 @@ impl SessionManager {
         text: String,
         images: Vec<ImagePayload>,
     ) -> Result<StopReason, SessionError> {
-        // Clone just the (cheap) `NativeHandle`, not the whole LiveSession.
-        let (handle, pending_turn, cancel_requested) = {
-            let sessions = self.driver.sessions.lock().await;
-            let live = sessions
+        // The `WorkerManager` (the late-wire) + the per-session coordinator
+        // state (the `LiveWorkerSession` — the `pending_turn` / `cancel_requested`
+        // moved from the `NativeHandle` here).
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let (pending_turn, cancel_requested) = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let live = live
                 .get(session_id)
-                .map(|l| {
-                    (
-                        l.handle.clone(),
-                        l.pending_turn.clone(),
-                        l.cancel_requested.clone(),
-                    )
-                })
                 .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
-            live
+            (live.pending_turn.clone(), live.cancel_requested.clone())
         };
 
         // Validate the images FIRST: a rejected payload must NOT be written
@@ -1736,28 +1270,12 @@ impl SessionManager {
         // guarantee real.
         validate_images(&images)?;
 
-        // A session is one-turn-at-a-time (the frontend's composer is
-        // locked until the turn resolves): a turn ALREADY IN FLIGHT (the
-        // `pending_turn` slot is occupied) is REJECTED rather than queued —
-        // the slot is a single last-wins resolver, and a queued prompt
-        // would be settled by the PREVIOUS turn's `agent_settled`
-        // (mis-attribution: the composer unlocks while a turn is still
-        // live).
-        //
-        // The check-and-claim is ATOMIC under ONE `pending_turn` lock
-        // acquisition (finding 2 — the pre-fix check DROPPED the lock, then
-        // `begin_user_turn` + `record_message` (two awaits) ran before the
-        // resolver was stored: two concurrent `send_prompt`s both observed
-        // an empty slot, both passed, and the second's `*slot = Some(tx)`
-        // dropped the first's sender (a phantom `Cancelled`) while the
-        // second's resolver was resolved by the FIRST turn's
-        // `agent_settled` (the composer unlocked mid-turn). Claiming the
-        // resolver BEFORE the user-row write / dispatch closes it: the
-        // user-row write order vs. the resolver is not load-bearing — what
-        // matters is that the check-and-claim is atomic (a rejected prompt
-        // writes nothing and overwrites nothing; an accepted prompt's
-        // resolver is claimed before the dispatch, so a settle arriving
-        // while the prompt is in flight is never lost on an empty slot).
+        // A session is one-turn-at-a-time (the frontend's composer is locked
+        // until the turn resolves): a turn ALREADY IN FLIGHT (the `pending_turn`
+        // slot is occupied) is REJECTED rather than queued. The check-and-claim
+        // is ATOMIC under ONE `pending_turn` lock acquisition (finding 2 — the
+        // resolver is claimed BEFORE the user-row write / dispatch, so a settle
+        // arriving while the prompt is in flight is never lost on an empty slot).
         let (tx, rx) = oneshot::channel::<StopReason>();
         {
             let mut slot = pending_turn.lock().unwrap_or_else(|p| p.into_inner());
@@ -1771,19 +1289,21 @@ impl SessionManager {
         // Reset the cancel flag (a fresh turn is not a cancel).
         *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = false;
 
-        // Record the user's message in the transcript (the client owns
-        // history) before the turn begins.
+        // Record the user's message in the transcript (the client owns history)
+        // before the turn begins — the USER DISPLAY ROW write stays Supervisor-side
+        // (the Worker persists only the provider-transcript user row via the store
+        // frames; the display row + `begin_user_turn` stay in the `send_prompt`
+        // path, unchanged).
         self.begin_user_turn(session_id).await;
         if let Some(db) = &self.driver.db {
             let payload = user_message_payload(&text, &images);
             let _ = db.record_message(session_id, "user", None, &payload.to_string());
         }
 
-        // Queue the text + the image attachments on the loop's prompt queue
-        // (a full / closed queue is a best-effort drop, mapped to the same
-        // error path as a refusal below). The wire `ImagePayload` maps onto
-        // the loop's `ImageRef` (the `name` / `sizeBytes` are transcript-only
-        // — the model transcript carries the `data` + `mimeType`).
+        // Queue the text + the image attachments on the WORKER's prompt queue
+        // (the `Prompt` frame — the `ImagePayload` maps onto the wire `ImageRef`).
+        // A `SendError` (the Worker died / the stdin pipe closed) maps to the
+        // same error path as a refusal below (resolve the turn `Refusal`).
         let image_refs: Vec<ImageRef> = images
             .iter()
             .map(|img| ImageRef {
@@ -1791,17 +1311,20 @@ impl SessionManager {
                 mime_type: img.mime_type.clone(),
             })
             .collect();
-        let send_error = if handle.send_prompt(&text, &image_refs) {
-            None
-        } else {
-            Some(SessionError::Command {
-                error: "the session is busy; the prompt was dropped".to_string(),
-            })
+        let send_error = match wm.handle_for(session_id) {
+            Some(handle) => match handle.send_prompt(&text, &image_refs) {
+                Ok(()) => None,
+                Err(e) => Some(SessionError::Command {
+                    error: format!("send the prompt to the session's Worker: {e}"),
+                }),
+            },
+            None => Some(SessionError::UnknownSession {
+                id: session_id.to_string(),
+            }),
         };
 
-        // A `success: false` prompt response is a REFUSAL — emit the error
-        // as a chunk (the user sees it) and resolve the turn `Refusal`
-        // without waiting for a settle that never comes.
+        // A `success: false` prompt (the Worker died) — resolve the turn
+        // `Refusal` without waiting for a settle that never comes.
         if let Some(e) = send_error {
             match e {
                 SessionError::Command { error } => {
@@ -1815,9 +1338,11 @@ impl SessionManager {
             }
         }
 
-        // Await the turn (unbounded — the turn can block on a user-paced
-        // permission prompt). A dropped resolver (replaced by a new prompt,
-        // or the session died) maps to `Cancelled`.
+        // Await the turn (unbounded — the turn can block on a user-paced permission
+        // prompt). The Worker's `agent_settled` (the `Event(RpcEvent)` bookkeeping)
+        // resolves the `pending_turn` (the router); a dropped resolver (replaced by
+        // a new prompt, or the session died — the `Exited` / crash path) maps to
+        // `Cancelled` (the composer unlocks — it never stays locked forever).
         match rx.await {
             Ok(reason) => Ok(reason),
             Err(_) => Ok(StopReason::Cancelled),
@@ -1836,22 +1361,29 @@ impl SessionManager {
     /// the loop's teardown token, which ENDED THE WHOLE SESSION (the driver
     /// tore it down) — a silent asymmetry with the pi `abort`.
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), SessionError> {
-        let (handle, cancel_requested) = {
-            let sessions = self.driver.sessions.lock().await;
-            let live = sessions
-                .get(session_id)
-                .map(|l| (l.handle.clone(), l.cancel_requested.clone()))
+        // The `WorkerManager` (the late-wire) + the per-session coordinator
+        // state (the `cancel_requested` moved from the `NativeHandle` here).
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let cancel_requested = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.get(session_id)
+                .map(|l| l.cancel_requested.clone())
                 .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
-                })?;
-            live
+                })?
         };
+        // The `cancel_requested` flag is set BEFORE the `abort` is sent so a fast
+        // settle maps to `Cancelled`, not `EndTurn`. Fire-and-forget on the Worker
+        // side: a no-op if there is no in-flight turn. BEHAVIOR (finding 8c): the
+        // `abort` cancels the Worker's current TURN token — the loop settles the
+        // turn `Cancelled` and STAYS ALIVE (a new prompt reuses the session; only a
+        // `close_session` tears the session down).
         *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        // The loop's current TURN token (finding 8c — the turn stops and the
-        // session STAYS ALIVE — a new prompt reuses it; only a
-        // `close_session` tears the session down). The `cancel_requested`
-        // flag (set above) maps the settle to `Cancelled`.
-        handle.cancel();
+        if let Some(handle) = wm.handle_for(session_id) {
+            let _ = handle.send_abort();
+        }
         Ok(())
     }
     /// Set a session config option (the model or the thinking level) on a
@@ -1869,28 +1401,33 @@ impl SessionManager {
         value: &str,
         sink: &Arc<dyn EventSink>,
     ) -> Result<Vec<Value>, SessionError> {
-        let (handle, config_state) = {
-            let sessions = self.driver.sessions.lock().await;
-            let live = sessions
+        // The `WorkerManager` (the late-wire) + the per-session config state
+        // (the `NativeConfigState` mirror moved from the `NativeHandle` here —
+        // the `set_config_option` re-synthesizer source).
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let state = {
+            let config_state = self.config_state.lock().unwrap_or_else(|p| p.into_inner());
+            config_state
                 .get(session_id)
-                .map(|l| (l.handle.clone(), l.handle.config_state()))
+                .cloned()
                 .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
-                })?;
-            live
+                })?
         };
 
         // The `Model` lookup + the re-synthesizer run against the EFFECTIVE
-        // catalog (the base catalog + the user's providers — a
-        // user-provider model can be switched TO mid-session, not just
-        // the base ones).
+        // catalog (the base catalog + the user's providers — a user-provider
+        // model can be switched TO mid-session, not just the base ones).
         let catalog = self.effective_catalog(None).await;
-        // Apply (the loop's control channel — `AgentLoop::set_model` /
-        // `set_thinking_level` on the loop task) + mirror the change on the
-        // handle's config state (the re-synthesizer source). Mirror + emit
-        // ONLY when `try_send` SUCCEEDS (finding 12): a full / closed queue
-        // means the loop never applies the change — claiming success (a
-        // mirrored state + a `config_option_update`) would silently diverge
+        // Apply (the `WorkerManager`'s `send_config` — the `Config` frame → the
+        // Worker's `AgentLoop` `set_model` / `set_thinking_level`, applied when
+        // the loop is idle) + mirror the change on the config state (the
+        // re-synthesizer source). Mirror + emit ONLY when the `send_config`
+        // SUCCEEDS (finding 12): a failed send (the Worker died / the pipe
+        // closed) means the loop never applies the change — claiming success
+        // (a mirrored state + a `config_option_update`) would silently diverge
         // from the model / level the loop is actually running.
         match config_id {
             "model" => {
@@ -1910,68 +1447,57 @@ impl SessionManager {
                     .ok_or_else(|| SessionError::Command {
                         error: format!("unknown model: {value}"),
                     })?;
-                let sent = handle
-                    .control_tx_clone()
-                    .try_send(ControlCmd::SetModel(model.clone()));
-                if sent.is_err() {
-                    return Err(SessionError::Command {
-                        error: "the session's loop is not running; the config change could not be applied".to_string(),
-                    });
-                }
-                let mut state = config_state.lock().unwrap_or_else(|p| p.into_inner());
-                state.model = model.clone();
-                // (ADR 0015) Minimal-surprise reset: the current level is
-                // KEPT across the switch when valid for the new model (its
-                // `thinking_levels` are non-empty and contain it — or EMPTY,
-                // the status quo); it is replaced (the new model's
-                // remembered level, or `None`) only when the new model
-                // doesn't support it. The second `try_send` mirrors ONLY on
-                // success (finding 12): a failed send leaves the mirror
-                // untouched (the loop never applies the reset). The arm does
+                self.send_config_to(&wm, session_id, Some(&model), None, None)?;
+                self.update_config_state(session_id, |s| s.model = model.clone());
+                // (ADR 0015) Minimal-surprise reset: the current level is KEPT across
+                // the switch when valid for the new model (its `thinking_levels` are
+                // non-empty and contain it — or EMPTY, the status quo); it is replaced
+                // (the new model's remembered level, or `None`) only when the new model
+                // doesn't support it. The second `send_config` mirrors ONLY on success
+                // (finding 12): a failed send leaves the mirror untouched. The arm does
                 // NOT write memory.
-                if let Some(level) = state.thinking_level.as_deref() {
+                let level = self
+                    .config_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(session_id)
+                    .and_then(|s| s.thinking_level.clone());
+                if let Some(level) = level {
                     let valid = model.thinking_levels.is_empty()
-                        || model.thinking_levels.iter().any(|t| t == level);
+                        || model.thinking_levels.iter().any(|t| t == &level);
                     if !valid {
                         let reset = remembered_thinking_level(
                             &load_settings(&self.config_dir).default_thinking_levels,
                             &model,
                         );
-                        let sent = handle
-                            .control_tx_clone()
-                            .try_send(ControlCmd::SetThinkingLevel(reset.clone()));
+                        let sent =
+                            self.send_config_to(&wm, session_id, None, reset.as_deref(), None);
                         if sent.is_ok() {
-                            state.thinking_level = reset;
+                            self.update_config_state(session_id, |s| {
+                                s.thinking_level = reset.clone();
+                            });
                         }
                     }
                 }
             }
             "thought_level" => {
-                // (review finding) An empty level is rejected BEFORE the
-                // control channel is touched (mirroring the model arm's
-                // rejection of an unresolvable key — an empty level would
-                // flow `reasoning_effort: Some("")` into the provider
-                // request body, which some endpoints reject).
+                // (review finding) An empty level is rejected BEFORE the `send_config`
+                // is touched (mirroring the model arm's rejection of an unresolvable
+                // key — an empty level would flow `reasoning_effort: Some("")` into the
+                // provider request body, which some endpoints reject).
                 if value.is_empty() {
                     return Err(SessionError::Command {
                         error: "a thinking level must be non-empty".to_string(),
                     });
                 }
-                let sent = handle
-                    .control_tx_clone()
-                    .try_send(ControlCmd::SetThinkingLevel(Some(value.to_string())));
-                if sent.is_err() {
-                    return Err(SessionError::Command {
-                        error: "the session's loop is not running; the config change could not be applied".to_string(),
-                    });
-                }
-                let mut state = config_state.lock().unwrap_or_else(|p| p.into_inner());
-                state.thinking_level = Some(value.to_string());
-                // (ADR 0015) Remember the level for the session's CURRENT
-                // model (best-effort: a write failure is logged and does NOT
-                // fail the config change — the level is applied in the loop
-                // either way; the value is guaranteed non-empty — an empty
-                // one is rejected above).
+                self.send_config_to(&wm, session_id, None, Some(value), None)?;
+                self.update_config_state(session_id, |s| {
+                    s.thinking_level = Some(value.to_string());
+                });
+                // (ADR 0015) Remember the level for the session's CURRENT model
+                // (best-effort: a write failure is logged and does NOT fail the config
+                // change — the level is applied in the loop either way; the value is
+                // guaranteed non-empty — an empty one is rejected above).
                 let key = format!("{}/{}", state.model.provider, state.model.id);
                 let mut settings = load_settings(&self.config_dir);
                 settings
@@ -1987,10 +1513,18 @@ impl SessionManager {
                 })
             }
         }
-        // Re-synthesize FROM THE `ModelCatalog` (a native session has no
-        // `get_state`) + emit (the agent does not emit a
-        // `config_option_update` itself — the client owns the frame).
-        let state = config_state.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-synthesize FROM THE `ModelCatalog` (a native session has no `get_state`)
+        // + emit (the agent does not emit a `config_option_update` itself — the
+        // client owns the frame).
+        let state = self
+            .config_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::UnknownSession {
+                id: session_id.to_string(),
+            })?;
         let options = synthesize_catalog_config_options(
             &catalog,
             &state.model,
@@ -2009,6 +1543,39 @@ impl SessionManager {
         Ok(options)
     }
 
+    /// Send a `Config` frame to the session's Worker (the `send_config` relay —
+    /// the `set_config_option` model / thinking changes). A `WorkerError` (the
+    /// Worker died / the pipe closed) maps to the "config change could not be
+    /// applied" error (finding 12 — a failed send leaves the mirror untouched).
+    fn send_config_to(
+        &self,
+        wm: &WorkerManager,
+        session_id: &str,
+        model: Option<&Model>,
+        thinking: Option<&str>,
+        trusted: Option<bool>,
+    ) -> Result<(), SessionError> {
+        let Some(handle) = wm.handle_for(session_id) else {
+            return Err(SessionError::UnknownSession {
+                id: session_id.to_string(),
+            });
+        };
+        handle
+            .send_config(model, thinking, trusted)
+            .map_err(|e| SessionError::Command {
+                error: format!("the session's Worker is not running; the config change could not be applied: {e}"),
+            })
+    }
+
+    /// Update the session's `NativeConfigState` mirror (the `set_config_option`
+    /// re-synthesizer source) in place.
+    fn update_config_state(&self, session_id: &str, f: impl Fn(&mut NativeConfigState)) {
+        let mut config_state = self.config_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = config_state.get_mut(session_id) {
+            f(state);
+        }
+    }
+
     /// Deliver the user's answer to a pending permission request.
     ///
     /// Looks up the oneshot sender by the compound key
@@ -2016,122 +1583,454 @@ impl SessionManager {
     /// entry is gone (the session closed, or the prompt already resolved), this
     /// is a silent no-op. Returns `true` when an entry was resolved (the caller
     /// can then route a miss to the subagent manager).
+    /// Deliver the user's answer to a pending permission request.
+    ///
+    /// The `pending_permissions` map lives in the WORKER now (the main-session
+    /// `SessionManager` ownership is gone — ADR 0025): this relays the `outcome`
+    /// to the session's Worker (`send_permission_response` — the Worker's
+    /// `PermissionResponse` handler resolves its `pending_permissions` oneshot,
+    /// or no-ops if the id is unknown). ADDED (Task 1 moved the `trust-space`
+    /// write out of the gate): when the outcome is `Selected { option_id:
+    /// "trust-space" }`, the Supervisor applies the `spaces` write (it owns the
+    /// `spaces` table — the persistence half; the Worker's `StaticTrustSource`
+    /// flip is the live-lookup half). Marks the request id as ANSWERED (the
+    /// pending-modal cleanup — the `interactive-request-close` diff).
     pub async fn respond_permission(
         &self,
         session_id: &str,
         request_id: &str,
         outcome: permission::PermissionOutcome,
     ) -> Result<bool, SessionError> {
-        let key = permission::permission_key(session_id, request_id);
-        let sender = self.driver.pending_permissions.lock().await.remove(&key);
-        // Best-effort: if the receiver is already gone the prompt was
-        // already resolved (timeout / session close), so there is nothing to
-        // do.
-        match sender {
-            Some(sender) => {
-                let _ = sender.send(outcome);
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        // The `cwd` (the `trust-space` write) + the "answered" mark (the
+        // pending-modal cleanup — the `interactive-request-close` diff).
+        let cwd = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.get(session_id).map(|l| l.cwd.clone())
+        };
+        let Some(handle) = wm.handle_for(session_id) else {
+            // No live Worker for this session (a main session that was never
+            // started, or already closed) — the caller routes a miss to the
+            // subagent manager (the subagent's own `pending_*` maps, Task 5).
+            return Ok(false);
+        };
+        match handle.send_permission_response(request_id, &outcome) {
+            Ok(()) => {
+                // (Task 1) The `trust-space` outcome persists the `spaces` write
+                // (the Supervisor owns the `spaces` table — the existing
+                // `set_space_trusted` `Db` method). The Worker's `StaticTrustSource`
+                // flip (Task 2's `PermissionResponse` handler) is the live-lookup
+                // half; this is the persistence half.
+                if let permission::PermissionOutcome::Selected { option_id } = &outcome {
+                    if option_id == "trust-space" {
+                        if let (Some(db), Some(cwd)) = (&self.driver.db, cwd) {
+                            let _ = db.set_space_trusted(&cwd.display().to_string(), true);
+                        }
+                    }
+                }
+                // Mark the request id as ANSWERED (the pending-modal cleanup — a
+                // session ending with an open prompt must NOT leave a stuck modal).
+                if let Some(live) = self
+                    .live
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(session_id)
+                {
+                    live.pending_modal_ids
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(request_id);
+                }
                 Ok(true)
             }
-            None => Ok(false),
+            Err(_) => Ok(false),
         }
     }
 
     /// Deliver the user's answer to a pending interactive request.
     ///
-    /// Looks up the oneshot sender by the compound key
-    /// `"{session_id}/{request_id}"` and sends the `result` `Value` verbatim
-    /// (no wrapper — for `password`, `{password}`; for `confirm`,
-    /// `{confirmed}`; for `ask`, the `AskResponsePayload`). If the entry is
-    /// gone (the session closed, or the request already resolved), this is a
-    /// silent no-op. Returns `true` when an entry was resolved (the caller
-    /// can then route a miss to the subagent manager).
+    /// The `pending_bridge` / `pending_sudo` maps live in the WORKER now (the
+    /// main-session `SessionManager` ownership is gone — ADR 0025): this relays
+    /// the `result` `Value` verbatim to the session's Worker (`send_interactive_response`
+    /// — the Worker's `InteractiveResponse` handler resolves its
+    /// `pending_bridge` / `pending_sudo` oneshot, or no-ops if the id is unknown).
+    /// Marks the request id as ANSWERED (the pending-modal cleanup).
     pub async fn respond_interactive_request(
         &self,
         session_id: &str,
         request_id: &str,
         result: serde_json::Value,
     ) -> Result<bool, SessionError> {
-        let key = interactive::interactive_key(session_id, request_id);
-        let sender = self.driver.pending_bridge.lock().await.remove(&key);
-        // Best-effort: if the receiver is already gone the request was
-        // already resolved (timeout / session close), so there is nothing to
-        // do.
-        match sender {
-            Some(sender) => {
-                let _ = sender.send(result);
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let Some(handle) = wm.handle_for(session_id) else {
+            // No live Worker for this session — the caller routes a miss to the
+            // subagent manager (the subagent's own `pending_*` maps, Task 5).
+            return Ok(false);
+        };
+        match handle.send_interactive_response(request_id, &result) {
+            Ok(()) => {
+                // Mark the request id as ANSWERED (the pending-modal cleanup).
+                if let Some(live) = self
+                    .live
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(session_id)
+                {
+                    live.pending_modal_ids
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(request_id);
+                }
                 Ok(true)
             }
-            None => {
-                // Phase 2: the `pending_bridge` lookup missed — check the
-                // `pending_sudo` sub-prompt oneshots (the `sudo_exec`
-                // `:confirm` / `:password` keys, `"{sid}/{id}:confirm"` /
-                // `"{sid}/{id}:password"`). The legacy `confirm` /
-                // `password` flow still resolves via `pending_bridge` (the
-                // lookup above is NOT removed).
-                let sudo_sender = self.driver.pending_sudo.lock().await.remove(&key);
-                match sudo_sender {
-                    Some(sender) => {
-                        let _ = sender.send(result);
-                        Ok(true)
-                    }
-                    None => Ok(false),
-                }
-            }
+            Err(_) => Ok(false),
         }
     }
 
     /// Close a live session.
     ///
-    /// `async` because it must lock the sessions map to find the session.
-    /// Records the `User` close kind (first-set-wins) and sends the close
-    /// flag; the driver task performs the map removal and the
-    /// `session-closed` emit. The handle's `close` is idempotent (the
-    /// driver teardown may also call it): it stops the prompt queue + the
-    /// in-flight turn and cancels the loop's teardown token (a clean
-    /// shutdown — the loop's `run()` exits on the token).
+    /// Records the `User` close kind (first-set-wins) + marks the in-flight turn
+    /// a cancel, then `detach`es the Worker (the `WorkerManager` removes the
+    /// `workers` entry + spawns the background reap — the graceful `close` +
+    /// grace + `kill`). The Worker's clean exit (`Exited`) triggers the router's
+    /// EXPECTED-exit handling (the `session-closed` emit + the `pending_turn`
+    /// `Cancelled` resolution + the pending-modal cleanup + the live-bookkeeping
+    /// removal). A `detach` miss (the session is already gone) is a no-op.
     pub async fn close_session(&self, session_id: &str) -> Result<(), SessionError> {
-        let (close_tx, close_kind, handle, cancel_requested) = {
-            let sessions = self.driver.sessions.lock().await;
-            let live = sessions
+        let wm = self.worker_manager.get().cloned().ok_or_else(|| {
+            SessionError::Io("the session's WorkerManager is not attached".to_string())
+        })?;
+        let (close_kind, cancel_requested) = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let live = live
                 .get(session_id)
-                .map(|l| {
-                    (
-                        l.close_tx.clone(),
-                        l.close_kind.clone(),
-                        l.handle.clone(),
-                        l.cancel_requested.clone(),
-                    )
-                })
                 .ok_or_else(|| SessionError::UnknownSession {
                     id: session_id.to_string(),
                 })?;
-            live
+            (live.close_kind.clone(), live.cancel_requested.clone())
         };
-        // A close KILLS an in-flight turn: mark it a cancel BEFORE the
-        // close (the driver's settle arm may win the race over the
-        // teardown — the `cancel_requested` flag maps that settle to
-        // `Cancelled`, not `EndTurn`, for a turn that was killed, not
-        // ended; the teardown arm sends `Cancelled` too, so the outcome
-        // is `Cancelled` either way, not timing-dependent).
+        // A close KILLS an in-flight turn: mark it a cancel BEFORE the `detach`
+        // (the router's `agent_settled` arm may win the race over the `Exited`
+        // teardown — the `cancel_requested` flag maps that settle to `Cancelled`,
+        // not `EndTurn`, for a turn that was killed, not ended; the `Exited`
+        // teardown arm sends `Cancelled` too, so the outcome is `Cancelled` either
+        // way, not timing-dependent).
         *cancel_requested.lock().unwrap_or_else(|p| p.into_inner()) = true;
         // Decide the kind BEFORE starting the close. First-set-wins: a kind
-        // already present means the close is in progress (another setter won
-        // the race) or the reason is already decided. The kind mutex is never
-        // held by anyone who also holds the close flag's future, so the set
-        // and the send can run safely in this order.
+        // already present means the close is in progress (another setter won the
+        // race) or the reason is already decided.
         if let Ok(mut kind) = close_kind.lock() {
             if kind.is_none() {
                 *kind = Some(CloseKind::User);
             }
         }
-        close_tx
-            .send(true)
-            .map_err(|_| SessionError::Io("session already closed".to_string()))?;
-        // Tear the loop down (the prompt queue + the in-flight turn stop; the
-        // driver teardown cancels too — idempotent).
-        handle.close();
+        // `detach` the Worker (the `WorkerManager` removes the `workers` entry +
+        // spawns the background reap — the `Exited` is EXPECTED: NO `on_crash`;
+        // the router's EXPECTED-exit handling does the `session-closed` cleanup).
+        // A `detach` miss (the session was already torn down) is a no-op — the
+        // `UnknownSession` above guards the `live` entry, so a miss here means the
+        // Worker was already reaped (idempotent close).
+        let _ = wm.detach(session_id);
         Ok(())
     }
+
+    // ── The Worker event router (ADR 0025 Task 4) ──────────────────────────
+    // The `WorkerManager`'s `on_event` callback (wired in `lib.rs` with the
+    // `OnceLock` late-wire). The reviewer-corrected routing: the UI's contract
+    // is the `SinkFrame`s (re-emitted verbatim); the store frames drive
+    // persistence only; the raw `RpcEvent` stream drives internal bookkeeping
+    // only (settle detection + the `pending_turn` resolution — NEVER the UI, to
+    // avoid double-delivering the `session-update` frames); the
+    // `PermissionRequest` / `InteractiveRequest` frames are re-emitted with the
+    // payload UNCHANGED (the frontend contract preserved by construction).
+    pub fn route_event(&self, session_id: &str, is_subagent: bool, evt: WorkerInboundEvent) {
+        match evt {
+            WorkerInboundEvent::Store(frame) => {
+                // Persistence ONLY (not the UI — the `TranscriptPersister` applies
+                // the store frame to SQLite, the sole writer).
+                if let Some(p) = self.persister.get() {
+                    p.apply(is_subagent, &frame);
+                }
+            }
+            WorkerInboundEvent::SinkFrame { event, payload } => {
+                // The ENTIRE UI contract — re-emitted VERBATIM (the same event name +
+                // payload; the frontend is unchanged).
+                if let Some(sink) = self.sink.get() {
+                    sink.emit(&event, payload);
+                }
+            }
+            WorkerInboundEvent::Event(e) => {
+                // Internal bookkeeping ONLY (NOT the `TauriSink` — forwarding would
+                // DOUBLE-DELIVER every `session-update` the loop emits both as an
+                // `RpcEvent` and as a `session-update` `SinkFrame`): the
+                // `agent_settled` settle detection (the session's "busy" state) + the
+                // `pending_turn` resolution.
+                if matches!(e, RpcEvent::agent_settled) {
+                    self.resolve_turn(session_id);
+                }
+            }
+            WorkerInboundEvent::PermissionRequest { id, payload } => {
+                // Re-emit as the `permission-request` Tauri event with the payload
+                // UNCHANGED (the frontend contract preserved by construction —
+                // `PermissionPrompt.tsx` / `store/permissions.ts` consume the
+                // payload's `requestId` / `toolTitle` / `options` verbatim).
+                if let Some(sink) = self.sink.get() {
+                    sink.emit("permission-request", payload);
+                }
+                self.track_modal(session_id, &id);
+            }
+            WorkerInboundEvent::InteractiveRequest { id, payload } => {
+                // Re-emit as the `interactive-request` Tauri event with the payload
+                // UNCHANGED (same reasoning — `store/interactive.ts` consumes
+                // `method` + `params`).
+                if let Some(sink) = self.sink.get() {
+                    sink.emit("interactive-request", payload);
+                }
+                self.track_modal(session_id, &id);
+            }
+            WorkerInboundEvent::Exited(code) => {
+                // EXPECTED (a `detach` / `reap_all` was in flight) → the
+                // `session-closed` cleanup. UNEXPECTED (a crash — the `WorkerManager`
+                // fired `on_crash`) → `is_exit_expected` is `false` → no-op (the
+                // `on_crash` path handles the stalled marking + the same cleanup).
+                if let Some(wm) = self.worker_manager.get() {
+                    if wm.is_exit_expected(session_id) {
+                        self.on_session_exited_expected(session_id);
+                    }
+                }
+                let _ = code;
+            }
+            WorkerInboundEvent::Ready { .. }
+            | WorkerInboundEvent::WorkerError { .. }
+            | WorkerInboundEvent::SubagentDispatch(_)
+            | WorkerInboundEvent::SubagentCancel { .. } => {
+                // The `WorkerManager`'s pump handles the `SubagentDispatch` (the
+                // Supervisor-side `dispatch_subagent` flow); the `Ready` / `WorkerError`
+                // / `SubagentCancel` frames are bookkeeping (the `SubagentCancel` →
+                // `cancel_subagent` is Task 5). Ignored here.
+            }
+        }
+    }
+
+    /// The `WorkerManager`'s `on_crash` callback (the UNEXPECTED `Exited` — a Worker
+    /// crash): mark the session STALLED (the `stalled` registry + the
+    /// `session-stalled` event + the `stalled_info` query), perform the pending-modal
+    /// cleanup (the `interactive-request-close` frames — a crashed session's open
+    /// permission / interactive modals are dismissed, no stuck modal alongside the
+    /// banner), and resolve the in-flight `send_prompt` (the crash outcome — the
+    /// composer unlocks; it never stays locked forever).
+    pub fn handle_crash(&self, session_id: &str, code: Option<i32>) {
+        let at = now_ms();
+        let crash_log = find_newest_crash_log();
+        // Mark the session STALLED (the `stalled` registry — the frontend reads it via
+        // `stalled_info` + the `session-stalled` event).
+        self.stalled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.to_string(), StalledInfo { at, crash_log });
+        // The pending-modal cleanup (the `interactive-request-close` frames — the
+        // unanswered-request-id diff: a crashed session's open permission / interactive
+        // modals are dismissed, no stuck modal alongside the banner).
+        self.cleanup_pending_modals(session_id);
+        // Resolve the in-flight `send_prompt` (the crash outcome — the turn is
+        // incomplete; `Cancelled` unlocks the composer. The `StopReason` has no error
+        // variant — the `session-stalled` event is the frontend's crash signal).
+        self.resolve_turn_forced(session_id, StopReason::Cancelled);
+        // Emit the `session-stalled` event (the frontend's banner — the `StalledInfo`
+        // shape: `at` + `crash_log`).
+        if let Some(sink) = self.sink.get() {
+            sink.emit(
+                "session-stalled",
+                json!({
+                    "sessionId": session_id,
+                    "at": at,
+                    "crashLog": find_newest_crash_log(),
+                }),
+            );
+        }
+        let _ = code;
+    }
+
+    /// The `stalled_info` query (the frontend's banner query — the `SessionManager`
+    /// exposes it; the `get_stalled_info` command wraps it).
+    pub fn stalled_info(&self, session_id: &str) -> Option<StalledInfo> {
+        self.stalled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Resolve the session's in-flight turn (the `pending_turn` oneshot) on an
+    /// `agent_settled` (the `cancel_requested` flag maps the settle to `Cancelled`,
+    /// else `EndTurn` — the existing settle semantics). A no-op when no turn is in
+    /// flight (the slot is empty) or the session is gone.
+    fn resolve_turn(&self, session_id: &str) {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(live) = live.get(session_id) else {
+            return;
+        };
+        let cancelled_guard = live
+            .cancel_requested
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cancelled = *cancelled_guard;
+        let reason = if cancelled {
+            StopReason::Cancelled
+        } else {
+            StopReason::EndTurn
+        };
+        let mut pending_guard = live.pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(tx) = pending_guard.take() {
+            let _ = tx.send(reason);
+        }
+    }
+
+    /// Resolve the session's in-flight turn with a FORCED reason (the `Exited`
+    /// / crash path — the turn is over regardless of the `cancel_requested` flag;
+    /// a mid-turn death / a close must not tell `send_prompt` "turn ended normally").
+    fn resolve_turn_forced(&self, session_id: &str, reason: StopReason) {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(live) = live.get(session_id) {
+            let mut pending_guard = live.pending_turn.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(tx) = pending_guard.take() {
+                let _ = tx.send(reason);
+            }
+        }
+    }
+
+    /// The EXPECTED `Exited` handling (a `detach` / `reap_all` was in flight — the
+    /// `close_session` / `reap_all` path): emit `session-closed` (the `ClosedReason`
+    /// payload — the `close_kind`: `User` for a `close_session`, `AgentExited` for a
+    /// clean self-exit), resolve the in-flight `pending_turn` → `Cancelled`, perform
+    /// the pending-modal cleanup (the `interactive-request-close` frames), and remove
+    /// the live-session bookkeeping.
+    fn on_session_exited_expected(&self, session_id: &str) {
+        let (reason, exists) = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(live) = live.get(session_id) else {
+                return; // the session is already gone (idempotent).
+            };
+            let kind_guard = live.close_kind.lock().unwrap_or_else(|p| p.into_inner());
+            let kind = *kind_guard;
+            // The `ClosedReason` mapping (the current `session.rs:876` shape): a
+            // `close_session` (`CloseKind::User`) → `User`; a clean self-exit (`None`
+            // — the Worker exited on its own) → `AgentExited`.
+            let reason = match kind {
+                Some(CloseKind::User) => ClosedReason::User,
+                None => ClosedReason::AgentExited,
+            };
+            (reason, true)
+        };
+        if !exists {
+            return;
+        }
+        // Resolve the in-flight `pending_turn` → `Cancelled` (a close / a clean self-
+        // exit kills the turn — the composer unlocks; it never stays locked forever).
+        self.resolve_turn_forced(session_id, StopReason::Cancelled);
+        // The pending-modal cleanup (the `interactive-request-close` frames — the
+        // unanswered-request-id diff: a session ending with an open prompt must NOT
+        // leave a stuck modal).
+        self.cleanup_pending_modals(session_id);
+        // Remove the live-session bookkeeping (the `live` / `config_state` / `stalled`
+        // entries — the session is over).
+        {
+            let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.remove(session_id);
+        }
+        self.config_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session_id);
+        // Emit the `session-closed` event (the `ClosedReason` payload — the frontend's
+        // close handling).
+        if let Some(sink) = self.sink.get() {
+            sink.emit(
+                "session-closed",
+                json!({
+                    "sessionId": session_id,
+                    "reason": reason.as_str(),
+                }),
+            );
+        }
+    }
+
+    /// The pending-modal cleanup (the round-3 fix — the Worker's pending maps die with
+    /// it, so the Supervisor tracks the cleanup state itself: per session, the
+    /// `PermissionRequest` / `InteractiveRequest` frames it relayed MINUS the
+    /// `*Response`s it sent = the UNANSWERED request ids — the Supervisor sees both
+    /// halves of every round-trip, so the diff is exact). Emits the same
+    /// `interactive-request-close` frames the in-process teardown emits for unanswered
+    /// prompts (keyed by the unanswered ids; a session ending with an open
+    /// permission / interactive prompt must NOT leave a stuck modal).
+    fn cleanup_pending_modals(&self, session_id: &str) {
+        let unanswered = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(live) = live.get(session_id) else {
+                return;
+            };
+            let ids_guard = live
+                .pending_modal_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ids_guard.clone()
+        };
+        if unanswered.is_empty() {
+            return;
+        }
+        let Some(sink) = self.sink.get() else {
+            return;
+        };
+        for request_id in unanswered {
+            sink.emit(
+                "interactive-request-close",
+                json!({
+                    "sessionId": session_id,
+                    "requestId": request_id,
+                }),
+            );
+        }
+    }
+
+    /// Track a relayed `PermissionRequest` / `InteractiveRequest` frame (the
+    /// `pending_modal_ids` set — the pending-modal cleanup's source). The `id` is the
+    /// request's `requestId` (the payload's key — the `interactive-request-close`
+    /// frame's `requestId` field).
+    fn track_modal(&self, session_id: &str, id: &str) {
+        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(live) = live.get_mut(session_id) {
+            let mut ids_guard = live
+                .pending_modal_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            ids_guard.insert(id.to_string());
+        }
+    }
+}
+
+/// The newest `crash-<ts>-worker*.log` in the data dir (the `StalledInfo`'s
+/// `crash_log` — globbed and FROZEN at crash time; best-effort attribution across
+/// concurrent sessions — crash logs are diagnostic, not load-bearing). `None` when
+/// the data dir is unresolvable or no crash log is found.
+fn find_newest_crash_log() -> Option<PathBuf> {
+    let dir = dirs::data_dir()?.join("archimedes");
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("crash-") && name.ends_with("-worker.log") {
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    newest = Some((mtime, entry.path()));
+                }
+            }
+        }
+    }
+    newest.map(|(_, p)| p)
 }
 
 /// Resolve a composed model key (`"<provider>/<id>"` — the catalog / config
@@ -2593,8 +2492,12 @@ pub fn normalize_capabilities(raw: &str) -> Value {
     }
 }
 
-/// Persist one `session-update` (the FROZEN JSON shapes the normalizer
-/// emits) into the transcript.
+/// Compute the display `messages` rows for one `session-update` (the
+/// FROZEN JSON shapes the normalizer emits) — the PURE row-computation
+/// half of the ACP-era persistence (the write half is
+/// `Store::persist_display` — ADR 0025: the `SqliteStore` writes them via
+/// `db.record_message`, the `IpcStore` frames them, the `NoopStore`
+/// ignores them).
 ///
 /// The persistence semantics are the ACP-era ones, unchanged: upsert keys
 /// (`(session_id, kind, message_key)`), agent-text accumulation per
@@ -2603,15 +2506,18 @@ pub fn normalize_capabilities(raw: &str) -> Value {
 /// ToolCallContent[]` diff channel has no RPC input in Phase 1 — pi's tool
 /// results carry no diff-structured content — so the `has_diff` branch is
 /// gone with the crate types). `pub(crate)` so the native `AgentLoop`
-/// (Task 6) persists through the SAME function.
-pub(crate) fn persist_update(
-    db: &Db,
-    session_id: &str,
+/// (Task 6) computes through the SAME function.
+///
+/// Returns 0 or 1 rows (the `_` arm — an update kind without a display
+/// row — yields none). `created_at` is the current time (the write half's
+/// `now_ms` stamp — the `SqliteStore`'s `db.record_message` re-stamps it
+/// at write time; the `IpcStore` frames it for the Supervisor's writer).
+pub(crate) fn compute_display_rows(
     update: &Value,
     agent_text_acc: &StdMutex<HashMap<String, String>>,
     tool_call_state: &StdMutex<HashMap<String, Value>>,
     thought_state: &StdMutex<ThoughtState>,
-) {
+) -> Vec<DisplayRow> {
     let kind = update.get("sessionUpdate").and_then(Value::as_str);
     match kind {
         Some("agent_thought_chunk") => {
@@ -2620,10 +2526,10 @@ pub(crate) fn persist_update(
                 .and_then(|c| c.get("text"))
                 .and_then(Value::as_str)
             else {
-                return;
+                return Vec::new();
             };
             if text.is_empty() {
-                return;
+                return Vec::new();
             }
             let key = update
                 .get("messageId")
@@ -2641,12 +2547,12 @@ pub(crate) fn persist_update(
             state.current.push_str(text);
             let row_key = format!("{}#{}", state.open_key.as_ref().unwrap(), state.next);
             let payload = json!({ "text": state.current });
-            let _ = db.record_message(
-                session_id,
-                "agent-thought",
-                Some(&row_key),
-                &payload.to_string(),
-            );
+            vec![DisplayRow {
+                kind: "agent-thought".to_string(),
+                message_key: row_key,
+                payload_json: payload,
+                created_at: now_ms(),
+            }]
         }
         Some("agent_message_chunk") => {
             let Some(text) = update
@@ -2654,10 +2560,10 @@ pub(crate) fn persist_update(
                 .and_then(|c| c.get("text"))
                 .and_then(Value::as_str)
             else {
-                return;
+                return Vec::new();
             };
             if text.is_empty() {
-                return;
+                return Vec::new();
             }
             thought_state
                 .lock()
@@ -2674,7 +2580,12 @@ pub(crate) fn persist_update(
             let entry = acc.entry(key.clone()).or_default();
             entry.push_str(text);
             let payload = json!({ "text": entry });
-            let _ = db.record_message(session_id, "agent-text", Some(&key), &payload.to_string());
+            vec![DisplayRow {
+                kind: "agent-text".to_string(),
+                message_key: key,
+                payload_json: payload,
+                created_at: now_ms(),
+            }]
         }
         Some("tool_call") => {
             let Some(key) = update
@@ -2682,7 +2593,7 @@ pub(crate) fn persist_update(
                 .and_then(Value::as_str)
                 .map(str::to_string)
             else {
-                return;
+                return Vec::new();
             };
             thought_state
                 .lock()
@@ -2690,12 +2601,12 @@ pub(crate) fn persist_update(
                 .open_key = None;
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
             state.insert(key.clone(), update.clone());
-            let _ = db.record_message(
-                session_id,
-                "tool-call",
-                Some(&key),
-                &state[&key].to_string(),
-            );
+            vec![DisplayRow {
+                kind: "tool-call".to_string(),
+                payload_json: state[&key].clone(),
+                message_key: key,
+                created_at: now_ms(),
+            }]
         }
         Some("tool_call_update") => {
             let Some(key) = update
@@ -2703,7 +2614,7 @@ pub(crate) fn persist_update(
                 .and_then(Value::as_str)
                 .map(str::to_string)
             else {
-                return;
+                return Vec::new();
             };
             let mut state = tool_call_state.lock().expect("tool-call state poisoned");
             let is_new = !state.contains_key(&key);
@@ -2711,7 +2622,7 @@ pub(crate) fn persist_update(
                 .entry(key.clone())
                 .or_insert_with(|| Value::Object(Default::default()));
             merge_json(entry, update);
-            let _ = db.record_message(session_id, "tool-call", Some(&key), &entry.to_string());
+            let payload = entry.clone();
             drop(state);
             // A first-seen tool-call update segments the thought stream
             // (the same rule as the ACP `has_diff` branch — a new tool
@@ -2722,9 +2633,25 @@ pub(crate) fn persist_update(
                     .expect("thought state poisoned")
                     .open_key = None;
             }
+            vec![DisplayRow {
+                kind: "tool-call".to_string(),
+                message_key: key,
+                payload_json: payload,
+                created_at: now_ms(),
+            }]
         }
-        _ => {}
+        _ => Vec::new(),
     }
+}
+
+/// The current unix time in milliseconds (the `DisplayRow` `created_at`
+/// stamp — the `Db::now_ms` mirror; the `SqliteStore`'s `db.record_message`
+/// re-stamps it at write time, so the two are the same value in practice).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -3136,11 +3063,9 @@ mod normalize_tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use crate::agent::harness::provider::{
-        ChatRole, FinishReason, MessageContent, ModelRequest, ProviderError, ProviderEvent,
-    };
+    use crate::agent::worker::client::{WorkerError, WorkerHandle};
+    use crate::agent::worker::manager::WorkerFactory;
     use crate::storage::Db;
-    use futures_util::StreamExt;
     use std::path::Path;
     use tokio::sync::mpsc;
 
@@ -3185,13 +3110,9 @@ mod session_tests {
     #[tokio::test]
     async fn native_resume_carries_the_archived_flag() {
         let dir = temp_config_dir();
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db.clone());
-        manager.set_catalog(native_test_catalog());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+        let (manager, _wm, db) = build_worker_manager(&dir, native_test_catalog(), &sink);
 
         let info = manager
             .start_session(dir.clone(), &sink)
@@ -3234,6 +3155,7 @@ mod session_tests {
             config_options: None,
             archived: true,
             context_usage: None,
+            is_subagent: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"archived\":true"), "got: {json}");
@@ -3280,31 +3202,67 @@ mod session_tests {
         }
     }
 
-    /// A `Provider` whose `complete` never resolves (the in-flight turn
-    /// hangs in the model call — the cancel / close tests).
-    struct HangingProvider;
-    #[async_trait::async_trait]
-    impl Provider for HangingProvider {
-        async fn complete(
-            &self,
-            _req: &ModelRequest,
-        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
-        {
-            futures_util::future::pending().await
+    /// The `fake_worker` fixture factory (the `WorkerFactory` seam —
+    /// `cargo test` builds the bin targets; the fixture answers the
+    /// `ready` handshake + the `start` / `prompt` frames; the
+    /// `AgentLoop` runs in the fixture process, NOT in-process —
+    /// ADR 0025).
+    struct FixtureFactory;
+
+    impl WorkerFactory for FixtureFactory {
+        fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
+            WorkerHandle::spawn(&fixture_path())
         }
     }
 
-    /// Start a native session with the given `provider_factory` seam.
-    async fn start_native_session_with(
+    /// The `fake_worker` fixture path (the `CARGO_MANIFEST_DIR`/
+    /// `target/debug` convention — `cargo test` builds the bin targets).
+    fn fixture_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_worker"
+        ))
+    }
+
+    /// Build the Worker-mediated manager (the ADR 0025 late-wire — the
+    /// `WorkerManager`'s `on_event` / `on_crash` callbacks point at the
+    /// `SessionManager`'s router / crash handler; `attach_worker_manager`
+    /// hands the `WorkerManager` to the `SessionManager` after both are
+    /// built). Returns the manager + the `WorkerManager` + the `Db`.
+    fn build_worker_manager(
         dir: &Path,
+        catalog: ModelCatalog,
         sink: &Arc<dyn EventSink>,
-        factory: impl Fn(&Model) -> Box<dyn Provider> + Send + Sync + 'static,
-    ) -> (SessionManager, SessionInfo) {
+    ) -> (Arc<SessionManager>, Arc<WorkerManager>, Arc<Db>) {
         let db = open_db(dir);
         let mut manager = SessionManager::new(dir.to_path_buf());
-        manager.attach_db(db);
-        manager.set_catalog(native_test_catalog());
-        manager.set_provider_factory(factory);
+        manager.attach_db(db.clone());
+        manager.set_catalog(catalog);
+        manager.set_sink(sink.clone());
+        let manager = Arc::new(manager);
+        let wm = {
+            let m = manager.clone();
+            let m2 = manager.clone();
+            Arc::new(WorkerManager::new(
+                Arc::new(FixtureFactory),
+                Arc::new(move |s, c| m.handle_crash(&s, c)),
+                Arc::new(move |s, b, e| m2.route_event(&s, b, e)),
+                Arc::new(|_s| None),
+            ))
+        };
+        manager.attach_worker_manager(wm.clone());
+        (manager, wm, db)
+    }
+
+    /// Start a native session with the given catalog (the Worker-mediated
+    /// path — the `fake_worker` fixture answers the `ready` handshake;
+    /// the Supervisor-side assertions run against the coordinator state).
+    async fn start_native_session_with_catalog(
+        dir: &Path,
+        sink: &Arc<dyn EventSink>,
+        catalog: ModelCatalog,
+    ) -> (Arc<SessionManager>, SessionInfo) {
+        let (manager, _wm, _db) = build_worker_manager(dir, catalog, sink);
         let info = manager
             .start_session(dir.to_path_buf(), sink)
             .await
@@ -3312,13 +3270,13 @@ mod session_tests {
         (manager, info)
     }
 
-    /// Start a native session (the mock `provider_factory` seam — the
-    /// `HangingProvider` hangs the turn in the model call).
+    /// Start a native session (the `native_test_catalog` — a single
+    /// `fake/m1` model).
     async fn start_native_session(
         dir: &Path,
         sink: &Arc<dyn EventSink>,
-    ) -> (SessionManager, SessionInfo) {
-        start_native_session_with(dir, sink, |_m: &Model| Box::new(HangingProvider)).await
+    ) -> (Arc<SessionManager>, SessionInfo) {
+        start_native_session_with_catalog(dir, sink, native_test_catalog()).await
     }
 
     /// A full `Model` literal for the `resolve_native_model` chain test
@@ -3380,25 +3338,6 @@ mod session_tests {
             thinking_levels: levels.iter().map(|s| s.to_string()).collect(),
             api: Some("openai-completions".to_string()),
         }
-    }
-
-    /// Start a native session with the given catalog (the `HangingProvider`
-    /// seam — the turn hangs in the model call).
-    async fn start_native_session_with_catalog(
-        dir: &Path,
-        sink: &Arc<dyn EventSink>,
-        catalog: ModelCatalog,
-    ) -> (SessionManager, SessionInfo) {
-        let db = open_db(dir);
-        let mut manager = SessionManager::new(dir.to_path_buf());
-        manager.attach_db(db);
-        manager.set_catalog(catalog);
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let info = manager
-            .start_session(dir.to_path_buf(), sink)
-            .await
-            .expect("the native session started");
-        (manager, info)
     }
 
     /// (ADR 0015) Native start: the remembered level (VALIDATED against the
@@ -3623,21 +3562,21 @@ mod session_tests {
             "the empty level is rejected with a Command error, got {err:?}"
         );
         // The mirror is UNCHANGED (a fresh session has no level — an
-        // applied change would have mirrored `Some("")`).
+        // applied change would have mirrored `Some("")`). The mirror's home
+        // moved from the `NativeHandle` to the `SessionManager`'s
+        // `config_state` map (the `NativeHandle` is gone for main sessions).
         let state = {
-            let sessions = manager.driver.sessions.lock().await;
-            sessions
+            let config_state = manager
+                .config_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            config_state
                 .get(&info.session_id)
                 .expect("the session is live")
-                .handle
-                .config_state()
+                .clone()
         };
         assert_eq!(
-            state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .thinking_level
-                .as_deref(),
+            state.thinking_level.as_deref(),
             None,
             "the mirror must be untouched by a rejected change"
         );
@@ -3755,11 +3694,7 @@ mod session_tests {
             &dir,
             serde_json::json!({ "defaultThinkingLevels": { "tama/m1": "xhigh" } }),
         );
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db.clone());
-        manager.set_catalog(catalog);
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (manager, _wm, db) = build_worker_manager(&dir, catalog, &sink);
         // The stored row: the start-of-session level (`"high"` — valid for
         // the model; a mid-session change to `xhigh` is only in the memory).
         db.record_session(&SessionInfo {
@@ -3774,6 +3709,7 @@ mod session_tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         })
         .expect("record_session should succeed");
         let info = manager
@@ -3825,6 +3761,7 @@ mod session_tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         })
         .expect("record_session should succeed");
         db.record_session_context_usage("nat-list-1", 53_760, 128_000)
@@ -3887,11 +3824,7 @@ mod session_tests {
         let dir = temp_config_dir();
         let (tx, _rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db.clone());
-        manager.set_catalog(catalog);
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (manager, _wm, db) = build_worker_manager(&dir, catalog, &sink);
         db.record_session(&SessionInfo {
             session_id: "nat-resume-cu-1".to_string(),
             cwd: dir.clone(),
@@ -3903,6 +3836,7 @@ mod session_tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         })
         .expect("record_session should succeed");
         db.record_session_context_usage("nat-resume-cu-1", 96_000, 128_000)
@@ -3942,11 +3876,7 @@ mod session_tests {
         // Phase 1: settings `s/m1` (in the catalog) → the settings rung
         // wins over the catalog default.
         write_settings_default_model(&dir, Some("s/m1"));
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db);
-        manager.set_catalog(catalog.clone());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (manager, _wm, _db) = build_worker_manager(&dir, catalog.clone(), &sink);
         let info = manager
             .start_session(dir.clone(), &sink)
             .await
@@ -3961,11 +3891,7 @@ mod session_tests {
         // unresolvable settings key falls through to the CATALOG DEFAULT
         // rung (not straight to the selectable set).
         write_settings_default_model(&dir, Some("gone/m1"));
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db);
-        manager.set_catalog(catalog.clone());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (manager, _wm, _db) = build_worker_manager(&dir, catalog.clone(), &sink);
         let info = manager
             .start_session(dir.clone(), &sink)
             .await
@@ -3978,11 +3904,7 @@ mod session_tests {
 
         // Phase 3: NO settings default → the catalog default applies.
         write_settings_default_model(&dir, None);
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db);
-        manager.set_catalog(catalog.clone());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
+        let (manager, _wm, _db) = build_worker_manager(&dir, catalog.clone(), &sink);
         let info = manager
             .start_session(dir.clone(), &sink)
             .await
@@ -4282,907 +4204,154 @@ mod session_tests {
         server.abort();
         server2.abort();
     }
+}
 
-    /// A `Provider` whose `complete` blocks until signalled (the stream
-    /// then emits a single `Done(Stop)` — the test paces the turn's
-    /// settle: a signal settles the turn, no signal hangs it).
-    struct PacedProvider {
-        settle: Arc<tokio::sync::Notify>,
+#[cfg(test)]
+mod compute_display_rows_tests {
+    use serde_json::json;
+
+    use super::{compute_display_rows, SessionInfo, ThoughtState};
+    use crate::agent::harness::store::{SessionStore, Store};
+    use crate::storage::Db;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// A temp-dir `Db` with a recorded `sessions` row (the `messages`
+    /// rows FK to `sessions`).
+    fn temp_db() -> Arc<Db> {
+        let dir =
+            std::env::temp_dir().join(format!("harness-display-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
+        db.record_session(&SessionInfo {
+            session_id: "s1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            capabilities: serde_json::json!({}),
+            config_options: None,
+            archived: false,
+            context_usage: None,
+            is_subagent: false,
+        })
+        .expect("record_session");
+        db
     }
 
-    #[async_trait::async_trait]
-    impl Provider for PacedProvider {
-        async fn complete(
-            &self,
-            _req: &ModelRequest,
-        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
-        {
-            let settle = self.settle.clone();
-            // The stream BLOCKS on the signal (its first `next()` awaits
-            // it), then yields a single `Done(Stop)` and ends — the turn
-            // settles when the test signals.
-            Ok(futures_util::stream::once(async move {
-                settle.notified().await;
-                ProviderEvent::Done(FinishReason::Stop)
-            })
-            .boxed())
-        }
-    }
+    /// The `persist_update` split (ADR 0025) GOLDEN test:
+    /// `compute_display_rows` on a canned normalized update + canned
+    /// accumulators yields the same `Vec<DisplayRow>` the old
+    /// `persist_update` wrote (the normalize + accumulator logic moved
+    /// verbatim — `SqliteStore::persist_display` applies the rows via
+    /// `db.record_message`, so the `messages` rows are identical).
+    #[test]
+    fn compute_display_rows_matches_the_legacy_persist_update_writes() {
+        let db = temp_db();
+        let store = SessionStore::new(db.clone());
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
 
-    /// (native, finding 3a) `close_session` resolves an in-flight
-    /// `send_prompt` `Cancelled` — deterministically, whichever driver
-    /// arm wins the race: the turn is KILLED by the close (`handle.close`
-    /// cancels the turn token; the loop settles it), so the
-    /// `cancel_requested` flag set in `close_session` maps the settle to
-    /// `Cancelled` (the settle arm), and the teardown arm sends
-    /// `Cancelled` too (pre-fix the settle arm mapped a killed turn to
-    /// `EndTurn` — the outcome was timing-dependent). A native turn
-    /// blocked on a hanging model call + a `close_session` → the
-    /// `send_prompt`'s `pending_turn` resolves `Cancelled` (the driver's
-    /// teardown resolves it BEFORE the session is removed — pre-fix the
-    /// unbounded `rx.await` hung forever: a close / cancel could not
-    /// unblock the waiter).
-    #[tokio::test]
-    async fn native_close_resolves_the_in_flight_prompt() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        let (reason, close_res) = tokio::join!(
-            async { manager.send_prompt(&sid, "hi".to_string()).await },
-            async {
-                // A head start for the prompt (the turn hangs in the
-                // model call before the close arrives).
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                manager.close_session(&sid).await
-            },
-        );
-        assert_eq!(close_res, Ok(()), "close should succeed");
-        assert_eq!(
-            reason,
-            Ok(StopReason::Cancelled),
-            "the close resolved the in-flight prompt `Cancelled` (not `EndTurn` — the turn was killed)"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (finding 4) A loop task that DIES mid-turn (the `loop_settle_rx`
-    /// sender is dropped — `changed()` returns `Err`) must NOT resolve the
-    /// in-flight `send_prompt` `EndTurn` (pre-fix the `_ =` pattern treated
-    /// the `Err` as a settle and resolved `pending_turn` `EndTurn` + wrote a
-    /// duplicate `(seq, reason)` to the driver watch — the `send_prompt`
-    /// caller was told "turn ended normally" when the agent actually died
-    /// mid-turn). The teardown resolves `pending_turn` with `Cancelled`
-    /// instead.
-    ///
-    /// The loop task is killed DIRECTLY (`handle.close` — NOT `close_session`,
-    /// which sets `cancel_requested` and would map the settle to `Cancelled`
-    /// even pre-fix): a loop task that dies on its own, not a user close.
-    #[tokio::test]
-    async fn native_loop_task_death_resolves_the_in_flight_prompt_cancelled() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        // Get the `NativeHandle` (to kill the loop task DIRECTLY — NOT
-        // `close_session`, which sets `cancel_requested` and would map the
-        // settle to `Cancelled` even pre-fix).
-        let handle = {
-            let sessions = manager.driver.sessions.lock().await;
-            let live = sessions.get(&sid).expect("the session is live");
-            live.handle.clone()
-        };
-        // Start a `send_prompt` (the turn hangs in the `HangingProvider`
-        // `complete()`). Poll it (via a `select!` with a sleep arm) until
-        // the turn is IN-FLIGHT (the prompt is sent to the loop, the loop
-        // starts a turn, and `complete()` hangs) — a never-polled future
-        // would leave the loop idle (nothing to resolve).
-        let mut prompt = Box::pin(manager.send_prompt(&sid, "hi".to_string()));
-        tokio::select! {
-            r = &mut prompt => {
-                // The turn settled before the abort (unexpected — the
-                // `HangingProvider` should hang). Fail the test.
-                panic!("the turn settled before the abort: {r:?}");
+        // The canned normalized update sequence (the FULL
+        // `session-update` frames the `normalize` emits):
+        let updates = [
+            // The assistant message m1: two chunks (the accumulator grows).
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "Hel" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "lo" } }),
+            // A thought segment for m1 (one chunk).
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "think" } }),
+            // A tool-call announcement + update (the `merge_json` shallow-merge).
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "run" }),
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": { "type": "completed" } }),
+            // A second assistant message m2 (segments the thought stream).
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m2", "content": { "text": "x" } }),
+            // An unknown kind (NO row — the `_` arm).
+            json!({ "sessionUpdate": "usage_update" }),
+        ];
+        let mut all_rows = Vec::new();
+        for u in &updates {
+            let rows = compute_display_rows(u, &text_acc, &tool_state, &thought_state);
+            if !rows.is_empty() {
+                assert_eq!(rows.len(), 1, "at most one row per update");
             }
-            _ = tokio::time::sleep(Duration::from_millis(300)) => {
-                // The turn is in-flight (hanging in `complete()`).
-            }
+            all_rows.extend(rows);
         }
-        // Kill the loop task DIRECTLY (a `JoinHandle::abort` — NO token
-        // cancelled, so the loop emits NO final settle; the `settle_tx`
-        // sender drops unseen → `changed()` returns `Err` deterministically
-        // → the teardown resolves `pending_turn` `Cancelled`, NOT `EndTurn`
-        // (which pre-fix the `changed()` `Err` arm produced)).
-        handle.abort_loop_task();
-        // The `send_prompt` resolves `Cancelled` (the teardown resolves
-        // `pending_turn` with `Cancelled` — NOT `EndTurn`, which is what
-        // pre-fix the `changed()` `Err` arm produced).
-        let reason = tokio::time::timeout(Duration::from_secs(5), &mut prompt)
-            .await
-            .expect("the prompt resolved (not a hang)");
-        assert_eq!(
-            reason,
-            Ok(StopReason::Cancelled),
-            "a loop task that died mid-turn resolves the in-flight prompt `Cancelled` (not `EndTurn` — the agent died, not a normal turn end)"
+        // 6 rows (the 7th update — the unknown kind — yields none).
+        assert_eq!(all_rows.len(), 6);
+        // The per-row golden (what the old `persist_update` wrote):
+        let (r0, r1, r2, r3, r4, r5) = (
+            &all_rows[0],
+            &all_rows[1],
+            &all_rows[2],
+            &all_rows[3],
+            &all_rows[4],
+            &all_rows[5],
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        assert_eq!(
+            (r0.kind.as_str(), r0.message_key.as_str()),
+            ("agent-text", "m1")
+        );
+        assert_eq!(r0.payload_json, json!({ "text": "Hel" }), "the first chunk");
+        assert_eq!(
+            r1.payload_json,
+            json!({ "text": "Hello" }),
+            "the accumulator grew"
+        );
+        assert_eq!(
+            (r2.kind.as_str(), r2.message_key.as_str()),
+            ("agent-thought", "m1#1"),
+            "the thought segment key"
+        );
+        assert_eq!(r2.payload_json, json!({ "text": "think" }));
+        assert_eq!(
+            (r3.kind.as_str(), r3.message_key.as_str()),
+            ("tool-call", "t1")
+        );
+        assert_eq!(r3.payload_json["title"], "run", "the announcement row");
+        assert_eq!(
+            r4.payload_json["title"], "run",
+            "the merged row keeps the title"
+        );
+        assert_eq!(
+            r4.payload_json["status"]["type"], "completed",
+            "the merge added the status"
+        );
+        assert_eq!(
+            (r5.kind.as_str(), r5.message_key.as_str()),
+            ("agent-text", "m2")
+        );
+        assert_eq!(r5.payload_json, json!({ "text": "x" }));
+        // `created_at` is the current time (the write half's `now_ms`).
+        assert!(r0.created_at > 0);
 
-    /// (finding 2) Two CONCURRENT native `send_prompt`s: the busy check +
-    /// the resolver claim are ATOMIC under one `pending_turn` lock, so
-    /// EXACTLY ONE is accepted (it claims the slot) and the other is
-    /// rejected "busy". Pre-fix the check dropped the lock, so both
-    /// observed an empty slot, both passed, and the second's claim dropped
-    /// the first's sender (a phantom `Cancelled`) while the second's
-    /// resolver was resolved by the FIRST turn's `agent_settled`.
-    ///
-    /// The prompts are fired TRULY concurrently (the `tokio::spawn` calls in
-    /// the same tick, NO sleep between them): a staggered test (task 2 200 ms
-    /// after task 1) saw an occupied slot even pre-fix (the TOCTOU window was
-    /// two awaits wide and closed in well under 200 ms), so it could not catch
-    /// an atomicity regression. Pre-fix this shape accepts BOTH (one phantom
-    /// `Cancelled`), so the exactly-one-`Ok` assertion discriminates.
-    #[tokio::test]
-    async fn two_concurrent_native_send_prompts_exactly_one_is_accepted() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        // `HangingProvider`: the turn hangs in the model call, so the
-        // claimed slot stays occupied (the second prompt is rejected).
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        let manager = Arc::new(manager);
-        // Fire BOTH `send_prompt`s TRULY concurrently (the `tokio::spawn`
-        // calls in the same tick, NO sleep between them — see the doc above).
-        let m1 = manager.clone();
-        let sid1 = sid.clone();
-        let t1 = tokio::spawn(async move { m1.send_prompt(&sid1, "A".to_string()).await });
-        let m2 = manager.clone();
-        let sid2 = sid.clone();
-        let t2 = tokio::spawn(async move { m2.send_prompt(&sid2, "B".to_string()).await });
-        // The rejected task resolves immediately (busy); the accepted task
-        // hangs in the model call (the `HangingProvider`). Give the rejected
-        // task a head start to resolve, then cancel the session (resolve the
-        // accepted task `Cancelled` — free the slot).
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = manager.cancel_session(&sid).await;
-        let r1 = tokio::time::timeout(Duration::from_secs(5), t1)
-            .await
-            .expect("Task 1 resolved (not a hang)")
-            .expect("Task 1 did not panic");
-        let r2 = tokio::time::timeout(Duration::from_secs(5), t2)
-            .await
-            .expect("Task 2 resolved (not a hang)")
-            .expect("Task 2 did not panic");
-        // EXACTLY ONE is accepted (`Ok` — `Cancelled` after the cancel) + the
-        // other is rejected "busy". Pre-fix BOTH were accepted (one phantom
-        // `Cancelled`), so this discriminates.
-        let outcomes = [r1, r2];
-        let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
-        let busy = outcomes
+        // The WRITE half (`SqliteStore::persist_display` via
+        // `db.record_message`): the rows land as `messages` rows — the
+        // FINAL golden values (the last row per key wins, the upsert
+        // idempotency — the old `persist_update`'s semantics,
+        // unchanged).
+        store.persist_display("s1", &all_rows).unwrap();
+        let db_rows = db.messages_for("s1").unwrap();
+        assert_eq!(db_rows.len(), 4, "four distinct rows landed");
+        let text = db_rows
             .iter()
-            .filter(|r| matches!(r, Err(SessionError::Command { .. })))
-            .count();
+            .find(|r| r.kind == "agent-text" && r.message_key.as_deref() == Some("m1"))
+            .unwrap();
         assert_eq!(
-            accepted, 1,
-            "exactly one prompt is accepted, got {outcomes:?}"
+            text.payload_json, r#"{"text":"Hello"}"#,
+            "the m1 row holds the GROWN accumulator (the last upsert wins)"
         );
-        assert_eq!(
-            busy, 1,
-            "exactly one prompt is rejected busy, got {outcomes:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (finding 2, multi-round) Five ROUNDS of two CONCURRENT native
-    /// `send_prompt`s: each round fires two prompts truly concurrently
-    /// (exactly one accepted + one busy-rejected), then cancels the accepted
-    /// turn (free the slot for the next round). A staggered single-round test
-    /// could not catch an atomicity regression (the pre-fix TOCTOU window
-    /// closed in well under a 200 ms stagger), so the multi-round variant
-    /// makes the test robust.
-    #[tokio::test]
-    async fn two_concurrent_native_send_prompts_exactly_one_is_accepted_five_rounds() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        // `HangingProvider`: the turn hangs in the model call, so the
-        // claimed slot stays occupied (the second prompt is rejected).
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        let manager = Arc::new(manager);
-        // 5 rounds: each round fires TWO `send_prompt`s truly concurrently
-        // (exactly one accepted + one busy-rejected), then cancels the
-        // accepted turn (free the slot for the next round).
-        for round in 0..5 {
-            let m1 = manager.clone();
-            let sid1 = sid.clone();
-            let t1 = tokio::spawn(async move { m1.send_prompt(&sid1, format!("A{round}")).await });
-            let m2 = manager.clone();
-            let sid2 = sid.clone();
-            let t2 = tokio::spawn(async move { m2.send_prompt(&sid2, format!("B{round}")).await });
-            // The rejected task resolves immediately (busy); the accepted task
-            // hangs in the model call (the `HangingProvider`). Give the rejected
-            // task a head start to resolve, then cancel the session (resolve the
-            // accepted task `Cancelled` — free the slot for the next round).
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = manager.cancel_session(&sid).await;
-            let r1 = tokio::time::timeout(Duration::from_secs(5), t1)
-                .await
-                .expect("Task 1 resolved (not a hang)")
-                .expect("Task 1 did not panic");
-            let r2 = tokio::time::timeout(Duration::from_secs(5), t2)
-                .await
-                .expect("Task 2 resolved (not a hang)")
-                .expect("Task 2 did not panic");
-            // EXACTLY ONE is accepted (`Ok`) + the other is rejected "busy".
-            let outcomes = [r1, r2];
-            let accepted = outcomes.iter().filter(|r| r.is_ok()).count();
-            let busy = outcomes
-                .iter()
-                .filter(|r| matches!(r, Err(SessionError::Command { .. })))
-                .count();
-            assert_eq!(
-                accepted, 1,
-                "round {round}: exactly one prompt is accepted, got {outcomes:?}"
-            );
-            assert_eq!(
-                busy, 1,
-                "round {round}: exactly one prompt is rejected busy, got {outcomes:?}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (settle watch) `wait_for_settle` must not resolve a STALE settle when
-    /// a turn is IN FLIGHT: after turn 1 settles, a `wait_for_settle` with a
-    /// turn IN FLIGHT (the `pending_turn` slot occupied) must NOT return
-    /// turn 1's settle — it is pinned to the current version
-    /// (`mark_unchanged`) and resolves only on a NEW settle. With NO turn in
-    /// flight (the caller's turn already settled — the subagent dispatches a
-    /// raw prompt, which does NOT occupy `pending_turn`, then awaits the
-    /// settle: a fast turn settles before the await), the `mark_unchanged` is
-    /// SKIPPED: the clone inherits the stored receiver's last-seen version, so
-    /// `changed()` resolves immediately with the LATEST settle (the fast-turn
-    /// contract — hanging on a new settle that never comes would be the bug).
-    /// The `mark_unchanged` + the `pending_turn` snapshot are under ONE
-    /// `sessions` lock (finding 6), and the driver's settle arm takes the slot
-    /// + sends the watch under the same lock (watch send last), so a settle
-    /// landing between the snapshot and the mark is ordered (a settle after the
-    /// mark is a NEW version → resolves; one before empties the slot → no mark
-    /// → resolves with the latest).
-    #[tokio::test]
-    async fn wait_for_settle_does_not_return_a_stale_settle() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let settle = Arc::new(tokio::sync::Notify::new());
-        let provider_settle = settle.clone();
-        let (manager, info) = start_native_session_with(&dir, &sink, move |_m: &Model| {
-            Box::new(PacedProvider {
-                settle: provider_settle.clone(),
-            })
-        })
-        .await;
-        let sid = info.session_id.clone();
-
-        // Turn 1 settles (the signal releases the model call).
-        let (reason, r) = tokio::join!(
-            async { manager.send_prompt(&sid, "one".to_string()).await },
-            async {
-                // A head start for the prompt (the turn waits in the
-                // model call before the signal arrives).
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                settle.notify_one();
-                Ok::<(), ()>(())
-            },
-        );
-        assert_eq!(r, Ok(()), "the signal should have been sent");
-        assert_eq!(reason, Ok(StopReason::EndTurn), "turn 1 settles");
-
-        // Turn 2 starts (IN FLIGHT — `send_prompt` occupies `pending_turn`;
-        // the turn blocks in the model call until signalled). Poll `prompt`
-        // until it has dispatched the turn (it then blocks in the model
-        // call — the short timeout elapses, `prompt` stays pending).
-        let prompt = manager.send_prompt(&sid, "two".to_string());
-        tokio::pin!(prompt);
-        let _ = tokio::time::timeout(Duration::from_millis(200), &mut prompt).await;
-
-        // `wait_for_settle` while turn 2 is IN FLIGHT: it must NOT resolve
-        // on turn 1's STALE settle (500 ms ≪ the settle timeout) — the
-        // `pending_turn` slot is occupied, so the wait is pinned to the
-        // channel's current version and resolves only on a NEW settle.
-        let stale = tokio::time::timeout(
-            Duration::from_millis(500),
-            manager.driver.wait_for_settle(&sid),
-        );
-        assert!(
-            stale.await.is_err(),
-            "a stale (previous turn's) settle must not resolve the wait while a turn is in flight"
-        );
-
-        // Turn 2 settles (the signal releases the model call) → `send_prompt`
-        // resolves, and a `wait_for_settle` with NO turn in flight resolves
-        // immediately with the turn's (latest) settle — the fast-turn contract
-        // (a fast turn settles before the await; hanging on a new settle that
-        // never comes would be the bug).
-        settle.notify_one();
-        assert_eq!(prompt.await, Ok(StopReason::EndTurn), "turn 2 settles");
-        let w = manager.driver.wait_for_settle(&sid).await;
-        assert_eq!(
-            w,
-            Ok(StopReason::EndTurn),
-            "a settled turn's settle resolves immediately"
-        );
-
-        let _ = manager.close_session(&sid).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (native, finding 8c) A native Stop matches the external `abort`:
-    /// the turn stops (the `send_prompt` resolves `Cancelled`) and the
-    /// session STAYS ALIVE (a new prompt reuses it — the pre-fix Stop
-    /// cancelled the loop's teardown token, which ENDED THE WHOLE
-    /// SESSION: a second `send_prompt` would be an `UnknownSession`). A
-    /// stale cancel does not settle the new turn (a fresh turn token);
-    /// a second Stop settles it.
-    #[tokio::test]
-    async fn native_cancel_stops_the_turn_and_keeps_the_session() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        // The first Stop: the turn settles `Cancelled` (the session stays
-        // alive).
-        let (reason, cancel_res) = tokio::join!(
-            async { manager.send_prompt(&sid, "hi".to_string()).await },
-            async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                manager.cancel_session(&sid).await
-            },
-        );
-        assert_eq!(cancel_res, Ok(()), "cancel should succeed");
-        assert_eq!(
-            reason,
-            Ok(StopReason::Cancelled),
-            "the Stop settled the turn"
-        );
-        // The session is still alive: a new prompt starts (a FRESH turn —
-        // the stale cancel does not settle it), and a second Stop
-        // settles it.
-        let (reason2, cancel_res2) = tokio::join!(
-            async { manager.send_prompt(&sid, "again".to_string()).await },
-            async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                manager.cancel_session(&sid).await
-            },
-        );
-        assert_eq!(cancel_res2, Ok(()), "the second cancel should succeed");
-        assert_eq!(
-            reason2,
-            Ok(StopReason::Cancelled),
-            "the session was reused (a stale cancel did not settle the new turn; the second Stop did)"
-        );
-        let _ = manager.close_session(&sid).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (critical) A native prompt writes EXACTLY ONE `user` row to the
-    /// display `messages`: the manager's `record_message` (in
-    /// `send_prompt_with_images`) is the SOLE write — the loop's
-    /// `handle_turn` must not re-persist the user message (the
-    /// `(session_id, kind, message_key)` key with `message_key = NULL`
-    /// treats NULLs as DISTINCT in `ON CONFLICT`, so a double write
-    /// deterministically duplicates the user bubble in restored
-    /// history).
-    #[tokio::test]
-    async fn a_native_prompt_writes_exactly_one_user_row() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        // The turn hangs in the (hanging) model call: the manager's row
-        // is written before the turn begins, and the loop's own write
-        // (when it has one) happens when the turn starts. Drive the
-        // prompt until it blocks (a 500 ms timeout) so both writes have
-        // happened.
-        let prompt = manager.send_prompt(&sid, "hi".to_string());
-        tokio::pin!(prompt);
-        let _ = tokio::time::timeout(Duration::from_millis(500), &mut prompt).await;
-        let db = open_db(&dir);
-        let rows = db.messages_for(&sid).expect("messages_for");
-        let user_rows = rows.iter().filter(|r| r.kind == "user").count();
-        assert_eq!(
-            user_rows, 1,
-            "exactly one `user` row (a double write would show a duplicate user bubble)"
-        );
-        let _ = manager.cancel_session(&sid).await;
-        assert_eq!(prompt.await, Ok(StopReason::Cancelled));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (concurrent native prompts) The frontend is one-turn-at-a-time:
-    /// a `send_prompt` on a native session with a turn ALREADY IN
-    /// FLIGHT is REJECTED ("a turn is already in flight") rather than
-    /// queued — the `pending_turn` slot is a single last-wins resolver,
-    /// and a queued prompt would be settled by the PREVIOUS turn's
-    /// `agent_settled` (mis-attribution: the composer unlocks while a
-    /// turn is still live). The external path keeps its steer/
-    /// last-wins behavior (a single steer turn).
-    #[tokio::test]
-    async fn a_concurrent_native_prompt_is_rejected_busy() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        // The first prompt's turn hangs in the model call (the
-        // `pending_turn` slot stays occupied). Drive the prompt until it
-        // blocks (a 300 ms timeout) so its resolver is stored.
-        let p1 = manager.send_prompt(&sid, "one".to_string());
-        tokio::pin!(p1);
-        let _ = tokio::time::timeout(Duration::from_millis(300), &mut p1).await;
-        let r2 = manager.send_prompt(&sid, "two".to_string()).await;
-        assert!(
-            matches!(&r2, Err(SessionError::Command { error }) if error.contains("already in flight")),
-            "the concurrent prompt is rejected busy, got {r2:?}"
-        );
-        // The first resolver was NOT overwritten: a Stop settles the
-        // FIRST prompt (not the rejected one).
-        let _ = manager.cancel_session(&sid).await;
-        assert_eq!(
-            p1.await,
-            Ok(StopReason::Cancelled),
-            "the first turn's resolver was kept"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (native, finding 12) A `set_config_option` whose `try_send` fails
-    /// (the control queue is FULL — the loop is busy in a hanging model
-    /// call and never consumes it) returns an error: the state is NOT
-    /// mirrored and no `config_option_update` is claimed (pre-fix the
-    /// `try_send` failure was ignored — the UI would show the new config
-    /// while the loop kept running the old one, a silent divergence).
-    #[tokio::test]
-    async fn native_set_config_option_fails_when_the_queue_is_full() {
-        let dir = temp_config_dir();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        let (manager, info) = start_native_session(&dir, &sink).await;
-        let sid = info.session_id.clone();
-        // The loop is BUSY (a hanging model call) — the control queue
-        // (8) is not consumed. The first 8 changes queue (Ok); the 9th
-        // `try_send` fails (the queue is full) → an error, NOT a silent
-        // success.
-        for i in 0..8 {
-            manager
-                .set_config_option(&sid, "thought_level", "low", &sink)
-                .await
-                .unwrap_or_else(|e| panic!("change {i} should have queued: {e:?}"));
-        }
-        let result = manager
-            .set_config_option(&sid, "thought_level", "low", &sink)
-            .await;
-        assert!(
-            matches!(result, Err(SessionError::Command { .. })),
-            "a full control queue is an error (finding 12), got {result:?}"
-        );
-        let _ = manager.close_session(&sid).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (teardown) A session close clears the session's Phase 2 shared
-    /// state (the `sudo_password` cache + the `todo_store` entry — the
-    /// suite's `credentialCache` is cleared at every session boundary; a
-    /// stale credential must not survive the session, and a resume under
-    /// the same id must re-prompt, not silently reuse it). Ported to a
-    /// NATIVE session (the desktop is native-only).
-    #[tokio::test]
-    async fn session_close_clears_the_cached_sudo_password_and_the_todos() {
-        let dir = temp_config_dir();
-        let db = open_db(&dir);
-        let mut manager = SessionManager::new(dir.clone());
-        manager.attach_db(db.clone());
-        manager.set_catalog(native_test_catalog());
-        manager.set_provider_factory(|_m: &Model| Box::new(HangingProvider));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let info = manager.start_session(dir.clone(), &sink).await.unwrap();
-        let sid = info.session_id.clone();
-
-        // Simulate mid-session state: a cached credential + todos for this
-        // session (the `sudo_password` cache is keyed by the BARE session
-        // id — `cache.get(sid)` — and the todo store likewise).
-        manager.driver.sudo_password.lock().await.insert(
-            sid.clone(),
-            CachedPassword {
-                password: "pw".to_string(),
-                expires_at: std::time::Instant::now() + Duration::from_secs(600),
-            },
-        );
-        manager.driver.todo_store.set(
-            &sid,
-            vec![crate::agent::todo::TodoItem {
-                content: "a".to_string(),
-                status: crate::agent::todo::TodoStatus::Pending,
-                description: None,
-            }],
-        );
-
-        let _ = manager.close_session(&sid).await;
-
-        // Wait for the driver's `session-closed` event (it is emitted AFTER
-        // the teardown — the assertions below are only meaningful once the
-        // teardown has run).
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut closed = false;
-        while std::time::Instant::now() < deadline && !closed {
-            if let Ok(msg) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                if msg.unwrap()["event"] == "session-closed" {
-                    closed = true;
-                }
-            }
-        }
-        assert!(closed, "the session-closed event fired");
-        assert!(
-            !manager.driver.sudo_password.lock().await.contains_key(&sid),
-            "the cached sudo password is cleared at the session boundary"
-        );
-        assert!(
-            manager.driver.todo_store.get(&sid).is_empty(),
-            "the todo list is cleared at the session boundary"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ── Native system prompt (ADR 0017, Task 3: the prompt is built
-    // ONCE at a NEW session's start — persisted at seq 0 — and a
-    // RESUME replays the stored transcript verbatim) ──
-
-    /// A `Provider` that RECORDS every `ModelRequest` it receives (pushed
-    /// into the shared vec) and then answers with a short canned stream
-    /// (`TextDelta` + `Done(Stop)` — the turn settles `EndTurn`).
-    struct RecordingProvider {
-        requests: Arc<StdMutex<Vec<ModelRequest>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for RecordingProvider {
-        async fn complete(
-            &self,
-            req: &ModelRequest,
-        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
-        {
-            self.requests.lock().unwrap().push(req.clone());
-            Ok(futures_util::stream::iter(vec![
-                ProviderEvent::TextDelta("ok".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ])
-            .boxed())
-        }
-    }
-
-    /// Build a `SessionManager` (a temp config dir + a native `AgentEntry`
-    /// with the given `enabled_tools`) + a Space dir (an EMPTY `.git/` dir
-    /// bounds the project-context walk at the Space, per the Task 1
-    /// scratch-dir rule; the optional `AGENTS.md` is the controlled project
-    /// context) + the `RecordingProvider` seam. Returns the manager, the
-    /// Space dir, the shared request vec, the `Db` (the FK assertions), and
-    /// the sink.
-    async fn native_manager_with_recording(
-        enabled_tools: &[&str],
-        agents_md: Option<&str>,
-    ) -> (
-        SessionManager,
-        PathBuf,
-        Arc<StdMutex<Vec<ModelRequest>>>,
-        std::sync::Arc<Db>,
-        Arc<dyn EventSink>,
-    ) {
-        let dir = temp_config_dir();
-        let space = dir.join("space");
-        std::fs::create_dir_all(space.join(".git")).unwrap();
-        if let Some(content) = agents_md {
-            std::fs::write(space.join("AGENTS.md"), content).unwrap();
-        }
-        // The harness-level tool filter (the `Settings.enabled_tools` —
-        // `[]` = all): the settings.json replacement for the old
-        // agents.json harness fixture.
-        let settings = serde_json::json!({ "enabledTools": enabled_tools });
-        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
-        let db = open_db(&dir);
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let factory_requests = requests.clone();
-        let mut manager = SessionManager::new(dir);
-        manager.attach_db(db.clone());
-        manager.set_catalog(native_test_catalog());
-        manager.set_provider_factory(move |_m: &Model| {
-            Box::new(RecordingProvider {
-                requests: factory_requests.clone(),
-            })
-        });
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-        (manager, space, requests, db, sink)
-    }
-
-    /// Start a native session in `space` and drive ONE turn (the
-    /// `RecordingProvider` settles it `EndTurn`); returns the `SessionInfo`
-    /// + the turn's recorded `ModelRequest`.
-    async fn start_and_drive_one_turn(
-        manager: &SessionManager,
-        space: &Path,
-        requests: &Arc<StdMutex<Vec<ModelRequest>>>,
-        sink: &Arc<dyn EventSink>,
-    ) -> (SessionInfo, ModelRequest) {
-        let info = manager
-            .start_session(space.to_path_buf(), sink)
-            .await
-            .expect("the native session started");
-        let sid = info.session_id.clone();
-        let reason = tokio::time::timeout(Duration::from_secs(15), {
-            manager.send_prompt(&sid, "hello".to_string())
-        })
-        .await
-        .expect("the turn settled (not a hang)")
-        .expect("the turn settled");
-        assert_eq!(reason, StopReason::EndTurn, "a normal turn settles EndTurn");
-        let req = requests
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .expect("the model was called");
-        (info, req)
-    }
-
-    /// The `messages[0]` text (a `System` message with plain text content).
-    fn system_text(req: &ModelRequest) -> String {
-        let first = &req.messages[0];
-        assert!(
-            matches!(first.role, ChatRole::System),
-            "messages[0] is the system message, got {:?}",
-            first.role
-        );
-        match &first.content {
-            MessageContent::Text(t) => t.clone(),
-            other => panic!("the system message is plain text, got {other:?}"),
-        }
-    }
-
-    /// (ADR 0017) A NEW native session's first model request carries the
-    /// built system prompt at `messages[0]` (the preamble + a `<tools>`
-    /// section + the project context + the `<cwd>` section), AND the seq-0
-    /// `native_messages` row exists — the FK fix: the session row is
-    /// recorded BEFORE the seq-0 persist inside `build_native_session`
-    /// (a persist BEFORE the row would hit an FK violation and be dropped).
-    #[tokio::test]
-    async fn start_native_session_persists_system_prompt() {
-        let (manager, space, requests, db, sink) =
-            native_manager_with_recording(&[], Some("project rules")).await;
-        let space_canon = std::fs::canonicalize(&space).unwrap();
-        let space_str = space_canon.to_string_lossy().into_owned();
-        let (info, req) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
-
-        // The prompt assertions are `contains`-based: the real `~/.pi/agent`
-        // context file + the discovered skills leak in (not injectable at
-        // this level) — assert on the controlled content.
-        let text = system_text(&req);
-        assert!(
-            text.contains("You are an expert coding assistant operating inside Archimedes Desktop"),
-            "the preamble: {text}"
-        );
-        assert!(
-            text.contains("- read:"),
-            "a <tools> section with the read line: {text}"
-        );
-        assert!(
-            text.contains("<project_context>"),
-            "a <project_context> section: {text}"
-        );
-        assert!(
-            text.contains("project rules"),
-            "the Space's AGENTS.md: {text}"
-        );
-        assert!(text.contains("<cwd>"), "a <cwd> section: {text}");
-        assert!(
-            text.contains(&space_str),
-            "the <cwd> section carries the Space path: {text}"
-        );
-
-        // The FK fix: the session row exists AND a `native_messages` row
-        // with the system content exists (the persist did NOT hit an FK
-        // violation — the row was recorded BEFORE the prompt block).
-        assert!(
-            db.session(&info.session_id)
-                .expect("the db works")
-                .is_some(),
-            "the session row exists"
-        );
-        let rows = db
-            .load_native_messages(&info.session_id)
-            .expect("the db works");
-        assert!(!rows.is_empty(), "a native_messages row exists");
-        assert!(
-            rows[0].contains("\"role\":\"system\""),
-            "the FIRST row (seq 0) is the system message, got: {}",
-            &rows[0]
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(space.parent().unwrap());
-    }
-
-    /// The `<rules>` section body (the text between `<rules>\n` and
-    /// `\n</rules>`): built purely from the advertised specs (the two pi
-    /// lines + the conditional guidance lines) — env-independent, so
-    /// negative assertions are scoped to it (a whole-prompt `!contains`
-    /// would be flaky-by-construction: a global `AGENTS.md` / skill
-    /// containing the phrase would turn CI red).
-    fn rules_body(prompt: &str) -> &str {
-        let start = prompt
-            .find("<rules>\n")
-            .unwrap_or_else(|| panic!("a <rules> section: {prompt}"));
-        let end = prompt
-            .find("\n</rules>")
-            .unwrap_or_else(|| panic!("the </rules> close: {prompt}"));
-        &prompt[start + "<rules>\n".len()..end]
-    }
-
-    /// (ADR 0017) `enabled_tools` restricts the prompt's `<tools>` section
-    /// (the `advertised_specs` — the prompt matches the `tools[]` API param
-    /// exactly) AND the conditional `<rules>` guidance lines (`[
-    /// "read", "bash"]` → neither the `manage_todo_list` nor the
-    /// `subagent` guidance line).
-    #[tokio::test]
-    async fn start_native_session_prompt_respects_enabled_tools() {
-        let (manager, space, requests, _db, sink) =
-            native_manager_with_recording(&["read", "bash"], Some("project rules")).await;
-        let (info, req) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
-
-        let text = system_text(&req);
-        // The `<tools>` body: EXACTLY the `read` + `bash` lines (no
-        // `subagent` line, no other tool line).
-        let start = text.find("<tools>\n").expect("a <tools> section: {text}");
-        let end = text.find("\n</tools>").expect("the </tools> close: {text}");
-        let body = &text[start + "<tools>\n".len()..end];
-        let lines: Vec<&str> = body.split('\n').collect();
-        assert_eq!(lines.len(), 2, "exactly the read + bash lines, got: {body}");
-        assert!(
-            lines.iter().any(|l| l.starts_with("- read:")),
-            "the read line: {body}"
-        );
-        assert!(
-            lines.iter().any(|l| l.starts_with("- bash:")),
-            "the bash line: {body}"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("subagent")),
-            "no subagent line: {body}"
-        );
-        // The conditional guidance: `manage_todo_list` + `subagent` are NOT
-        // advertised → both guidance lines absent from the `<rules>`
-        // section (scoped to the section — a whole-prompt `!contains` would
-        // be flaky-by-construction: a global `AGENTS.md` / skill containing
-        // the phrase would turn CI red; the section is built purely from
-        // the advertised specs, so it is env-independent).
-        let rules = rules_body(&text);
-        assert!(
-            !rules.contains("manage_todo_list to track"),
-            "no TODO guidance in <rules>: {rules}"
-        );
-        assert!(
-            !rules.contains("Delegate independent subtasks"),
-            "no subagent guidance in <rules>: {rules}"
-        );
-        assert!(
-            rules.contains("Be concise in your responses")
-                && rules.contains("Show file paths clearly when working with files"),
-            "the two pi lines in <rules>: {rules}"
-        );
-        assert!(
-            text.contains("- Be concise in your responses")
-                && text.contains("- Show file paths clearly when working with files"),
-            "the two pi lines: {text}"
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(space.parent().unwrap());
-    }
-
-    /// (ADR 0017, the static-per-session decision) A RESUME replays the
-    /// stored transcript verbatim — the prompt is NOT rebuilt: a changed
-    /// `AGENTS.md` applies from the next NEW session, not the resume.
-    #[tokio::test]
-    async fn resume_native_session_replays_system_prompt_verbatim() {
-        let (manager, space, requests, _db, sink) =
-            native_manager_with_recording(&[], Some("v1 rules")).await;
-        let (info, _req1) = start_and_drive_one_turn(&manager, &space, &requests, &sink).await;
-
-        // The context CHANGES after the start (the Space's `.git` bounds
-        // the walk, so the overwrite is the only context change). A FRESH
-        // marker makes the negative assertion collision-proof (a whole-prompt
-        // `!contains("v2 rules")` would be flaky-by-construction: a global
-        // `AGENTS.md` / skill containing the phrase would turn CI red; the
-        // marker cannot collide — `v1` lives in the `.git`-bounded temp
-        // Space, so its positive `contains` stays unmarked).
-        let marker = uuid::Uuid::new_v4().to_string();
-        std::fs::write(space.join("AGENTS.md"), format!("v2 rules {marker}")).unwrap();
-
-        let resumed = manager
-            .resume_session(&info.session_id, space.clone(), &sink)
-            .await
-            .expect("the native resume succeeded");
-        assert_eq!(resumed.session_id, info.session_id);
-        let sid = resumed.session_id.clone();
-        let reason = tokio::time::timeout(Duration::from_secs(15), {
-            manager.send_prompt(&sid, "again".to_string())
-        })
-        .await
-        .expect("the turn settled (not a hang)")
-        .expect("the turn settled");
-        assert_eq!(reason, StopReason::EndTurn);
-
-        // The resumed session's model request replays the STORED prompt
-        // verbatim (the seq-0 row from the start — "v1 rules", NOT the
-        // overwritten "v2 rules {marker}").
-        let req = requests
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .expect("the model was called");
-        let text = system_text(&req);
-        assert!(
-            text.contains("v1 rules"),
-            "the stored prompt is replayed verbatim: {text}"
-        );
-        assert!(
-            !text.contains(&marker),
-            "a changed AGENTS.md does NOT leak into the resumed prompt: {text}"
-        );
-
-        let _ = manager.close_session(&info.session_id).await;
-        let _ = std::fs::remove_dir_all(space.parent().unwrap());
-    }
-
-    /// (review finding 1) A RESUME whose `load_messages` errors (a corrupt
-    /// transcript row) must FAIL the session start — the old swallow
-    /// proceeded with an empty transcript, and the next persist would
-    /// upsert over the stored rows (seq 0 = the system prompt, cascading
-    /// to seq 1, 2, …).
-    #[tokio::test]
-    async fn resume_native_session_fails_on_corrupt_transcript() {
-        let (manager, space, _requests, db, sink) =
-            native_manager_with_recording(&[], Some("v1 rules")).await;
-        let (info, _req) = start_and_drive_one_turn(&manager, &space, &_requests, &sink).await;
-        let sid = info.session_id.clone();
-
-        // Corrupt the seq-0 row (invalid JSON → `load_messages` `Json`
-        // error — "a corrupt transcript must not silently load as an
-        // empty one").
-        db.insert_native_message(&sid, 0, "system", "not valid json")
-            .expect("the db works");
-
-        // The resume FAILS (the load error is propagated as
-        // `SessionError::Io` — NOT silently swallowed into an empty
-        // transcript).
-        let err = manager
-            .resume_session(&sid, space.clone(), &sink)
-            .await
-            .expect_err("a corrupt transcript must fail the resume");
-        assert!(
-            matches!(err, SessionError::Io(_)),
-            "the load error is propagated as `SessionError::Io`, got: {err:?}"
-        );
-
-        let _ = manager.close_session(&sid).await;
-        let _ = std::fs::remove_dir_all(space.parent().unwrap());
+        let thought = db_rows.iter().find(|r| r.kind == "agent-thought").unwrap();
+        assert_eq!(thought.message_key.as_deref(), Some("m1#1"));
+        assert_eq!(thought.payload_json, r#"{"text":"think"}"#);
+        let tool = db_rows
+            .iter()
+            .find(|r| r.kind == "tool-call" && r.message_key.as_deref() == Some("t1"))
+            .unwrap();
+        let tool: serde_json::Value = serde_json::from_str(&tool.payload_json).unwrap();
+        assert_eq!(tool["title"], "run");
+        assert_eq!(tool["status"]["type"], "completed");
+        // A re-send of the SAME rows is an idempotent upsert (no
+        // duplicates — the old `persist_update`'s semantics).
+        store.persist_display("s1", &all_rows).unwrap();
+        let db_rows = db.messages_for("s1").unwrap();
+        assert_eq!(db_rows.len(), 4, "the upsert never duplicates");
     }
 }

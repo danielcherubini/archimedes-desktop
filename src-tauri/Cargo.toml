@@ -35,7 +35,7 @@ tauri-plugin-window-state = "2"
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "time", "net", "rt"] }
+tokio = { version = "1", features = ["process", "io-util", "io-std", "sync", "macros", "time", "net", "rt"] }
 tokio-util = "0.7"
 # The `exec_find` fallback when `fd` is not installed (walk the cwd tree).
 walkdir = "2"
@@ -94,5 +94,8 @@ libc = "0.2"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# The ADR 0025 consequence: a Worker panic stays in the Worker (the
+# process dies, the app lives); the binary grows with unwind tables —
+# accepted.
+panic = "unwind"
 strip = true

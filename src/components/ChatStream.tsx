@@ -42,6 +42,7 @@ import ChangesGroupCard from "./ChangesGroupCard";
 import PermissionPrompt from "./PermissionPrompt";
 import AskQuestionCard from "./AskQuestionCard";
 import FileSummaryCard from "./FileSummaryCard";
+import SessionStalledBanner from "./SessionStalledBanner";
 import SudoConfirmModal from "./SudoConfirmModal";
 import SudoPasswordModal from "./SudoPasswordModal";
 
@@ -879,6 +880,10 @@ export default function ChatStream() {
           the Spaces are the top TABS (`SpaceTabs`, above this component —
           the `...` menu + the toggle live on that row) and the session
           title lives in the side pane (its top section). */}
+      {/* The stalled-session banner (a Worker crash — the `session-stalled`
+          event set the store's `stalled` entry): above the transcript, below
+          the (removed) header. `null` when the session is not stalled. */}
+      {activeSessionId && <SessionStalledBanner sessionId={activeSessionId} />}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
         {/* The request cards and the working/blocked/stop-reason lines
             render UNCONDITIONALLY (regardless of the transcript's

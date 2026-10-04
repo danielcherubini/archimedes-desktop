@@ -1,109 +1,46 @@
-//! The native session e2e (native-agent-harness Task 7): `start_session`
-//! (settings-driven — no agent registry) spawns an in-process `AgentLoop`
-//! (NOT a subprocess — the provider comes from the `set_provider_factory`
-//! injection seam, so no real model call is made) → `send_prompt` → the
-//! normalized `session-update` events flow (the existing frozen shapes) →
-//! `resume_session` (the native branch — BEFORE the `piSessionFile` check: a
-//! native session's `capabilities_json` has no `piSessionFile`) →
-//! `load_messages` (resume) works.
+//! The native session e2e (ADR 0025 Task 4): `start_session` spawns a
+//! WORKER (the `AgentLoop` runs in the Worker process — the
+//! `set_provider_factory` in-process mock `Provider` CANNOT survive, the
+//! provider lives in the Worker process; the rewrite drives via the
+//! `WorkerFactory` seam with the `fake_worker` fixture — the canned
+//! `SinkFrame` / store-frame stream) → `send_prompt` → the
+//! `session-update` `SinkFrame`s flow (the frozen shapes, re-emitted
+//! verbatim) + the store frames are persisted (the `TranscriptPersister`)
+//! → `resume_session` (the native branch — the `native_messages` re-read)
+//! → the resumed session operates normally.
 
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use archimedes_lib::agent::harness::{
-    ChatMessage, ChatRole, CompactionConfig, FinishReason, MessageContent, Model, ModelCatalog,
-    Provider, ProviderError, ProviderEvent,
-};
+use archimedes_lib::agent::harness::{CompactionConfig, Model, ModelCatalog};
+use archimedes_lib::agent::worker::client::WorkerHandle;
+use archimedes_lib::agent::worker::manager::{WorkerFactory, WorkerManager};
 use archimedes_lib::agent::{EventSink, SessionInfo, SessionManager, StopReason};
 use archimedes_lib::storage::Db;
-use async_trait::async_trait;
-use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-// ── the mock `Provider` (canned responses + request recording) ──────────
+// ── the `fake_worker` fixture factory (the `WorkerFactory` seam) ──────────
 
-enum MockResponse {
-    Stream(Vec<ProviderEvent>),
-    Error(ProviderError),
-}
+/// The `fake_worker` fixture (the `WorkerFactory` seam — `cargo test`
+/// builds the bin targets; the fixture speaks the Worker protocol: the
+/// canned `SinkFrame` / store-frame stream, the `ready` handshake).
+struct FixtureFactory;
 
-impl MockResponse {
-    fn text_then_done(delta: &str) -> Self {
-        Self::Stream(vec![
-            ProviderEvent::TextDelta(delta.to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ])
+impl WorkerFactory for FixtureFactory {
+    fn spawn(&self) -> Result<WorkerHandle, archimedes_lib::agent::worker::client::WorkerError> {
+        WorkerHandle::spawn(&fixture_path())
     }
 }
 
-// The mock provider's shared state (type aliases — `clippy::type_complexity`).
-type ResponseQueue = Arc<StdMutex<VecDeque<MockResponse>>>;
-type RecordedTurns = Arc<StdMutex<Vec<Vec<(String, String)>>>>;
-
-/// A `Provider` returning canned responses in order (a `complete()` beyond
-/// the queue is a `Fatal` error — a test bug) that ALSO records each
-/// request's messages (the resume assertion: the resumed loop's first model
-/// request carries the `load_messages` transcript).
-struct MockProvider {
-    responses: ResponseQueue,
-    recorded: RecordedTurns,
-}
-
-impl MockProvider {
-    fn new(responses: ResponseQueue, recorded: RecordedTurns) -> Self {
-        Self {
-            responses,
-            recorded,
-        }
-    }
-}
-
-#[async_trait]
-impl Provider for MockProvider {
-    async fn complete(
-        &self,
-        req: &archimedes_lib::agent::harness::ModelRequest,
-    ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // Record the request's messages (role + text) — the resume assertion.
-        let recorded_msgs: Vec<(String, String)> = req
-            .messages
-            .iter()
-            .map(|m| (role_str(m.role), text_of(m)))
-            .collect();
-        self.recorded.lock().unwrap().push(recorded_msgs);
-        let next = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(MockResponse::Error(ProviderError::Fatal(
-                "mock: no canned response left".into(),
-            )));
-        match next {
-            MockResponse::Stream(events) => Ok(futures_util::stream::iter(events).boxed()),
-            MockResponse::Error(e) => Err(e),
-        }
-    }
-}
-
-fn role_str(role: ChatRole) -> String {
-    match role {
-        ChatRole::System => "system".to_string(),
-        ChatRole::User => "user".to_string(),
-        ChatRole::Assistant => "assistant".to_string(),
-        ChatRole::Tool => "tool".to_string(),
-    }
-}
-
-fn text_of(m: &ChatMessage) -> String {
-    match &m.content {
-        MessageContent::Text(t) => t.clone(),
-        MessageContent::Blocks(_) => String::new(),
-    }
+/// The `fake_worker` fixture path (the `CARGO_MANIFEST_DIR`/
+/// `target/debug` convention — `cargo test` builds the bin targets).
+fn fixture_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/target/debug/fake_worker"
+    ))
 }
 
 // ── a recording `EventSink` ──────────────────────────────────────────────
@@ -120,11 +57,27 @@ impl EventSink for RecSink {
 
 // ── the fixtures ──────────────────────────────────────────────────────────
 
+/// A temp config dir (the `settings.json` home — the seeded settings give
+/// the session start a `defaultThinkingLevel` — the settings-driven rung).
+fn temp_config_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("session-native-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        json!({ "theme": "dark", "defaultThinkingLevel": "high" }).to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+/// A full `Model` literal (the `base_url` EMPTY so
+/// `refresh_model_metadata` is a no-op — no network;
+/// `openai-completions` so the model is selectable).
 fn test_model(id: &str) -> Model {
     Model {
         id: id.to_string(),
-        provider: "test".to_string(),
-        base_url: "http://localhost/v1".to_string(),
+        provider: "fake".to_string(),
+        base_url: String::new(),
         api_key: "k".to_string(),
         context_window: 128000,
         cost_per_mtok_in: 0.0,
@@ -136,69 +89,45 @@ fn test_model(id: &str) -> Model {
     }
 }
 
-/// A temp config dir (the `settings.json` home — the effective catalog
-/// reads the `providers` entries from here; the seeded settings give the
-/// session start a `defaultThinkingLevel` — the settings-driven rung).
-fn temp_config_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("session-native-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("settings.json"),
-        json!({ "theme": "dark", "defaultThinkingLevel": "high" }).to_string(),
-    )
-    .unwrap();
-    dir
-}
-
 /// A known catalog (the `set_catalog` seam — the base catalog is empty
 /// in a test, so the effective catalog is this one): two
-/// OpenAI-compatible models, the default `test/m1`.
+/// OpenAI-compatible models, the default `fake/m1`.
 fn test_catalog() -> ModelCatalog {
     ModelCatalog {
         models: vec![test_model("m1"), test_model("m2")],
-        default_model: Some("test/m1".to_string()),
+        default_model: Some("fake/m1".to_string()),
         compaction: CompactionConfig::default(),
     }
 }
 
-/// The e2e manager: `set_provider_factory` (the injection seam — BEFORE
-/// `start_session`) + `set_catalog` (a known catalog).
-async fn build_manager(
+/// The e2e manager (ADR 0025 — the Worker-mediated path): `set_catalog`
+/// (a known catalog) + a `WorkerManager` with the `fake_worker` factory
+/// (the LATE-WIRE — the `SessionManager` ↔ `WorkerManager` construction
+/// cycle: the `WorkerManager`'s `on_crash` / `on_event` callbacks capture
+/// the `Arc<SessionManager>`; the `attach_*` methods are `&self`, so the
+/// `OnceLock` `set` needs no exclusive access).
+fn build_manager(
     dir: &Path,
-) -> (
-    SessionManager,
-    RecordedTurns,
-    Arc<dyn EventSink>,
-    mpsc::UnboundedReceiver<(String, Value)>,
-) {
+    sink: &Arc<dyn EventSink>,
+) -> (Arc<SessionManager>, Arc<WorkerManager>, Arc<Db>) {
     let db = Arc::new(Db::open(&dir.join("archimedes.db")).unwrap());
     let mut manager = SessionManager::new(dir.to_path_buf());
-    manager.attach_db(db);
-
-    // The injection seams (BEFORE `start_session`): a mock `Provider`
-    // factory (no real model call) + a known catalog.
-    let responses = Arc::new(StdMutex::new(VecDeque::new()));
-    let recorded: RecordedTurns = Arc::new(StdMutex::new(Vec::new()));
-    let responses_factory = Arc::clone(&responses);
-    let recorded_factory = Arc::clone(&recorded);
-    manager.set_provider_factory(move |_m: &Model| {
-        Box::new(MockProvider::new(
-            Arc::clone(&responses_factory),
-            Arc::clone(&recorded_factory),
-        )) as Box<dyn Provider>
-    });
+    manager.attach_db(db.clone());
     manager.set_catalog(test_catalog());
-
-    // The mock's canned responses: session 1's prompt → "Hello"; session 2
-    // (the resume)'s prompt → "Resumed".
-    *responses.lock().unwrap() = VecDeque::from(vec![
-        MockResponse::text_then_done("Hello"),
-        MockResponse::text_then_done("Resumed"),
-    ]);
-
-    let (sink_tx, sink_rx) = mpsc::unbounded_channel();
-    let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-    (manager, recorded, sink, sink_rx)
+    manager.set_sink(sink.clone());
+    let manager = Arc::new(manager);
+    let wm = {
+        let m = manager.clone();
+        let m2 = manager.clone();
+        Arc::new(WorkerManager::new(
+            Arc::new(FixtureFactory),
+            Arc::new(move |s, c| m.handle_crash(&s, c)),
+            Arc::new(move |s, b, e| m2.route_event(&s, b, e)),
+            Arc::new(|_s| None),
+        ))
+    };
+    manager.attach_worker_manager(wm.clone());
+    (manager, wm, db)
 }
 
 /// Wait for a `session-update` frame with the given `sessionUpdate` kind.
@@ -218,25 +147,39 @@ async fn wait_for_update(rx: &mut mpsc::UnboundedReceiver<(String, Value)>, kind
     }
 }
 
-/// (a) The full native-session e2e: start (in-process `AgentLoop`, no
-/// subprocess) → the capability envelope has NO `piSessionFile` + the
-/// synthesized `config_options` (model + thought_level) are present →
-/// `send_prompt` → the normalized `session-update` frames flow → the
-/// `native_messages` transcript is persisted → `resume_session` (the native
-/// branch — NOT `NotResumable`) → `load_messages` (the resumed loop's first
-/// model request carries the loaded transcript).
+/// Drain the sink channel (clear pending frames — a prior turn's leftover
+/// `agent_message_chunk` must not be confused with the next turn's frames).
+/// The `send_prompt` resolved on `agent_settled` (the LAST frame the
+/// `fake_worker` emits), so the turn's frames are all in the channel by
+/// the time the drain runs — the short settle window covers the delivery
+/// gap (the frames are emitted in order, `agent_settled` last).
+async fn drain(rx: &mut mpsc::UnboundedReceiver<(String, Value)>) {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while rx.try_recv().is_ok() {}
+}
+
+/// (a) The full native-session e2e (ADR 0025 — the Worker-mediated path):
+/// start (the `AgentLoop` runs in the Worker — NO in-process loop) → the
+/// capability envelope has NO `piSessionFile` + the synthesized
+/// `config_options` (model + thought_level) are present → `send_prompt` →
+/// the `session-update` `SinkFrame`s flow (re-emitted verbatim) + the
+/// store frames are persisted (the `native_messages` transcript + the
+/// `messages` display rows) → `resume_session` (the native branch — NOT
+/// `NotResumable` — the `native_messages` re-read) → the resumed session
+/// operates normally (a fresh `fake_worker` + re-hydrate).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_session_end_to_end() {
     let dir = temp_config_dir();
-
-    let (manager, recorded, sink, mut sink_rx) = build_manager(&dir).await;
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
+    let (manager, _wm, _db) = build_manager(&dir, &sink);
 
     // The base catalog is empty in a test → the model resolves from the
-    // `set_catalog` catalog's default (`test/m1`).
+    // `set_catalog` catalog's default (`fake/m1`).
     let info = manager
         .start_session(dir.clone(), &sink)
         .await
-        .expect("the native session starts (in-process, no subprocess)");
+        .expect("the native session starts (a Worker spawned — no in-process loop)");
     assert!(
         info.session_id.starts_with("arch_"),
         "a fresh native session ID starts with arch_, got {}",
@@ -253,7 +196,7 @@ async fn native_session_end_to_end() {
         info.capabilities
     );
     assert_eq!(info.capabilities["loadSession"], true);
-    assert_eq!(info.capabilities["model"], "test/m1");
+    assert_eq!(info.capabilities["model"], "fake/m1");
 
     // (2) The synthesized `config_options` (the existing shape — the
     // frontend is unchanged): a model selector (the `selectable()`
@@ -266,14 +209,14 @@ async fn native_session_end_to_end() {
         .iter()
         .find(|o| o["id"] == "model")
         .expect("a model selector");
-    assert_eq!(model_opt["currentValue"], "test/m1");
+    assert_eq!(model_opt["currentValue"], "fake/m1");
     let model_values: Vec<String> = model_opt["options"]
         .as_array()
         .unwrap()
         .iter()
         .map(|o| o["value"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(model_values, vec!["test/m1", "test/m2"]);
+    assert_eq!(model_values, vec!["fake/m1", "fake/m2"]);
     let thought_opt = options
         .iter()
         .find(|o| o["id"] == "thought_level")
@@ -290,41 +233,46 @@ async fn native_session_end_to_end() {
         .collect();
     assert_eq!(thought_values, vec!["low", "high"]);
 
-    // (3) The turn: `send_prompt` → the normalized `session-update` frames
-    // flow (the SAME frozen shapes an external session emits) + `EndTurn`.
+    // (3) The turn: `send_prompt` → the `session-update` `SinkFrame`s flow
+    // (re-emitted VERBATIM — the SAME frozen shapes) + `EndTurn` (the
+    // `agent_settled` settle).
     let reason = manager
         .send_prompt(&sid, "hi".to_string())
         .await
         .expect("the native turn resolves");
     assert_eq!(reason, StopReason::EndTurn);
     let chunk = wait_for_update(&mut sink_rx, "agent_message_chunk").await;
-    assert_eq!(chunk["content"]["text"], "Hello");
-
-    // (4) The provider transcript (the `native_messages` table): the
-    // system prompt (seq 0 — the NEW-session prompt, ADR 0017, persisted
-    // at session start) + user + assistant.
-    let db = Db::open(&dir.join("archimedes.db")).unwrap();
-    let rows = db.load_native_messages(&sid).unwrap();
-    assert_eq!(rows.len(), 3, "system + user + assistant persisted");
-    // seq 0 is the system prompt (persisted at session start, before the
-    // first prompt).
-    let sys_msg: ChatMessage = serde_json::from_str(&rows[0]).unwrap();
-    assert_eq!(sys_msg.role, ChatRole::System, "seq 0 is the system prompt");
-    // seq 1 is the user message.
-    let user_msg: ChatMessage = serde_json::from_str(&rows[1]).unwrap();
     assert_eq!(
-        user_msg,
-        ChatMessage {
-            role: ChatRole::User,
-            content: MessageContent::Text("hi".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }
+        chunk["content"]["text"], "canned ",
+        "the first canned chunk"
     );
 
-    // (5) Close + RESUME (the native branch — BEFORE the `piSessionFile`
-    // check: the stored `capabilities_json` has no `piSessionFile`, so the
-    // external path would be `NotResumable`).
+    // (4) The transcript (the `native_messages` table — the store frames
+    // applied by the `TranscriptPersister`): the user + assistant rows
+    // (the `fake_worker`'s canned `TranscriptInsert` frames) + the display
+    // row (the `DisplayUpsert` frame — the `messages` table).
+    let db = Db::open(&dir.join("archimedes.db")).unwrap();
+    let rows = db.load_native_messages(&sid).unwrap();
+    let roles: Vec<Value> = rows
+        .iter()
+        .map(|c| serde_json::from_str(c).unwrap())
+        .collect();
+    assert!(
+        roles.iter().any(|v| v["role"] == "user"),
+        "the user transcript row is persisted, got {roles:?}"
+    );
+    assert!(
+        roles.iter().any(|v| v["role"] == "assistant"),
+        "the assistant transcript row is persisted, got {roles:?}"
+    );
+    let msgs = db.messages_for(&sid).unwrap();
+    assert!(
+        msgs.iter().any(|m| m.kind == "agent-text"),
+        "the display row is persisted, got {msgs:?}"
+    );
+
+    // (5) Close + RESUME (the native branch — the `native_messages`
+    // re-read: NOT `NotResumable`).
     manager.close_session(&sid).await.expect("close works");
     let resumed = manager
         .resume_session(&sid, dir.clone(), &sink)
@@ -336,47 +284,23 @@ async fn native_session_end_to_end() {
         "the resumed native session has no pi session file"
     );
 
-    // (6) `load_messages` (resume) works: the resumed loop's FIRST model
-    // request carries the loaded transcript (user "hi" + assistant "Hello")
-    // BEFORE the new prompt's user message.
+    // (6) The resumed session operates normally (a fresh `fake_worker` +
+    // re-hydrate — the `StartEnv` carries the re-read transcript): the
+    // turn's `agent_message_chunk` frame flows. The channel is DRAINED
+    // first (turn 1's leftover `answer` chunk — the `send_prompt` resolved
+    // on `agent_settled`, the LAST frame, so the leftover is in the
+    // channel by now) so the fresh `canned ` chunk is the first the wait
+    // finds.
+    drain(&mut sink_rx).await;
     let reason = manager
         .send_prompt(&sid, "again".to_string())
         .await
         .expect("the resumed turn resolves");
     assert_eq!(reason, StopReason::EndTurn);
     let resumed_chunk = wait_for_update(&mut sink_rx, "agent_message_chunk").await;
-    assert_eq!(resumed_chunk["content"]["text"], "Resumed");
-
-    // The resumed loop's model request (cloned — the `MutexGuard` is NOT
-    // held across the assertions below).
-    let req: Vec<(String, String)> = {
-        let guard = recorded.lock().unwrap();
-        guard
-            .last()
-            .cloned()
-            .expect("the resumed loop made a model call")
-    };
-    let loaded: Vec<&(String, String)> = req.iter().collect();
-    // The loaded transcript (the system prompt + user "hi" + assistant
-    // "Hello" — 3 messages) precedes the new prompt.
-    assert!(
-        loaded.len() >= 3,
-        "the request carries the loaded transcript + the new prompt, got {loaded:?}"
-    );
-    let user_hi = loaded.iter().position(|(r, t)| r == "user" && t == "hi");
-    let assistant_hello = loaded
-        .iter()
-        .position(|(r, t)| r == "assistant" && t == "Hello");
-    assert!(user_hi.is_some(), "the loaded user message, got {loaded:?}");
-    assert!(
-        assistant_hello.is_some(),
-        "the loaded assistant message, got {loaded:?}"
-    );
-    let user_hi = user_hi.unwrap();
-    let assistant_hello = assistant_hello.unwrap();
-    assert!(
-        user_hi < assistant_hello,
-        "the transcript order is preserved"
+    assert_eq!(
+        resumed_chunk["content"]["text"], "canned ",
+        "the resumed turn's first canned chunk"
     );
 
     let _ = manager.close_session(&sid).await;
@@ -388,7 +312,9 @@ async fn native_session_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resuming_legacy_bare_uuid_session_preserves_id() {
     let dir = temp_config_dir();
-    let (manager, _recorded, sink, mut sink_rx) = build_manager(&dir).await;
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+    let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
+    let (manager, _wm, _db) = build_manager(&dir, &sink);
 
     let legacy_id = uuid::Uuid::new_v4().to_string();
     assert!(
@@ -396,31 +322,28 @@ async fn resuming_legacy_bare_uuid_session_preserves_id() {
         "legacy id has no arch_ prefix: {legacy_id}"
     );
 
-    // Seed the DB with a legacy session record and a system prompt in native_messages.
+    // Seed the DB with a legacy session record (the stored `model` —
+    // `fake/m1` — resolves against the catalog) + a system prompt in
+    // `native_messages` (the resume's re-read).
     let db = Db::open(&dir.join("archimedes.db")).unwrap();
     let info = SessionInfo {
         session_id: legacy_id.clone(),
         cwd: dir.clone(),
         capabilities: json!({
-            "model": "test/m1",
+            "model": "fake/m1",
             "loadSession": true,
         }),
         config_options: None,
         archived: false,
         context_usage: None,
+        is_subagent: false,
     };
     db.record_session(&info).unwrap();
-    let sys_msg = ChatMessage {
-        role: ChatRole::System,
-        content: MessageContent::Text("legacy system prompt".to_string()),
-        tool_call_id: None,
-        tool_calls: None,
-    };
     db.insert_native_message(
         &legacy_id,
         0,
         "system",
-        &serde_json::to_string(&sys_msg).unwrap(),
+        r#"{"role":"system","content":"legacy system prompt"}"#,
     )
     .unwrap();
 
@@ -428,20 +351,20 @@ async fn resuming_legacy_bare_uuid_session_preserves_id() {
         .resume_session(&legacy_id, dir.clone(), &sink)
         .await
         .expect("legacy session resumes");
-
     assert_eq!(
         resumed.session_id, legacy_id,
         "the resumed session preserves its exact legacy bare-UUID ID"
     );
 
-    // Send a turn to ensure the session operates normally under the legacy ID.
+    // The resumed session operates normally under the legacy ID (a fresh
+    // `fake_worker` + re-hydrate — the `native_messages` re-read).
     let reason = manager
         .send_prompt(&legacy_id, "hello legacy".to_string())
         .await
         .expect("turn completes");
     assert_eq!(reason, StopReason::EndTurn);
     let chunk = wait_for_update(&mut sink_rx, "agent_message_chunk").await;
-    assert_eq!(chunk["content"]["text"], "Hello");
+    assert_eq!(chunk["content"]["text"], "canned ");
 
     let _ = manager.close_session(&legacy_id).await;
     let _ = std::fs::remove_dir_all(&dir);

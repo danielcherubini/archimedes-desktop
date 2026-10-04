@@ -5,6 +5,7 @@ import {
   listenInteractiveRequestClose,
   listenPermissionRequest,
   listenSessionClosed,
+  listenSessionStalled,
   listenSessionUpdate,
   listenSubagentClosed,
   listenSubagentSessionStarted,
@@ -65,6 +66,16 @@ function App() {
         // `handleSessionClosed` behavior above stays unchanged).
         discardSessionMessages(payload.sessionId);
       }),
+    );
+    // A Worker crash (ADR 0025): the `session-stalled` event marks the
+    // session STALLED in the store (the `SessionStalledBanner`'s data
+    // source — the `StalledInfo` shape: `at` + `crashLog`).
+    unlistenPromises.push(
+      listenSessionStalled((payload) =>
+        useSessions
+          .getState()
+          .markStalled(payload.sessionId, payload.at, payload.crashLog),
+      ),
     );
     unlistenPromises.push(
       listenPermissionRequest((payload) =>

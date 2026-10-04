@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
+use crate::agent::worker::manager::WorkerManager;
 use crate::storage::Db;
 
 /// The folder check + canonicalizer for the new-space dialog.
@@ -52,14 +53,27 @@ pub async fn delete_space(state: State<'_, Arc<Db>>, path: String) -> Result<(),
 /// Set (or clear) a space's trust flag (Trusted Space, ADR 0010).
 /// No-op if the row is missing — still a SUCCESS (the shield's optimistic
 /// update just has nothing to persist; the no-op is logged, not silent).
+///
+/// ALSO (the Spaces-UI mid-session trust toggle — ADR 0025): after the
+/// `db` write, send `Config { trusted }` to every RUNNING Worker in the
+/// affected Space (the Worker's `StaticTrustSource` flip — the live
+/// lookup half; the `trust-space` permission-outcome path is the separate
+/// `respond_permission` `db` write + flip). A mid-session toggle for a
+/// session in ANOTHER space is unaffected (the `cwd` match).
 #[tauri::command]
 pub async fn set_space_trusted(
     state: State<'_, Arc<Db>>,
+    wm: State<'_, Arc<WorkerManager>>,
     path: String,
     trusted: bool,
 ) -> Result<(), String> {
     match state.set_space_trusted(&path, trusted) {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            // The running-Workers `config` update (the `StaticTrustSource`
+            // flip — a dead / absent Worker is a no-op, not an error).
+            wm.send_config_to_space(&path, trusted);
+            Ok(())
+        }
         Ok(false) => {
             eprintln!("set_space_trusted: no space row for {path} (no-op)");
             Ok(())

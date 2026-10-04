@@ -51,6 +51,10 @@ pub struct SessionRow {
     /// close — the row is the source of truth for the stored session's bar).
     /// `None` until the first frame (a fresh session with no usage yet).
     pub context_usage_json: Option<String>,
+    /// The ephemeral-subagent flag (ADR 0025 §3): `true` for a subagent
+    /// session (hidden from `list_sessions` — `is_subagent = 0` filter).
+    /// `false` for a main session.
+    pub is_subagent: bool,
 }
 
 /// A row from the `messages` table.
@@ -205,6 +209,22 @@ impl Db {
                 [],
             )?;
         }
+        // One-time migration for pre-existing databases: add `is_subagent`
+        // to `sessions` (fresh databases already have it from SCHEMA). The
+        // same pragma-gated pattern as the `archived` / `context_usage_json`
+        // migrations above. `DEFAULT 0` (existing rows are main sessions —
+        // ADR 0025 §6: no data migration).
+        let has_is_subagent: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'is_subagent'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_is_subagent == 0 {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // One-time migration for pre-existing databases: give
         // `native_messages` its `ON DELETE CASCADE` foreign key (a
         // pre-existing table cannot GAIN an FK in place — recreate it,
@@ -294,17 +314,19 @@ impl Db {
     pub fn record_session(&self, info: &SessionInfo) -> Result<(), DbError> {
         let capabilities = serde_json::to_string(&info.capabilities)?;
         self.conn.lock().expect("db mutex poisoned").execute(
-            "INSERT INTO sessions (id, cwd, created_at, title, capabilities_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO sessions (id, cwd, created_at, title, capabilities_json, is_subagent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                cwd = excluded.cwd,
-               capabilities_json = excluded.capabilities_json",
+               capabilities_json = excluded.capabilities_json,
+               is_subagent = excluded.is_subagent",
             params![
                 info.session_id.to_string(),
                 info.cwd.display().to_string(),
                 now_ms(),
                 Option::<String>::None,
                 capabilities,
+                info.is_subagent,
             ],
         )?;
         Ok(())
@@ -366,7 +388,7 @@ impl Db {
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json \
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json, is_subagent \
              FROM sessions WHERE id = ?1",
         )?;
         let row = stmt
@@ -379,6 +401,7 @@ impl Db {
                     capabilities_json: row.get(4)?,
                     archived: row.get::<_, i64>(5)? != 0,
                     context_usage_json: row.get(6)?,
+                    is_subagent: row.get::<_, i64>(7)? != 0,
                 })
             })?
             .next()
@@ -394,13 +417,14 @@ impl Db {
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionRow>, DbError> {
         let guard = self.conn.lock().expect("db mutex poisoned");
         let sql = if include_archived {
-            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json, is_subagent
              FROM sessions
+             WHERE is_subagent = 0
              ORDER BY created_at DESC, id DESC"
         } else {
-            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json
+            "SELECT id, cwd, created_at, title, capabilities_json, archived, context_usage_json, is_subagent
              FROM sessions
-             WHERE archived = 0
+             WHERE archived = 0 AND is_subagent = 0
              ORDER BY created_at DESC, id DESC"
         };
         let mut stmt = guard.prepare(sql)?;
@@ -414,6 +438,7 @@ impl Db {
                     capabilities_json: row.get(4)?,
                     archived: row.get::<_, i64>(5)? != 0,
                     context_usage_json: row.get(6)?,
+                    is_subagent: row.get::<_, i64>(7)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -682,7 +707,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     capabilities_json TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
-    context_usage_json TEXT
+    context_usage_json TEXT,
+    is_subagent INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -1204,6 +1230,7 @@ mod tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         };
         // Two sessions; one of them gets archived.
         db.record_session(&mk("sess-1"))
@@ -1280,9 +1307,13 @@ mod tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         };
         db.record_session(&session)
             .expect("record_session should succeed");
+        // The `is_subagent` flag is written (the `record_session` upsert).
+        let row = db.session("sess-1").unwrap().unwrap();
+        assert!(!row.is_subagent);
         db.set_session_archived("sess-1", true)
             .expect("set_session_archived should succeed");
         // The resume re-record (the same upsert, a refreshed row).
@@ -1296,6 +1327,52 @@ mod tests {
             all[0].archived,
             "a re-record never clears the archived flag"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (ADR 0025 §3) A subagent `sessions` row (`is_subagent = 1`) is
+    /// HIDDEN from `list_sessions` (the `is_subagent = 0` filter) but its
+    /// transcript rows are still loadable (`load_native_messages` works
+    /// for subagent ids — it does NOT filter on `is_subagent`).
+    #[test]
+    fn list_sessions_hides_subagent_rows_but_their_transcripts_load() {
+        let dir = std::env::temp_dir().join(format!("db-subagent-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(&path).expect("db should open");
+        // A main session row.
+        let main = SessionInfo {
+            session_id: "main-1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({}),
+            config_options: None,
+            archived: false,
+            context_usage: None,
+            is_subagent: false,
+        };
+        db.record_session(&main).expect("record main");
+        // A subagent session row (hidden).
+        let sub = SessionInfo {
+            session_id: "sub-1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            capabilities: serde_json::json!({}),
+            config_options: None,
+            archived: false,
+            context_usage: None,
+            is_subagent: true,
+        };
+        db.record_session(&sub).expect("record subagent");
+        // `list_sessions` (both variants) hides the subagent row.
+        let all = db.list_sessions(true).expect("list");
+        assert_eq!(all.len(), 1, "only the main session is listed");
+        assert_eq!(all[0].id, "main-1");
+        // The subagent's transcript is still loadable (no `is_subagent` filter).
+        db.insert_native_message("sub-1", 0, "system", r#"{\"role\":\"system\"}"#)
+            .expect("insert subagent transcript");
+        let rows = db
+            .load_native_messages("sub-1")
+            .expect("load subagent transcript");
+        assert_eq!(rows.len(), 1, "the subagent transcript loads");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1387,6 +1464,7 @@ mod tests {
             config_options: None,
             context_usage: None,
             archived: false,
+            is_subagent: false,
         };
         db.record_session(&session)
             .expect("record_session should succeed");
