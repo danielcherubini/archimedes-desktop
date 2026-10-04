@@ -5,15 +5,15 @@ A cross-platform (Windows/macOS/Linux) desktop app, built with Tauri 2, that run
 ## Language
 
 **Client**:
-The Archimedes Desktop application itself — the **Client** role: it runs the in-process **Agent harness** (a **Native session** — ADR 0022; the spawned-agent-process / RPC-client framing is gone), renders the conversation, and provides file/terminal/permission backends.
-_Avoid_: App, frontend, IDE
+The Archimedes Desktop application itself — the **Client** role: it is the **Supervisor** (worker lifecycle + sole SQLite writer + the response side of the permission/interactive gates — ADR 0025), renders the conversation, and provides the settings/skills/MCP surfaces.
+_Avoid_: App, frontend, IDE, desktop (too generic)
 
 **Agent**:
-The conversation *partner* — the thing that produces the assistant's responses. Always embodied in the desktop's in-process harness (a **Native session** — no external process, ADR 0022). _Generalized 2026-10-06: a native session has no subprocess; the partner is embodied in the desktop's own runtime. 2026-10-02: the external (pi) embodiment is removed — the harness is the desktop's own runtime, full stop._
+The conversation *partner* — the thing that produces the assistant's responses. Always embodied in the desktop's own **Agent harness** (a **Native session** — ADR 0022), which runs in a **Worker process** (ADR 0025) — never an external agent process. _Generalized 2026-10-06: a native session has no subprocess; the partner is embodied in the desktop's own runtime. 2026-10-02: the external (pi) embodiment is removed — the harness is the desktop's own runtime, full stop. 2026-10-04: the harness runs in a Worker process (ADR 0025) — still the desktop's own binary, never an external agent._
 _Avoid_: Subagent, worker, bot, assistant. (Note: in the pi-archimedes project "Agent" means a subagent configuration — different meaning, different project. "Subagent session" is the desktop's term for a desktop-spawned delegated session — see its entry below.)
 
 **Agent harness**:
-The machinery that runs an agent conversation end-to-end — the model loop (model call → tool dispatch → retry/compaction) + the tool registry + session persistence + provider integration. A harness is a *runtime*, not a model: the desktop's in-process Rust runtime is the **only** harness (ADR 0022 — the external pi harness embodiment is removed). The harness owns the conversation's *control flow*; the model only produces tokens, the tools only act on the world.
+The machinery that runs an agent conversation end-to-end — the model loop (model call → tool dispatch → retry/compaction) + the tool registry + session persistence + provider integration. A harness is a *runtime*, not a model: the desktop's own Rust runtime is the **only** harness (ADR 0022 — the external pi harness embodiment is removed), running in a **Worker process** (ADR 0025). The harness owns the conversation's *control flow*; the model only produces tokens, the tools only act on the world.
 _Avoid_: Agent (that's the conversation *partner*; a harness *runs* it), loop, brain, runtime (too generic)
 
 **Space**:
@@ -21,19 +21,31 @@ A single on-disk folder the Client can open — the workspace in which a convers
 _Avoid_: Project, workspace, folder, directory, environment
 
 **Session**:
-One live conversation, backed by the desktop's in-process **Agent harness** (a **Native session** — ADR 0022; the external embodiment is removed). The unit of lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session. _Generalized 2026-10-06: a native session has no subprocess; embodiment is a harness, not a process._
+One live conversation, backed by the desktop's **Agent harness** running in a **Worker process** (a **Native session** — ADR 0022/0025; the external embodiment is removed). The unit of lifecycle, history, and permission state. A Session lives inside one **Space**: its `cwd` (and fs sandbox root) is the Space's folder; a Space's active conversation is its most recent Session. _Generalized 2026-10-06: a native session has no external subprocess; embodiment is a harness, not an agent process. 2026-10-04: the harness runs in a Worker process (ADR 0025) — the session's embodiment is a Worker, and the Client is its Supervisor._
 _Avoid_: Conversation, chat, thread, run
 
 **Native session**:
-A **Session** — the desktop's in-process Rust runtime is the **only** **Agent harness** (ADR 0022): no spawned agent process. Driven by the desktop's own AgentLoop (a tokio task) that calls the model directly (an OpenAI-compatible provider), executes tools in-process (Rust executors), and persists to SQLite.
+A **Session** — the desktop's own Rust runtime is the **only** **Agent harness** (ADR 0022): no external agent process. Runs in a **Worker process** (ADR 0025) driven by the desktop's own AgentLoop, which calls the model directly (an OpenAI-compatible provider) and executes tools in the Worker (Rust executors); the **Supervisor** persists the transcript to SQLite from the event stream (the Worker has no DB).
 _Avoid_: In-process session, local session, built-in session
+
+**Worker process**:
+One child OS process (the desktop's own binary, self-exec `archimedes --worker` — ADR 0025) that runs ONE session's **Agent harness** — the `AgentLoop` + tool executors + provider client — speaking a stdio JSONL protocol to its **Supervisor**. Worker lifetime = session lifetime (a main session's Worker is reaped at session end / app quit; a subagent's after `agent_settled`). The Worker has no DB (its `SessionStore` is a no-op; the conversation is in-memory) and never reads `settings.json` (the resolved provider config arrives in the protocol envelope). A Worker crash degrades to a **Stalled session** or a `SubagentOutcome::Failed` tool error — never an app death.
+_Avoid_: Child process, agent process, harness process
+
+**Supervisor**:
+The Tauri app process (the **Client**) in the Worker-process architecture (ADR 0025): React UI + WorkerManager (spawn / reap / crash-detect / abort-all) + sole SQLite writer (persists transcripts from the Worker event stream) + provider catalog + the response side of the permission/interactive gates (relays the user's answers back over the protocol).
+_Avoid_: Main process, parent, daemon
+
+**Stalled session**:
+A **Session** whose **Worker process** died (a crash, or a spawn failure) — the transcript is intact (persisted as events arrived), the last turn is incomplete (no `agent_settled` = incomplete), and the session offers a **Resume** action (a fresh Worker + the Supervisor-rehydrated transcript). A view/lifecycle state, distinct from **Archived** (a user action) and from a running session.
+_Avoid_: Dead session, crashed session, orphaned session
 
 **Archived session**:
 A stored **Session** hidden from its **Space** group by an explicit user action (the `archived` flag on the `sessions` row) — listed in the sidebar's **Archived** section instead of its Space group. Archiving is a *view* property, not a lifecycle one: the transcript stays in the desktop's storage, the session is still openable and resumable (first send resumes it, as for any stored session), and the flag is **sticky** — it survives resume/pause and changes only via explicit archive/unarchive. Delete is offered only from the Archived section (ADR 0016).
 _Avoid_: Paused session, closed session, hidden session
 
 **Subagent session**:
-A **Session** the desktop spawns to run a task delegated by the main agent — an in-process native **AgentLoop** child (the parent's model/tools minus `subagent` and `list_agents`, plus optional `launch` overrides; its `agentName` resolves against discovered **Agent definitions** — ADR 0020; an unknown/omitted name is a config-less label-only dispatch). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same event pipeline as a Session. The subagent's interactive tools (ask, sudo_exec) run in the desktop's in-process **interactive** channel, so their prompts go directly to the Client without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge — it is a child of the desktop's own runtime. 2026-10-02: the bridge-mode embodiment is removed (ADR 0022) — a subagent session is always an in-process native child._
+A **Session** the desktop spawns to run a task delegated by the main agent — a **Worker process** running a native **AgentLoop** child (the parent's model/tools minus `subagent` and `list_agents`, plus optional `launch` overrides; its `agentName` resolves against discovered **Agent definitions** — ADR 0020; an unknown/omitted name is a config-less label-only dispatch). Unlike a **Session**, it is not a user-facing conversation — it exists to complete the delegated task, and its progress renders in the Client through the same event pipeline as a Session (its transcript is persisted as a hidden ephemeral row — ADR 0025). The subagent's interactive tools (ask, sudo_exec) run on the Worker's **interactive** channel, so their prompts go directly to the Client (the Supervisor's relay) without relaying through the main agent. _Generalized 2026-10-01: a native-native subagent has no pi process and no bridge. 2026-10-02: the bridge-mode embodiment is removed (ADR 0022). 2026-10-04: a subagent session is a Worker process (ADR 0025) — ephemeral, no resume; a crash degrades to a `SubagentOutcome::Failed` tool error._
 _Avoid_: Worker, delegated task, child session, background session
 
 **Agent definition**:
