@@ -84,6 +84,14 @@ export default function ComposerRow({
   setConfigValue: (optionId: string, value: string) => Promise<void>;
   isLive: boolean;
 }) {
+  // The token counts as TEXT (the number is what the bar shows; these are
+  // what the assistive tech and the tooltip carry). `undefined` until the
+  // first usage frame — the same gate as the label itself.
+  const countsText =
+    contextUsage && contextPercent !== undefined
+      ? `${contextUsage.used.toLocaleString()} of ${contextUsage.window.toLocaleString()} tokens (${contextPercent}%)`
+      : undefined;
+  const countsLabel = countsText ? `Context used: ${countsText}` : undefined;
   return (
     <div
       className="relative m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
@@ -225,12 +233,17 @@ export default function ComposerRow({
               aria-hidden
               data-testid="context-bar-icon"
             />
+            {/* The counts ride the progressbar as its TEXT alternative
+                (`aria-valuetext`) — a bare percentage is what the bar
+                draws, but the numbers are the useful part and a
+                progressbar exposes only its value. */}
             <div
               role="progressbar"
               aria-label="Context used"
               aria-valuemin={0}
               aria-valuemax={100}
               aria-valuenow={contextPercent ?? 0}
+              aria-valuetext={countsText}
               className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground-subtlest"
             >
               <div
@@ -241,13 +254,22 @@ export default function ComposerRow({
             {contextPercent !== undefined && contextUsage && (
               <TooltipProvider>
                 <Tooltip>
+                  {/* The trigger is a BUTTON, not a `<span>`: Radix opens
+                      the tooltip on focus, so the counts are
+                      keyboard-reachable only if the trigger is a tab stop;
+                      and they ride in the accessible NAME, so they are
+                      heard without opening the tooltip at all. Visuals are
+                      unchanged — the reset classes keep the bare-number
+                      look. */}
                   <TooltipTrigger asChild>
-                    <span
+                    <button
+                      type="button"
                       data-testid="context-usage"
-                      className={`shrink-0 cursor-help text-ui-sm tabular-nums ${contextRamp.label}`}
+                      aria-label={countsLabel}
+                      className={`shrink-0 cursor-help appearance-none rounded-sm border-0 bg-transparent p-0 text-ui-sm tabular-nums focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${contextRamp.label}`}
                     >
                       {contextPercent}%
-                    </span>
+                    </button>
                   </TooltipTrigger>
                   <TooltipContent side="top" align="end">
                     {contextUsage.used.toLocaleString()} /{" "}

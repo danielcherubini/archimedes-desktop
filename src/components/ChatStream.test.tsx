@@ -1103,6 +1103,37 @@ describe("ChatStream", () => {
     expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
   });
 
+  // The counts are keyboard-accessible: the tooltip trigger is a focusable
+  // control (a Tab stop) whose accessible name carries the token counts,
+  // and the progressbar exposes them as its text alternative — so nothing
+  // about the context is hover-only.
+  it("the context counts are reachable by keyboard, not hover alone", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 53760, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const label = screen.getByTestId("context-usage");
+    // A real control in the tab order (a bare `<span>` was not).
+    expect(label.tagName).toBe("BUTTON");
+    expect(label.getAttribute("tabindex")).not.toBe("-1");
+    // The accessible name carries the counts (a screen reader hears them
+    // without opening the tooltip).
+    expect(label.getAttribute("aria-label")).toBe(
+      "Context used: 53,760 of 128,000 tokens (42%)",
+    );
+    // The progressbar's text alternative carries them too.
+    const bar = screen
+      .getByTestId("context-usage-bar")
+      .querySelector('[role="progressbar"][aria-label="Context used"]') as HTMLElement;
+    expect(bar.getAttribute("aria-valuetext")).toBe(
+      "53,760 of 128,000 tokens (42%)",
+    );
+    // And focus (keyboard) opens the tooltip, as hover does.
+    fireEvent.focus(label);
+    expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
+  });
+
   it("a yellow-band context percentage (50–69%) renders the fill in yellow", () => {
     seedLiveSession();
     useSessions.setState({
