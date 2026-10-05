@@ -51,10 +51,36 @@ describe("SessionConfigSelect", () => {
     render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
     // The trigger shows the shared `modelItemsFromCatalog` derivation — the
     // value's provider PREFIX is dropped (the provider is the suffix), so
-    // the composer's `max-w-48` trigger is not wasted on `acme/…`.
+    // the composer's trigger is not wasted on `acme/…`.
     const trigger = screen.getByRole("button", { name: "Model" });
     expect(trigger.textContent).toBe("alpha · acme");
     expect(trigger.textContent).not.toContain("acme/alpha");
+  });
+
+  it("the composer's model trigger sizes to its text up to a WIDE cap (a long model id is not chopped to `Qwen/Qwen3.8-27…`)", () => {
+    render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Model" });
+    // CONTENT-SIZED (auto-resizing): no fixed `w-*`, so a short name gets a
+    // short trigger and `truncate` + the cap only kick in past the cap.
+    const fixedWidth = trigger.className
+      .split(/\s+/)
+      .filter((cls) => /(^|:)w-/.test(cls));
+    expect(fixedWidth).toEqual([]);
+    // The cap is wide enough for `<model id> · <provider>` (the old
+    // `max-w-48` chopped `Qwen/Qwen3.8-27B (Tama)` to an unreadable stub).
+    expect(trigger.className).toContain("max-w-72");
+    expect(trigger.className).not.toContain("max-w-48");
+    // It also GIVES width back when the row is tight (the Button base's
+    // `shrink-0` would otherwise push the send button out of the composer).
+    expect(trigger.className).toContain("min-w-0");
+    expect(trigger.className).toContain("shrink");
+  });
+
+  it("the null-option stub keeps the same width contract as the live trigger", () => {
+    render(<SessionConfigSelect kind="model" option={null} onSet={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Model" });
+    expect(trigger.className).toContain("max-w-72");
+    expect(trigger.className).not.toContain("max-w-48");
   });
 
   it("renders a bot icon for a model option (category 'model')", () => {

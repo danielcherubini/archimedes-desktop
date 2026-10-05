@@ -19,6 +19,17 @@ import { Button } from "./ui/button";
 type OnSet = (optionId: string, value: string) => Promise<void>;
 
 /**
+ * The composer triggers' width contract: CONTENT-SIZED (no fixed `w-*`, and
+ * `shrink` + `min-w-0` override the Button's `shrink-0`) — the trigger hugs
+ * its text, so a short value never leaves dead space, and it gives width
+ * back when the row gets tight (the inner `truncate` ellipsizes it). The
+ * cap is generous: sized for the widest realistic value — `<model id> ·
+ * <provider>` (`Qwen/Qwen3.8-27B · tama`) — where the old `max-w-48`
+ * (12rem) chopped it to the unreadable `Qwen/Qwen3.8-27…`.
+ */
+const COMPOSER_TRIGGER_WIDTH = "min-w-0 shrink max-w-72";
+
+/**
  * The props: a REAL option (the `kind` is optional — it falls back to the
  * option's `category` / `id`) OR a `null` option (a closed session's config
  * is dropped — the `kind` is REQUIRED then, since there is no option to
@@ -103,7 +114,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
   if (option === null) {
     if (isModel) {
       return (
-        <div className="relative">
+        <div className="relative min-w-0">
           <ModelPicker
             label="Model"
             value=""
@@ -111,7 +122,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
             items={[]}
             onSelect={() => {}}
             variant="ghost"
-            triggerClassName="max-w-48"
+            triggerClassName={COMPOSER_TRIGGER_WIDTH}
             disabled
             icon={
               <Bot
@@ -125,11 +136,11 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
       );
     }
     return (
-      <div className="relative">
+      <div className="relative min-w-0">
         <Button
           variant="ghost"
           size="sm"
-          className="max-w-48 justify-start"
+          className={`${COMPOSER_TRIGGER_WIDTH} justify-start`}
           aria-label="Thinking"
           disabled
         >
@@ -186,14 +197,14 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
   // options).
   if (isModel) {
     return (
-      <div className="relative">
+      <div className="relative min-w-0">
         <ModelPicker
           label={option.name}
           value={value}
           items={modelItems}
           onSelect={(val) => void handleValueChange(val)}
           variant="ghost"
-          triggerClassName="max-w-48"
+          triggerClassName={COMPOSER_TRIGGER_WIDTH}
           disabled={isDisabled}
           icon={
             <Bot
@@ -214,12 +225,12 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
 
   // The THINKING-LEVEL option: the compact Radix Select (unchanged).
   return (
-    <div className="relative">
+    <div className="relative min-w-0">
       <Select value={value} onValueChange={handleValueChange}>
         <SelectTrigger
           variant="ghost"
           size="sm"
-          className="max-w-48"
+          className={COMPOSER_TRIGGER_WIDTH}
           disabled={isDisabled}
           aria-label={option.name}
         >

@@ -1000,6 +1000,48 @@ describe("ChatStream", () => {
     expect(screen.getByText("Medium")).toBeTruthy();
   });
 
+  it("groups the model + thinking triggers in ONE tight cluster (they are one block of session config, not three evenly-spaced controls)", () => {
+    seedLiveSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "acme/alpha",
+            options: [{ value: "acme/alpha", name: "acme/Alpha" }],
+          },
+          {
+            id: "thought_level",
+            name: "Thinking",
+            type: "select",
+            currentValue: "medium",
+            options: [{ value: "medium", name: "Medium" }],
+          },
+        ],
+      },
+    });
+    const { container } = render(<ChatStream />);
+    // Both triggers sit inside a single wrapper whose inner gap (`gap-1`) is
+    // TIGHTER than the `gap-2` that separates the cluster from Send.
+    const group = container.querySelector(
+      '[data-testid="composer-config-controls"]',
+    ) as HTMLElement;
+    expect(group).toBeTruthy();
+    expect(group.className).toContain("gap-1");
+    expect(group.className).not.toContain("gap-2");
+    expect(
+      group.querySelector('[aria-label="Model"]') &&
+        group.querySelector('[aria-label="Thinking"]'),
+    ).toBeTruthy();
+    // The cluster is the toolbar's last item before Send (the toolbar's own
+    // `gap-2` is the wider separation).
+    const toolbar = group.parentElement!;
+    expect(toolbar.className).toContain("gap-2");
+    expect(toolbar.lastElementChild?.getAttribute("aria-label")).toBe("Send");
+  });
+
   // --- The context bar (the dynamic percentage — a progress bar spanning
   // from the `+` button to the model selector, the reference UI's
   // `🧠 [====bar====] 61%` look). ---

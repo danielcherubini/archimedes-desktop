@@ -249,10 +249,18 @@ export default function ComposerRow({
             values (the store's kept entry, else the row's synthesized
             `configOptions` / persisted `contextUsage`) with DISABLED
             selectors (a stored session can't set config — a resume
-            re-emits the fresh values). */}
+            re-emits the fresh values).
+            The MODEL + THINKING pair is a GROUP with a tighter inner gap
+            (`gap-1`): they are one cluster of session config, and the
+            roomier `gap-2` now only separates the cluster from Send. */}
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          <SessionConfigSelect kind="model" option={modelOption ?? null} onSet={setConfigValue} disabled={!isLive} />
-          <SessionConfigSelect kind="thinking" option={thinkingOption ?? null} onSet={setConfigValue} disabled={!isLive} />
+          <div
+            className="flex min-w-0 items-center gap-1"
+            data-testid="composer-config-controls"
+          >
+            <SessionConfigSelect kind="model" option={modelOption ?? null} onSet={setConfigValue} disabled={!isLive} />
+            <SessionConfigSelect kind="thinking" option={thinkingOption ?? null} onSet={setConfigValue} disabled={!isLive} />
+          </div>
           <Button
             size="icon-md"
             aria-label="Send"
