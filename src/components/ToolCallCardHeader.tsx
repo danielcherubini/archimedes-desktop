@@ -10,6 +10,7 @@ import {
 import type { ToolCallUiStatus } from "../store/sessions";
 import FileChip from "./FileChip";
 import DiffCount from "./DiffCount";
+import { TRANSCRIPT_ROW_BLEED } from "./lib/transcriptRail";
 import {
   Tooltip,
   TooltipContent,
@@ -81,7 +82,7 @@ export function ToolCallCardHeader({
     <button
       type="button"
       onClick={onToggle}
-      className="group/tool-summary flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left hover:bg-surface-hover"
+      className={`group/tool-summary flex h-8 items-center gap-2 rounded-lg text-left hover:bg-surface-hover ${TRANSCRIPT_ROW_BLEED}`}
     >
       <Icon className="size-4 shrink-0 text-foreground-subtle" />
       <span

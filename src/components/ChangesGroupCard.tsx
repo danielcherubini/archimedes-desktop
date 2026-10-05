@@ -8,6 +8,7 @@ import {
 } from "../lib/toolOutput";
 import FileChip from "./FileChip";
 import DiffCount from "./DiffCount";
+import { TRANSCRIPT_ROW_BLEED } from "./lib/transcriptRail";
 import ToolCallCard from "./ToolCallCard";
 
 const CHIP_GAP_PX = 8;
@@ -167,7 +168,7 @@ export default function ChangesGroupCard({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="group/tool-summary flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left hover:bg-surface-hover"
+        className={`group/tool-summary flex h-8 items-center gap-2 rounded-lg text-left hover:bg-surface-hover ${TRANSCRIPT_ROW_BLEED}`}
       >
         <PencilIcon className="size-4 shrink-0 text-foreground-subtle" />
         <span className="shrink-0 whitespace-nowrap font-medium text-foreground-subtlest">
