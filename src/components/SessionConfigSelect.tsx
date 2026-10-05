@@ -26,8 +26,17 @@ type OnSet = (optionId: string, value: string) => Promise<void>;
  * cap is generous: sized for the widest realistic value — `<model id> ·
  * <provider>` (`Qwen/Qwen3.8-27B · tama`) — where the old `max-w-48`
  * (12rem) chopped it to the unreadable `Qwen/Qwen3.8-27…`.
+ *
+ * The two triggers face each other on a SEAM, so the seam-side padding drops
+ * to `1` (4px) while the text side keeps its `2` (8px) inset: with the
+ * cluster's `gap-1`, the old 8px + 8px + 4px was a dead 20px band that made
+ * the pair read as two unrelated controls.
  */
 const COMPOSER_TRIGGER_WIDTH = "min-w-0 shrink max-w-72";
+/** The model trigger's right edge (it faces the thinking trigger). */
+const COMPOSER_MODEL_EDGE = "pr-1";
+/** The thinking trigger's left edge (it faces the model trigger). */
+const COMPOSER_THINKING_EDGE = "pl-1";
 
 /**
  * The props: a REAL option (the `kind` is optional — it falls back to the
@@ -122,7 +131,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
             items={[]}
             onSelect={() => {}}
             variant="ghost"
-            triggerClassName={COMPOSER_TRIGGER_WIDTH}
+            triggerClassName={`${COMPOSER_TRIGGER_WIDTH} ${COMPOSER_MODEL_EDGE}`}
             disabled
             icon={
               <Bot
@@ -140,7 +149,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
         <Button
           variant="ghost"
           size="sm"
-          className={`${COMPOSER_TRIGGER_WIDTH} justify-start`}
+          className={`${COMPOSER_TRIGGER_WIDTH} ${COMPOSER_THINKING_EDGE} justify-start`}
           aria-label="Thinking"
           disabled
         >
@@ -204,7 +213,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
           items={modelItems}
           onSelect={(val) => void handleValueChange(val)}
           variant="ghost"
-          triggerClassName={COMPOSER_TRIGGER_WIDTH}
+          triggerClassName={`${COMPOSER_TRIGGER_WIDTH} ${COMPOSER_MODEL_EDGE}`}
           disabled={isDisabled}
           icon={
             <Bot
@@ -230,7 +239,7 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
         <SelectTrigger
           variant="ghost"
           size="sm"
-          className={COMPOSER_TRIGGER_WIDTH}
+          className={`${COMPOSER_TRIGGER_WIDTH} ${COMPOSER_THINKING_EDGE}`}
           disabled={isDisabled}
           aria-label={option.name}
         >
