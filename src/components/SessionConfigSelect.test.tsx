@@ -47,11 +47,14 @@ const thinkingOption: SessionConfigOption = {
 };
 
 describe("SessionConfigSelect", () => {
-  it("renders the current value as the trigger text (the FULL `provider/id` value — the `Qwen/Qwen3.8-27B` shape)", () => {
+  it("renders the current model's BARE id + the provider as a muted suffix (never the redundant `provider/id` prefix)", () => {
     render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
-    // The trigger shows the value itself (the row name IS the value —
-    // the shared `modelItemsFromCatalog` derivation).
-    expect(screen.getByText("acme/alpha")).toBeTruthy();
+    // The trigger shows the shared `modelItemsFromCatalog` derivation — the
+    // value's provider PREFIX is dropped (the provider is the suffix), so
+    // the composer's `max-w-48` trigger is not wasted on `acme/…`.
+    const trigger = screen.getByRole("button", { name: "Model" });
+    expect(trigger.textContent).toBe("alpha · acme");
+    expect(trigger.textContent).not.toContain("acme/alpha");
   });
 
   it("renders a bot icon for a model option (category 'model')", () => {
@@ -143,9 +146,10 @@ describe("SessionConfigSelect", () => {
     // NOT a Radix dropdown — the catalog is too long for a menu).
     fireEvent.click(screen.getByRole("button", { name: "Model" }));
 
-    // Pick the row (the row name is the FULL value — the shared
-    // derivation).
-    const beta = screen.getByText("acme/beta");
+    // Pick the row (the row name is the BARE id — the shared
+    // `modelItemsFromCatalog` derivation; the VALUE sent is still the
+    // full composed key).
+    const beta = screen.getByText("beta");
     fireEvent.click(beta);
 
     await waitFor(() => expect(onSet).toHaveBeenCalledWith("model", "acme/beta"));
@@ -160,7 +164,7 @@ describe("SessionConfigSelect", () => {
     const trigger = screen.getByRole("button", { name: "Model" });
 
     fireEvent.click(trigger);
-    fireEvent.click(screen.getByText("acme/beta"));
+    fireEvent.click(screen.getByText("beta"));
 
     expect(trigger.hasAttribute("disabled")).toBe(true);
 
@@ -196,9 +200,9 @@ describe("SessionConfigSelect", () => {
     const onSet = vi.fn().mockRejectedValue(new Error("boom"));
     render(<SessionConfigSelect option={mockOption} onSet={onSet} />);
 
-    // Open the dialog + pick the row.
+    // Open the dialog + pick the row (the row name is the bare id).
     fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    fireEvent.click(screen.getByText("acme/beta"));
+    fireEvent.click(screen.getByText("beta"));
 
     // Error should appear
     const alert = await screen.findByRole("alert");
@@ -255,20 +259,22 @@ describe("SessionConfigSelect", () => {
     render(<SessionConfigSelect option={groupedOption} onSet={onSet} />);
 
     // Open the dialog: the rows are FLAT (the grouped entries flattened
-    // to their values) — the row name is the FULL `provider/id` value,
-    // and the provider cue is the value's PREFIX (no configured provider
+    // to their values) — the row name is the value MINUS the provider
+    // prefix, and the provider cue is that prefix (no configured provider
     // here → the raw key, inline in muted grey).
     fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    expect(screen.getByText("openai/gpt-4")).toBeTruthy();
-    expect(screen.getByText("openai/gpt-4-turbo")).toBeTruthy();
-    // `anthropic/claude` appears TWICE — the trigger's current value AND
-    // the dialog's row.
-    expect(screen.getAllByText("anthropic/claude")).toHaveLength(2);
-    // The provider cue (both `openai` rows — the ` (openai)` spans).
+    expect(screen.getByText("gpt-4")).toBeTruthy();
+    expect(screen.getByText("gpt-4-turbo")).toBeTruthy();
+    // The trigger's current value and the dialog's `claude` row are the two
+    // places `claude` now appears (the composed key is only the VALUE).
+    expect(screen.getAllByText(/^claude/)).toHaveLength(2);
+    // The provider cue (`openai` on both `openai` rows + the trigger's
+    // `anthropic` suffix).
     expect(screen.getAllByText(/\(openai\)/)).toHaveLength(2);
+    expect(screen.getByText(/·\s*anthropic/)).toBeTruthy();
 
-    // Select a row: the value is sent.
-    fireEvent.click(screen.getByText("openai/gpt-4"));
+    // Select a row: the full composed VALUE is sent.
+    fireEvent.click(screen.getByText("gpt-4"));
     await waitFor(() => expect(onSet).toHaveBeenCalledWith("model", "openai/gpt-4"));
   });
 });

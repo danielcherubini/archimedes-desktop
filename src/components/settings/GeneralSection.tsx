@@ -61,10 +61,11 @@ export default function GeneralSection({
           // The SHARED `ModelPicker` (the one component every model picker
           // uses — a trigger opening the fuzzy-searched, alphabetical
           // dialog; the catalog is too long for a Radix dropdown). The
-          // items are the SHARED derivation (the row name is the FULL
-          // `provider/id` value; the provider cue is the provider's
-          // display name — `tama` → `Tama` from the configured providers)
-          // + the "System default" row (value `""` → `defaultModel: null`).
+          // items are the SHARED derivation (the row name is the BARE
+          // model id — the provider prefix is dropped; the provider cue is
+          // the provider's display name — `tama` → `Tama` from the
+          // configured providers) + the "System default" row (value `""`
+          // → `defaultModel: null`).
           <ModelPicker
             label="Default model"
             value={settings.defaultModel ?? ""}

@@ -45,6 +45,14 @@ export default function ModelPicker({
 }) {
   const [open, setOpen] = useState(false);
   const unset = value === "";
+  // The trigger's text is the selected ITEM's display name (the bare model
+  // id) plus the provider as a muted suffix — NOT the raw `provider/id`
+  // value: the provider would then be printed twice (prefix + name), and
+  // the prefix eats the composer's narrow `max-w-48` trigger
+  // (`wizards/Qwen/Qw…`). A value matching no item (a stale override, a
+  // hand-set key) falls back to the raw value, unsuffixed.
+  const selected = items.find((item) => item.value === value);
+  const displayText = selected?.name ?? value;
   return (
     <>
       <Button
@@ -69,7 +77,12 @@ export default function ModelPicker({
             unset ? "text-foreground-subtlest" : ""
           }`}
         >
-          {unset ? placeholder ?? "" : value}
+          {unset ? placeholder ?? "" : displayText}
+          {!unset && selected?.provider !== undefined && (
+            <span className="text-foreground-subtlest">
+              {" · " + selected.provider}
+            </span>
+          )}
         </span>
         <ChevronDownIcon
           className="size-3.5 shrink-0 text-foreground-subtle"

@@ -1,6 +1,9 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { ModelPickerItem } from "./ModelPickerDialog";
+import {
+  modelItemsFromCatalog,
+  type ModelPickerItem,
+} from "./ModelPickerDialog";
 import ModelPickerDialog from "./ModelPickerDialog";
 
 // The dialog is PROP-DRIVEN (like `SkillsDialog` — the data comes from the
@@ -27,6 +30,46 @@ function renderDialog(
     />,
   );
 }
+
+describe("modelItemsFromCatalog (the ONE model-row derivation)", () => {
+  const providers = [{ id: "wizards", name: "Wizards" }];
+
+  it("the row NAME is the BARE model id — the provider prefix is stripped (it would otherwise be printed twice: once in the name, once in the cue)", () => {
+    expect(
+      modelItemsFromCatalog(["wizards/Qwen/Qwen3.8-27B"], providers),
+    ).toEqual([
+      {
+        value: "wizards/Qwen/Qwen3.8-27B",
+        name: "Qwen/Qwen3.8-27B",
+        provider: "Wizards",
+      },
+    ]);
+    // The VALUE still carries the full composed key (the selection is
+    // unchanged — only the DISPLAY drops the prefix).
+    expect(
+      modelItemsFromCatalog(["wizards/Qwen/Qwen3.8-27B"], providers)[0].value,
+    ).toBe("wizards/Qwen/Qwen3.8-27B");
+  });
+
+  it("splits on the FIRST `/` (model ids may contain `/`)", () => {
+    expect(modelItemsFromCatalog(["wizards/deepseek/deepseek-v4-flash"], providers)[0].name).toBe(
+      "deepseek/deepseek-v4-flash",
+    );
+  });
+
+  it("an unconfigured provider key is the cue verbatim; a value with no `/` has no cue and keeps its name", () => {
+    expect(modelItemsFromCatalog(["tama/m1"], providers)[0]).toEqual({
+      value: "tama/m1",
+      name: "m1",
+      provider: "tama",
+    });
+    expect(modelItemsFromCatalog(["bare-model"], providers)[0]).toEqual({
+      value: "bare-model",
+      name: "bare-model",
+      provider: undefined,
+    });
+  });
+});
 
 describe("ModelPickerDialog", () => {
   it("lists every model, ALPHABETICALLY (case-insensitive — the input order is ignored)", async () => {
@@ -63,7 +106,7 @@ describe("ModelPickerDialog", () => {
     expect(row.textContent).toBe("Qwen3.8");
   });
 
-  it("the fuzzy search filters by subsequence (name OR provider)", async () => {
+  it("the fuzzy search filters by subsequence (name OR provider OR the full value)", async () => {
     renderDialog([
       item({ value: "tama/Qwen3.8", name: "Qwen3.8", provider: "tama" }),
       item({ value: "openai/gpt-4", name: "GPT-4", provider: "openai" }),
@@ -82,6 +125,14 @@ describe("ModelPickerDialog", () => {
     });
     expect(screen.getByText("GPT-4")).toBeTruthy();
     expect(screen.queryByText("Qwen3.8")).toBeNull();
+  });
+
+  it("a query spanning provider AND model matches the composed VALUE (the row text no longer contains the joined shape)", async () => {
+    renderDialog([item({ value: "wizards/Qwen3.8", name: "Qwen3.8", provider: "Wizards" })]);
+    fireEvent.change(screen.getByPlaceholderText("Search models…"), {
+      target: { value: "wizards/q" },
+    });
+    expect(screen.getByText("Qwen3.8")).toBeTruthy();
   });
 
   it("clicking a row selects its value and closes the dialog", async () => {

@@ -157,8 +157,8 @@ function SessionConfigSelect({ option, kind, onSet, disabled }: SessionConfigSel
   // options flattened to their VALUES (the Rust
   // `synthesize_catalog_config_options` shape — flat `{ value:
   // "provider/id" }` entries; grouped entries flattened too) → the row
-  // name is the FULL `provider/id` value + the provider's display name
-  // as the muted-grey inline cue (the `Qwen/Qwen3.8-27B (Tama)` shape).
+  // name is the value MINUS its provider prefix + the provider's display
+  // name as the muted-grey inline cue (the `Qwen3.8-27B (Tama)` shape).
   const modelItems = modelItemsFromCatalog(
     (option.options ?? []).flatMap((opt) =>
       "options" in opt ? opt.options.map((sub) => sub.value) : [opt.value],

@@ -994,7 +994,9 @@ describe("ChatStream", () => {
     const composer = container.querySelector(".rounded-2xl")!;
     expect(composer.querySelector('[aria-label="Model"]')).toBeTruthy();
     expect(composer.querySelector('[aria-label="Thinking"]')).toBeTruthy();
-    expect(screen.getByText("acme/alpha")).toBeTruthy();
+    // The model trigger shows the BARE id + the provider suffix (the
+    // composed `provider/id` key is the VALUE, not the display text).
+    expect(screen.getByText(/alpha/)).toBeTruthy();
     expect(screen.getByText("Medium")).toBeTruthy();
   });
 
@@ -1180,7 +1182,7 @@ describe("ChatStream", () => {
     // deliver `set_config_option` to).
     const model = screen.getByRole("button", { name: "Model" });
     expect(model.hasAttribute("disabled")).toBe(true);
-    expect(model.textContent).toContain("tama/m1");
+    expect(model.textContent).toContain("m1 · tama");
     // The thinking selector is POPULATED with the stored level + disabled.
     const thinking = screen.getByRole("combobox");
     expect(thinking.hasAttribute("disabled")).toBe(true);
@@ -1210,7 +1212,7 @@ describe("ChatStream", () => {
     });
     render(<ChatStream />);
     const model = screen.getByRole("button", { name: "Model" });
-    expect(model.textContent).toContain("tama/m2");
+    expect(model.textContent).toContain("m2 · tama");
     const bar = screen.getByRole("progressbar", { name: "Context used" });
     expect(bar.getAttribute("aria-valuenow")).toBe("78"); // 100000/128000 ≈ 78%
   });
@@ -1312,7 +1314,8 @@ describe("ChatStream", () => {
     // The model picker is a DIALOG (the trigger is a button — the catalog
     // is too long for a Radix dropdown).
     fireEvent.click(screen.getByRole("button", { name: "Model" }));
-    fireEvent.click(screen.getByText("acme/beta"));
+    // The row name is the BARE id; the sent value is the full composed key.
+    fireEvent.click(screen.getByText("beta"));
     expect(setSessionConfigOption).toHaveBeenCalledWith("s1", "model", "acme/beta");
   });
 

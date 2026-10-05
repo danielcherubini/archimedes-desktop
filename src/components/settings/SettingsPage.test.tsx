@@ -425,19 +425,22 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     // dropdown) — the trigger is a button, not a combobox.
     const trigger = screen.getByRole("button", { name: "Default model" });
     fireEvent.click(trigger);
-    // The catalog entry (the `provider/id` name + the provider's
-    // display-name cue — `tama` → `Tama` from the configured providers)
-    // + the "System default" row.
-    expect(screen.getByText(/tama\/Qwen3\.8/)).toBeTruthy();
-    expect(screen.getByText(/Tama/)).toBeTruthy();
+    // The catalog entry (the BARE model id + the provider's display-name
+    // cue — `tama` → `Tama` from the configured providers; the composed
+    // `tama/Qwen3.8` key is the VALUE, never the row text) + the
+    // "System default" row.
+    expect(screen.getByText(/Qwen3\.8/)).toBeTruthy();
+    expect(screen.getByText(/\(Tama\)/)).toBeTruthy();
+    expect(screen.queryByText(/tama\/Qwen3\.8/)).toBeNull();
     // "System default" appears TWICE — the trigger's placeholder AND the
     // dialog's row — so the row is picked scoped to the dialog.
     const dialog = within(
       document.querySelector("[data-slot=dialog-content]") as HTMLElement,
     );
     expect(dialog.getByText("System default")).toBeTruthy();
-    // Choosing the model saves the composed key.
-    fireEvent.click(screen.getByText(/tama\/Qwen3\.8/));
+    // Choosing the model saves the COMPOSED key (the row's text is the
+    // bare id, the value is `provider/id`).
+    fireEvent.click(dialog.getByText(/Qwen3\.8/));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ defaultModel: "tama/Qwen3.8" }),
@@ -899,7 +902,7 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     });
     fireEvent.click(trigger);
     // Pick a catalog model (the `listModels` fixture's first model).
-    fireEvent.click(await screen.findByText("tama/Qwen3.8"));
+    fireEvent.click(await screen.findByText("Qwen3.8"));
     // Immediate save of the COMPLETE document: `subagentModels` gains the
     // entry; every other field is the loaded document, unchanged.
     await waitFor(() =>
@@ -1065,7 +1068,7 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
     });
     // Pick a different catalog model.
     fireEvent.click(trigger);
-    fireEvent.click(await screen.findByText("openai/GPT-5"));
+    fireEvent.click(await screen.findByText("GPT-5"));
     await waitFor(() =>
       expect(saveSettings).toHaveBeenLastCalledWith(
         expect.objectContaining({ subagentModels: { scout: "openai/GPT-5" } }),

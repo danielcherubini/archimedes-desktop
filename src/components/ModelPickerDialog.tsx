@@ -39,11 +39,17 @@ export function providerDisplayName(
 /**
  * The picker items for a model catalog (the Rust
  * `synthesize_catalog_config_options` shape — flat `{ value: "provider/id" }`
- * entries): the row NAME is the FULL `provider/id` value (the
- * `Qwen/Qwen3.8-27B` shape — the model id alone would lose the provider in
- * the trigger) and the provider cue is the provider's display name (its
- * configured `name` — the raw key when unconfigured). A value without a
- * `/` (no provider prefix) gets no cue.
+ * entries): the row NAME is the BARE model id (the provider PREFIX is
+ * dropped — the provider is already printed as the cue, so keeping the
+ * prefix showed it twice: `wizards/Qwen/Qwen3.8-27B (Wizards)`), and the
+ * provider cue is the provider's display name (its configured `name` —
+ * the raw key when unconfigured). Splitting follows `ModelKey::parse`: the
+ * provider id never contains `/`, the MODEL id may, so the FIRST `/` is
+ * the boundary. A value without a `/` keeps its name and gets no cue.
+ *
+ * The VALUE always keeps the full composed key — this is a DISPLAY-only
+ * derivation (`settings.defaultModel`, `subagentModels` and
+ * `set_config_option` all still carry `provider/id`).
  */
 export function modelItemsFromCatalog(
   values: string[],
@@ -54,9 +60,11 @@ export function modelItemsFromCatalog(
     const providerKey = slash > 0 ? value.slice(0, slash) : "";
     return {
       value,
-      name: value,
+      name: providerKey === "" ? value : value.slice(slash + 1),
       provider:
-        providerKey === "" ? undefined : providerDisplayName(providers, providerKey),
+        providerKey === ""
+          ? undefined
+          : providerDisplayName(providers, providerKey),
     };
   });
 }
@@ -87,10 +95,13 @@ export default function ModelPickerDialog({
 }) {
   const [query, setQuery] = useState("");
   const needle = query.trim().toLowerCase();
-  // The fuzzy filter: the query is a subsequence of the name OR the
-  // provider (`oa` finds `openai`'s models).
+  // The fuzzy filter: the query is a subsequence of the name, the provider,
+  // OR the full `provider/id` VALUE (`oa` finds `openai`'s models;
+  // `wizards/q` finds `wizards/Qwen3.8` — the row text is now the BARE id,
+  // so only the value carries the joined shape a user may type).
   const matches = (item: ModelPickerItem): boolean =>
     fuzzyMatch(needle, item.name) ||
+    fuzzyMatch(needle, item.value) ||
     (item.provider !== undefined && fuzzyMatch(needle, item.provider));
   // Alphabetical (case-insensitive) — the caller's order is ignored.
   const filtered = (
@@ -147,7 +158,7 @@ export default function ModelPickerDialog({
                         min-width:auto floor would push the row past the
                         dialog's right edge). The provider (when known)
                         is INLINE, after the name, in muted grey — the
-                        `Qwen/Qwen3.8-27B (Tama)` shape. */}
+                        `Qwen3.8-27B (Tama)` shape. */}
                     <span className="min-w-0 flex-1 truncate text-ui-base">
                       {model.name}
                       {model.provider !== undefined && (

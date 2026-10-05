@@ -4,12 +4,12 @@ import type { ModelPickerItem } from "./ModelPickerDialog";
 import ModelPicker from "./ModelPicker";
 
 const items: ModelPickerItem[] = [
-  { value: "tama/Qwen3.8", name: "tama/Qwen3.8", provider: "Tama" },
+  { value: "tama/Qwen3.8", name: "Qwen3.8", provider: "Tama" },
   { value: "", name: "System default" },
 ];
 
 describe("ModelPicker (the SHARED trigger + dialog — every model picker uses it)", () => {
-  it("the trigger shows the current value and opens the dialog", () => {
+  it("the trigger shows the selected item's NAME + the provider as a muted suffix, and opens the dialog", () => {
     render(
       <ModelPicker
         label="Default model"
@@ -19,11 +19,33 @@ describe("ModelPicker (the SHARED trigger + dialog — every model picker uses i
       />,
     );
     const trigger = screen.getByRole("button", { name: "Default model" });
-    expect(trigger.textContent).toContain("tama/Qwen3.8");
+    // NOT the raw `provider/id` value (the prefix is redundant next to
+    // the provider name) — `Qwen3.8 · Tama`.
+    expect(trigger.textContent).toContain("Qwen3.8");
+    expect(trigger.textContent).not.toContain("tama/Qwen3.8");
+    // The provider suffix is the muted token, prefixed by the separator.
+    const suffix = trigger.querySelector("span > span") as HTMLElement;
+    expect(suffix.textContent).toBe(" · Tama");
+    expect(suffix.className).toContain("text-foreground-subtlest");
     // Closed by default.
     expect(screen.queryByText("System default")).toBeNull();
     fireEvent.click(trigger);
     expect(screen.getByText("System default")).toBeTruthy();
+  });
+
+  it("a selected value that matches no item falls back to the raw value (a value outside the derived list)", () => {
+    render(
+      <ModelPicker
+        label="Default model"
+        value="other/x"
+        items={items}
+        onSelect={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Default model" });
+    expect(trigger.textContent).toContain("other/x");
+    // No provider suffix.
+    expect(trigger.querySelector("span > span")).toBeNull();
   });
 
   it("an unset value shows the muted placeholder (the SelectValue placeholder pattern)", () => {

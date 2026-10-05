@@ -82,8 +82,8 @@ export default function SubagentSection({
             description={`${def.description || "No description"} · file: ${def.model ?? "— (inherits parent model)"}`}
             control={
               // The SHARED `ModelPicker` (ADR 0023): the catalog's models
-              // (the shared derivation — the row name is the FULL
-              // `provider/id` value; the provider cue is the display name)
+              // (the shared derivation — the row name is the BARE model
+              // id; the provider cue is the display name)
               // + the "File value (no override)" row (picking it DELETES
               // the key) + a stale stored override as its own DISABLED
               // row (a key no longer in the catalog — the
