@@ -164,3 +164,24 @@ export function splitSkillBlocks(
     blocks: matches.map((m) => ({ name: m.name, body: m.body })),
   };
 }
+
+/**
+ * The active skill token at the caret (the ONE shared helper — used by the
+ * composer's `onChange` re-computation, the keydown re-evaluation, and
+ * `selectSkill`): the span between the nearest preceding whitespace (or
+ * start-of-line) and the caret. Returns `{ remainder, start }` when the span
+ * starts with `$` — `remainder` is the token's remainder AFTER the `$` (a
+ * bare `$` is `""`), `start` is the `$`'s index in the string — else `null`
+ * (no active token: the span doesn't start with `$`, or it contains a
+ * character that can't be part of a skill name, e.g. uppercase — the regex
+ * `[a-z0-9-]*$` simply won't reach the caret).
+ */
+export function activeSkillToken(
+  value: string,
+  caret: number,
+): { remainder: string; start: number } | null {
+  const before = value.slice(0, caret);
+  const m = before.match(/(^|\s)(\$[a-z0-9-]*)$/);
+  if (!m) return null;
+  return { remainder: m[2]!.slice(1), start: (m.index ?? 0) + m[1]!.length };
+}

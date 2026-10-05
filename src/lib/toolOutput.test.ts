@@ -519,9 +519,13 @@ describe("subagent metadata and activity formatting helpers", () => {
     expect(cleanModelName("claude-3-7-sonnet")).toBe("claude-3-7-sonnet");
     expect(cleanModelName("anthropic/claude-3-7-sonnet:high")).toBe("anthropic/claude-3-7-sonnet");
     expect(cleanModelName(undefined)).toBeUndefined();
+    // A model id may contain a colon — the level is the trailing
+    // segment after the LAST colon (mirrors Rust's `ModelRef::parse`).
+    expect(cleanModelName("tama/m:1:high")).toBe("tama/m:1");
 
     expect(extractThinkingFromModel("claude-3-7-sonnet:high")).toBe("high");
     expect(extractThinkingFromModel("claude-3-7-sonnet")).toBeUndefined();
+    expect(extractThinkingFromModel("tama/m:1:high")).toBe("high");
   });
 
   it("subagentActivityLine formats recent tool calls when no active tool is running", () => {

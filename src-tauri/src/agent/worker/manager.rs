@@ -38,11 +38,14 @@ use serde_json::{json, Value};
 use tokio::sync::watch;
 
 use crate::agent::debuglog;
+use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::build_child_system_message;
 use crate::agent::harness::r#loop::tool_specs;
-use crate::agent::session::{mint_session_id, resolve_composed_model, EventSink};
+use crate::agent::harness::{ModelKey, ModelRef};
+use crate::agent::session::resolve_composed_model;
 use crate::agent::subagent::{SubagentMetrics, SubagentOutcome};
+use crate::agent::types::mint_session_id;
 use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
 use crate::agent::worker::protocol::{Inbound, StartEnv, StartMode, SubagentDispatchWire};
 
@@ -776,14 +779,22 @@ fn dispatch_subagent(
     // (the loop's pre-flight resolved it against the Worker's
     // catalog). An unresolvable key is `Failed` (the current
     // driver's "unknown model" — NO fallback).
+    // NOTE: ADR 0023 chain — see `resolve_model_ref` (not yet
+    // unified). The last-`:` strip is `ModelRef::parse`; a ref
+    // whose BARE part is not a valid key (no `/`) parses to
+    // `None` — the old code used the WHOLE string as the bare key
+    // (a `"a:b"` key: old message `unknown model: a`, new
+    // `unknown model: a:b`). Both are unresolvable (a key without
+    // `/` can never be in the catalog) — same `Failed` outcome;
+    // only the error MESSAGE on a pathological input differs.
     let (model, level_suffix) = match &wire.launch.model {
         Some(key) => {
-            let (bare, suffix) = key
-                .rsplit_once(':')
-                .map(|(b, s)| (b.to_string(), Some(s.to_string())))
-                .unwrap_or_else(|| (key.clone(), None));
+            let (bare, level) = match ModelRef::parse(key) {
+                Some(ref_) => (ref_.key.to_string(), ref_.level),
+                None => (key.clone(), None),
+            };
             match resolve_composed_model(&parent_env.catalog, &bare) {
-                Some(m) => (m, suffix),
+                Some(m) => (m, level),
                 None => {
                     sink.deliver(
                         &state,
@@ -825,7 +836,7 @@ fn dispatch_subagent(
         .or(level_suffix)
         .or(wire.launch.frontmatter_thinking.clone());
     if let Some(level) = &thinking {
-        if !model.thinking_levels.is_empty() && !model.thinking_levels.iter().any(|l| l == level) {
+        if !model.supports_thinking_level(level) {
             thinking = None;
         }
     }
@@ -905,7 +916,7 @@ fn dispatch_subagent(
                 "parentSessionId": parent_session_id,
                 "agentName": wire.agent_name,
                 "task": wire.task,
-                "model": format!("{}/{}", model.provider, model.id),
+                "model": ModelKey::from(&model).to_string(),
                 "thinkingLevel": thinking.as_deref(),
                 "enabledTools": child_tools,
             }),
@@ -1256,8 +1267,8 @@ mod tests {
 
     use serde_json::Value;
 
+    use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::{Model, ModelCatalog};
-    use crate::agent::session::EventSink;
     use crate::agent::subagent::SubagentOutcome;
     use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
     use crate::agent::worker::manager::{SubagentCapture, WorkerFactory, WorkerManager};

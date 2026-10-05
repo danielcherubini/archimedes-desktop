@@ -336,6 +336,13 @@ export interface MessageRow {
   createdAt: number;
 }
 
+/** The provider wire vocabulary (ADR 0024 + 0026): the three wires the harness speaks + the `litellm` DISCOVERY MODE (its wire is `openai-completions` — ADR 0026). */
+export type WireApi =
+  | "openai-completions"
+  | "anthropic-messages"
+  | "openai-responses"
+  | "litellm";
+
 /** A user-configured model provider (`settings.json` `providers` entry). */
 export interface ProviderConfig {
   id: string;
@@ -343,7 +350,7 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey: string;
   /** The wire API (ADR 0024): `"openai-completions"` (default) / `"anthropic-messages"` / `"openai-responses"` / `"litellm"` (discovery via `GET /model/info`, wire = openai-completions — ADR 0026). */
-  api: string;
+  api: WireApi;
   /** The key-management page URL (set by the known-providers picker — the row's "Get key" link; `null` / absent for a hand-typed provider). */
   keyUrl?: string | null;
 }
@@ -353,7 +360,7 @@ export interface KnownProvider {
   id: string;
   name: string;
   baseUrl: string;
-  api: string;
+  api: WireApi;
   keyUrl: string;
 }
 

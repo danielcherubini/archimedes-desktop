@@ -6,15 +6,19 @@
 //! catalog (Task 5). Grows across Tasks 5–7; the pieces land one per
 //! task.
 
+pub(crate) mod ask;
 pub mod catalog;
 pub mod compact;
 pub mod dispatch;
+pub(crate) mod launch;
 pub mod r#loop;
+pub mod model_key;
 pub mod prompt;
 pub mod provider;
 pub mod retry;
 pub mod store;
 pub mod trust;
+pub mod wire;
 
 pub use catalog::{
     discover_models, merge_catalog, CompactionConfig, DiscoveredMeta, Model, ModelCatalog,
@@ -22,6 +26,7 @@ pub use catalog::{
 };
 pub use compact::{split_for_compaction, Compactor};
 pub use dispatch::{InProcessDispatcher, MockDispatcher, SubagentDispatcher};
+pub use model_key::{ModelKey, ModelRef};
 pub use prompt::{
     build_child_system_message, build_main_prompt, load_project_context, PromptContext,
 };
@@ -35,3 +40,4 @@ pub use r#loop::{AgentLoop, ControlCmd, Prompt, SudoDeps};
 pub use retry::RetryPolicy;
 pub use store::{DisplayRow, NoopStore, SessionStore, Store};
 pub use trust::{SqliteTrustSource, StaticTrustSource, TrustSource};
+pub use wire::WireApi;

@@ -1,10 +1,12 @@
 pub mod agent;
 pub mod agents;
 pub mod commands;
+pub mod config;
 pub mod skills;
 pub mod storage;
 #[doc(hidden)]
 pub mod test_support;
+pub mod types;
 
 use std::path::PathBuf;
 use std::sync::Arc;

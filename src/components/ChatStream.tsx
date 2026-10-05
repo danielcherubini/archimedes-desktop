@@ -5,7 +5,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowUp, Brain, Plus, X } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   cancelSession,
@@ -16,7 +15,7 @@ import {
   type SkillInfo,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
-import { expandSkillMentions } from "../lib/skills";
+import { activeSkillToken, expandSkillMentions } from "../lib/skills";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
@@ -33,39 +32,11 @@ import { useSettings } from "../store/settings";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
-import { BrailleLoader } from "./ui/braille-loader";
 import { normalizeVariant } from "../lib/braille-loader";
-import { Button } from "./ui/button";
-import SessionConfigSelect from "./SessionConfigSelect";
-import MessageBubble from "./MessageBubble";
-import ChangesGroupCard from "./ChangesGroupCard";
-import PermissionPrompt from "./PermissionPrompt";
-import AskQuestionCard from "./AskQuestionCard";
-import FileSummaryCard from "./FileSummaryCard";
 import SessionStalledBanner from "./SessionStalledBanner";
-import SudoConfirmModal from "./SudoConfirmModal";
-import SudoPasswordModal from "./SudoPasswordModal";
-
-/**
- * The active skill token at the caret (the ONE shared helper — used by the
- * `onChange` re-computation, the keydown re-evaluation, and `selectSkill`):
- * the span between the nearest preceding whitespace (or start-of-line) and
- * the caret. Returns `{ remainder, start }` when the span starts with `$`
- * — `remainder` is the token's remainder AFTER the `$` (a bare `$` is `""`),
- * `start` is the `$`'s index in the string — else `null` (no active token:
- * the span doesn't start with `$`, or it contains a character that can't be
- * part of a skill name, e.g. uppercase — the regex `[a-z0-9-]*$` simply won't
- * reach the caret).
- */
-function activeSkillToken(
-  value: string,
-  caret: number,
-): { remainder: string; start: number } | null {
-  const before = value.slice(0, caret);
-  const m = before.match(/(^|\s)(\$[a-z0-9-]*)$/);
-  if (!m) return null;
-  return { remainder: m[2]!.slice(1), start: (m.index ?? 0) + m[1]!.length };
-}
+import MessageList from "./chat/MessageList";
+import ComposerRow from "./chat/ComposerRow";
+import ComposerModals, { WorkingIndicator } from "./chat/ComposerModals";
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -884,377 +855,67 @@ export default function ChatStream() {
           event set the store's `stalled` entry): above the transcript, below
           the (removed) header. `null` when the session is not stalled. */}
       {activeSessionId && <SessionStalledBanner sessionId={activeSessionId} />}
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-4">
-        {/* The request cards and the working/blocked/stop-reason lines
-            render UNCONDITIONALLY (regardless of the transcript's
-            length — a native agent that asks at session start, or the
-            window between `openSession` and `loadHistory` hydration,
-            must not have its request swallowed by the hint). */}
-        {messages.length === 0 &&
-          !hasPendingRequest &&
-          !workingOrInTurn &&
-          agentState !== "blocked" && (
-            <div className="flex h-full items-center justify-center">
-              <p className="text-ui-base text-foreground-subtlest">
-                Send a prompt to start
-              </p>
-            </div>
-          )}
-        {units.map((unit, i) => {
-          if (unit.kind === "changes-group") {
-            return (
-              <ChangesGroupCard
-                key={`${activeSessionId}:${i}`}
-                messages={unit.messages}
-              />
-            );
-          }
-          const message = unit.message;
-          // The key is session-scoped: switching sessions must not reuse the
-          // previous session's component at the same index (a `Reasoning`
-          // would otherwise carry over expanded state, duration, and timers).
-          // The `AskQuestionCard` replaces the pending `ask`
-          // `ToolCallCard` (correlated via `(source, toolCallId)`/
-          // `requestId` — a `main` ask whose `toolCallId` matches this
-          // tool-call message).
-          if (message.kind === "tool-call") {
-            const anchored = askRequests.find(
-              (r) => r.source === "main" && r.toolCallId === message.id,
-            );
-            if (anchored) {
-              return (
-                <AskQuestionCard
-                  key={`${activeSessionId}:${i}`}
-                  sessionId={activeSessionId}
-                  requestId={anchored.requestId}
-                />
-              );
-            }
-          }
-          return (
-            <MessageBubble
-              key={`${activeSessionId}:${i}`}
-              message={message}
-              isStreaming={
-                message.kind === "agent-thought" &&
-                inTurn &&
-                i === units.length - 1
-              }
-              sessionId={activeSessionId}
-            />
-          );
-        })}
-        {prompts.map((prompt) => (
-          <PermissionPrompt
-            key={prompt.requestId}
-            sessionId={activeSessionId}
-            requestId={prompt.requestId}
-          />
-        ))}
-        {/* Stacked interactive `ask` cards (one per pending request, arrival
-            order — concurrent asks stack vertically in the stream). */}
-        {stackedAskRequests.map((r) => (
-          <AskQuestionCard
-            key={r.requestId}
-            sessionId={activeSessionId}
-            requestId={r.requestId}
-          />
-        ))}
-        {turnDiffs.length > 0 && <FileSummaryCard diffs={turnDiffs} />}
-        {!inTurn && stopReason && stopReason !== "end_turn" && (
-          <p className="text-ui-sm text-foreground-subtlest">
-            Turn ended: {stopReason}
-          </p>
-        )}
-      </div>
+      <MessageList
+        scrollRef={scrollRef}
+        units={units}
+        messageCount={messages.length}
+        activeSessionId={activeSessionId}
+        inTurn={inTurn}
+        askRequests={askRequests}
+        prompts={prompts}
+        stackedAskRequests={stackedAskRequests}
+        hasPendingRequest={hasPendingRequest}
+        workingOrInTurn={workingOrInTurn}
+        agentState={agentState}
+        turnDiffs={turnDiffs}
+        stopReason={stopReason}
+      />
 
       {error && (
         <p className="mb-2 px-3 text-ui-sm text-destructive">
           {error}
         </p>
       )}
-      {/* The working indicator is PINNED above the composer (the top of
-          the text input field — the reference TUI's editor bottom-border
-          row: the spinner + the rotating quip). It appears while the
-          agent works or waits for input; the message stream scrolls above
-          it. `blocked` takes precedence over `working` (a blocked agent
-          that is also mid-turn shows the waiting line, NOT the braille
-          loader — both would render otherwise). The `-mb-2` pulls the row
-          a few px down so it hugs the composer (the composer's `m-3` top
-          margin minus 8px). */}
-      {agentState === "blocked" || workingOrInTurn ? (
-        <div
-          className="-mb-2 flex items-center gap-2 px-4 py-1.5"
-          data-testid="working-indicator"
-        >
-          {agentState === "blocked" ? (
-            <p className="text-ui-sm text-foreground-subtle">
-              Waiting for your input…
-            </p>
-          ) : (
-            <>
-              <BrailleLoader
-                variant={spinnerStyle}
-                speed="normal"
-                fontSize={14}
-                label="Agent working"
-              />
-              <p className="text-ui-sm text-foreground-subtle">{quip}</p>
-            </>
-          )}
-        </div>
-      ) : null}
-      <div
-        className="relative m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
-        onDrop={handleDrop}
-      >
-        {picker && filtered.length > 0 && (
-          <div
-            data-testid="skill-picker"
-            className="absolute left-3 right-3 -top-2 z-10 -translate-y-full rounded-lg border border-input-border bg-input p-1 shadow-lg"
-          >
-            {filtered.map((s, i) => (
-              <button
-                key={s.name}
-                type="button"
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  selectSkill(s);
-                }}
-                className={`flex w-full flex-col gap-0.5 rounded-md px-2 py-1 text-left ${i === activeIndex ? "bg-surface-hover" : ""}`}
-              >
-                <span className="text-ui-base">{s.name}</span>
-                {s.description !== "" && (
-                  <span
-                    className="truncate text-ui-sm text-foreground-subtle"
-                    title={s.description}
-                  >
-                    {s.description}
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-        )}
-        {attachments.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-2">
-            {attachments.map((att) => (
-              <div
-                key={att.id}
-                className="group relative size-12 overflow-hidden rounded-lg border border-input-border bg-input"
-              >
-                <img
-                  src={att.objectUrl}
-                  alt={att.filename}
-                  className="size-full object-cover"
-                />
-                <button
-                  type="button"
-                  aria-label="Remove image attachment"
-                  onClick={() => removeAttachment(att.id)}
-                  className="absolute right-0.5 top-0.5 size-4 rounded-full bg-input p-0 opacity-0 transition-opacity group-hover:opacity-100"
-                >
-                  <X className="size-3 text-foreground" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        <textarea
-          ref={composerRef}
-          value={draft}
-          onChange={(e) => {
-            // The `$`-trigger: a bare `$` (empty token remainder) opens the
-            // picker with the FULL list, any non-`$` span closes it.
-            const token = activeSkillToken(
-              e.target.value,
-              e.target.selectionStart ?? e.target.value.length,
-            );
-            setDraft(e.target.value);
-            setPicker(token ? { query: token.remainder, index: 0 } : null);
-          }}
-          onPaste={handlePaste}
-          onKeyDown={(e) => {
-            // Re-evaluate the active token at KEYDOWN time (the caret is on
-            // the event's target): ArrowLeft/Right, Home/End, and a mouse
-            // click move the caret WITHOUT `onChange`, so the `picker` state
-            // (only recomputed in `onChange`) can be STALE — the caret may
-            // no longer be on the token.
-            const el = e.currentTarget;
-            const token = activeSkillToken(
-              el.value,
-              el.selectionStart ?? el.value.length,
-            );
-            if (picker && !token) {
-              // The caret left the token: CLOSE the picker instead of
-              // `selectSkill`'s silent early-return — a stale picker must
-              // never swallow keys (Enter sends, arrows move the caret, Tab
-              // falls through to the textarea default).
-              setPicker(null);
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-              return;
-            }
-            // The picker is open AND the token is active at the caret: ↑/↓
-            // move the highlight (with wrap), Enter/Tab select the highlighted
-            // row (ZCode's `MentionPlugin` registers `KEY_TAB_COMMAND` →
-            // `selectOption(selectedIndex)` — the same handler Enter uses),
-            // Escape closes. `Shift+Enter` (a newline) and `Shift+Tab`
-            // (move focus BACKWARD — intercepting it would be a
-            // keyboard/a11y trap) fall through to the textarea default
-            // (NOT a selection, NOT swallowed). The index used here is
-            // `activeIndex` (the derivation above — NOT the raw
-            // `picker.index`, which can be stale against a changed
-            // `filtered`).
-            if (picker && token && filtered.length > 0) {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setPicker({
-                  ...picker,
-                  index: (activeIndex + 1) % filtered.length,
-                });
-                return;
-              }
-              if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setPicker({
-                  ...picker,
-                  index: (activeIndex + filtered.length - 1) % filtered.length,
-                });
-                return;
-              }
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                selectSkill(filtered[activeIndex]!);
-                return;
-              }
-              if (e.key === "Tab" && !e.shiftKey) {
-                e.preventDefault();
-                selectSkill(filtered[activeIndex]!);
-                return;
-              }
-              if (e.key === "Escape") {
-                e.preventDefault();
-                setPicker(null);
-                return;
-              }
-            }
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          // The SINGLE static placeholder (the state if/else is gone — the
-          // working indicator carries the working state, and a closed
-          // session's send auto-resumes it, so "follow-up changes" is
-          // accurate there too).
-          placeholder="Ask for follow-up changes"
-          rows={2}
-          className="max-h-32 w-full resize-none overflow-y-auto bg-transparent text-ui-base outline-none placeholder:text-foreground-subtlest"
-        />
-        <div className="mt-1 flex items-center gap-2">
-          {/* The `+` attach button (the native file picker — the same
-              staging path as a paste / drop; disabled while the composer
-              is locked or the agent doesn't advertise image support,
-              fail-closed). */}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Attach files"
-            disabled={!composerEnabled || composerLocked || !imageCapable}
-            title={
-              imageCapable
-                ? "Attach an image (file picker)"
-                : "The agent does not support images"
-            }
-            onClick={() => void handleAttachClick()}
-          >
-            <Plus className="size-4" />
-          </Button>
-          {/* The context bar (the dynamic percentage — a progress bar
-              spanning from the `+` button to the model selector, the
-              reference UI's `🧠 [====] 61%` look). ALWAYS rendered (the
-              `isLive` gate is gone): a live session's fill appears as the
-              session grows, the label waits for the first frame, and a
-              closed session (the context is dropped on close — re-emitted
-              on resume) shows the empty 0% track. */}
-          <div
-              className="flex min-w-0 flex-1 items-center gap-2"
-              data-testid="context-usage-bar"
-            >
-              <Brain
-                className="size-3.5 shrink-0 text-foreground-subtle"
-                aria-hidden
-                data-testid="context-bar-icon"
-              />
-              <div
-                role="progressbar"
-                aria-label="Context used"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={contextPercent ?? 0}
-                className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground-subtlest"
-              >
-                <div
-                  className={`h-full rounded-full transition-[width] duration-500 ${contextRamp.fill}`}
-                  style={{ width: `${contextPercent ?? 0}%` }}
-                />
-              </div>
-              {contextPercent !== undefined && contextUsage && (
-                <span
-                  data-testid="context-usage"
-                  className={`shrink-0 text-ui-sm tabular-nums ${contextRamp.label}`}
-                  title={`${contextPercent}% of context used (${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens)`}
-                >
-                  {contextPercent}%
-                </span>
-              )}
-          </div>
-          {/* ZCode's composer carries the config controls in its toolbar
-              (left of the send button) — the header does not. ALWAYS
-              rendered (the `isLive` gate is gone): a live session shows
-              the live values, a stored session shows the POPULATED
-              values (the store's kept entry, else the row's synthesized
-              `configOptions` / persisted `contextUsage`) with DISABLED
-              selectors (a stored session can't set config — a resume
-              re-emits the fresh values). */}
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <SessionConfigSelect kind="model" option={modelOption ?? null} onSet={setConfigValue} disabled={!isLive} />
-            <SessionConfigSelect kind="thinking" option={thinkingOption ?? null} onSet={setConfigValue} disabled={!isLive} />
-            <Button
-              size="icon-md"
-              aria-label="Send"
-              disabled={
-                !composerEnabled ||
-                composerLocked ||
-                (draft.trim() === "" && !hasImages)
-              }
-              onClick={() => void send()}
-              className="bg-primary text-primary-foreground"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          </div>
-        </div>
-      </div>
+      <WorkingIndicator
+        agentState={agentState}
+        workingOrInTurn={workingOrInTurn}
+        spinnerStyle={spinnerStyle}
+        quip={quip}
+      />
+      <ComposerRow
+        composerRef={composerRef}
+        draft={draft}
+        setDraft={setDraft}
+        picker={picker}
+        setPicker={setPicker}
+        filtered={filtered}
+        activeIndex={activeIndex}
+        selectSkill={selectSkill}
+        attachments={attachments}
+        removeAttachment={removeAttachment}
+        handlePaste={handlePaste}
+        handleDrop={handleDrop}
+        handleAttachClick={handleAttachClick}
+        send={send}
+        composerEnabled={composerEnabled}
+        composerLocked={composerLocked}
+        imageCapable={imageCapable}
+        hasImages={hasImages}
+        contextPercent={contextPercent}
+        contextRamp={contextRamp}
+        contextUsage={contextUsage}
+        modelOption={modelOption}
+        thinkingOption={thinkingOption}
+        setConfigValue={setConfigValue}
+        isLive={isLive}
+      />
       {/* Interactive modals (rendered at the `ChatStream` root — `fixed`
           overlays, NOT inside the scroll region). */}
-      {confirmRequests.map((r) => (
-        <SudoConfirmModal
-          key={r.requestId}
-          sessionId={activeSessionId}
-          requestId={r.requestId}
-        />
-      ))}
-      {passwordRequests.map((r) => (
-        <SudoPasswordModal
-          key={r.requestId}
-          sessionId={activeSessionId}
-          requestId={r.requestId}
-        />
-      ))}
+      <ComposerModals
+        activeSessionId={activeSessionId}
+        confirmRequests={confirmRequests}
+        passwordRequests={passwordRequests}
+      />
     </main>
   );
 }

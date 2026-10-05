@@ -158,14 +158,16 @@ export function formatThinkingIndicator(level?: string): string | undefined {
 
 export function cleanModelName(model?: string): string | undefined {
   if (!model) return undefined;
-  const withoutThinking = model.includes(":") ? model.split(":")[0] : model;
-  return withoutThinking;
+  // The level is the trailing segment after the LAST `:` (a model id
+  // may contain `:` — mirrors Rust's `ModelRef::parse` / `rsplit_once`).
+  const i = model.lastIndexOf(":");
+  return i >= 0 ? model.slice(0, i) : model;
 }
 
 export function extractThinkingFromModel(model?: string): string | undefined {
-  if (!model || !model.includes(":")) return undefined;
-  const parts = model.split(":");
-  return parts[parts.length - 1];
+  if (!model) return undefined;
+  const i = model.lastIndexOf(":");
+  return i >= 0 ? model.slice(i + 1) : undefined;
 }
 
 export function getModelContextWindow(model?: string): number {

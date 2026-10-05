@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use crate::agent::harness::provider::ChatMessage;
+use crate::agent::harness::provider::{ChatMessage, ChatRole};
 use crate::storage::{Db, DbError};
 
 /// One display `messages`-table upsert (the `Db::record_message` shape).
@@ -244,10 +244,20 @@ impl SessionStore {
     }
 }
 
+/// The denormalized `role` index (the `native_messages.role` column).
+pub(crate) fn role_str(role: ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DisplayRow, NoopStore, SessionStore, Store};
-    use crate::agent::harness::provider::ChatMessage;
+    use super::{role_str, DisplayRow, NoopStore, SessionStore, Store};
+    use crate::agent::harness::provider::{ChatMessage, ChatRole};
     use crate::agent::SessionInfo;
     use crate::storage::Db;
     use std::sync::Arc;
@@ -269,6 +279,14 @@ mod tests {
         })
         .expect("record_session");
         (db, dir)
+    }
+
+    #[test]
+    fn role_str_maps_the_roles() {
+        assert_eq!(role_str(ChatRole::System), "system");
+        assert_eq!(role_str(ChatRole::User), "user");
+        assert_eq!(role_str(ChatRole::Assistant), "assistant");
+        assert_eq!(role_str(ChatRole::Tool), "tool");
     }
 
     /// `NoopStore` — all 6 seam methods return `Ok(())` (never errors,

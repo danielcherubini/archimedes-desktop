@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { expandSkillMentions, splitSkillBlocks } from "./skills";
+import {
+  activeSkillToken,
+  expandSkillMentions,
+  splitSkillBlocks,
+} from "./skills";
 import type { SkillInfo } from "./tauri";
 
 /** A full `SkillInfo` with `debug` defaults; override any field. */
@@ -223,5 +227,24 @@ describe("splitSkillBlocks", () => {
       text: expanded,
       blocks: [],
     });
+  });
+});
+
+describe("activeSkillToken", () => {
+  it("no_token_returns_null", () => {
+    expect(activeSkillToken("hello world", 11)).toBeNull();
+    expect(activeSkillToken("foo Bar", 7)).toBeNull();
+  });
+  it("bare_dollar_at_caret_is_an_empty_remainder", () => {
+    expect(activeSkillToken("run $", 5)).toEqual({ remainder: "", start: 4 });
+  });
+  it("returns the remainder and the dollar index", () => {
+    expect(activeSkillToken("use $debug-now here", 14)).toEqual({
+      remainder: "debug-now",
+      start: 4,
+    });
+  });
+  it("only a token starting at a word boundary counts", () => {
+    expect(activeSkillToken("a$de", 4)).toBeNull();
   });
 });

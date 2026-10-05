@@ -47,6 +47,7 @@ use std::io::{BufRead, Write};
 
 use archimedes_lib::agent::events::RpcEvent;
 use archimedes_lib::agent::harness::store::DisplayRow;
+use archimedes_lib::agent::harness::ModelKey;
 use archimedes_lib::agent::subagent::LaunchConfig;
 use archimedes_lib::agent::worker::protocol::{decode_inbound, encode_outbound, Inbound, Outbound};
 
@@ -325,7 +326,7 @@ fn main() {
         match msg {
             Inbound::Start(env) => {
                 session_id = Some(env.session_id.clone());
-                model_key = Some(format!("{}/{}", env.model.provider, env.model.id));
+                model_key = Some(ModelKey::from(&env.model).to_string());
                 // The advertised tool set (the `SubagentCapture` /
                 // wire-convention test input — a `session-update`
                 // `SinkFrame` with the `enabledTools` field — the
