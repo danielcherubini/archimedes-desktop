@@ -12,10 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A provider pointed at the mock server.
 fn provider(base: &MockServer) -> OpenAiCompatibleProvider {
-    OpenAiCompatibleProvider {
-        base_url: base.uri(),
-        api_key: "sk-test".to_string(),
-    }
+    OpenAiCompatibleProvider::new(base.uri(), "sk-test".to_string())
 }
 
 /// A minimal request (one user message, no tools).
@@ -44,6 +41,31 @@ async fn mount_sse(server: &MockServer, body: &str) {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(body.to_string(), "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The happy-path SSE body (one text delta + a stop).
+const OK_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+     data: [DONE]\n\n";
+
+/// A strict proxy that 400s on `stream_options` — ANY request carrying the
+/// field is rejected (so each provider instance must learn the lesson once
+/// for itself).
+async fn mount_stream_options_hostile(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("stream_options"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string(r#"{"error":{"message":"Unrecognized field: stream_options"}}"#),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(OK_SSE.to_string(), "text/event-stream"),
         )
         .mount(server)
         .await;
@@ -283,4 +305,106 @@ async fn openai_provider_omits_session_id_headers_when_absent() {
         !sent_headers.contains_key(wiremock::http::HeaderName::from_static("x-request-id")),
         "x-request-id header should not be present"
     );
+}
+
+// ── (n) the `stream_options` 400 retry-and-latch ───────────────────────
+
+/// A strict proxy that 400s on `stream_options` must NOT break the
+/// session: the FIRST call re-issues WITHOUT the field (the turn survives),
+/// and the rejection LATCHES — every later call omits the field outright
+/// (the fallback costs one request per provider, not one per model call).
+#[tokio::test]
+async fn a_400_on_stream_options_retries_without_it_and_latches() {
+    let server = MockServer::start().await;
+    mount_stream_options_hostile(&server).await;
+
+    let provider = provider(&server);
+    let events = collect(&provider, &request()).await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ProviderEvent::TextDelta(_),
+                ProviderEvent::Done(FinishReason::Stop)
+            ]
+        ),
+        "the rejected call is re-issued without the field: {events:?}"
+    );
+
+    // A SECOND model call on the SAME provider — the latch is set, so the
+    // field is never sent again (a per-call probe would double the latency
+    // of every turn for the whole session).
+    let events = collect(&provider, &request()).await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ProviderEvent::TextDelta(_),
+                ProviderEvent::Done(FinishReason::Stop)
+            ]
+        ),
+        "the latched call succeeds: {events:?}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let body_of = |i: usize| String::from_utf8_lossy(&requests[i].body).to_string();
+    assert_eq!(requests.len(), 3, "one rejected + two served");
+    assert!(
+        body_of(0).contains("stream_options"),
+        "the first call asks for usage"
+    );
+    assert!(
+        !body_of(1).contains("stream_options"),
+        "the retry drops the field: {}",
+        body_of(1)
+    );
+    assert!(
+        !body_of(2).contains("stream_options"),
+        "the latch holds: the next call never re-sends it: {}",
+        body_of(2)
+    );
+}
+
+/// The 400 must be re-tried ONLY when it is ABOUT `stream_options` — a
+/// different 400 (a malformed request, a bad model) is the `Fatal` it
+/// always was, unretried (a blind retry would double the cost of every
+/// genuine client error).
+#[tokio::test]
+async fn a_400_about_something_else_is_fatal_and_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(r#"{"error":"unknown model"}"#))
+        .mount(&server)
+        .await;
+
+    let err = match provider(&server).complete(&request()).await {
+        Ok(_) => panic!("an unrelated 400 is an error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, ProviderError::Fatal(_)),
+        "an unrelated 400 stays Fatal: {err:?}"
+    );
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1, "the unrelated 400 is NOT re-tried");
+}
+
+/// The latch is per provider INSTANCE: a fresh provider (a new session, or
+/// a different provider row) asks for usage again — one hostile proxy does
+/// not disable usage reporting for the whole process.
+#[tokio::test]
+async fn the_stream_options_latch_is_per_provider_instance() {
+    let server = MockServer::start().await;
+    mount_stream_options_hostile(&server).await;
+
+    let first = provider(&server);
+    collect(&first, &request()).await;
+    let second = provider(&server);
+    collect(&second, &request()).await;
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    let asks = |i: usize| String::from_utf8_lossy(&requests[i].body).contains("stream_options");
+    assert_eq!(requests.len(), 4, "two latched sequences");
+    assert!(asks(0) && !asks(1), "the first provider latches");
+    assert!(asks(2) && !asks(3), "the second provider asks again");
 }

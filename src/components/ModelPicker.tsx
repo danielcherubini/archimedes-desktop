@@ -35,8 +35,9 @@ export default function ModelPicker({
   items: ModelPickerItem[];
   onSelect: (value: string) => void;
   variant?: "ghost" | "outline";
-  /** The trigger's size classes (the composer's `max-w-48` / the
-   *  settings' `w-64`). */
+  /** The trigger's size classes (the composer's content-sized
+   *  `min-w-0 shrink max-w-72`; the settings pass none and get the
+   *  `Button` default, content-sized). */
   triggerClassName?: string;
   /** An optional leading icon (the composer's bot icon). */
   icon?: ReactNode;

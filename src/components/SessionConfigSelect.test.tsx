@@ -51,10 +51,65 @@ describe("SessionConfigSelect", () => {
     render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
     // The trigger shows the shared `modelItemsFromCatalog` derivation — the
     // value's provider PREFIX is dropped (the provider is the suffix), so
-    // the composer's `max-w-48` trigger is not wasted on `acme/…`.
+    // the composer's trigger is not wasted on `acme/…`.
     const trigger = screen.getByRole("button", { name: "Model" });
     expect(trigger.textContent).toBe("alpha · acme");
     expect(trigger.textContent).not.toContain("acme/alpha");
+  });
+
+  it("the composer's model trigger sizes to its text up to a WIDE cap (a long model id is not chopped to `Qwen/Qwen3.8-27…`)", () => {
+    render(<SessionConfigSelect option={mockOption} onSet={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Model" });
+    // CONTENT-SIZED (auto-resizing): no fixed `w-*`, so a short name gets a
+    // short trigger and `truncate` + the cap only kick in past the cap.
+    const fixedWidth = trigger.className
+      .split(/\s+/)
+      .filter((cls) => /(^|:)w-/.test(cls));
+    expect(fixedWidth).toEqual([]);
+    // The cap is wide enough for `<model id> · <provider>` (the old
+    // `max-w-48` chopped `Qwen/Qwen3.8-27B (Tama)` to an unreadable stub).
+    expect(trigger.className).toContain("max-w-72");
+    expect(trigger.className).not.toContain("max-w-48");
+    // It also GIVES width back when the row is tight (the Button base's
+    // `shrink-0` would otherwise push the send button out of the composer).
+    expect(trigger.className).toContain("min-w-0");
+    expect(trigger.className).toContain("shrink");
+    // Its SEAM edge (the chevron side, facing the thinking trigger) drops to
+    // `pr-1`: the trigger's text-side `px-2` inset is right, but 8px on both
+    // sides of the pair's 4px gap reads as one dead 22px band.
+    const tokens = trigger.className.split(/\s+/);
+    expect(tokens).toContain("pr-1");
+    expect(tokens).toContain("px-2");
+  });
+
+  it("the thinking trigger's SEAM edge (the glyph side, facing the model trigger) is tight too", () => {
+    render(
+      <SessionConfigSelect option={thinkingOption} onSet={vi.fn()} kind="thinking" />,
+    );
+    const tokens = screen
+      .getByRole("combobox", { name: "Thinking" })
+      .className.split(/\s+/);
+    expect(tokens).toContain("pl-1");
+    expect(tokens).not.toContain("pl-2");
+  });
+
+  it("the null-option stubs keep the same width contract as the live triggers", () => {
+    const { unmount } = render(
+      <SessionConfigSelect kind="model" option={null} onSet={vi.fn()} />,
+    );
+    const model = screen.getByRole("button", { name: "Model" });
+    expect(model.className).toContain("max-w-72");
+    expect(model.className).not.toContain("max-w-48");
+    expect(model.className.split(/\s+/)).toContain("pr-1");
+    unmount();
+
+    render(
+      <SessionConfigSelect kind="thinking" option={null} onSet={vi.fn()} />,
+    );
+    const thinking = screen.getByRole("button", { name: "Thinking" });
+    expect(thinking.className).toContain("max-w-72");
+    expect(thinking.className).not.toContain("max-w-48");
+    expect(thinking.className.split(/\s+/)).toContain("pl-1");
   });
 
   it("renders a bot icon for a model option (category 'model')", () => {

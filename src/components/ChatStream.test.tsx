@@ -1000,6 +1000,48 @@ describe("ChatStream", () => {
     expect(screen.getByText("Medium")).toBeTruthy();
   });
 
+  it("groups the model + thinking triggers in ONE tight cluster (they are one block of session config, not three evenly-spaced controls)", () => {
+    seedLiveSession();
+    useSessions.setState({
+      configOptions: {
+        s1: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "acme/alpha",
+            options: [{ value: "acme/alpha", name: "acme/Alpha" }],
+          },
+          {
+            id: "thought_level",
+            name: "Thinking",
+            type: "select",
+            currentValue: "medium",
+            options: [{ value: "medium", name: "Medium" }],
+          },
+        ],
+      },
+    });
+    const { container } = render(<ChatStream />);
+    // Both triggers sit inside a single wrapper whose inner gap (`gap-1`) is
+    // TIGHTER than the `gap-2` that separates the cluster from Send.
+    const group = container.querySelector(
+      '[data-testid="composer-config-controls"]',
+    ) as HTMLElement;
+    expect(group).toBeTruthy();
+    expect(group.className).toContain("gap-1");
+    expect(group.className).not.toContain("gap-2");
+    expect(
+      group.querySelector('[aria-label="Model"]') &&
+        group.querySelector('[aria-label="Thinking"]'),
+    ).toBeTruthy();
+    // The cluster is the toolbar's last item before Send (the toolbar's own
+    // `gap-2` is the wider separation).
+    const toolbar = group.parentElement!;
+    expect(toolbar.className).toContain("gap-2");
+    expect(toolbar.lastElementChild?.getAttribute("aria-label")).toBe("Send");
+  });
+
   // --- The context bar (the dynamic percentage — a progress bar spanning
   // from the `+` button to the model selector, the reference UI's
   // `🧠 [====bar====] 61%` look). ---
@@ -1035,10 +1077,61 @@ describe("ChatStream", () => {
     expect(labelEl.className).toContain("text-success");
     // The brain icon cues the bar (the reference UI's `🧠` placement).
     expect(group!.querySelector('[data-testid="context-bar-icon"]')).toBeTruthy();
-    // The tooltip carries the token counts (the percentage alone is opaque).
-    expect(
-      group!.querySelector('[data-testid="context-usage"]')!.getAttribute("title"),
-    ).toBe("42% of context used (53,760 / 128,000 tokens)");
+  });
+
+  // The token counts are HOVER-ONLY on the number (the bar row is dense —
+  // `53,760 / 128,000 tokens` inline would push the model selector off the
+  // row, and the native `title` tooltip is unstyled and ~1s slow).
+  it("the context number reveals the token counts on hover, not inline", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 53760, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const label = screen.getByTestId("context-usage");
+    // The inline text stays the bare percentage.
+    expect(label.textContent).toBe("42%");
+    // No native tooltip (the styled Radix one replaces it).
+    expect(label.getAttribute("title")).toBeNull();
+    // CLOSED until hover — the counts are not in the DOM at rest.
+    expect(document.body.textContent).not.toContain("53,760");
+    // Radix `TooltipTrigger` opens on pointer/focus (see the
+    // `ToolCallCard` failure-tooltip test — `mouseEnter` does not fire it
+    // in this Radix version; `focus` does; `TooltipProvider`'s
+    // `delayDuration = 0` mounts the portal synchronously).
+    fireEvent.focus(label);
+    expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
+  });
+
+  // The counts are keyboard-accessible: the tooltip trigger is a focusable
+  // control (a Tab stop) whose accessible name carries the token counts,
+  // and the progressbar exposes them as its text alternative — so nothing
+  // about the context is hover-only.
+  it("the context counts are reachable by keyboard, not hover alone", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 53760, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const label = screen.getByTestId("context-usage");
+    // A real control in the tab order (a bare `<span>` was not).
+    expect(label.tagName).toBe("BUTTON");
+    expect(label.getAttribute("tabindex")).not.toBe("-1");
+    // The accessible name carries the counts (a screen reader hears them
+    // without opening the tooltip).
+    expect(label.getAttribute("aria-label")).toBe(
+      "Context used: 53,760 of 128,000 tokens (42%)",
+    );
+    // The progressbar's text alternative carries them too.
+    const bar = screen
+      .getByTestId("context-usage-bar")
+      .querySelector('[role="progressbar"][aria-label="Context used"]') as HTMLElement;
+    expect(bar.getAttribute("aria-valuetext")).toBe(
+      "53,760 of 128,000 tokens (42%)",
+    );
+    // And focus (keyboard) opens the tooltip, as hover does.
+    fireEvent.focus(label);
+    expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
   });
 
   it("a yellow-band context percentage (50–69%) renders the fill in yellow", () => {

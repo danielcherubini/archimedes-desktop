@@ -246,6 +246,45 @@ impl E2e {
     }
 }
 
+/// The `agent_message_chunk` texts among the collected frames'
+/// `SinkFrame` `session-update` payloads (the UI contract stream — step
+/// (d) asserts on these, so the settle barrier waits on them too).
+fn sink_chunk_texts(evs: &[(String, bool, WorkerInboundEvent)]) -> Vec<String> {
+    evs.iter()
+        .filter_map(|(_, _, e)| match e {
+            WorkerInboundEvent::SinkFrame { event, payload } if event == "session-update" => {
+                payload.get("update").cloned()
+            }
+            _ => None,
+        })
+        .filter(|u| u.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk"))
+        .filter_map(|u| {
+            u.get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Poll the transcript rows until `want` rows are persisted (bounded).
+/// The `native_messages` rows are written by the `TranscriptPersister`
+/// from the WORKER's store frames, which arrive on their own schedule —
+/// the `agent_settled` RpcEvent does NOT imply the last message's row has
+/// landed, so a read right after the settle races it.
+async fn wait_for_rows(db: &Db, session_id: &str, want: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = db
+            .load_native_messages(session_id)
+            .expect("the transcript loads");
+        if rows.len() >= want || tokio::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The `RpcEvent` kinds among the collected frames (in order).
 fn event_kinds(evs: &[(String, bool, WorkerInboundEvent)]) -> Vec<Cow<'static, str>> {
     evs.iter()
@@ -364,12 +403,23 @@ async fn full_turn_real_worker_canned_provider() {
         .expect("the prompt is sent");
 
     // (c) The `RpcEvent` bookkeeping stream (in order, up to
-    // `agent_settled`).
+    // `agent_settled`) — and, in the SAME drain, the final message's
+    // `agent_message_chunk` sink frames.
+    //
+    // Waiting on `agent_settled` ALONE is a race: the two frame kinds
+    // reach stdout over SEPARATE paths — a `SinkFrame` / store frame rides
+    // the main loop's `outbound_rx` arm (`run_worker_inner`), an
+    // `RpcEvent` rides the spawned pump task — and although both take the
+    // same stdout mutex, nothing orders one against the other. The settle
+    // can therefore be written BEFORE the last message's chunks that the
+    // loop emitted first. So the trigger waits for the data step (d)
+    // asserts on, and `rows` below waits for what (e) asserts on.
     let evs = h
         .wait(Duration::from_secs(60), |evs| {
-            evs.iter().any(|(_, _, e)| {
-                    matches!(e, WorkerInboundEvent::Event(ev) if ev.kind() == "agent_settled")
-                })
+            let settled = evs
+                .iter()
+                .any(|(_, _, e)| matches!(e, WorkerInboundEvent::Event(ev) if ev.kind() == "agent_settled"));
+            settled && sink_chunk_texts(evs).iter().any(|t| t == "done")
         })
         .await
         .expect("the turn settles within the bound");
@@ -468,9 +518,7 @@ async fn full_turn_real_worker_canned_provider() {
     // `prepend_system`), the user message, the assistant message with
     // the `tool_calls`, the tool-role message with the result, the
     // final assistant text. A resume of the session would work.
-    let rows =
-        h.db.load_native_messages("e2e-full")
-            .expect("the transcript loads");
+    let rows = wait_for_rows(&h.db, "e2e-full", 5).await;
     assert_eq!(
         rows.len(),
         5,
@@ -713,10 +761,10 @@ async fn permission_round_trip_real_worker() {
         .unwrap_or_default();
     assert!(text.contains("gated"), "the bash output, got {text:?}");
     // The transcript: the user + assistant(tool_calls) + tool + final
-    // assistant rows (the system prompt at seq 0).
-    let rows =
-        h.db.load_native_messages("e2e-perm")
-            .expect("the transcript loads");
+    // assistant rows (the system prompt at seq 0) — polled (the rows are
+    // written by the persister from the worker's store frames, which are
+    // not ordered against the settle — see `full_turn`'s (c)).
+    let rows = wait_for_rows(&h.db, "e2e-perm", 5).await;
     assert_eq!(rows.len(), 5, "the complete transcript, got {rows:?}");
     // A clean close (the `on_crash` callback did NOT fire).
     let handle = h
@@ -1105,10 +1153,10 @@ async fn subagent_dispatch_end_to_end_real_workers() {
         text.contains("the answer is 42"),
         "the SubagentCapture's final text (the child's last message), got {text:?}"
     );
-    // The main's final assistant text (the tool-result turn's `stop`).
-    let rows =
-        h.db.load_native_messages("e2e-sub")
-            .expect("the main transcript loads");
+    // The main's final assistant text (the tool-result turn's `stop`) —
+    // polled (the store frames are not ordered against the settle — see
+    // `full_turn`'s (c)).
+    let rows = wait_for_rows(&h.db, "e2e-sub", 5).await;
     let v: Vec<Value> = rows
         .iter()
         .map(|r| serde_json::from_str(r).expect("the row is JSON"))

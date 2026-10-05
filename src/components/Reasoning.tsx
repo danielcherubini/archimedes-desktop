@@ -7,6 +7,7 @@
 import { useControllableState } from "@radix-ui/react-use-controllable-state";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/components/lib/utils";
+import { TRANSCRIPT_ROW } from "@/components/lib/transcriptRow";
 import { BrainIcon, ChevronRightIcon } from "lucide-react";
 import { QueuedSummaryContent } from "./QueuedSummaryContent";
 import type { ComponentProps, CSSProperties, ReactNode } from "react";
@@ -384,10 +385,7 @@ export const ReasoningTrigger = memo(
     return (
       <CollapsibleTrigger
         data-testid="reasoning-trigger"
-        className={cn(
-          "group/reasoning inline-flex max-w-full min-w-0 items-center gap-2 self-start text-ui-base transition-colors",
-          className,
-        )}
+        className={cn("group/reasoning", TRANSCRIPT_ROW, className)}
         {...props}
       >
         {children ?? (

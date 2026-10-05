@@ -237,6 +237,46 @@ body {
   --color-plugin-node-foreground: var(--color-amber-600);
   --color-plugin-paid-plan-badge: #ffe3c8;
   --color-plugin-paid-plan-badge-foreground: #4b280f;
+
+  /* FILE-TYPE DESCRIPTOR COLORS (ZCode's DESIGN.md: "Keep file-type icons on
+   * their own descriptor colors"). Deliberately NOT the semantic tokens:
+   * `--color-brand` is WHITE in zai-dark (so a `.tsx` chip painted with it
+   * rendered colorless), and painting `.rs`/`.py` with `--color-destructive`/
+   * `--color-success` claims a file failed or was added.
+   *
+   * These BASE values are the light-theme-safe shades (every one clears 3:1
+   * on the white background — several of ZCode's material-icon fills are pale
+   * yellows that vanish there); `.theme-zai-dark` overrides them with
+   * ZCode's exact glyph fills, which are tuned for a dark surface. A file
+   * type is not a light/dark concern, so the pair is the hue's two readings
+   * of the same identity — like `--color-trajectory-*`.
+   *
+   * The extension → hue mapping follows ZCode's `resolveIconName`. */
+  --color-file-ts: #0277bd;
+  --color-file-react: #0093a5;
+  --color-file-js: #a3811a;
+  --color-file-json: #b3791b;
+  --color-file-html: #e65100;
+  --color-file-css: #7e57c2;
+  --color-file-sass: #d81b60;
+  --color-file-md: #378bce;
+  --color-file-rs: #db603a;
+  --color-file-py: #0277bd;
+  --color-file-sh: #db603a;
+  --color-file-yaml: #ed4c4c;
+  --color-file-toml: #808688;
+  --color-file-lock: #9e8431;
+  --color-file-image: #22958b;
+  --color-file-svg: #b07c00;
+  --color-file-archive: #878b21;
+  --color-file-go: #0094a6;
+  --color-file-vue: #35976b;
+  --color-file-svelte: #ed5120;
+  --color-file-java: #e53935;
+  --color-file-php: #1e88e5;
+  --color-file-xml: #689237;
+  --color-file-graphql: #d81b60;
+  --color-file-db: #a3811a;
 }
 
 .dark {
@@ -681,6 +721,35 @@ body {
   --color-plugin-node-foreground: #efc58f;
   --color-plugin-paid-plan-badge: #5a341b;
   --color-plugin-paid-plan-badge-foreground: #ffd8b8;
+
+  /* The dark reading of the file-type descriptor hues: ZCode's literal
+   * Material Icon Theme glyph fills (its transcript renders those SVGs),
+   * which are bright by design on a dark surface. See the `@theme` block. */
+  --color-file-ts: #0288d1;
+  --color-file-react: #00bcd4;
+  --color-file-js: #ffca28;
+  --color-file-json: #f9a825;
+  --color-file-html: #e65100;
+  --color-file-css: #7e57c2;
+  --color-file-sass: #ec407a;
+  --color-file-md: #42a5f5;
+  --color-file-rs: #ff7043;
+  --color-file-py: #0288d1;
+  --color-file-sh: #ff7043;
+  --color-file-yaml: #ff5252;
+  --color-file-toml: #cfd8dc;
+  --color-file-lock: #ffd54f;
+  --color-file-image: #26a69a;
+  --color-file-svg: #ffb300;
+  --color-file-archive: #afb42b;
+  --color-file-go: #00acc1;
+  --color-file-vue: #41b883;
+  --color-file-svelte: #ff5722;
+  --color-file-java: #f44336;
+  --color-file-php: #1e88e5;
+  --color-file-xml: #8bc34a;
+  --color-file-graphql: #ec407a;
+  --color-file-db: #ffca28;
 }
 
 /*

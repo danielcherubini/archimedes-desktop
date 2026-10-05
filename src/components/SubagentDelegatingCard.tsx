@@ -621,7 +621,7 @@ export default function SubagentDelegatingCard({
   }, [hasRunning]);
 
   return (
-    <div className="w-full">
+    <div className="flex w-full flex-col">
       <ToolCallCardHeader
         title={title}
         status={status}
