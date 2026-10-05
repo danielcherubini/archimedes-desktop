@@ -1,6 +1,12 @@
 import { ArrowUp, Brain, Plus } from "lucide-react";
 import type { RefObject } from "react";
 import { Button } from "../ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "../ui/tooltip";
 import SessionConfigSelect from "../SessionConfigSelect";
 import AttachmentStrip from "./AttachmentStrip";
 import ComposerSkills from "./ComposerSkills";
@@ -233,13 +239,23 @@ export default function ComposerRow({
               />
             </div>
             {contextPercent !== undefined && contextUsage && (
-              <span
-                data-testid="context-usage"
-                className={`shrink-0 text-ui-sm tabular-nums ${contextRamp.label}`}
-                title={`${contextPercent}% of context used (${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens)`}
-              >
-                {contextPercent}%
-              </span>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      data-testid="context-usage"
+                      className={`shrink-0 cursor-help text-ui-sm tabular-nums ${contextRamp.label}`}
+                    >
+                      {contextPercent}%
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" align="end">
+                    {contextUsage.used.toLocaleString()} /{" "}
+                    {contextUsage.window.toLocaleString()} tokens ·{" "}
+                    {contextPercent}% of context
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             )}
         </div>
         {/* ZCode's composer carries the config controls in its toolbar

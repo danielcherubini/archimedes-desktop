@@ -1077,10 +1077,30 @@ describe("ChatStream", () => {
     expect(labelEl.className).toContain("text-success");
     // The brain icon cues the bar (the reference UI's `🧠` placement).
     expect(group!.querySelector('[data-testid="context-bar-icon"]')).toBeTruthy();
-    // The tooltip carries the token counts (the percentage alone is opaque).
-    expect(
-      group!.querySelector('[data-testid="context-usage"]')!.getAttribute("title"),
-    ).toBe("42% of context used (53,760 / 128,000 tokens)");
+  });
+
+  // The token counts are HOVER-ONLY on the number (the bar row is dense —
+  // `53,760 / 128,000 tokens` inline would push the model selector off the
+  // row, and the native `title` tooltip is unstyled and ~1s slow).
+  it("the context number reveals the token counts on hover, not inline", () => {
+    seedLiveSession();
+    useSessions.setState({
+      contextUsage: { s1: { used: 53760, window: 128000 } },
+    });
+    render(<ChatStream />);
+    const label = screen.getByTestId("context-usage");
+    // The inline text stays the bare percentage.
+    expect(label.textContent).toBe("42%");
+    // No native tooltip (the styled Radix one replaces it).
+    expect(label.getAttribute("title")).toBeNull();
+    // CLOSED until hover — the counts are not in the DOM at rest.
+    expect(document.body.textContent).not.toContain("53,760");
+    // Radix `TooltipTrigger` opens on pointer/focus (see the
+    // `ToolCallCard` failure-tooltip test — `mouseEnter` does not fire it
+    // in this Radix version; `focus` does; `TooltipProvider`'s
+    // `delayDuration = 0` mounts the portal synchronously).
+    fireEvent.focus(label);
+    expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
   });
 
   it("a yellow-band context percentage (50–69%) renders the fill in yellow", () => {
