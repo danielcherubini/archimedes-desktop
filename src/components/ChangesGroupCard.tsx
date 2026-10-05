@@ -8,7 +8,7 @@ import {
 } from "../lib/toolOutput";
 import FileChip from "./FileChip";
 import DiffCount from "./DiffCount";
-import { TRANSCRIPT_ROW_BLEED } from "./lib/transcriptRail";
+import { TRANSCRIPT_ROW } from "./lib/transcriptRow";
 import ToolCallCard from "./ToolCallCard";
 
 const CHIP_GAP_PX = 8;
@@ -164,11 +164,11 @@ export default function ChangesGroupCard({
   // live latest-member chip (below) replaces it (ZCode's behavior).
 
   return (
-    <div className="w-full" data-changes-group-row="">
+    <div className="flex w-full flex-col" data-changes-group-row="">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className={`group/tool-summary flex h-8 items-center gap-2 rounded-lg text-left hover:bg-surface-hover ${TRANSCRIPT_ROW_BLEED}`}
+        className={`group/tool-summary ${TRANSCRIPT_ROW}`}
       >
         <PencilIcon className="size-4 shrink-0 text-foreground-subtle" />
         <span className="shrink-0 whitespace-nowrap font-medium text-foreground-subtlest">

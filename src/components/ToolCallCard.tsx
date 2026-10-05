@@ -77,7 +77,7 @@ export default function ToolCallCard({
       : undefined;
 
   return (
-    <div className="w-full">
+    <div className="flex w-full flex-col">
       <ToolCallCardHeader
         title={title}
         status={status}
