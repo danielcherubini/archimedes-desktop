@@ -16,13 +16,18 @@ import type { StopReason } from "../../lib/tauri";
  *
  * Base gap (`gap-3`, 12px) on the scroll container: the prose ↔ `Thought`
  * rhythm, unchanged. `TRANSCRIPT_BREATHING_GAP` is then added to a row whose
- * IMMEDIATE NEIGHBOUR is a tool row — so a tool call gets 12+8 = 20px of air
- * on each side (ZCode's 20px text↔work rhythm) while thinking and chat stay
- * as close together as they were. It is a property of the PAIR (applied to
- * whichever side is second), which is what keeps a run of tool calls at a
- * steady 20px instead of alternating 20/28.
+ * IMMEDIATE NEIGHBOUR is a tool row — so a tool call gets 12+16 = 28px of air
+ * on each side while thinking and chat stay as close together as they were.
+ * It is a property of the PAIR (applied to whichever side is second), which
+ * is what keeps a run of tool calls at a steady 28px instead of alternating.
+ *
+ * THE DELTA HAS TO BE LEGIBLE. A real turn interleaves `Ran`/`Thought`
+ * one-after-another, so ALMOST EVERY pair touches a tool row and the base gap
+ * rarely shows — the breathing value is effectively the transcript's rhythm.
+ * At `mt-2` (20px against a 12px base) the column read as uniform and still
+ * cramped; 28px is the point where the tool rows visibly separate.
  */
-const TRANSCRIPT_BREATHING_GAP = "mt-2";
+const TRANSCRIPT_BREATHING_GAP = "mt-4";
 
 /** A unit that reads as a TOOL ROW (a tool call, or a folded `Changes` group). */
 function isToolUnit(unit: RenderUnit): boolean {

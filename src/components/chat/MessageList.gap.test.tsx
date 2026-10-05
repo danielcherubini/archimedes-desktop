@@ -92,12 +92,12 @@ describe("the transcript's vertical rhythm", () => {
   it("prose → tool: the tool row gets the breathing gap", () => {
     const [prose, toolRow] = rows([single(text("a")), single(tool("t1"))]);
     expect(extra(prose!)).toEqual([]);
-    expect(extra(toolRow!)).toEqual(["mt-2"]);
+    expect(extra(toolRow!)).toEqual(["mt-4"]);
   });
 
   it("tool → prose: the breathing gap is symmetric (it is the PAIR that is airy, not the tool row)", () => {
     const [, prose] = rows([single(tool("t1")), single(text("a"))]);
-    expect(extra(prose!)).toEqual(["mt-2"]);
+    expect(extra(prose!)).toEqual(["mt-4"]);
   });
 
   it("thinking → chat keeps the tight base gap (unchanged)", () => {
@@ -114,9 +114,9 @@ describe("the transcript's vertical rhythm", () => {
     expect(extra(thoughtRow!)).toEqual([]);
   });
 
-  it("tool → tool keeps the same breathing gap (never doubled to 28px)", () => {
+  it("tool → tool keeps ONE breathing gap (a run of tool calls is a steady 28px, not alternating)", () => {
     const [, second] = rows([single(tool("t1")), single(tool("t2"))]);
-    expect(extra(second!)).toEqual(["mt-2"]);
+    expect(extra(second!)).toEqual(["mt-4"]);
   });
 
   it("a folded `Changes` group counts as a tool row", () => {
@@ -125,7 +125,7 @@ describe("the transcript's vertical rhythm", () => {
       messages: [tool("t1", "edit"), tool("t2", "write")] as never,
     };
     const [, prose] = rows([group, single(text("a"))]);
-    expect(extra(prose!)).toEqual(["mt-2"]);
+    expect(extra(prose!)).toEqual(["mt-4"]);
   });
 
   it("the FIRST row gets no breathing gap (the container's own padding is its air)", () => {
