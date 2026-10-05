@@ -162,7 +162,10 @@ impl LineAssembler {
         if self.buf.is_empty() {
             return None;
         }
-        let line: Vec<u8> = self.buf.drain(..).collect();
+        // `mem::take`, not `drain(..).collect()` — same result (the whole
+        // buffer handed over, `buf` left empty) without the extra
+        // allocation (`clippy::drain_collect`, rustc 1.99).
+        let line = std::mem::take(&mut self.buf);
         Some(String::from_utf8_lossy(&line).into_owned())
     }
 }
@@ -734,6 +737,32 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Error),
             ]
         );
+    }
+
+    /// `LineAssembler::finish` is shared by all three SSE parsers, so its
+    /// contract is pinned directly: a non-empty tail is returned ONCE as
+    /// lossy text and the buffer is left empty (a second call yields `None`),
+    /// and a never-written assembler reports `None`.
+    #[test]
+    fn line_assembler_finish_returns_tail_once_then_none() {
+        let mut a = LineAssembler::new();
+        assert_eq!(a.finish(), None, "empty assembler has no tail");
+
+        // An unterminated tail (no trailing '\n') is flushed as-is.
+        assert!(a.push(b"data: partial").is_empty(), "no newline, no line");
+        assert_eq!(a.finish(), Some("data: partial".to_string()));
+        assert_eq!(a.finish(), None, "the tail is consumed, not replayed");
+
+        // A complete line is returned by push (terminator included —
+        // `handle_line` strips it), leaving nothing to flush.
+        assert_eq!(a.push(b"data: whole\n"), vec!["data: whole\n".to_string()]);
+        assert_eq!(a.finish(), None, "complete lines leave no tail");
+
+        // A tail that ends mid-codepoint is truncated lossily (the only
+        // option once the wire is done).
+        assert!(a.push("你好".as_bytes()[..4].as_ref()).is_empty());
+        let tail = a.finish().expect("split codepoint still flushes a tail");
+        assert!(tail.contains('\u{FFFD}'), "got {tail:?}");
     }
 
     #[tokio::test]
