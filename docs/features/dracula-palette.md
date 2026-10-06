@@ -1,0 +1,46 @@
+---
+status: live
+last-verified: 2026-10-06
+verified-by: feature/dracula-palette — pnpm test (1131 tests / 66 files) + pnpm build; every figure below re-measured from `src/index.css`, not copied from the plan
+---
+
+# Dracula Palette
+
+The Client's second **Palette** — the persisted `palette: "zai" | "dracula"` axis, orthogonal to **Theme** (the light/dark mode), except that only Dracula's dark variant ships, so `dracula` pins the app dark and the mode is ignored, `system` included. `.theme-dracula` is a PARTIAL diff over the shared `.dark` tokens: 115 declarations (84 structural + 25 file-type descriptors + 6 ramp), inheriting 59 of `.theme-zai-dark`'s 168. Syntax highlighting DERIVES from the palette (Shiki `dracula` / `github-dark`, one `createHighlighter` holding both), never a third setting. **ADR 0027 holds the decision and its three amendments — including the "count it, do not recall it" lesson and the three retracted self-reported facts. This doc records only what the values cost, so a future palette author does not pay it twice.**
+
+## The token map
+
+`src/index.css` is the authority; `src/lib/paletteCompleteness.test.ts` is the gate (it rejects any hex in the block that <https://draculatheme.com/spec> does not publish). Surfaces walk the spec's elevation ladder:
+
+- `#21222c` — inputs, popover header (recessed within a panel; `#191a21`, the bottom rung, is `--color-terminal-bg` and paints nothing — see below).
+- `#282a36` — the page, AND the sidebar: `--color-sidebar` is an alias of `--color-background`, because the chrome bar is `bg-background` (`App.tsx`, `data-testid="chrome-bar"`) so sidebar and menubar are one plane. `--color-tab-active` sits here too.
+- `#343746` — header, panel, tabs, menus, popovers, toasts, tooltips (the floating step; header and panel are one band and so share a rung, as in zai dark), plus `--color-context-track`.
+- `#424450` — cards, menu hover, `bg-secondary`, the inline-code chip (`tag` / `tooltip-tag`). NOTHING rests above it: `secondary`/`tag` used to be `#44475a`, which is brighter than `card`, an elevation inversion zai dark does not have.
+- `#44475a` is spec **Selection** — reserved for selection and pressed states, and appearing nowhere as a border or a resting surface. `--color-border` is instead Current Line `#6272a4`, the spec's literal "subtle borders" instruction, reaching card/tab/input/popover borders through aliases.
+- Four deliberate departures from the spec, all stated in the block's own doc-comment: (1) status **text** keeps the bright syntax hues while the **Functional** palette drives fills, borders and focus (`#815cd6` brand = the spec focus ring via `--color-input-border-focused`; `#0081d6` interactive borders) — and where even a syntax hue fails on a real background the spec's ANSI *bright* variant is used rather than a new hue, which is why `destructive` and `diff-removed` are `#ff6e6e`; (2) `--color-foreground-subtle`/`-subtlest` are Foreground at 70% / 55%, not a hue, so they stay on-palette at every elevation; (3) Selection is never a border; (4) the 25 `--color-file-*` **Identity color** hues are off-spec on purpose — 11 hues cannot name 25 file types, and the hue IS the signal. The gate allow-lists 24 of them by name; `file-css` needs no exemption (`#bd93f9`, already on-spec — zai's `#7e57c2` is 2.73 on the page, under the 3:1 glyph floor).
+
+## Contrast ceilings (constraints on any future palette, not defects to fix)
+
+Re-measured against the composited surfaces the tokens actually render on. These are walls, not unfinished work.
+
+- **No spec-published red clears 4.5:1 on the elevated surfaces.** `#ff6e6e` is the brightest red the spec publishes: 5.23 on the page, **4.33 on `#343746`**, 3.54 on `#424450`, 3.36 on Selection — and lower still on tinted diff rows (4.47 on a page-tinted row, 4.02 on the transcript column's, 3.72 inside `ToolCallCard`, where a tool diff actually renders). The only spec-published value near enough to red to clear 4.5 on the floating step is AnsiBrightMagenta `#ff92df` (5.86 there) — Pink, the hue this palette gives string literals: trading a 0.17 shortfall for a real ambiguity. The gate pins 4.3 / 3.3 there and *fails if either ever clears 4.5*, so the exemption cannot outlive its reason.
+- **`--color-border` is 2.51 on panel and 2.05 on card — by spec instruction.** `#6272a4` clears the 3:1 UI floor on the page (3.03) and the input well (3.36) and nowhere else; borders inside floats are structurally told apart by the container's own edge, not by the rule's contrast.
+- **The Functional colours fail as text though they are correct as fills**: on the page, Functional Green 3.43, Red 3.74, Orange 4.66 (4.5 is the spec's own floor, and the spec does not scope it to body text — treating the syntax hues as exempt is our reading, not its words). The ratio that decides the split is consumption: 31 `text-destructive` against 12 `bg-destructive` in `src/components/` + `App.tsx`, tests excluded.
+- **A palette that omits an Identity color does not fail — it silently resolves through `.dark` to `@theme`'s light-safe reading**, and 5 of the 25 descriptors fall under 3:1 on `#282a36` that way (`file-ts`/`file-py` 2.97, `file-sass`/`file-graphql` 2.88, `file-css` 2.73). That is why the palette test is a completeness test, not a spot check.
+
+## Tokens that paint nothing (say so plainly before someone "fixes" them)
+
+- **22 `--color-terminal-*` tokens, 21 of which are inert**: there is no terminal surface — no terminal component, no `xterm`/`node-pty`/`portable-pty`/`alacritty`/`vt100` dependency, and zero `(bg|text|border)-terminal-*` consumers. The palette owns them anyway because the spec publishes the 16-colour ANSI table (copying beats inventing) and a half-owned palette is the failure mode the completeness test exists to prevent. **One is live, by alias rather than by class:** `@theme` defines `--color-icon-blue: var(--color-terminal-bright-blue)`, so markdown links (`MessageBubble.tsx`) and diff `@@` hunks (`DiffBlock.tsx`) take AnsiBrightBlue `#d6acff` — 7.60 on the page, 6.29 on the panel, 5.15 on a card. That alias is the ONLY consumer of any terminal token outside `index.css`.
+- **`--color-background-win-alt` has zero JSX consumers** and paints no titlebar (ADR 0027 retracts the comment that called it one); the chrome bar is `bg-background`. It survives because `--color-background-alt` derives from it, and that DOES paint the content column (`ChatStream`, `SidePane`) — `#343746` at 60% over the page = `#2f3240`. `--color-card-selected` (`#44475a`) is in the same class of forward declaration: no JSX reads `bg-card-selected`; the sidebar rows paint `bg-selected`.
+
+## Open follow-ups
+
+- **`--color-accent` is invisible as text under zai.** `SubagentDelegatingCard.tsx:655` renders the thinking level with `text-accent`, and `.theme-zai-dark` sets `#001d3d` — 1.07 on its page (`.theme-zai-light`'s `#ebf4ff` is 1.11 on white). The token's `.dark` definition (`color-mix` of sky-950) shows it was meant as a surface tint, not a text hue. Dracula is fine by being itself (`#bd93f9`, 5.90); fixing zai changes zai's appearance, so it needs its own decision.
+- **`text-secondary-foreground` (`src/components/ui/badge.tsx:13`) names a token declared nowhere** — no `--color-secondary-foreground` in `src/index.css`, so Tailwind emits no utility. Pre-existing, unrelated to the palette.
+- **Shiki's `langs` allowlist still omits `css`, `html`, `markdown` and `vue`.** `codeToHtml` THROWS on an absent language, the call site catches it, and the fence renders plain with no signal — so these are silently unhighlighted (`tsx`/`jsx` were added on this branch; `sql`/`go`/`svelte`/`diff`/`ini` likewise absent). The header stays correct either way, since it comes from `fileIconFor`, not Shiki. Widening the allowlist or moving to bundled grammars is the fix.
+- **Alucard Classic — the spec's official Dracula light variant (`#FFFBEB`) — is deferred, not rejected.** It is exactly the case the two-axis design was bought for: a light reading of the Palette axis that drops in without touching the mode logic or the `system` resolution. It also means "Dracula" currently labels a *variant* of a *family*; if Alucard ever ships, the picker names the variant.
+
+## Two toolchain facts that generalize
+
+- **Tailwind v4's scale is `oklch()`, so "copy the old hex" is never byte-identical.** The ramp tokens replace utilities like `text-blue-500` with literals that are Tailwind v3's *hex* for those colours. Decoding the real v4 `oklch()` and comparing: worst case on this branch is **0.0110 relative luminance / 0.19 contrast** against the surface the glyph paints on (orange, the context band; the five ramp hues are ≤0.0105 / ≤0.18) — sub-perceptual, all still clearing their floors, but "identical" is a claim about pixels and these are different pixels.
+- **`lightningcss` emits a static approximation for any `color-mix()` containing `var()`, then the real rule behind an `@supports` guard.** The build artifact reads `--color-background-alt:#e5e5e599` followed by `@supports (color:color-mix(in lab, red, red)){…color-mix(in oklab, var(…) 60%, transparent)}`, so capable webviews get the true value. Grep the *source*, not `dist/`, when reasoning about a `color-mix` token.

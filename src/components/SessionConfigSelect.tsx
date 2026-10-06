@@ -54,9 +54,14 @@ type SessionConfigSelectProps =
  * `thinkingLevelIcons` + `thinkingLevelColors` ramp, ported to the design
  * system): the GLYPH's fill is the level's magnitude (○ off/minimal,
  * ◔ low 25%, ◑ medium 50%, ◕ high 75%, ● xhigh/max full — the app's own
- * `THINKING_GLYPHS`, the same source), the HUE is the level's identity
- * (gray → blue → indigo → purple → pink → red). An empty / unknown level
- * is the open circle in the dim color (the reference's `off` state).
+ * `THINKING_GLYPHS`, the same source), the HUE is the level's identity (the
+ * `--color-thinking-*` ramp, off/minimal in the dim color). An empty /
+ * unknown level is the open circle in the dim color (the reference's `off`
+ * state).
+ *
+ * The hues are TOKENS, never raw Tailwind shades: a level's hue is an IDENTITY
+ * color (CONTEXT.md), so it must survive a Palette swap and stay out of the
+ * status ramp — a red glyph would read as a failure, not as max effort.
  */
 function thinkingLevelIndicator(
   level: string,
@@ -69,15 +74,15 @@ function thinkingLevelIndicator(
   const glyph = l === "" ? "○" : THINKING_GLYPHS[l] ?? "◑";
   const className =
     l === "low"
-      ? "text-blue-500"
+      ? "text-thinking-low"
       : l === "medium"
-        ? "text-indigo-500"
+        ? "text-thinking-medium"
         : l === "high"
-          ? "text-purple-500"
+          ? "text-thinking-high"
           : l === "xhigh"
-            ? "text-pink-500"
+            ? "text-thinking-xhigh"
             : l === "max"
-              ? "text-red-500"
+              ? "text-thinking-max"
               : "text-foreground-subtle";
   return { glyph, className };
 }

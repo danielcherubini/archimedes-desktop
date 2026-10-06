@@ -137,16 +137,16 @@ describe("SessionConfigSelect", () => {
     expect(icon).toBeTruthy();
     // `currentValue: "medium"` → the 50% glyph, in the medium hue.
     expect(icon!.textContent).toBe("◑");
-    expect(icon!.className).toContain("text-indigo-500");
+    expect(icon!.className).toContain("text-thinking-medium");
     expect(container.querySelector('[data-testid="thinking-level-icon"]')).toBeTruthy();
   });
 
   it("the thinking glyph's fill follows the level (◔ low, ◕ high, ● xhigh/max)", () => {
     for (const [level, glyph, hue] of [
-      ["low", "◔", "text-blue-500"],
-      ["high", "◕", "text-purple-500"],
-      ["xhigh", "●", "text-pink-500"],
-      ["max", "●", "text-red-500"],
+      ["low", "◔", "text-thinking-low"],
+      ["high", "◕", "text-thinking-high"],
+      ["xhigh", "●", "text-thinking-xhigh"],
+      ["max", "●", "text-thinking-max"],
     ] as const) {
       const { unmount } = render(
         <SessionConfigSelect

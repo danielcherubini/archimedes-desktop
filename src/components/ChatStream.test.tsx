@@ -24,6 +24,7 @@ import { setSidePaneCollapsed } from "../lib/sidePaneState";
 /** A full settings fixture (the spinner-style tests seed the store with it). */
 const SETTINGS_FIXTURE: AppSettings = {
   theme: "dark",
+  palette: null,
   paneLayout: {},
   defaultTrustNewSpaces: false,
   defaultModel: null,
@@ -1070,7 +1071,7 @@ describe("ChatStream", () => {
     const fill = bar!.firstElementChild as HTMLElement;
     expect(fill.style.width).toBe("42%");
     expect(fill.className).toContain("bg-success");
-    expect(fill.className).not.toContain("bg-yellow-500");
+    expect(fill.className).not.toContain("bg-caution");
     // The label sits at the bar's right edge (the reference UI's `61%`).
     const labelEl = group!.querySelector('[data-testid="context-usage"]') as HTMLElement;
     expect(labelEl.textContent).toBe("42%");
@@ -1134,7 +1135,7 @@ describe("ChatStream", () => {
     expect(document.body.textContent).toContain("53,760 / 128,000 tokens");
   });
 
-  it("a yellow-band context percentage (50–69%) renders the fill in yellow", () => {
+  it("a caution-band context percentage (50–69%) renders the fill in caution", () => {
     seedLiveSession();
     useSessions.setState({
       contextUsage: { s1: { used: 78080, window: 128000 } },
@@ -1145,18 +1146,18 @@ describe("ChatStream", () => {
       '[role="progressbar"][aria-label="Context used"]',
     ) as HTMLElement;
     expect(bar.getAttribute("aria-valuenow")).toBe("61");
-    // 61% is the yellow band (50–69%): yellow (NOT green, NOT orange),
+    // 61% is the caution band (50–69%): caution (NOT green, NOT warning),
     // and the label follows the fill's color.
     const fill = bar.firstElementChild as HTMLElement;
-    expect(fill.className).toContain("bg-yellow-500");
+    expect(fill.className).toContain("bg-caution");
     expect(fill.className).not.toContain("bg-success");
-    expect(fill.className).not.toContain("bg-orange-500");
+    expect(fill.className).not.toContain("bg-warning");
     const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
     expect(label.textContent).toBe("61%");
-    expect(label.className).toContain("text-yellow-500");
+    expect(label.className).toContain("text-caution");
   });
 
-  it("a mid context percentage (70–89%) escalates the fill to orange", () => {
+  it("a mid context percentage (70–89%) escalates the fill to the warning color", () => {
     seedLiveSession();
     useSessions.setState({
       contextUsage: { s1: { used: 96000, window: 128000 } },
@@ -1167,15 +1168,15 @@ describe("ChatStream", () => {
       '[role="progressbar"][aria-label="Context used"]',
     ) as HTMLElement;
     expect(bar.getAttribute("aria-valuenow")).toBe("75");
-    // 75% is the orange band (70–89%): orange (NOT yellow, NOT red),
+    // 75% is the warning band (70–89%): warning (NOT caution, NOT red),
     // and the label follows the fill's color.
     const fill = bar.firstElementChild as HTMLElement;
-    expect(fill.className).toContain("bg-orange-500");
-    expect(fill.className).not.toContain("bg-yellow-500");
+    expect(fill.className).toContain("bg-warning");
+    expect(fill.className).not.toContain("bg-caution");
     expect(fill.className).not.toContain("bg-destructive");
     const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
     expect(label.textContent).toBe("75%");
-    expect(label.className).toContain("text-orange-500");
+    expect(label.className).toContain("text-warning");
   });
 
   it("a high context percentage (>= 90%) escalates the fill to the destructive color", () => {
@@ -1193,7 +1194,7 @@ describe("ChatStream", () => {
     // follows the fill's color).
     const fill = bar.firstElementChild as HTMLElement;
     expect(fill.className).toContain("bg-destructive");
-    expect(fill.className).not.toContain("bg-orange-500");
+    expect(fill.className).not.toContain("bg-warning");
     const label = group.querySelector('[data-testid="context-usage"]') as HTMLElement;
     expect(label.textContent).toBe("90%");
     expect(label.className).toContain("text-destructive");

@@ -139,6 +139,66 @@ export function SettingsSidebarButton({
   );
 }
 
+/** Whether a persisted string is a value the picker actually offers — returned
+ * narrowed, or `null`. A blank string counts as ABSENT (the same rule the blank
+ * `defaultThinkingLevel` case establishes — and Radix rejects an empty-valued
+ * item). */
+function offeredValue(
+  stored: string | null | undefined,
+  options: readonly string[],
+): string | null {
+  return typeof stored === "string" && stored !== "" && options.includes(stored)
+    ? stored
+    : null;
+}
+
+/**
+ * The `Select` value for a setting whose option list is a CLOSED vocabulary
+ * (`theme`, `palette`). The persisted document is user-editable and the
+ * backend round-trips these fields unvalidated, so any string can reach a
+ * picker — and Radix renders NOTHING for a value with no matching item, which
+ * blanks the trigger (the user loses both the "what is active" readout and
+ * the way back to an option). So an unrecognised value selects `fallback`
+ * instead. This is a RENDERING rule only: it never writes, so opening the page
+ * leaves the file untouched.
+ */
+export function closedSelectValue(
+  stored: string | null | undefined,
+  options: readonly string[],
+  fallback: string,
+): string {
+  return offeredValue(stored, options) ?? fallback;
+}
+
+/**
+ * The `Select` value + items for a setting whose vocabulary is OPEN (the font
+ * families: `applySettingsFont` splices ANY non-null family into the CSS
+ * stack, so an off-list one is genuinely applied and coercing it to the
+ * default would misreport what is on screen). A value the list does not offer
+ * is surfaced as its own extra item — the app's established pattern for a
+ * stored value outside a select's list (the default-thinking-level and
+ * subagent-model pickers) — so the trigger always reads the stored value and
+ * the offered options stay reachable as the way out.
+ */
+export function openSelectItems(
+  stored: string | null | undefined,
+  options: readonly { value: string; label: string }[],
+): { value: string; items: { value: string; label: string }[] } {
+  const values = options.map((option) => option.value);
+  const offered = offeredValue(stored, values);
+  if (offered !== null) return { value: offered, items: [...options] };
+  // Not offered: either an off-list value (kept, and shown as its own item) or
+  // an absent/blank one (the first option — the `"default"` sentinel).
+  const offList = typeof stored === "string" && stored !== "" ? stored : null;
+  return {
+    value: offList ?? options[0]!.value,
+    items:
+      offList === null
+        ? [...options]
+        : [...options, { value: offList, label: offList }],
+  };
+}
+
 /**
  * Humanize a braille variant name for display (`wave-rows` → `Wave rows`):
  * the spinner picker's cell labels + accessible names (the reference

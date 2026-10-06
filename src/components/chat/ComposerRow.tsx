@@ -237,6 +237,17 @@ export default function ComposerRow({
                 (`aria-valuetext`) — a bare percentage is what the bar
                 draws, but the numbers are the useful part and a
                 progressbar exposes only its value. */}
+            {/* The track is its OWN token (`--color-context-track`), not the
+                subtlest-TEXT token it used to borrow. The bar's whole meaning is
+                the band FILL (green → caution → warning → red) and the track is
+                the only thing separating that fill from the unfilled remainder;
+                under Dracula the borrowed Comment hue measured 3.43 / 4.21 /
+                2.76 / 1.73 against the four fills this component emits, so the
+                red band was almost invisible on the bar it was drawn on. Every
+                palette but Dracula aliases the new token straight back to
+                `foreground-subtlest`, so zai renders EXACTLY as it always has.
+                The per-palette ratios are pinned in the context-bar gate in
+                `paletteCompleteness.test.ts`. */}
             <div
               role="progressbar"
               aria-label="Context used"
@@ -244,7 +255,7 @@ export default function ComposerRow({
               aria-valuemax={100}
               aria-valuenow={contextPercent ?? 0}
               aria-valuetext={countsText}
-              className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground-subtlest"
+              className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-context-track"
             >
               <div
                 className={`h-full rounded-full transition-[width] duration-500 ${contextRamp.fill}`}

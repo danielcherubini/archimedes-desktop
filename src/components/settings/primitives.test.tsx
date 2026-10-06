@@ -1,7 +1,13 @@
 import { describe, expect, it, vi, beforeAll } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { SettingsIcon } from "lucide-react";
-import { SettingsGroupCard, SettingsRow, SettingsSidebarButton } from "./primitives";
+import {
+  SettingsGroupCard,
+  SettingsRow,
+  SettingsSidebarButton,
+  closedSelectValue,
+  openSelectItems,
+} from "./primitives";
 
 // The primitives wrap Radix primitives (the `SettingsSidebarButton` tooltip) —
 // jsdom lacks the pointer-capture API + `matchMedia` (same stubs as
@@ -20,6 +26,51 @@ beforeAll(() => {
     removeListener: vi.fn(),
     dispatchEvent: vi.fn(),
   }));
+});
+
+describe("the select value helpers (a stored value outside the option list)", () => {
+  // The settings document is user-editable and the backend round-trips these
+  // fields unvalidated, so any string can reach a picker. Radix renders NO
+  // label for a value with no matching item, which blanks the trigger.
+  const PALETTE = ["zai", "dracula"] as const;
+
+  it("closedSelectValue keeps an offered value and falls back otherwise", () => {
+    expect(closedSelectValue("dracula", PALETTE, "zai")).toBe("dracula");
+    expect(closedSelectValue("solarized", PALETTE, "zai")).toBe("zai");
+    // Absent AND blank both mean "the default" (the blank `palette` is not a
+    // palette, and Radix rejects an empty-valued item anyway).
+    expect(closedSelectValue(null, PALETTE, "zai")).toBe("zai");
+    expect(closedSelectValue(undefined, PALETTE, "zai")).toBe("zai");
+    expect(closedSelectValue("", PALETTE, "zai")).toBe("zai");
+    // Case-sensitive: `"Dracula"` is not `"dracula"` — the app would render
+    // Zai for it, so the trigger must not claim otherwise.
+    expect(closedSelectValue("Dracula", PALETTE, "zai")).toBe("zai");
+  });
+
+  it("openSelectItems surfaces an off-list value as its own option", () => {
+    const options = [
+      { value: "default", label: "Default (Noto Sans)" },
+      { value: '"Fira Sans"', label: "Fira Sans" },
+    ];
+    // An offered value: the list is untouched and no duplicate is added.
+    expect(openSelectItems('"Fira Sans"', options)).toEqual({
+      value: '"Fira Sans"',
+      items: options,
+    });
+    // An off-list value: selected, and appended as its own item so the trigger
+    // has a label to render (the font family really IS applied).
+    expect(openSelectItems("Georgia", options)).toEqual({
+      value: "Georgia",
+      items: [...options, { value: "Georgia", label: "Georgia" }],
+    });
+    // Absent / blank → the first option (the `"default"` sentinel) and the
+    // ORIGINAL list — no empty-valued item.
+    expect(openSelectItems(null, options)).toEqual({
+      value: "default",
+      items: options,
+    });
+    expect(openSelectItems("", options)).toEqual({ value: "default", items: options });
+  });
 });
 
 describe("settings primitives (the ZCode port)", () => {
@@ -64,8 +115,7 @@ describe("settings primitives (the ZCode port)", () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
-  it("SettingsGroupCard_renders_children_in_a_card", () => {
-    const { container } = render(
+  it("SettingsGroupCard_renders_children_in_a_card", () => {    const { container } = render(
       <SettingsGroupCard>
         <span>child-content</span>
       </SettingsGroupCard>,

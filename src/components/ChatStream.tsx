@@ -177,17 +177,20 @@ export default function ChatStream() {
       ? Math.min(100, Math.round((contextUsage.used / contextUsage.window) * 100))
       : undefined;
   // The context bar's color ramp (the traffic-light scheme — the label
-  // follows the fill's color): green at 0–49%, yellow at 50–69%, orange
-  // at 70–89%, the destructive red at 90–100%.
+  // follows the fill's color): green at 0–49%, caution at 50–69%, warning
+  // at 70–89%, the destructive red at 90–100%. Context pressure IS a status
+  // ramp, so every band rides a semantic token (no raw hue to stand beside a
+  // Palette's own yellow); `caution` is the band `success` and `warning` have
+  // no room for.
   const contextRamp =
     contextPercent === undefined
       ? { fill: "bg-success", label: "text-success" }
       : contextPercent < 50
         ? { fill: "bg-success", label: "text-success" }
         : contextPercent < 70
-          ? { fill: "bg-yellow-500", label: "text-yellow-500" }
+          ? { fill: "bg-caution", label: "text-caution" }
           : contextPercent < 90
-            ? { fill: "bg-orange-500", label: "text-orange-500" }
+            ? { fill: "bg-warning", label: "text-warning" }
             : { fill: "bg-destructive", label: "text-destructive" };
   const findOption = (category: string, id: string) =>
     configOptions?.find(

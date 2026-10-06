@@ -88,6 +88,18 @@ _Avoid_: Thinking tokens (reads as a token-count statistic), reasoning block (ZC
 An image staged in the composer (via clipboard paste or drag-and-drop) that is sent with the next prompt. Previewed as a removable thumbnail in a strip above the composer's textarea; persisted inline in the user message's payload.
 _Avoid_: File, image, media, clip, paperclip
 
+**Theme**:
+The light/dark **mode** of the Client's UI — the persisted `theme` setting (`system` / `dark` / `light`), resolved to an `AppTheme` (`zai-light` / `zai-dark`) by `src/lib/theme.ts`, where `system` follows the OS scheme. A Theme selects *how light or dark the app is*; it says nothing about which hues the app uses — that is the **Palette**. The two are separate settings (ADR 0027).
+_Avoid_: Color scheme, skin, appearance (the Settings *section* that hosts both controls), style
+
+**Palette**:
+The Client's **color scheme** — the persisted `palette` setting (`zai` / `dracula`), applied as a `.theme-<name>` class on `<html>` over the shared `.dark` token block. A Palette selects *which hues* the app wears; it is orthogonal to **Theme** (the light/dark mode), except that `dracula` has no light reading and therefore PINS the app dark, ignoring the mode — `system` included (ADR 0027). The syntax-highlight theme is DERIVED from the palette (Shiki `dracula` / `github-dark`), never a third setting.
+_Avoid_: Theme (that is the mode), skin, color scheme (ambiguous between the two axes)
+
+**Identity color**:
+A color token whose hue encodes *what kind of thing this is* rather than decoration — the file-type descriptors (`--color-file-*`), git status (`--color-git-*`), the **Thinking block**/tool/assistant row hues (`--color-trajectory-*`), usage-chart and context-breakdown scales, and the role chips (file/skill/command/session/plugin nodes). Because the hue IS the signal, an Identity color is never re-hued by a **Palette**: `.theme-dracula` inherits these from `.dark` (deriving them from Dracula's 8 hues would make a `.py` chip indistinguishable from a `.json` one). A Palette-owned structural token, by contrast, is always restated per palette — see ADR 0027's completeness consequence.
+_Avoid_: Accent (a Palette choice), brand color, semantic color (the status hues — success/destructive/warning — ARE overridden per palette)
+
 **Skill**:
 A directory containing a `SKILL.md` — YAML frontmatter (`name`, `description`) + a markdown body (instructions, optionally referencing bundled files) — discovered from the standard locations (the user home `~/.agents/skills` + `~/.pi/agent/skills`; the Space/project's `.agents/skills` + `.pi/skills` walked up to the repository root). The **Agent harness** advertises each skill's metadata (name, description, location) in the system prompt and loads the full instructions on demand (progressive disclosure). In the Client, a skill is explicitly invoked with a `$name` composer mention; the Client expands the mention into the skill's full content on send, before the message is recorded (ADR 0013).
 _Avoid_: Plugin, command, prompt template

@@ -18,6 +18,7 @@ import { humanizeVariant } from "./primitives";
 // MCP server.
 const baseSettings: AppSettings = {
   theme: "dark",
+  palette: null,
   paneLayout: {},
   defaultTrustNewSpaces: false,
   defaultModel: null,
@@ -50,6 +51,7 @@ vi.mock("../../lib/tauri", async () => {
     // the const's initializer (a TDZ reference would throw at import time).
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",
+      palette: null,
       paneLayout: {},
       defaultTrustNewSpaces: false,
       defaultModel: null,
@@ -1319,6 +1321,95 @@ describe("SettingsPage (the known-providers picker + the provider api field — 
   });
 });
 
+describe("Appearance: palette", () => {
+  // (ADR 0027) The palette is a second, orthogonal axis beside Theme. The UI
+  // stores the default as the `null` sentinel (like `spinnerStyle` / the font
+  // families), so a Zai selection leaves `settings.json` minimal — the shape a
+  // pre-feature file already has.
+  it("offers Zai and Dracula, with Zai preselected for a `null` palette", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const trigger = await screen.findByRole("combobox", { name: "Palette" });
+    fireEvent.click(trigger);
+    expect(screen.getByRole("option", { name: "Zai (default)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Dracula" })).toBeTruthy();
+    // The row states the pin (Dracula overrides the Theme setting).
+    expect(
+      screen.getByText(/Dracula is dark-only .* overrides the Theme setting/i),
+    ).toBeTruthy();
+  });
+
+  it("saves Dracula as the palette, and Zai as the null default", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    fireEvent.click(await screen.findByRole("combobox", { name: "Palette" }));
+    fireEvent.click(screen.getByRole("option", { name: "Dracula" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.palette).toBe("dracula");
+    // The complete document (the other fields intact — the mode unchanged).
+    expect(saved.theme).toBe("dark");
+    expect(saved.font).toEqual(baseSettings.font);
+  });
+
+  it("saves Zai as the null sentinel, not as the string zai", async () => {
+    // The OTHER direction, which was asserted nowhere: the select's option value
+    // is the `"zai"` SENTINEL, and `onValueChange` must translate it to `null`
+    // on the way out (the same pattern as `spinnerStyle` and the font families)
+    // so a default palette leaves `settings.json` minimal and a pre-feature file
+    // (no `palette` key at all) and an explicit Zai choice stay the SAME
+    // document. Save `"zai"` instead of `null` and the two documents fork — the
+    // file grows a key that means nothing, and any other reader of `palette`
+    // that only knows `null` as "default" now disagrees with the UI.
+    //
+    // Reached from a document that is ALREADY Dracula: starting from `null` the
+    // select is already on Zai, Radix fires no change, and the test would assert
+    // nothing.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      palette: "dracula",
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    fireEvent.click(await screen.findByRole("combobox", { name: "Palette" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Zai (default)" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    expect(saved.palette).toBeNull();
+    expect(saved.palette).not.toBe("zai");
+    // And it is still a COMPLETE document — the sentinel must not be sent alone.
+    expect(saved.theme).toBe(baseSettings.theme);
+    expect(saved.providers).toEqual(baseSettings.providers);
+  });
+
+  it("shows the stored palette in the trigger for both values", async () => {
+    // The trigger is what the user reads as "which palette am I on", and it is
+    // driven by `settings.palette ?? "zai"` — so the `null` default has to render
+    // a LABEL, not nothing (the failure mode the font pickers document for an
+    // empty-string Radix value: `SelectValue` renders nothing and the control
+    // goes blank).
+    for (const [palette, expected] of [
+      [null, "Zai (default)"],
+      ["dracula", "Dracula"],
+    ] as const) {
+      vi.mocked(getSettings).mockResolvedValueOnce({ ...baseSettings, palette });
+      const { unmount } = render(<SettingsPage onBack={vi.fn()} />);
+      await loaded();
+      await go("Appearance");
+      const trigger = await screen.findByRole("combobox", { name: "Palette" });
+      expect(
+        trigger.querySelector("[data-slot=select-value]")?.textContent,
+        `palette: ${JSON.stringify(palette)}`,
+      ).toBe(expected);
+      unmount();
+      cleanup();
+    }
+  });
+});
+
 describe("Appearance: thinking spinner", () => {
   it("offers every braille variant as a live preview (the default typing is preselected)", async () => {
     render(<SettingsPage onBack={vi.fn()} />);
@@ -1356,5 +1447,194 @@ describe("Appearance: thinking spinner", () => {
     // The complete document (the other fields intact).
     expect(saved.theme).toBe("dark");
     expect(saved.font).toEqual(baseSettings.font);
+  });
+});
+
+describe("a stored value the option list does not offer", () => {
+  // The settings document is user-editable and the backend round-trips
+  // `palette` / `theme` / the font families UNVALIDATED, so any string can
+  // reach these selects. Radix renders NOTHING for a value that has no
+  // matching item, so an out-of-vocabulary value used to blank the trigger —
+  // the user could not see what was active, and could not find their way back
+  // to an option. These cases pin the legible rendering; they deliberately
+  // assert that merely OPENING the page saves nothing (viewing the page must
+  // not rewrite the user's file).
+  /** The text the trigger's value slot renders (the picker's "what is
+   * active" readout — the same probe the other trigger tests use). */
+  function triggerText(name: string): string | undefined {
+    return screen
+      .getByRole("combobox", { name })
+      .querySelector("[data-slot=select-value]")?.textContent;
+  }
+
+  it("renders the Zai default for a palette outside the vocabulary, not a blank trigger", async () => {
+    // `"solarized"` is the reported defect. The app applies Zai for anything
+    // it does not recognise (`applySettingsTheme` matches `palette ===
+    // "dracula"` exactly), so "Zai (default)" is not merely a placeholder — it
+    // is the truth about what is on screen, and the option the user can pick
+    // to get back to a clean document.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      palette: "solarized" as AppSettings["palette"],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const trigger = await screen.findByRole("combobox", { name: "Palette" });
+    expect(trigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "Zai (default)",
+    );
+    // And the default is the SELECTED option — the way back is visible.
+    fireEvent.click(trigger);
+    const zai = await screen.findByRole("option", { name: "Zai (default)" });
+    expect(zai.getAttribute("data-state")).toBe("checked");
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    // Viewing the page rewrote nothing.
+    expect(saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("renders the Zai default for a blank palette (Radix renders nothing for an empty value)", async () => {
+    // A hand-edited `"palette": ""`. Blank means absent (the same rule the
+    // blank `defaultThinkingLevel` case establishes), so it reads as the
+    // default rather than as a blank control.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      palette: "" as AppSettings["palette"],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    await screen.findByRole("combobox", { name: "Palette" });
+    expect(triggerText("Palette")).toBe("Zai (default)");
+  });
+
+  it("renders the mode an out-of-vocabulary theme actually applies, not a blank trigger", async () => {
+    // The Theme picker has the identical blank-trigger hole (`"sepia"` used to
+    // render `""`). Its fallback is NOT the field's documented default (`dark`)
+    // but `light`, because that is what the resolver really applies: every
+    // value outside the vocabulary falls through `resolveTheme`'s final branch
+    // (`theme === "dark" ? zai-dark : zai-light`). A label of "Dark" would have
+    // described the default while the window rendered light — a lie of the same
+    // kind as the blank it replaces.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      theme: "sepia" as AppSettings["theme"],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const trigger = await screen.findByRole("combobox", { name: "Theme" });
+    expect(trigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "Light",
+    );
+    fireEvent.click(trigger);
+    expect(
+      (await screen.findByRole("option", { name: "Light" })).getAttribute(
+        "data-state",
+      ),
+    ).toBe("checked");
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("shows an off-list font family in the trigger as its own option (both pickers)", async () => {
+    // The font pickers share the blank-trigger symptom, but their vocabulary is
+    // OPEN: `applySettingsFont` splices ANY non-null family into the CSS stack,
+    // so a hand-edited `"Georgia"` is genuinely applied. Coercing it to "Default
+    // (Noto Sans)" would misreport the font on screen, so the stored value is
+    // surfaced as its own option — the app's established pattern for a stored
+    // value outside a select's list (the default-thinking-level and
+    // subagent-model pickers).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      font: { sizePx: 14, uiFamily: "Georgia", codeFamily: "Iosevka" },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const uiTrigger = await screen.findByRole("combobox", { name: "UI font" });
+    expect(uiTrigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "Georgia",
+    );
+    // It is a real, selected option — and the list still offers the default, so
+    // the user can leave the off-list family.
+    fireEvent.click(uiTrigger);
+    const georgia = await screen.findByRole("option", { name: "Georgia" });
+    expect(georgia.getAttribute("data-state")).toBe("checked");
+    expect(
+      screen.getByRole("option", { name: "Default (Noto Sans)" }),
+    ).toBeTruthy();
+    // Picking an offered option saves it normally (the escape hatch works).
+    fireEvent.click(screen.getByRole("option", { name: "Fira Sans" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(
+      (vi.mocked(saveSettings).mock.calls[0][0] as AppSettings).font.uiFamily,
+    ).toBe('"Fira Sans"');
+    cleanup();
+    // The code font, same treatment (a second render: an open Radix Select
+    // `aria-hidden`s the rest of the document).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      font: { sizePx: 14, uiFamily: null, codeFamily: "Iosevka" },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const codeTrigger = await screen.findByRole("combobox", { name: "Code font" });
+    expect(
+      codeTrigger.querySelector("[data-slot=select-value]")?.textContent,
+    ).toBe("Iosevka");
+  });
+
+  it("treats a blank stored font family as absent (the default label, one option)", async () => {    // `"uiFamily": ""` is not a font; it must read as the default (and must not
+    // add a second empty-valued option, which Radix rejects).
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      font: { sizePx: 14, uiFamily: "", codeFamily: null },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Appearance");
+    const trigger = await screen.findByRole("combobox", { name: "UI font" });
+    expect(trigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "Default (Noto Sans)",
+    );
+    fireEvent.click(trigger);
+    expect(saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("labels a provider api outside the wire list as the wire it actually speaks", async () => {
+    // The same class of hole, in the Providers section: a hand-edited
+    // `"api": "grpc-gateway"` blanked the row's API select. Both consumers
+    // parse the api leniently (`WireApi::parse(..).unwrap_or(OpenAi
+    // Completions)` for the wire, ditto discovery), so an unrecognised api
+    // really does speak the OpenAI-compatible protocol — that is the label
+    // shown, and the option the user can move the row to.
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      providers: [
+        {
+          ...baseSettings.providers[0],
+          api: "grpc-gateway" as AppSettings["providers"][number]["api"],
+        },
+      ],
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    await go("Providers");
+    const trigger = await screen.findByRole("combobox", { name: "API" });
+    expect(trigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "OpenAI-compatible",
+    );
+    fireEvent.click(trigger);
+    expect(
+      (await screen.findByRole("option", { name: "OpenAI-compatible" })).getAttribute(
+        "data-state",
+      ),
+    ).toBe("checked");
+    // Every offered wire is still there to switch to.
+    expect(screen.getByRole("option", { name: "Anthropic" })).toBeTruthy();
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(saveSettings).not.toHaveBeenCalled();
   });
 });

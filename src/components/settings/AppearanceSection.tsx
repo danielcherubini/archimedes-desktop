@@ -8,8 +8,57 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SettingsGroupCard, SettingsRow } from "./primitives";
+import { SettingsGroupCard, SettingsRow, closedSelectValue, openSelectItems } from "./primitives";
 import { FontSizeInput, SpinnerStylePicker } from "./controls";
+
+/** The Theme picker's options — its CLOSED vocabulary (Radix renders no label
+ * for a value outside it), and the single source for both the select's items
+ * and the membership check. */
+const THEME_OPTIONS = [
+  { value: "system", label: "System (follow the OS)" },
+  { value: "dark", label: "Dark" },
+  { value: "light", label: "Light" },
+] as const;
+/** The Palette picker's closed vocabulary (ADR 0027). `"zai"` is the SENTINEL
+ * the trigger uses for the `null` default — never `""`, which Radix renders as
+ * nothing. */
+const PALETTE_OPTIONS = [
+  { value: "zai", label: "Zai (default)" },
+  { value: "dracula", label: "Dracula" },
+] as const;
+
+/** The UI font's offered families (the saved value is the QUOTED CSS family
+ * name for a web font — `applySettingsFont` splices it into the `--font-sans`
+ * stack, where an unquoted multi-word name would not be a valid family. The
+ * stack's tail (system + CJK fallbacks) still applies when a web font is
+ * unavailable, e.g. offline). The `"default"` sentinel (saved as `null`) is the
+ * APP DEFAULT — Noto Sans, which the `index.css` `--font-sans` stack resolves
+ * to first, with the system tail as the offline fallback. */
+const UI_FONT_OPTIONS = [
+  { value: "default", label: "Default (Noto Sans)" },
+  { value: "ui-serif, Georgia, serif", label: "Serif" },
+  {
+    value: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    label: "Monospace",
+  },
+  { value: '"Noto Sans"', label: "Noto Sans" },
+  { value: '"Fira Sans"', label: "Fira Sans" },
+  { value: '"Martel Sans"', label: "Martel Sans" },
+] as const;
+
+/** The Code font's offered families (the `"default"` sentinel and the quoted
+ * web-font names follow the UI font's conventions; the value is spliced into
+ * the `--font-mono` stack). The default is Fira Code — the `index.css`
+ * `--font-mono` stack resolves to it first, with the system + CJK tail as the
+ * offline fallback. */
+const CODE_FONT_OPTIONS = [
+  { value: "default", label: "Default (Fira Code)" },
+  { value: '"JetBrains Mono"', label: "JetBrains Mono" },
+  { value: '"Fira Code"', label: "Fira Code" },
+  { value: '"Cascadia Code"', label: "Cascadia Code" },
+  { value: "Menlo", label: "Menlo" },
+  { value: "Consolas", label: "Consolas" },
+] as const;
 
 /** The Appearance section's props (every piece of state stays in `SettingsPage`). */
 interface AppearanceSectionProps {
@@ -24,13 +73,28 @@ export default function AppearanceSection({
   onSave,
 }: AppearanceSectionProps): ReactElement | null {
   if (settings === null) return null;
+  // The font families have an OPEN vocabulary — `applySettingsFont` splices
+  // ANY non-null family into the CSS stack — so a stored family the list does
+  // not offer (a hand-edited `"Georgia"`) is genuinely applied and is surfaced
+  // as its own option rather than coerced to the default, which would lie
+  // about the font on screen (the app's pattern for a stored value outside a
+  // select's list, as in the default-thinking-level picker).
+  const uiFont = openSelectItems(settings.font.uiFamily, UI_FONT_OPTIONS);
+  const codeFont = openSelectItems(settings.font.codeFamily, CODE_FONT_OPTIONS);
+  const themeValues = THEME_OPTIONS.map((option) => option.value);
+  const paletteValues = PALETTE_OPTIONS.map((option) => option.value);
   return (
     <SettingsGroupCard>
       <SettingsRow
         label="Theme"
         control={
           <Select
-            value={settings.theme}
+            // A `theme` outside the vocabulary (a hand-edited file) resolves to
+            // the LIGHT mode — `resolveTheme`'s final branch treats anything not
+            // `dark` as light — so that is the mode the trigger names, rather
+            // than the documented `dark` default (which would describe the
+            // default while the window rendered light).
+            value={closedSelectValue(settings.theme, themeValues, "light")}
             onValueChange={(value) =>
               onSave({ theme: value as AppSettings["theme"] })
             }
@@ -39,9 +103,47 @@ export default function AppearanceSection({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="system">System (follow the OS)</SelectItem>
-              <SelectItem value="dark">Dark</SelectItem>
-              <SelectItem value="light">Light</SelectItem>
+              {THEME_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        }
+      />
+      <SettingsRow
+        label="Palette"
+        description="The color scheme. Dracula is dark-only — it overrides the Theme setting (including System)."
+        controlLayout="wide"
+        control={
+          <Select
+            // `closedSelectValue`: the backend stores `palette` as an
+            // unvalidated string, so any value can arrive (e.g. a hand-edited
+            // `"solarized"`). Nothing but `"dracula"` selects a scheme other
+            // than Zai, so the Zai label is the honest readout for anything
+            // unrecognised — and it keeps the default selectable, instead of
+            // blanking the trigger (Radix renders no label for an off-list
+            // value). RENDERING ONLY: nothing is re-saved for being unreadable.
+            value={closedSelectValue(settings.palette, paletteValues, "zai")}
+            onValueChange={(value) =>
+              onSave({ palette: value === "zai" ? null : "dracula" })
+            }
+          >
+            {/* The `"zai"` option saves `null` (not `"zai"`) — the same
+                default-sentinel pattern as `spinnerStyle` and the font
+                families — so a default palette leaves `settings.json`
+                minimal, and a pre-feature file (no `palette` key) and an
+                explicit Zai choice stay the SAME document (ADR 0027). */}
+            <SelectTrigger aria-label="Palette" className="w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PALETTE_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         }
@@ -65,7 +167,7 @@ export default function AppearanceSection({
         label="UI font"
         control={
           <Select
-            value={settings.font.uiFamily ?? "default"}
+            value={uiFont.value}
             onValueChange={(value) =>
               onSave({
                 font: {
@@ -79,28 +181,11 @@ export default function AppearanceSection({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {/* The `"default"` sentinel (saved as `null`) is the APP
-                  DEFAULT — Noto Sans for the UI font (the `index.css`
-                  `--font-sans` stack resolves to it first, with the
-                  system tail as the offline fallback). A sentinel value
-                  (NOT `""`): Radix's `SelectValue` renders nothing for
-                  an empty-string value, so the trigger would go blank
-                  when the default is selected. */}
-              <SelectItem value="default">Default (Noto Sans)</SelectItem>
-              <SelectItem value="ui-serif, Georgia, serif">Serif</SelectItem>
-              <SelectItem value="ui-monospace, SFMono-Regular, Menlo, monospace">
-                Monospace
-              </SelectItem>
-              {/* Web fonts (the `index.html` Google Fonts link — the
-                  saved value is the QUOTED CSS family name:
-                  `applySettingsFont` splices it into the `--font-sans`
-                  stack, where an unquoted multi-word name would not be a
-                  valid family). The stack's tail (system + CJK
-                  fallbacks) still applies when a web font is
-                  unavailable, e.g. offline. */}
-              <SelectItem value='"Noto Sans"'>Noto Sans</SelectItem>
-              <SelectItem value='"Fira Sans"'>Fira Sans</SelectItem>
-              <SelectItem value='"Martel Sans"'>Martel Sans</SelectItem>
+              {uiFont.items.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         }
@@ -109,7 +194,7 @@ export default function AppearanceSection({
         label="Code font"
         control={
           <Select
-            value={settings.font.codeFamily ?? "default"}
+            value={codeFont.value}
             onValueChange={(value) =>
               onSave({
                 font: {
@@ -123,21 +208,11 @@ export default function AppearanceSection({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {/* The `"default"` sentinel (saved as `null`) is the APP
-                  DEFAULT — Fira Code for the code font (the `index.css`
-                  `--font-mono` stack resolves to it first, with the
-                  system + CJK tail as the offline fallback; a sentinel
-                  value, NOT `""` — see the UI font's note). The
-                  multi-word values are the QUOTED CSS family names (the
-                  same convention as the UI font's web-font options —
-                  `applySettingsFont` splices the value into the
-                  `--font-mono` stack). */}
-              <SelectItem value="default">Default (Fira Code)</SelectItem>
-              <SelectItem value='"JetBrains Mono"'>JetBrains Mono</SelectItem>
-              <SelectItem value='"Fira Code"'>Fira Code</SelectItem>
-              <SelectItem value='"Cascadia Code"'>Cascadia Code</SelectItem>
-              <SelectItem value="Menlo">Menlo</SelectItem>
-              <SelectItem value="Consolas">Consolas</SelectItem>
+              {codeFont.items.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         }

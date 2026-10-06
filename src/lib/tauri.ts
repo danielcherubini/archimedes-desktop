@@ -402,6 +402,8 @@ export interface FontSettings {
 export interface AppSettings {
   /** "system" follows the OS scheme live (the `matchMedia` listener in theme.ts). */
   theme: "system" | "dark" | "light";
+  /** (ADR 0027) The color scheme; `null` = `"zai"` (a pre-feature file). Orthogonal to `theme` — `"dracula"` is dark-only and PINS dark, so the mode is ignored. */
+  palette: "zai" | "dracula" | null;
   paneLayout: Record<string, unknown>;
   defaultTrustNewSpaces: boolean;
   defaultModel: string | null;

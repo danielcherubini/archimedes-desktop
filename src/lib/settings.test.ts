@@ -8,9 +8,13 @@ vi.mock("./tauri", () => ({
   saveSettings: vi.fn(),
 }));
 
-import { getSettings } from "./tauri";
+import { getSettings, type AppSettings } from "./tauri";
 import { applyThemeToDocument } from "./theme";
-import { applySettingsFont, loadAndApplySettings } from "./settings";
+import {
+  applySettingsFont,
+  applySettingsToDocument,
+  loadAndApplySettings,
+} from "./settings";
 
 /** A simple matchMedia stub with a flippable `matches` (the settings tests
  * never invoke the "change" listener — the live re-apply is covered in
@@ -35,8 +39,40 @@ function stubMatchMedia(initialMatches: boolean) {
  * while the inline `style` read is reliable. */
 const style = () => document.documentElement.style;
 
+/**
+ * A complete `AppSettings` document for the wiring tests. `theme: "light"` on
+ * purpose: the palette assertions below then fail if the palette ever stops
+ * reaching `theme.ts`, because a light mode that stayed in charge would put
+ * `.theme-zai-light` on `<html>` instead of `.dark` + `.theme-dracula`.
+ */
+function settingsFixture(overrides: Partial<AppSettings> = {}): AppSettings {
+  return {
+    theme: "light",
+    palette: null,
+    paneLayout: {},
+    defaultTrustNewSpaces: false,
+    defaultModel: null,
+    defaultThinkingLevel: null,
+    enabledTools: [],
+    providers: [],
+    mcpServers: {},
+    font: { sizePx: 14, uiFamily: null, codeFamily: null },
+    defaultThinkingLevels: {},
+    subagentModels: {},
+    spinnerStyle: null,
+    ...overrides,
+  };
+}
+
+/** The four classes `applyThemeToDocument` owns. Every test starts from a
+ * document that carries none of them, so a `contains(…) === false` assertion
+ * cannot pass merely because a previous test never set the class. */
+const THEME_CLASSES = ["dark", "theme-zai-light", "theme-zai-dark", "theme-dracula"];
+const resetRoot = () => document.documentElement.classList.remove(...THEME_CLASSES);
+
 describe("applySettingsFont", () => {
   beforeEach(() => {
+    resetRoot();
     document.documentElement.style.removeProperty("--ui-font-size");
     document.documentElement.style.removeProperty("--font-sans");
     document.documentElement.style.removeProperty("--font-mono");
@@ -82,11 +118,7 @@ describe("applySettingsFont", () => {
 describe("loadAndApplySettings", () => {
   beforeEach(() => {
     // Simulate the first-frame state (main.tsx's `applyThemeToDocument("zai-dark")`).
-    document.documentElement.classList.remove(
-      "dark",
-      "theme-zai-light",
-      "theme-zai-dark",
-    );
+    resetRoot();
     applyThemeToDocument("zai-dark");
     document.documentElement.style.removeProperty("--ui-font-size");
     document.documentElement.style.removeProperty("--font-sans");
@@ -98,6 +130,7 @@ describe("loadAndApplySettings", () => {
   it("applies the stored settings (system theme + font)", async () => {
     vi.mocked(getSettings).mockResolvedValue({
       theme: "system",
+      palette: null,
       paneLayout: {},
       defaultTrustNewSpaces: false,
       defaultModel: null,
@@ -125,6 +158,88 @@ describe("loadAndApplySettings", () => {
     const settings = await loadAndApplySettings();
     expect(settings).toBeNull();
     expect(document.documentElement.classList.contains("theme-zai-dark")).toBe(
+      true,
+    );
+  });
+
+  it("applies a stored `dracula` palette to the document (boot wiring, ADR 0027)", async () => {
+    // The persisted `palette` reaches `<html>` ONLY through
+    // `applySettingsToDocument` → `applySettingsTheme`'s second argument, and
+    // this boot path is the only place that happens on launch. Sever that one
+    // argument and everything else still looks healthy: the save succeeds, the
+    // store updates, code blocks recolour (they subscribe to the store
+    // directly), and the chrome silently stays Zai forever.
+    vi.mocked(getSettings).mockResolvedValue(
+      settingsFixture({ theme: "light", palette: "dracula" }),
+    );
+    stubMatchMedia(false); // OS prefers LIGHT: only the palette pins dark.
+
+    await loadAndApplySettings();
+
+    const classes = document.documentElement.classList;
+    expect(classes.contains("theme-dracula")).toBe(true);
+    expect(classes.contains("dark")).toBe(true);
+    expect(classes.contains("theme-zai-light")).toBe(false);
+    expect(classes.contains("theme-zai-dark")).toBe(false);
+  });
+
+  it("applies a stored `zai` palette to the document (the default stays wired too)", async () => {
+    vi.mocked(getSettings).mockResolvedValue(
+      settingsFixture({ theme: "light", palette: "zai" }),
+    );
+    stubMatchMedia(false);
+
+    await loadAndApplySettings();
+
+    const classes = document.documentElement.classList;
+    expect(classes.contains("theme-zai-light")).toBe(true);
+    expect(classes.contains("theme-dracula")).toBe(false);
+    expect(classes.contains("dark")).toBe(false);
+  });
+});
+
+describe("applySettingsToDocument — the palette → <html> wiring (ADR 0027)", () => {
+  beforeEach(() => {
+    resetRoot();
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  it("puts theme-dracula + dark on <html> for a dracula palette over the LIGHT theme", () => {
+    // `theme: "light"` is the point: Dracula has no light reading, so the
+    // palette must pin dark rather than defer to the mode.
+    applySettingsToDocument(settingsFixture({ palette: "dracula" }));
+
+    const classes = document.documentElement.classList;
+    expect(classes.contains("theme-dracula")).toBe(true);
+    expect(classes.contains("dark")).toBe(true);
+    expect(classes.contains("theme-zai-light")).toBe(false);
+    expect(classes.contains("theme-zai-dark")).toBe(false);
+  });
+
+  it("puts theme-zai-light on <html> for an explicit zai palette", () => {
+    applySettingsToDocument(settingsFixture({ palette: "zai" }));
+
+    const classes = document.documentElement.classList;
+    expect(classes.contains("theme-zai-light")).toBe(true);
+    expect(classes.contains("theme-dracula")).toBe(false);
+    expect(classes.contains("dark")).toBe(false);
+  });
+
+  it("treats the null default as zai (a pre-feature settings.json keeps its chrome)", () => {
+    applySettingsToDocument(settingsFixture({ palette: null }));
+
+    const classes = document.documentElement.classList;
+    expect(classes.contains("theme-zai-light")).toBe(true);
+    expect(classes.contains("theme-dracula")).toBe(false);
+  });
+
+  it("keeps the font wiring alive on the palette path (both halves apply)", () => {
+    applySettingsToDocument(
+      settingsFixture({ palette: "dracula", font: { sizePx: 17, uiFamily: null, codeFamily: null } }),
+    );
+    expect(style().getPropertyValue("--ui-font-size")).toBe("17px");
+    expect(document.documentElement.classList.contains("theme-dracula")).toBe(
       true,
     );
   });

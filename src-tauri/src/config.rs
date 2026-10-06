@@ -85,6 +85,12 @@ pub struct Settings {
     /// `"system" | "dark" | "light"` (default `"dark"`).
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// (ADR 0027) The color scheme: `"zai" | "dracula"`. `None` = `"zai"` (a
+    /// pre-feature file — `#[serde(default)]`, no migration). Orthogonal to
+    /// `theme` (the light/dark mode): `dracula` has no light reading, so it
+    /// PINS the app dark and the mode is ignored.
+    #[serde(default)]
+    pub palette: Option<String>,
     /// Free-form pane layout state (owned by the frontend).
     #[serde(default)]
     pub pane_layout: Value,
@@ -143,6 +149,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
+            palette: None,
             pane_layout: Value::Object(Default::default()),
             default_trust_new_spaces: false,
             default_model: None,
@@ -436,6 +443,7 @@ mod tests {
         assert_eq!(settings.font, FontSettings::default());
         assert!(settings.subagent_models.is_empty());
         assert_eq!(settings.spinner_style, None);
+        assert_eq!(settings.palette, None);
     }
 
     #[test]
@@ -455,6 +463,24 @@ mod tests {
         );
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.spinner_style, Some("pendulum".to_string()));
+    }
+
+    #[test]
+    fn palette_defaults_to_none_and_round_trips() {
+        // (ADR 0027) A pre-feature file (no `palette`) parses to `None` (the
+        // frontend falls back to the `zai` scheme); an explicit choice
+        // survives a round trip in camelCase.
+        assert_eq!(Settings::default().palette, None);
+        let file: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
+        assert_eq!(file.palette, None);
+        let settings = Settings {
+            palette: Some("dracula".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"palette\""), "missing palette in {json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.palette, Some("dracula".to_string()));
     }
 
     #[test]
@@ -593,6 +619,7 @@ mod tests {
     fn settings_round_trip_with_the_new_fields() {
         let settings = Settings {
             theme: "system".to_string(),
+            palette: Some("dracula".to_string()),
             pane_layout: serde_json::json!({ "chatWidth": 480 }),
             default_thinking_level: Some("high".to_string()),
             enabled_tools: vec!["read".to_string()],
@@ -634,6 +661,7 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
             "\"defaultThinkingLevel\"",
+            "\"palette\"",
             "\"enabledTools\"",
             "\"defaultTrustNewSpaces\"",
             "\"defaultModel\"",

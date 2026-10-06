@@ -27,7 +27,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SettingsBadge, SettingsGroupCard } from "./primitives";
+import {
+  SettingsBadge,
+  SettingsGroupCard,
+  closedSelectValue,
+} from "./primitives";
 import { Field, TextField } from "./controls";
 
 /** The Providers section's props (every piece of state stays in `SettingsPage`). */
@@ -168,7 +172,13 @@ function ProviderRow({
         </Field>
         <Field label="API">
           <Select
-            value={provider.api}
+            // A stored `api` outside the wire list (a hand-edited file) leaves
+            // BOTH consumers on the OpenAI-compatible wire — `WireApi::parse`
+            // falls back to it for discovery and for `build_provider` — so that
+            // is the label the trigger shows instead of going blank (Radix
+            // renders no label for a value with no matching item). Nothing is
+            // re-saved for being unreadable.
+            value={closedSelectValue(provider.api, API_VALUES, "openai-completions")}
             onValueChange={(value) => onCommitField({ api: value as WireApi })}
           >
             <SelectTrigger aria-label="API" className="w-full">

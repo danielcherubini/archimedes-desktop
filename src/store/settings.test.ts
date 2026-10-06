@@ -16,6 +16,7 @@ const mockGetSettings = vi.mocked(getSettings);
 /** A full settings fixture (every field — the store carries the whole shape). */
 const FULL_SETTINGS: AppSettings = {
   theme: "dark",
+  palette: null,
   paneLayout: {},
   defaultTrustNewSpaces: false,
   defaultModel: null,

@@ -189,6 +189,14 @@ body {
   --color-foreground: var(--color-neutral-700);
   --color-foreground-subtle: color-mix(in oklab, var(--color-neutral-700) 60%, transparent);
   --color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-700) 40%, transparent);
+  /* The context bar's TRACK (`ComposerRow`'s progressbar background). Its own
+   * token because it is a FILL whose job is to contrast with the bar's band
+   * colours, while `--color-foreground-subtlest` is TEXT whose job is to be
+   * readable — two roles that need opposite values, and which shared one token
+   * until the Dracula audit. Aliased here (rather than restated per palette) so
+   * every reading keeps the track it has always had; `.theme-dracula` is the one
+   * block that overrides it. See that block for the measured band separation. */
+  --color-context-track: var(--color-foreground-subtlest);
   --color-foreground-inverse: var(--color-white);
   --color-success: var(--color-green-600);
   --color-success-foreground: var(--color-foreground-inverse);
@@ -277,6 +285,46 @@ body {
   --color-file-xml: #689237;
   --color-file-graphql: #d81b60;
   --color-file-db: #a3811a;
+
+  /* RAMP TOKENS — the thinking-LEVEL indicator and the context-usage bar.
+   * Both were raw Tailwind hues in components (`text-blue-500`,
+   * `bg-yellow-500`), which no Palette can move: they would sit unchanged
+   * beside Dracula's own orange/purple/yellow and clash.
+   *
+   * The thinking levels are IDENTITY colors (CONTEXT.md), not statuses: the
+   * hue answers "which level is this" — like `--color-file-*` answers "which
+   * file type" — so they get their OWN family rather than riding
+   * `--color-warning`/`--color-destructive`, which would make a max-effort
+   * model read as a failure and would let a Palette re-hue the level. The
+   * family pairs with `THINKING_GLYPHS` (src/lib/toolOutput.ts): the glyph is
+   * the level's magnitude, the hue its identity. `--color-caution` IS a
+   * status — context pressure genuinely is a warning ramp — and slots between
+   * `success` and `warning`.
+   *
+   * These BASE values are the LIGHT reading, and that placement is load-
+   * bearing: `applyThemeToDocument` gives zai light `.theme-zai-light` with NO
+   * `.dark` class, and a classless document reads `@theme`, so `@theme` is
+   * what a light mode resolves — and the hues these replace did not clear it
+   * there. Measured on what ACTUALLY rendered (this repo is Tailwind v4, whose
+   * palette is `oklch()`, so `text-blue-500` was `oklch(62.3% 0.214 259.815)` =
+   * `#2b7fff` at 3.76:1 on white and `bg-yellow-500` was `#f0b100` at a
+   * near-invisible 1.91:1 — not the v3 hexes' 3.68/1.92 that an earlier version
+   * of this comment quoted, though the conclusion is identical). The glyph is a
+   * level's only signal, so a pale hue is not a contrast
+   * warning, it is the signal gone. Each value below is the darkest shade of
+   * its own hue that still reads as that hue: the thinking ramp is non-text UI
+   * (3:1), `caution` also paints the percentage LABEL so it holds the 4.5:1
+   * text floor. The dark readings live in `.dark`, which zai dark also gets, so
+   * `.theme-zai-dark` needs no entry — the same two-reading structure as
+   * `--color-file-*`, and the reason `.theme-zai-light` must stay silent here:
+   * a second light value there would shadow this one and leave a classless
+   * document unlegible. */
+  --color-caution: #a16207;
+  --color-thinking-low: #0284c7;
+  --color-thinking-medium: #4f46e5;
+  --color-thinking-high: #7c3aed;
+  --color-thinking-xhigh: #be185d;
+  --color-thinking-max: #b91c1c;
 }
 
 .dark {
@@ -382,6 +430,7 @@ body {
   --color-foreground: var(--color-neutral-200);
   --color-foreground-subtle: color-mix(in oklab, var(--color-neutral-200) 60%, transparent);
   --color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-200) 30%, transparent);
+  --color-context-track: var(--color-foreground-subtlest); /* see @theme */
   --color-foreground-inverse: var(--color-white);
   --color-success: var(--color-green-500);
   --color-success-foreground: var(--color-foreground-inverse);
@@ -430,6 +479,28 @@ body {
   --color-plugin-node-foreground: var(--color-amber-300);
   --color-plugin-paid-plan-badge: #5a341b;
   --color-plugin-paid-plan-badge-foreground: #ffd8b8;
+  /* The dark reading of the ramps (see the `@theme` block for why the pair is
+   * split this way). These are DELIBERATELY the v3 HEX equivalents of the
+   * Tailwind hues the components used to name — `eab308` yellow-500, `3b82f6`
+   * blue-500, `6366f1` indigo-500, `a855f7` purple-500, `ec4899` pink-500,
+   * `ef4444` red-500 — so introducing the tokens moves almost nothing in the
+   * shipped themes and a Palette has something to override. "Almost", stated
+   * precisely because "byte-identical" is the wrong word for it: Tailwind v4
+   * renders those classes as `oklch()`, not as these hexes, so a site that read
+   * `text-blue-500` was getting `#2b7fff` and now gets `#3b82f6`. Worst case
+   * across the six is 0.0110 relative luminance (orange) / 0.19 contrast against
+   * the surface it paints on — sub-perceptual for a 16px glyph, and every value
+   * still clears its own floor. `themeTokens.test.ts` asserts the pairing (this
+   * value == the hex named there), which is what keeps it a token introduction
+   * rather than a re-design. (The one INTENTIONAL move is the context bar's
+   * 70–89% band, which now reads `--color-warning` — a hair warmer than
+   * orange-500 — instead of a hardcoded hue.) */
+  --color-caution: #eab308;
+  --color-thinking-low: #3b82f6;
+  --color-thinking-medium: #6366f1;
+  --color-thinking-high: #a855f7;
+  --color-thinking-xhigh: #ec4899;
+  --color-thinking-max: #ef4444;
 }
 
 .theme-zai-light {
@@ -527,6 +598,7 @@ body {
   --color-foreground: var(--color-neutral-800);
   --color-foreground-subtle: color-mix(in oklab, var(--color-neutral-800) 60%, transparent);
   --color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-800) 40%, transparent);
+  --color-context-track: var(--color-foreground-subtlest); /* see @theme */
   --color-foreground-inverse: #ffffff;
   --color-success: #1e8a3e;
   --color-success-foreground: #ffffff;
@@ -672,6 +744,7 @@ body {
   --color-foreground: var(--color-neutral-300);
   --color-foreground-subtle: color-mix(in oklab, var(--color-neutral-300) 60%, transparent);
   --color-foreground-subtlest: color-mix(in oklab, var(--color-neutral-300) 30%, transparent);
+  --color-context-track: var(--color-foreground-subtlest); /* see @theme */
   --color-foreground-inverse: #000000;
   --color-success: #46bf72;
   --color-success-foreground: #000000;
@@ -731,6 +804,525 @@ body {
   --color-file-json: #f9a825;
   --color-file-html: #e65100;
   --color-file-css: #7e57c2;
+  --color-file-sass: #ec407a;
+  --color-file-md: #42a5f5;
+  --color-file-rs: #ff7043;
+  --color-file-py: #0288d1;
+  --color-file-sh: #ff7043;
+  --color-file-yaml: #ff5252;
+  --color-file-toml: #cfd8dc;
+  --color-file-lock: #ffd54f;
+  --color-file-image: #26a69a;
+  --color-file-svg: #ffb300;
+  --color-file-archive: #afb42b;
+  --color-file-go: #00acc1;
+  --color-file-vue: #41b883;
+  --color-file-svelte: #ff5722;
+  --color-file-java: #f44336;
+  --color-file-php: #1e88e5;
+  --color-file-xml: #8bc34a;
+  --color-file-graphql: #ec407a;
+  --color-file-db: #ffca28;
+}
+
+/*
+ * The Dracula PALETTE (ADR 0027) — a color scheme, not a light/dark mode.
+ * `src/lib/theme.ts` applies it as `.dark` + `.theme-dracula`, so this block is
+ * a PARTIAL diff over the shared dark tokens: it restates the 115 tokens the
+ * palette owns and inherits the other 59 of `.theme-zai-dark`'s 168. Placement
+ * matters — every palette block is a single-class selector of equal
+ * specificity, so if two ever co-existed source order alone would decide the
+ * winner (`theme.ts` toggles all four classes with explicit booleans, so
+ * exactly one is ever present; this ordering just keeps that honest).
+ *
+ * SOURCE OF TRUTH: the official specification, https://draculatheme.com/spec.
+ * NOT `pi-dracula`. The first version of this block was transcribed from the
+ * user's pi TUI theme (`~/Coding/Javascript/pi-dracula/themes/dracula.json`),
+ * which is a LEGACY COMMUNITY PORT that disagrees with the current spec, and
+ * the transcription then invented further hues of its own. Two mistakes cost
+ * the UI most of its structure and both came from trusting that file:
+ *
+ * - it labels `#44475a` `currentLine`. The spec says Current Line is `#6272a4`
+ *   and `#44475a` is SELECTION. Reading the label literally made the selection
+ *   colour the app's border colour — 1.56 on the page, against a 3:1 floor for
+ *   a UI boundary — so essentially every rule in the chrome went invisible.
+ * - it exposes three surfaces (`bg`/`otherbg`/`currentLine`) where the spec
+ *   publishes an ELEVATION LADDER: Background Darker `#191a21` < Background
+ *   Dark `#21222c` < Background `#282a36` < Background Light / Floating
+ *   interactive elements `#343746` < Background Lighter `#424450`. Collapsing
+ *   it to one raised step left header == panel == page and card == border.
+ *
+ * So this block is written against the spec's own tables — core palette, UI
+ * palette, Functional colors, ANSI palette — and `src/lib/
+ * paletteCompleteness.test.ts` now REJECTS any hex in it that the spec does not
+ * publish, except the allow-listed file descriptors below. Read that test before
+ * changing a value here; the gate is the deliverable, not the bookkeeping.
+ *
+ * SURFACES follow the spec's ladder: `#191a21` (the terminal's own paper) <
+ * `#21222c` inputs / popover header (recessed within a panel) < `#282a36` the
+ * page AND THE SIDEBAR (the sidebar aliases the page: the top bar is
+ * `bg-background`, so sidebar and menubar are one plane of chrome — which is
+ * also what `.theme-zai-dark` does, where `--color-sidebar` equals
+ * `--color-background`) <
+ * `#343746` header, panel, tabs, menus, popovers, toasts, tooltips (floating)
+ * < `#424450` cards, menu hover, the `bg-secondary` badge, the inline-code chip
+ * and the context-bar track (raised). `#44475a` — SELECTION — is reserved for
+ * selection and pressed states (`card-selected`, the terminal's translucent
+ * selection) and appears NOWHERE as a border or a resting surface. Header and
+ * panel are the same step on purpose, exactly as `.theme-zai-dark` gives its
+ * header and panel one value: they are one band of chrome, and the spec's ladder
+ * has five steps for five real distinctions, not one per token.
+ *
+ * NOTHING MAY SIT ABOVE `#424450` as a resting surface. That is a real
+ * constraint and not a style rule: `secondary`, `tag` and `tooltip-tag` used to
+ * be `#44475a` (L 0.0647), which is BRIGHTER than `card` (L 0.0587), so a
+ * `bg-secondary` badge inside a dropdown separated from its own float by 1.06
+ * and the inline-code chip out-shone the card it landed on — an inversion zai
+ * dark does not have. `paletteCompleteness.test.ts` now walks the whole surface
+ * set as ordered groups (the five above, plus Selection as a STATE above all of
+ * them) rather than the five-token chain that let it through.
+ *
+ * DELIBERATE DEPARTURES FROM THE SPEC — four, all stated plainly.
+ *
+ * 1. STATUS TEXT KEEPS THE BRIGHT SYNTAX HUES; THE FUNCTIONAL PALETTE DRIVES
+ *    FILLS, BORDERS AND FOCUS. First, what the spec actually says, because the
+ *    distinction matters: its Accessibility Standards clause is "Maintain
+ *    **4.5:1 minimum contrast ratio** (WCAG 2.1 Level AA)" — it is NOT scoped to
+ *    body text, and there is no clause anywhere in it exempting syntax hues.
+ *    Reading the bright hues as exempt is OUR judgement, not a quotation, and
+ *    it is stated as such here. What we take from it: a literal string value is
+ *    rendered inside a code block whose whole purpose is the hue, so we hold
+ *    4.5 for UI text and treat 3:1 as the floor for a hue that is itself the
+ *    signal. That is a defensible reading and it is not the spec's words.
+ *
+ *    The spec's State Indicators rule says success / warning / error use
+ *    Functional Green / Orange / Red, and those are the right call for a fill —
+ *    but as TEXT they fail that 4.5:1 floor on the page (Green `#089108` 3.43,
+ *    Red `#DE5735` 3.74; even Orange `#A39514` only just clears at 4.66). These
+ *    tokens are overwhelmingly consumed as text (31 `text-destructive` against
+ *    12 `bg-destructive` in `src/components/` + `App.tsx`, tests excluded), so
+ *    the Functional set is applied where it passes and where the spec points
+ *    at it anyway — Functional Purple `#815cd6` for brand/primary, which is
+ *    also the spec's focus-ring colour and reaches the focus ring through
+ *    `--color-input-border-focused: var(--color-brand)`; Functional Cyan
+ *    `#0081d6` for interactive borders — while the text-carrying status tokens
+ *    keep the spec's syntax hues, which the spec itself assigns to "Errors,
+ *    warnings, deletion". Where even a syntax hue fails on a real background,
+ *    the spec's ANSI BRIGHT variant is used rather than an invented one: that
+ *    is why `diff-removed` is AnsiBrightRed `#ff6e6e` and not `#ff5555` —
+ *    `#ff5555` measures 3.88 on a surface-tinted diff row over the page where
+ *    `#ff6e6e` reaches 4.47. Neither clears 4.5 there; see the per-surface table
+ *    on `--color-diff-removed`.
+ * 2. `--color-foreground-subtle` is FOREGROUND AT 70%, not a new hue. The spec
+ *    has no "subtle text" token; Comment `#6272a4` is 3.03 and cannot carry
+ *    body copy (timestamps, secondary labels), and the previous `#9aa4c4` is in
+ *    no spec table at all. Deriving from Foreground is the only move that is
+ *    on-palette at every elevation — 7.34 on the page, 6.33 on `#343746`, 5.41
+ *    on `#424450` — instead of one hand-picked grey tuned to one surface.
+ * 3. SELECTION IS NEVER A BORDER OR A RESTING SURFACE (see the ladder above).
+ *    The spec's own "subtle borders: use Current Line" rule is followed instead,
+ *    and `#6272a4` clears 3:1 on the page at 3.03.
+ * 4. THE 25 FILE-TYPE DESCRIPTOR HUES BELOW ARE OFF-SPEC ON PURPOSE — see the
+ *    Identity-color note on them. They are the one place "use exact color
+ *    values from this specification" is knowingly not met.
+ *
+ * Also spec-driven, not inherited: EVERY FILL TAKES DARK INK
+ * (`*-foreground: #282a36`) because Dracula's hues are all high-luminance —
+ * white on Orange is 1.70 while `#282a36` on Orange is 8.36. The exception is
+ * `--color-primary-foreground`, which is white at 4.73: Functional Purple is
+ * the one fill here dark enough that dark ink would be the WORSE reading
+ * (`#282a36` on `#815cd6` is 3.01).
+ *
+ * WHY only 115 of `.theme-zai-dark`'s 168: the **Identity color** rule
+ * (`CONTEXT.md`). A hue that encodes *what kind of thing this is* is never
+ * re-hued by a palette — the usage/heatmap and context-breakdown scales, the
+ * git statuses, the transcript roles, the role chips and the white overlays all
+ * stay on `.dark`'s readings, because Dracula's 11 hues cannot name 25 file
+ * types and 8 git states without making them indistinguishable. `src/lib/
+ * paletteCompleteness.test.ts` pins that inherited set in BOTH directions, so a
+ * token added to `.theme-zai-dark` must be classified rather than silently
+ * dropped or silently inherited. These 59 do render differently from zai dark
+ * (which restates them by hand) — that is the rule working: untouched BY
+ * Dracula, not preserved FROM Zai. THE TERMINAL IS THE EXCEPTION, AND IT MOVED:
+ * the 22 `--color-terminal-*` tokens used to be inherited on the reasoning that
+ * the app has no terminal component and an ANSI set would therefore have to be
+ * INVENTED. The first half of that is still true — there is no terminal surface
+ * (no xterm dep, no PTY dep, no terminal component, and no class reads these
+ * tokens). What was wrong is the second half: the ANSI palette is not an
+ * invention, it is a published 16-colour table to copy, so owning these tokens
+ * costs nothing and leaves no half-owned palette. One effect IS live today:
+ * `--color-icon-blue` aliases `--color-terminal-bright-blue`, so markdown links
+ * and diff `@@` hunks pick up the ANSI bright-blue. The rest are forward-declared
+ * for a terminal that does not exist yet — see the amendment in ADR 0027.
+ *
+ * The six ramp tokens (`caution` + `thinking-*`) are all spec values, but the
+ * five LEVELS are no longer the same five the first cut used. They are IDENTITY
+ * tokens (a level, not a status), and the original set — `#8be9fd / #50fa7b /
+ * #f1fa8c / #ffb86c / #ff5555` — was drawn from the same 11 hues as the status
+ * tokens, which meant all five levels printed a status hex: `-medium` was
+ * `success`/`diff-added`, `-high` was `caution`, `-xhigh` was `warning`, `-max`
+ * was `destructive`, `-low` was `interaction-ask-foreground`. A max-effort glyph
+ * therefore rendered in the exact red of a failure, which is the single thing
+ * the family exists to prevent. They are now the spec's ANSI BRIGHT row (plus
+ * Red for the hot end), which no UI token in this block uses — see the table on
+ * the declarations. `src/lib/themeTokens.test.ts` measures the collision and its
+ * allow-list is empty, so a new one fails by name and a stale exemption fails as
+ * stale.
+ *
+ * THE TEXT/FILL ROLE SPLIT, which is the other thing a reader will look for.
+ * `--color-foreground-subtlest` used to be BOTH the de-emphasis text colour and
+ * the context bar's track, and the two need opposite values: the text wants
+ * contrast against the surface, the track wants contrast against the BAR'S FILL.
+ * It is now only the text (lightened to Foreground at 55%), and
+ * `--color-context-track` is the bar. The new token is declared in `@theme`,
+ * `.dark`, `.theme-zai-light` and `.theme-zai-dark` as a pure ALIAS back to
+ * `--color-foreground-subtlest`, so those readings composite to exactly the
+ * colour they did before it existed — zai's rendering does not move by one byte
+ * and Dracula is the only palette that overrides it. (`.theme-zai-light` has to
+ * carry it too: that block is pinned to declare exactly `.dark`'s token set, so
+ * anything added to `.dark` must be mirrored there.)
+ */
+.theme-dracula {
+  /* surfaces — the spec's elevation ladder, five steps, see the doc-comment. */
+  --color-background: #282a36; /* Background: the page */
+  /* FORWARDS ONLY — nothing reads this token. `--color-background-win-alt` has
+   * ZERO consumers in JSX (grep it: the only hits are this block's siblings and
+   * two allow-lists in `paletteCompleteness.test.ts`), and the app's real chrome
+   * bar is `bg-background` (`App.tsx`, `data-testid="chrome-bar"`), so it is NOT
+   * a titlebar band and an earlier comment here calling it one was invented.
+   * It survives because `--color-background-alt` derives from it, and that DOES
+   * paint (the content column: `ChatStream`, `SidePane`) — measured `#343746` at
+   * 60% over the page = `#2f3240`. Kept on the floating step so that derived
+   * surface sits where the ladder puts it; the value that came before was
+   * `#44475a`, i.e. spec Selection, 1.56 on the page. */
+  --color-background-win-alt: #343746; /* Background Light */
+  --color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
+  /* Header and panel are ONE band of chrome, so they take one step — exactly
+   * as `.theme-zai-dark` gives them one value each. */
+  --color-header: #343746;
+  --color-panel: #343746;
+  --color-sidebar: var(--color-background); /* == the page, as zai dark does */
+  --color-card: #424450; /* Background Lighter: the raised step */
+  /* Spec SELECTION, verbatim `#44475a` — and it is worth stating what that does
+   * and does not buy, because the previous comment here had it backwards ("Not
+   * the spec's Selection grey — that would vanish against the card"). `--color-card`
+   * is `#424450`, so this IS the spec's Selection value, and it does NOT vanish:
+   * it separates from the card it sits on by 1.06 and from the page by 1.56.
+   * 1.06 is not elevation, though — no fill at that step reads as "raised", so
+   * a selected row is told apart by its RING and its foreground, not by this
+   * step. That is the honest reason Selection is the right value here: the spec
+   * assigns Selection to selection, and the state is carried by the affordance
+   * around it. (Also true, and worth knowing before "fixing" it: no JSX reads
+   * `bg-card-selected` today, so this is a forward declaration like most of the
+   * terminal block. `bg-selected`, the white-overlay token `.theme-zai-dark`
+   * shares, is what the sidebar rows actually paint with.) */
+  --color-card-selected: #44475a; /* Selection — reserved for selection states */
+  --color-card-border: var(--color-border);
+  --color-popover: #343746; /* "Floating interactive elements", verbatim */
+  --color-popover-foreground: var(--color-foreground);
+  --color-popover-header: #21222c;
+  --color-popover-border: var(--color-border);
+  /* Recessed, where Zai raises it — the composer reads as a well in the page. */
+  --color-input: #21222c;
+  --color-input-focused: var(--color-input);
+  --color-tab: #343746;
+  --color-tab-active: #282a36;
+  --color-tab-border: var(--color-border);
+  --color-menu: #343746;
+  --color-menu-hover: #424450;
+  --color-toast: #343746;
+  --color-tooltip: #343746;
+  /* The inline-code chip (markdown-inline-code aliases `tag`), and a
+   * `bg-secondary` badge. BOTH are the RAISED step `#424450`, not `#44475a`: see
+   * the elevation note in the doc-comment above. They are fills that land inside
+   * a float (`bg-menu`/`bg-popover`), so they must read as raised above it, and
+   * the chip must not out-shine the card it lands on. */
+  --color-tag: #424450;
+  --color-tooltip-tag: #424450;
+  /* 9.06 on the chip (it was 8.59 while the chip was `#44475a`). */
+  --color-tooltip-tag-foreground: var(--color-foreground);
+  --color-tooltip-foreground: #f8f8f2;
+  /* borders + text */
+  /* The spec's rule, applied literally: "Subtle borders: use Current Line
+   * color". 3.03 on the page clears the 3:1 UI floor; the `#44475a` this
+   * replaces was Selection at 1.56, which is why the chrome lost its
+   * structure. It reaches card/tab/input/popover borders through the aliases
+   * below, so this one line is the whole fix. */
+  --color-border: #6272a4; /* Current Line == Comment */
+  /* "Interactive borders: use functional colors" — Functional Cyan, 3.47. */
+  --color-border-hover: #0081d6;
+  --color-input-border: var(--color-border);
+  --color-input-border-hover: var(--color-border-hover);
+  /* "Focus rings: Functional Purple" — lands via --color-brand below. */
+  --color-input-border-focused: var(--color-brand);
+  --color-foreground: #f8f8f2; /* Foreground, 13.36 */
+  /* Foreground at 70%, NOT a new hue: 7.34 on the page, 6.33 on #343746,
+   * 5.41 on #424450. See departure 2 in the doc-comment. */
+  --color-foreground-subtle: color-mix(in oklab, #f8f8f2 70%, transparent);
+  /* De-emphasis TEXT. The comment here used to say "de-emphasis and
+   * placeholders, never body text", which was simply untrue: 88 call sites read
+   * this token for small BODY-size copy — the sidebar's "Sessions" header
+   * (`SpacesList.tsx`), dropdown and select labels and their `data-disabled:`
+   * items, the `SessionConfigSelect` trigger value, `ToolCallCardHeader`
+   * metadata, the `SubagentDelegatingCard` metadata line. Comment `#6272a4`
+   * scored 3.03 on the page, 3.36 on `#21222c`, 2.51 on `#343746` and 2.05 on
+   * `#424450` — below the 4.5 text floor on every surface it is used on.
+   *
+   * It could not just be lightened, because the SAME token was the context bar's
+   * TRACK (`bg-foreground-subtlest` in `ComposerRow`), where its job is the
+   * opposite: to sit far enough from the band fills that the bands read. Lighten
+   * the track to a pale grey and fill-vs-track contrast collapses to ~1.06 and
+   * the bar stops communicating anything. So the roles are SPLIT: this is text,
+   * and `--color-context-track` below is the bar.
+   *
+   * Foreground at 55%, i.e. the same derivation as `foreground-subtle` one step
+   * lighter — on-palette at every elevation rather than a hand-picked grey tuned
+   * to one surface: page 5.12, `#21222c` 5.46, `#343746` 4.57, `#424450` 4.01,
+   * `#44475a` 3.86 (all measured composited). 55% rather than 60%+ so it stays
+   * visibly DIMMER than `foreground-subtle` (70%): at 60% the two separate by
+   * only 1.23 on the panel, which defeats the point of having two. */
+  --color-foreground-subtlest: color-mix(in oklab, #f8f8f2 55%, transparent);
+  /* The context bar's TRACK — see `--color-foreground-subtlest` above for why
+   * this is its own token.
+   *
+   * The track has two jobs that pull opposite ways, and the second one is the
+   * constraint that decides the value. It must separate the band FILL from the
+   * unfilled remainder, which wants a DARK track (the darkest value in the block,
+   * `#191a21`, scores 12.63 / 15.52 / 10.18 / 6.36 against the four bands) — but
+   * it must also be visible ITSELF, or the bar's extent does not read and the
+   * track is doing no work. Against the `#21222c` composer well it sits in, that
+   * dark end scores 1.10, i.e. no visible track at all. So the candidates are
+   * filtered to ones that read against the well (>= 1.3) and the worst band is
+   * then maximised among them:
+   *
+   *   candidate  vs the well   worst of the four bands
+   *   #191a21       1.10               6.36    (invisible: excluded)
+   *   #21222c       1.00               5.80    (invisible: excluded)
+   *   #282a36       1.11               5.23    (invisible: excluded)
+   *   #343746       1.34               4.33    <- the winner
+   *   #424450       1.64               3.54
+   *   #44475a       1.73               3.36    (Selection: banned as a surface)
+   *
+   * `#343746` (Background Light) is therefore the track: 8.59 / 10.55 / 6.92 /
+   * 4.33 against `success` / `caution` / `warning` / `destructive`, all composited
+   * on the well. The borrowed text hue this replaces measured 3.43 / 4.21 / 2.76 /
+   * 1.73 — the red band was almost invisible on the bar it was drawn on. Zai's own
+   * track is 2.14 at its worst band and is left EXACTLY as it was; not making
+   * Dracula's bar worse is a separate decision from fixing zai's.
+   *
+   * The gate in `paletteCompleteness.test.ts` recomputes this table on every run
+   * and asserts the declared value is the winner, so the table above is checked
+   * rather than trusted. */
+  --color-context-track: #343746;
+  --color-foreground-inverse: #282a36;
+  /* accent — Functional Purple, the spec's focus/accent colour. `brand` is
+   * load-bearing: --color-input-border-focused aliases it, so this is what
+   * puts the spec's focus-ring colour on the focus ring. */
+  --color-brand: #815cd6;
+  /* The send button, switch, badges and context bar. */
+  --color-primary: #815cd6;
+  /* WHITE here, unlike every other fill: Functional Purple is dark enough that
+   * dark ink would be the worse reading (3.01) while white is 4.73. */
+  --color-primary-foreground: #ffffff;
+  /* Background Lighter, NOT Selection: a `bg-secondary` badge sits inside a
+   * `bg-menu` float, so as `#44475a` it separated from its own container by 1.06
+   * — an elevation INVERSION (L 0.0647 vs `card`'s 0.0587). Its foreground is
+   * 9.06 here. */
+  --color-secondary: #424450;
+  /* Purple. `text-accent` has one consumer and it was illegible under zai dark
+   * at 1.07; Purple is 5.90 as text, so this palette fixes it by being itself. */
+  --color-accent: #bd93f9;
+  /* status — see departure 1: the syntax hues carry text, the Functional
+   * palette carries fills, borders and focus. */
+  --color-success: #50fa7b; /* Green, 10.38 */
+  --color-success-foreground: #282a36;
+  --color-warning: #ffb86c; /* Orange, 8.36 */
+  --color-warning-foreground: #282a36;
+  /* AnsiBrightRed, not Red — departure 1's rule again, and for the SAME reason
+   * `diff-removed` already takes it. `#ff5555` is 4.53 on the PAGE, one notch
+   * from the spec's own 4.5 floor, but this token is overwhelmingly TEXT
+   * (`text-destructive`: 31 uses against 12 `bg-destructive` in
+   * `src/components/` + `App.tsx`, tests excluded) and the error copy
+   * does not live on the page: `NewSpaceDialog` / `SudoConfirmModal` /
+   * `SudoPasswordModal` render on `bg-popover`, the six ✗ rows in
+   * `SubagentDelegatingCard` on `bg-panel`, the `data-[variant=destructive]`
+   * dropdown item on `bg-menu` — ALL `#343746`, where `#ff5555` scores 3.75, and
+   * 3.07 on `#424450` and 2.91 on `#44475a`.
+   *
+   * PER-SURFACE RATIOS (measured, not eyeballed — see the per-surface gate in
+   * `paletteCompleteness.test.ts`): page `#282a36` 5.23, composer well `#21222c`
+   * 5.80, floating `#343746` 4.33, raised `#424450` 3.54, Selection `#44475a`
+   * 3.36. STATED PLAINLY: the floating band is 4.33, not 4.5. `#ff6e6e` is the
+   * BRIGHTEST red the specification publishes, so no spec-published red reaches
+   * 4.5 on `#343746`; the only value that would is AnsiBrightMagenta `#ff92df`,
+   * which is Pink — the hue this palette uses for string literals, so making it
+   * mean "error" trades a 0.17 shortfall for a real ambiguity. The gate pins
+   * 4.3 on the floating band and 3.3 on the raised step, and fails if either
+   * value ever clears 4.5 there, so the exemption cannot outlive its reason.
+   *
+   * The FILL's ink `#282a36` IMPROVES: 4.53 on `#ff5555` → 5.23 on `#ff6e6e`
+   * (a brighter fill is a darker label's friend), so no label regresses. */
+  --color-destructive: #ff6e6e; /* AnsiBrightRed */
+  --color-destructive-foreground: #282a36;
+  --color-idle-task: #bd93f9;
+  --color-idle-task-surface: color-mix(in oklab, #bd93f9 18%, transparent);
+  /* Diff rows are TEXT tokens on a tinted row, and the tint is what decides
+   * this value. `DiffBlock`'s root is `bg-surface`; `--color-surface` is
+   * INHERITED from `.dark` here, where it is white at 5% — NOT "foreground at
+   * 5%" as an earlier comment here said (the same 5% of `#f8f8f2` instead of
+   * `#ffffff` is `#32343f` vs `#333540`, immaterial, but the token it actually
+   * is matters when you re-measure). Every ratio below is the ANSI value on the
+   * composited row, per real render site:
+   *
+   *   row over                       #ff5555   #ff6e6e
+   *   page `#282a36` (bare)            4.53      5.23
+   *   page row `#333540`               3.88      4.47
+   *   `bg-background-alt` `#2f3240`    4.05      4.67   ← the transcript column
+   *   that row, tinted `#393c4a`       3.48      4.02
+   *   panel `#343746`                  3.75      4.33
+   *   panel row `#3e414f` (ToolCallCard) 3.22    3.72
+   *
+   * So `#ff6e6e` is the better value everywhere — it gains 0.59 to 0.68 over
+   * `#ff5555` — but it does NOT "hold 4.5": 4.47 on a page-tinted row, 4.02 on
+   * the transcript column's own tint, and 3.72 inside `ToolCallCard`, which is
+   * where a diff actually renders for a tool call. `#ff6e6e` is the brightest
+   * red the spec publishes, so no spec red reaches 4.5 on those rows; this is a
+   * reported shortfall, not a pass. Stated plainly because a comment claiming
+   * the floor was met is exactly what stops the next reader measuring. */
+  --color-diff-added: #50fa7b;
+  --color-diff-added-foreground: #282a36;
+  --color-diff-removed: #ff6e6e; /* AnsiBrightRed */
+  --color-diff-removed-foreground: #282a36;
+  /* Interaction fills keep the `.dark` color-mix STRUCTURE, re-anchored on
+   * spec hues. These four replaced invented values (`#5b4a10`, `#5a341b`,
+   * `#ffd8b8`) that appear in no spec table. */
+  --color-interaction-ask-surface: color-mix(in oklab, #8be9fd 14%, transparent);
+  --color-interaction-ask-foreground: #8be9fd;
+  --color-interaction-ask-fill: color-mix(in oklab, #50fa7b 24%, transparent);
+  --color-interaction-confirmation-surface: color-mix(in oklab, #50fa7b 16%, transparent);
+  --color-interaction-confirmation-foreground: #50fa7b;
+  --color-find-highlight: color-mix(in oklab, #ffb86c 30%, transparent);
+  --color-find-highlight-active: #ffb86c;
+  --color-plugin-paid-plan-badge: color-mix(in oklab, #ffb86c 24%, transparent);
+  --color-plugin-paid-plan-badge-foreground: #ffb86c;
+  /* FORWARD-DECLARED ANSI SET — 21 of these 22 tokens paint NOTHING today, in
+   * any palette, because THIS APP HAS NO TERMINAL. Verified rather than
+   * assumed: no terminal component, no `xterm`/`node-pty`/`portable-pty`/
+   * `alacritty`/`vt100` dependency, and zero `bg-terminal-*`/`text-terminal-*`
+   * class consumers. So do NOT read this block as "what the Dracula terminal
+   * looks like" — there is nothing for it to look like. It is owned by the
+   * palette so that a terminal surface, when one lands, gets the spec's colours
+   * for free instead of inheriting `.dark`'s generic UI readings.
+   *
+   * The reason to own them is that the values are GIVEN, not invented: the 16
+   * chromatic slots are the spec's Dracula Classic ANSI table verbatim — note
+   * AnsiBlue is Purple and AnsiMagenta is Pink, which is the spec, not a
+   * mistake to "fix" — and a published table copied beats a partial palette.
+   * Background is Background Darker so a future sheet can read as distinct, and
+   * selection is spec Selection at alpha so it would sit over whatever the cell
+   * painted. `--color-terminal-selection` is NOT "finally used": it is one of
+   * the 21 that colour nothing.
+   *
+   * ONE token of the 22 IS live, via an alias rather than a class:
+   * `--color-icon-blue` is defined in `@theme` as
+   * `var(--color-terminal-bright-blue)`, so markdown links and diff `@@` hunks
+   * ride the terminal tokens. Under Dracula they are AnsiBrightBlue `#d6acff`
+   * instead of `.dark`'s sky reading — 7.60 on the page, 6.29 on the floating
+   * panel, 5.15 on a card, so comfortably above the text floor. That is the
+   * spec's own value arriving by alias rather than a stray edit, and it is the
+   * ONLY consumer of any `--color-terminal-*` outside this file. */
+  --color-terminal-bg: #191a21; /* Background Darker */
+  --color-terminal-fg: #f8f8f2; /* AnsiWhite */
+  --color-terminal-cursor: #f8f8f2;
+  --color-terminal-cursor-accent: #21222c; /* AnsiBlack */
+  --color-terminal-selection: color-mix(in oklab, #44475a 55%, transparent);
+  --color-terminal-selection-inactive: color-mix(in oklab, #f8f8f2 12%, transparent);
+  --color-terminal-black: #21222c;
+  --color-terminal-red: #ff5555;
+  --color-terminal-green: #50fa7b;
+  --color-terminal-yellow: #f1fa8c;
+  --color-terminal-blue: #bd93f9;
+  --color-terminal-magenta: #ff79c6;
+  --color-terminal-cyan: #8be9fd;
+  --color-terminal-white: #f8f8f2;
+  --color-terminal-bright-black: #6272a4;
+  --color-terminal-bright-red: #ff6e6e;
+  --color-terminal-bright-green: #69ff94;
+  --color-terminal-bright-yellow: #ffffa5;
+  --color-terminal-bright-blue: #d6acff;
+  --color-terminal-bright-magenta: #ff92df;
+  --color-terminal-bright-cyan: #a4ffff;
+  --color-terminal-bright-white: #ffffff;
+  /* The ramp (Task 2's family): Dracula cool to hot. `caution` carries a text
+   * label, hence the yellow. All six are already spec values. */
+  --color-caution: #f1fa8c;
+  /* The ramp, RE-HUED off the status colours. It used to read
+   * `#8be9fd / #50fa7b / #f1fa8c / #ffb86c / #ff5555`, which collided with
+   * `interaction-ask-foreground`, `success` + `diff-added` +
+   * `interaction-confirmation-foreground`, `caution`, `warning` and (until this
+   * commit) `destructive` — FIVE levels, FIVE collisions. That is the one thing
+   * this family's own rationale forbids: the hue answers "which level is this",
+   * so painting it with the status palette makes a max-effort model read as a
+   * FAILURE, and lets a palette change the level by editing a status token.
+   * `src/lib/themeTokens.test.ts` now measures it and the allow-list is empty.
+   *
+   * The fix is the spec's ANSI BRIGHT row, which is exactly the palette's own
+   * "intensified" set — the same move departure 1 makes for `diff-removed` and
+   * `destructive`. Chosen so that (a) all five are mutually distinct and ordered
+   * cool → hot, (b) none collides with ANY other UI-meaningful token in the
+   * block, and (c) every value is spec-published, so the off-spec gate stays
+   * green:
+   *
+   *   low     #a4ffff AnsiBrightCyan    hue 180.0  page 12.43  input 13.78
+   *   medium  #69ff94 AnsiBrightGreen   hue 137.2  page 11.08  input 12.28
+   *   high    #ffffa5 AnsiBrightYellow  hue  60.0  page 13.63  input 15.11
+   *   xhigh   #ff92df AnsiBrightMagenta hue 317.6  page  7.07  input  7.84
+   *   max     #ff5555 Red               hue   0.0  page  4.53  input  5.03
+   *
+   * DEVIATION FROM THE PROPOSED SET, on one slot: `xhigh` is AnsiBrightMagenta
+   * `#ff92df`, not Orange `#ffb86c`. Orange is `--color-warning`'s value in this
+   * very block (and `find-highlight`, `find-highlight-active`,
+   * `plugin-paid-plan-badge` and its foreground), so proposing it as a level hue
+   * re-introduces the exact collision being removed — as does `#ff5555` for
+   * `max` unless `destructive` moves first, which it now has (so `max` is safe
+   * against `destructive` and shares only `--color-terminal-red`, a token that
+   * paints nothing today).
+   *
+   * Adjacent hue separation: 42.8° / 77.2° / 102.4° / 42.4° — every step is
+   * tellable apart at 14px, which luminance-contrast alone would NOT show (a
+   * cool → hot ramp passes through yellow, the brightest hue there is, so
+   * luminance RISES for the first half and falls for the second). */
+  --color-thinking-low: #a4ffff; /* AnsiBrightCyan */
+  --color-thinking-medium: #69ff94; /* AnsiBrightGreen */
+  --color-thinking-high: #ffffa5; /* AnsiBrightYellow */
+  --color-thinking-xhigh: #ff92df; /* AnsiBrightMagenta */
+  --color-thinking-max: #ff5555; /* Red — the palette's hot end */
+
+  /* The 25 file-type DESCRIPTORS, restated with the vivid dark readings.
+   * OFF-SPEC ON PURPOSE, and this is the ONE place this block knowingly breaks
+   * "use exact color values from this specification". Dracula publishes 11
+   * hues; there are 25 file types. Re-huing these to the spec set would make a
+   * `.py` chip indistinguishable from a `.json` one, and the hue IS the signal
+   * — so the **Identity color** rule (`CONTEXT.md`) outranks the spec here, and
+   * the 24 non-`file-css` values below are allow-listed by name in
+   * `paletteCompleteness.test.ts` rather than exempted wholesale. A palette must
+   * not re-hue file-type identity.
+   *
+   * MANDATORY and easy to get wrong. These are declared in `@theme` (light-safe)
+   * AND in `.theme-zai-dark` (vivid dark) — `@theme` declares all 25 — but NOT
+   * in `.dark` or `.theme-zai-light`, which carry only the `file-node*` role
+   * chips. So a palette that omits one does not fail, it silently resolves
+   * through `.dark` to `@theme`'s light-safe reading, and 5 of those fall below
+   * 3:1 on #282a36. Copied from `.theme-zai-dark` verbatim except `file-css`:
+   * Zai's `#7e57c2` is 2.73 on the page, under the 3:1 floor for a 16px glyph,
+   * and this is a palette that already declares a purple, so CSS reads as
+   * `#bd93f9` (5.90). */
+  --color-file-ts: #0288d1;
+  --color-file-react: #00bcd4;
+  --color-file-js: #ffca28;
+  --color-file-json: #f9a825;
+  --color-file-html: #e65100;
+  --color-file-css: #bd93f9;
   --color-file-sass: #ec407a;
   --color-file-md: #42a5f5;
   --color-file-rs: #ff7043;

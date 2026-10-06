@@ -40,10 +40,10 @@ export function applySettingsFont(font: FontSettings): void {
   }
 }
 
-/** Apply BOTH (theme + font) — returns the theme cleanup. */
+/** Apply ALL (theme + palette + font) — returns the theme cleanup. */
 export function applySettingsToDocument(settings: AppSettings): () => void {
   applySettingsFont(settings.font);
-  return applySettingsTheme(settings.theme);
+  return applySettingsTheme(settings.theme, settings.palette ?? "zai");
 }
 
 /**
@@ -65,7 +65,7 @@ export async function loadAndApplySettings(): Promise<AppSettings | null> {
       "Failed to load settings; keeping the dark first-frame state",
       error,
     );
-    applyThemeToDocument("zai-dark");
+    applyThemeToDocument("zai-dark", "zai");
     return null;
   }
 }
