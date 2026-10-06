@@ -30,7 +30,8 @@ See [CONTEXT.md](CONTEXT.md) for the project's language and terminology.
 
 **Building:**
 
-- Rust ≥ 1.88 (stable)
+- Rust — the version is pinned in `src-tauri/rust-toolchain.toml`; rustup
+  installs it automatically when you run `cargo` from `src-tauri/`
 - Node.js ≥ 22.19 and [pnpm](https://pnpm.io)
 - Platform system dependencies:
   - **Linux:** `libwebkit2gtk-4.1-dev` (webkit2gtk 4.1),
@@ -122,5 +123,6 @@ This only affects the local AppImage; CI (Ubuntu) is unaffected.
 - `pnpm tauri dev` — full app in dev mode
 - `pnpm test` — frontend tests (Vitest)
 - `cargo test` (in `src-tauri/`) — Rust tests
-- CI (`.github/workflows/ci.yml`) runs fmt, clippy, and both test suites
-  on every push/PR.
+- CI (`.github/workflows/ci.yml`) runs fmt, clippy (`--all-targets`), and
+  both test suites on every push/PR, on the toolchain pinned in
+  `src-tauri/rust-toolchain.toml`.

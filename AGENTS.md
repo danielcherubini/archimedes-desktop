@@ -20,6 +20,12 @@ green:
 | Rust lint | `cargo clippy --all-targets` | `src-tauri/` (must be 0 warnings) |
 | Rust formatting | `cargo fmt --check` | `src-tauri/` |
 
+The Rust compiler is pinned in `src-tauri/rust-toolchain.toml`, so plain
+`cargo …` from `src-tauri/` is the pinned one — CI installs from that same
+file rather than naming a version. Do not float it: a newer rustc adds lints,
+and a lint CI hits that a local toolchain cannot see reddens `main`
+unreproducible.
+
 The `pi-archimedes` monorepo (the agent-side extension suite, a separate repo)
 is validated with `pnpm test` + `pnpm -r exec -- tsc --noEmit` from its root.
 

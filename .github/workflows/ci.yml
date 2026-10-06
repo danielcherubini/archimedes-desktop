@@ -13,10 +13,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain version named here on purpose: `src-tauri/rust-toolchain.toml`
+      # is the pin, and naming one in this step fights it (`rustup default`
+      # loses to the directory override, so the version installed would be
+      # the version NOT used — and its clippy/rustfmt would be installed
+      # onto a toolchain nothing runs). Run from `src-tauri/` so rustup reads
+      # the file, which also carries the `components` (a command-line
+      # `--component` is ignored when no toolchain is named). `rustup
+      # default` then makes the pin the default too, so a cargo step that
+      # does not set `working-directory` still resolves the pinned compiler.
+      - name: Install the pinned Rust toolchain
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -45,9 +57,12 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --all -- --check
 
+      # `--all-targets` is the documented gate (AGENTS.md); without it the
+      # integration tests under `src-tauri/tests/` are never linted and
+      # lint-only breakage lands on main green.
       - name: cargo clippy
         working-directory: src-tauri
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
         working-directory: src-tauri

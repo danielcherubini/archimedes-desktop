@@ -21,8 +21,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # The toolchain comes from `src-tauri/rust-toolchain.toml` — see ci.yml
+      # for why no version is named here. A release built on a different
+      # compiler than the one `main` was linted with is unvalidated.
+      - name: Install the pinned Rust toolchain
+        working-directory: src-tauri
+        # bash on every OS: the Windows job's default shell is PowerShell,
+        # which has no `cut`.
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -62,8 +72,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # The toolchain comes from `src-tauri/rust-toolchain.toml` — see ci.yml.
+      - name: Install the pinned Rust toolchain
+        working-directory: src-tauri
+        # bash on every OS: the Windows job's default shell is PowerShell,
+        # which has no `cut`.
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -97,8 +115,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # The toolchain comes from `src-tauri/rust-toolchain.toml` — see ci.yml.
+      - name: Install the pinned Rust toolchain
+        working-directory: src-tauri
+        # bash on every OS: the Windows job's default shell is PowerShell,
+        # which has no `cut`.
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

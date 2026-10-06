@@ -5,7 +5,9 @@
 # A branch is ready to merge when `make check` is green.
 #
 # One-time setup (system packages, NOT done by `setup`):
-#   - Rust >= 1.88, Node >= 22.19
+#   - Rust: pinned in src-tauri/rust-toolchain.toml (rustup honours it
+#     automatically in `src-tauri/`; `make` reads it for the root recipes)
+#   - Node >= 22.19
 #   - Linux: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
 #
 # `build` (release) signs the updater artifacts: it needs
@@ -18,8 +20,15 @@
 # override with `make build NO_STRIP=` (force off) or `NO_STRIP=1` (force on).
 
 PNPM     := pnpm
-CARGO    := cargo
 RUST_DIR := src-tauri
+
+# The Rust toolchain is pinned by `$(RUST_DIR)/rust-toolchain.toml`, but rustup
+# resolves that file from the CWD and the recipes below run from the repo root
+# (`--manifest-path`), which would silently use whatever `rustup default` is —
+# exactly the local/CI drift the pin exists to prevent. Read the channel out of
+# the file and name it, so `make check` lints and tests on the compiler CI does.
+RUST_CHANNEL := $(shell sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' $(RUST_DIR)/rust-toolchain.toml)
+CARGO        := $(if $(RUST_CHANNEL),cargo +$(RUST_CHANNEL),cargo)
 
 # The Fedora AppImage workaround (see header): auto-detected from
 # /etc/os-release. A command-line `NO_STRIP=…` always wins (GNU make
