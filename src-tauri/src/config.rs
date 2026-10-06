@@ -87,8 +87,9 @@ pub struct Settings {
     pub theme: String,
     /// (ADR 0027) The color scheme: `"zai" | "dracula"`. `None` = `"zai"` (a
     /// pre-feature file — `#[serde(default)]`, no migration). Orthogonal to
-    /// `theme` (the light/dark mode): `dracula` has no light reading, so it
-    /// PINS the app dark and the mode is ignored.
+    /// `theme` (the light/dark mode): we ship Dracula's dark variant only (a
+    /// scope decision), so `dracula` PINS the app dark and the mode is ignored
+    /// — the spec's light reading, Alucard Classic, is deferred, not impossible.
     #[serde(default)]
     pub palette: Option<String>,
     /// Free-form pane layout state (owned by the frontend).

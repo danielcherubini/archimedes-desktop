@@ -206,8 +206,9 @@ describe("applySettingsToDocument — the palette → <html> wiring (ADR 0027)",
   });
 
   it("puts theme-dracula + dark on <html> for a dracula palette over the LIGHT theme", () => {
-    // `theme: "light"` is the point: Dracula has no light reading, so the
-    // palette must pin dark rather than defer to the mode.
+    // `theme: "light"` is the point: only Dracula's dark variant ships (a
+    // scope decision — ADR 0027), so the stored light mode must LOSE to the
+    // palette, which pins dark rather than deferring to the mode.
     applySettingsToDocument(settingsFixture({ palette: "dracula" }));
 
     const classes = document.documentElement.classList;

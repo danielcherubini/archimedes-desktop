@@ -106,9 +106,9 @@ function getHighlighter(): Promise<Highlighter> {
  * Anything that is not `"dracula"` — `"zai"`, `null` (settings not loaded /
  * the stored default), `undefined` — answers `github-dark`, which is the
  * behaviour this component had before the palette axis existed. The pairing is
- * coherent in both directions: `dracula` is a DARK syntax theme and that
- * palette pins the app dark (it has no light reading), so dark code never sits
- * on a light bubble.
+ * coherent in both directions: `dracula` is a DARK syntax theme and only
+ * Dracula's dark variant ships here (a scope decision — ADR 0027), so that
+ * palette pins the app dark and dark code never sits on a light bubble.
  */
 export function shikiThemeFor(
   palette: AppPalette | null | undefined,

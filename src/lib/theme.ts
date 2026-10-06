@@ -2,8 +2,9 @@ export type AppTheme = "zai-light" | "zai-dark";
 export type SettingsTheme = "system" | "dark" | "light";
 /**
  * (ADR 0027) The color scheme — a second axis, ORTHOGONAL to `AppTheme` (the
- * light/dark mode). `dracula` has no light reading, so it PINS the app dark
- * and the mode is ignored (`system` included).
+ * light/dark mode). Only Dracula's dark variant ships here (a scope decision),
+ * so `dracula` PINS the app dark and the mode is ignored (`system` included);
+ * its official light reading, Alucard Classic, is deferred — not impossible.
  */
 export type AppPalette = "zai" | "dracula";
 
