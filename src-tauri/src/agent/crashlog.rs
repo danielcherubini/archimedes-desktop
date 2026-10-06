@@ -83,6 +83,20 @@ mod tests {
     use super::{install_panic_hook, write_crash_log_from_info};
     use std::time::Duration;
 
+    /// The panic hook is ONE process-global slot and `install_panic_hook`
+    /// is a `Once` that `take_hook`s whatever is installed, so these two
+    /// tests may never interleave: if the idempotency test runs while the
+    /// crash-log test's hook is installed, it STEALS that hook and puts the
+    /// PRODUCTION one in the slot, the crash-log test's own panic then
+    /// bypasses its hook and writes into the real
+    /// `dirs::data_dir()/archimedes` — and the crash-log test's cleanup
+    /// restores the production hook it accidentally captured, so every
+    /// later panic in the process pollutes the user's data dir. Held for
+    /// the whole body of each test. A poisoned guard is REUSED (the crate
+    /// convention): a `PoisonError` here would fail every test after the
+    /// first one that panicked while holding it.
+    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A temp dir for the crash logs (unique per test).
     fn temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("crashlog-test-{}", uuid::Uuid::new_v4()));
@@ -94,9 +108,19 @@ mod tests {
     /// crash log containing the panic message + location, with a
     /// NON-EMPTY backtrace section (the `force_capture` behavior —
     /// frames even without `RUST_BACKTRACE`).
+    ///
+    /// NOTE: the panic hook is process-global and the `--lib` suite runs
+    /// in parallel, so another test's panic — including one in a
+    /// detached task that fails nothing — lands in THIS test's temp
+    /// dir; the log is therefore identified by its payload marker, never
+    /// by its file name.
     #[test]
     fn the_panic_hook_writes_a_crash_log_with_location_and_a_nonempty_backtrace() {
+        let _hook = HOOK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = temp_dir();
+        // The marker is unique per run: it is what proves a candidate
+        // file is THIS panic's log (see the NOTE above).
+        let marker = format!("test crash payload {}", uuid::Uuid::new_v4());
         let previous = std::panic::take_hook();
         let dir_hook = dir.clone();
         std::panic::set_hook(Box::new(move |info| {
@@ -105,21 +129,29 @@ mod tests {
             // called here to keep the test output clean.
         }));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let panic_payload = marker.clone();
         std::thread::spawn(move || {
             let _ = tx.send(());
-            panic!("test crash payload");
+            panic!("{panic_payload}");
         });
         rx.recv().expect("the thread signalled before panicking");
         // The hook runs (synchronously) at the panic's start — the file
-        // appears once the hook's write lands (a bounded retry).
+        // appears once the hook's write lands (a bounded retry). A
+        // foreign `crash-*-worker.log` (another test's panic) is read
+        // and REJECTED here by its content, not skipped by its name.
         let mut path = None;
         for _ in 0..100 {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.starts_with("crash-") && name.ends_with("worker.log") {
-                        path = Some(entry.path());
-                        break;
+                        let candidate = entry.path();
+                        let owned =
+                            std::fs::read_to_string(&candidate).is_ok_and(|c| c.contains(&marker));
+                        if owned {
+                            path = Some(candidate);
+                            break;
+                        }
                     }
                 }
             }
@@ -133,7 +165,7 @@ mod tests {
         let path = path.expect("the crash log file appears");
         let content = std::fs::read_to_string(&path).expect("the crash log is readable");
         assert!(
-            content.contains("test crash payload"),
+            content.contains(&marker),
             "the panic message is in the log:\n{content}"
         );
         assert!(
@@ -162,7 +194,16 @@ mod tests {
     /// the `Once` guard; the second call is a no-op).
     #[test]
     fn install_panic_hook_is_idempotent() {
+        let _hook = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::panic::take_hook();
         install_panic_hook("worker");
         install_panic_hook("worker");
+        // Put the slot back as it was found: the `Once` above installed the
+        // production hook over it, and leaving that in place would write a
+        // crash log into the user's real data dir for every panic in the
+        // REST of the test process.
+        let installed = std::panic::take_hook();
+        drop(installed);
+        std::panic::set_hook(previous);
     }
 }
