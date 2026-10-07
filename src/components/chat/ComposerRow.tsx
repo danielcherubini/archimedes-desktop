@@ -94,7 +94,7 @@ export default function ComposerRow({
   const countsLabel = countsText ? `Context used: ${countsText}` : undefined;
   return (
     <div
-      className="relative m-3 rounded-2xl border border-input-border bg-input p-3 transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused"
+      className="relative m-3 rounded-2xl bg-input p-3"
       onDrop={handleDrop}
     >
       <ComposerSkills

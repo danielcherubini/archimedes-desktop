@@ -60,6 +60,10 @@ describe("toolIcon", () => {
     expect(toolIcon("bash")).toBe(SquareTerminalIcon);
     expect(toolIcon("edit")).toBe(PencilIcon);
   });
+  it("gives the skill tools an icon (not the unknown-tool wrench)", () => {
+    expect(toolIcon("list_skills")).not.toBe(WrenchIcon);
+    expect(toolIcon("read_skill")).not.toBe(WrenchIcon);
+  });
   it("falls back to the wrench icon for unknown tools", () => {
     expect(toolIcon("mystery_tool")).toBe(WrenchIcon);
   });
@@ -444,6 +448,20 @@ describe("summarizeToolCall", () => {
   });
   it("falls back to a truncated JSON dump for unknown tools", () => {
     expect(summarizeToolCall("some_tool", { a: 1, b: 2 })).toBe('{"a":1,"b":2}');
+  });
+});
+
+describe("summarizeToolCall (skill tools — the name is the handle)", () => {
+  it("shows nothing for the bare list_skills call", () => {
+    expect(summarizeToolCall("list_skills", {})).toBeUndefined();
+  });
+  it("shows the skill name", () => {
+    expect(summarizeToolCall("read_skill", { name: "discuss" })).toBe("discuss");
+  });
+  it("shows the skill name with the bundled file", () => {
+    expect(
+      summarizeToolCall("read_skill", { name: "discuss", path: "./adr-format.md" }),
+    ).toBe("discuss → adr-format.md");
   });
 });
 

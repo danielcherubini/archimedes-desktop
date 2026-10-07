@@ -539,16 +539,23 @@ describe("ChatStream", () => {
     expect(screen.queryByText("−1")).toBeNull();
   });
 
-  it("renders the composer shell (rounded-2xl, bg-input, border + border-input-border)", () => {
+  it("renders the composer shell as a BORDERLESS recessed well", () => {
+    // The frame used to be `border border-input-border`, i.e. Dracula's Comment
+    // `#6272a4` — a slate VIOLET that reads as a purple outline around the chat
+    // (and `focus-within:border-input-border-focused` put Functional Purple
+    // `#815cd6` on it while typing). Dropped: the well is defined by its FILL
+    // (`bg-input` `#21222c` against the column `#2c2e3b`, 1.17) and by its
+    // radius, not by a rule. Pinned as a negative because the token is shared
+    // with `input.tsx`/`select.tsx`/`ModelPicker`, which KEEP their borders —
+    // this is a per-site decision, and only a class assertion can tell the two
+    // apart.
     seedLiveSession();
     const { container } = render(<ChatStream />);
     const shell = container.querySelector(".rounded-2xl");
     expect(shell).toBeTruthy();
     expect(shell!.className).toContain("bg-input");
-    expect(shell!.className).toContain("border-input-border");
-    // The `border` WIDTH class (Tailwind preflight sets `border-width: 0`
-    // — the hover/focus border-COLOR states are dead without it).
-    expect(shell!.className).toMatch(/(^|\s)border(\s|$)/);
+    expect(shell!.className).not.toContain("border-input-border");
+    expect(shell!.className).not.toMatch(/(^|\s)border(\s|$)/);
   });
 
   it("the root main carries min-h-0 (a vertical flex item must be allowed to shrink — the transcript scrolls internally, not the window)", () => {

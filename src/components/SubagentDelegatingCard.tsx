@@ -636,7 +636,7 @@ export default function SubagentDelegatingCard({
         command={undefined}
       />
       {open && rows.length > 0 && (
-        <div className="mt-1 rounded-xl border border-border bg-panel px-4 py-3 divide-y divide-border/50">
+        <div className="mt-1 rounded-xl bg-panel px-4 py-3 divide-y divide-border/50">
           {rows.map((row) => {
             const activity = getActivityDisplay(row, row.sessionMessages, now);
 

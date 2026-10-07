@@ -649,6 +649,62 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     );
   });
 
+  it("sits the transcript column BELOW the floating step, not just under it", () => {
+    // `--color-background-alt` is the ONLY token that paints the reading
+    // surface — `bg-background-alt` on the transcript column (`ChatStream.tsx`)
+    // and the side pane (`SidePane.tsx`) — and it is a DERIVATION, not a hex:
+    // the floating step over the page at a ratio. Asserted as the formula so
+    // the gate survives either half moving, exactly as the subtle-text test
+    // above does.
+    //
+    // THE RATIO IS THE DECISION. At 60% the composite is `#2f3240` (L 0.0326),
+    // which sits 1.12 off the page and only 1.07 under the floating step — so
+    // the column read as a near-panel, and the page plane barely registered.
+    // At 33% it is `#2c2e3b` (L 0.0278): still strictly above the page, still
+    // strictly below the floating step, but the column now reads as the page's
+    // own plane lightly lifted rather than as a second float. The ladder test
+    // does NOT cover this token (it is exempted there because a `color-mix()`
+    // is not comparable as a literal hex), so this is the only gate on it —
+    // which is why the ratio is pinned numerically and not left to review.
+    expect(DRACULA_VALUES["color-background-alt"]).toBe(
+      "color-mix(in oklab, var(--color-background-win-alt) 33%, transparent)",
+    );
+
+    // And the composite must land between the two rungs it is defined against.
+    // Transparent-alpha compositing is linear in sRGB channel space, so the
+    // blend is computed here the way the browser resolves it.
+    const hex = (v: string) => {
+      const n = parseInt(v.slice(1), 16);
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    };
+    const blend = (over: string, under: string, alpha: number) =>
+      "#" +
+      hex(over)
+        .map((c, i) => Math.round(c * alpha + hex(under)[i]! * (1 - alpha)).toString(16).padStart(2, "0"))
+        .join("");
+    const lum = (v: string) => {
+      const [r, g, b] = hex(v).map((c) => {
+        const s = c / 255;
+        return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const composite = blend("#343746", "#282a36", 0.33);
+    expect(composite).toBe("#2c2e3b");
+    expect(lum(composite), "the column must stay above the page plane").toBeGreaterThan(
+      lum("#282a36"),
+    );
+    expect(lum(composite), "the column must stay below the floating step").toBeLessThan(
+      lum("#343746"),
+    );
+    // zai dark keeps its own reading untouched (its `--color-background-alt`
+    // derives from ITS `--color-background-win-alt` at 60%, i.e. `#222222`).
+    const ZAI = values(block(/^\.theme-zai-dark\s*\{/m));
+    expect(ZAI["color-background-alt"]).toBe(
+      "color-mix(in oklab, var(--color-background-win-alt) 60%, transparent)",
+    );
+  });
+
   it("keeps the sidebar on the same plane as the window chrome", () => {
     // The top bar is `bg-background` (App.tsx), and `SpacesList` is the ONLY
     // consumer of `bg-sidebar`, so the sidebar and the menubar are one visual

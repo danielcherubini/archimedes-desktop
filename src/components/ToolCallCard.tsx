@@ -22,7 +22,7 @@ const SHELL_TOOLS = new Set(["bash", "powershell", "sudo_exec"]);
  * `+N -M` change stat (edit only) + a red `Failed` word with a
  * dotted-underline tooltip (error text + copy) on failure + a hover
  * chevron. Expandable body: the diff via `DiffBlock` when present,
- * else a `rounded-xl border bg-panel` panel — a `$` prompt + mono
+ * else a `rounded-xl bg-panel` panel — a `$` prompt + mono
  * command for shell tools, the file chip + stat for file tools —
  * then the normalized `rawOutput` (scrollable, capped at 20k chars)
  * or a muted "No output."
@@ -92,7 +92,7 @@ export default function ToolCallCard({
         command={command}
       />
       {open && (
-        <div className="mt-1 rounded-xl border border-border bg-panel px-4 py-3">
+        <div className="mt-1 rounded-xl bg-panel px-4 py-3">
           {diff ? (
             <DiffBlock path={diff.path} patch={diff.patch} />
           ) : (

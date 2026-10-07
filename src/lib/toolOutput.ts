@@ -12,6 +12,8 @@ import {
   DownloadIcon,
   MessageCircleQuestionIcon,
   ListTodoIcon,
+  SparklesIcon,
+  WandSparklesIcon,
   BotIcon,
   PlugIcon,
   WrenchIcon,
@@ -78,6 +80,17 @@ export function summarizeToolCall(title: string, rawInput: unknown): string | un
           ? (first as Record<string, unknown>).question
           : undefined;
       return typeof q === "string" ? truncate(q, 60) : undefined;
+    }
+    case "list_skills":
+      // The bare catalog call — nothing worth showing.
+      return undefined;
+    case "read_skill": {
+      const name = str("name");
+      if (!name) return undefined;
+      const bundled = str("path");
+      // The skill name is the handle; a bundled file rides along by its
+      // basename (the `./` prefix adds no information).
+      return bundled ? `${name} → ${basenameOfPath(bundled)}` : name;
     }
     case "manage_todo_list":
       return str("operation");
@@ -456,6 +469,8 @@ const VERBS: Record<string, { completed: string; running: string }> = {
   fetch_content: { completed: "Fetched", running: "Fetching" },
   ask: { completed: "Asked", running: "Asking" },
   manage_todo_list: { completed: "Todos", running: "Updating todos" },
+  list_skills: { completed: "Skills", running: "Listing skills" },
+  read_skill: { completed: "Skill", running: "Loading skill" },
   subagent: { completed: "Delegated", running: "Delegating" },
   mcp: { completed: "MCP", running: "MCP" },
 };
@@ -488,6 +503,8 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
   fetch_content: DownloadIcon,
   ask: MessageCircleQuestionIcon,
   manage_todo_list: ListTodoIcon,
+  list_skills: SparklesIcon,
+  read_skill: WandSparklesIcon,
   subagent: BotIcon,
   mcp: PlugIcon,
 };

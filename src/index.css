@@ -991,12 +991,19 @@ body {
    * bar is `bg-background` (`App.tsx`, `data-testid="chrome-bar"`), so it is NOT
    * a titlebar band and an earlier comment here calling it one was invented.
    * It survives because `--color-background-alt` derives from it, and that DOES
-   * paint (the content column: `ChatStream`, `SidePane`) — measured `#343746` at
-   * 60% over the page = `#2f3240`. Kept on the floating step so that derived
-   * surface sits where the ladder puts it; the value that came before was
-   * `#44475a`, i.e. spec Selection, 1.56 on the page. */
+   * paint (the content column: `ChatStream`, `SidePane`). The ratio is 33% and
+   * not 60%: at 60% the composite is `#2f3240` (L 0.0326), only 1.07 under this
+   * step and 1.12 over the page, so the transcript column read as a near-panel
+   * and the page plane barely registered. At 33% it is `#2c2e3b` (L 0.0278) —
+   * still above the page, still below this step, but the column now reads as
+   * the page lightly lifted rather than as a second float. The ladder test
+   * cannot see this (a `color-mix()` is not comparable as a literal hex, so the
+   * token is exempted there), which is why
+   * `paletteCompleteness.test.ts` pins the ratio as a formula. This token stays
+   * on the floating step itself; the value that came before was `#44475a`, i.e.
+   * spec Selection, 1.56 on the page. */
   --color-background-win-alt: #343746; /* Background Light */
-  --color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
+  --color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 33%, transparent);
   /* Header and panel are ONE band of chrome, so they take one step — exactly
    * as `.theme-zai-dark` gives them one value each. */
   --color-header: #343746;
@@ -1177,18 +1184,23 @@ body {
    *   row over                       #ff5555   #ff6e6e
    *   page `#282a36` (bare)            4.53      5.23
    *   page row `#333540`               3.88      4.47
-   *   `bg-background-alt` `#2f3240`    4.05      4.67   ← the transcript column
-   *   that row, tinted `#393c4a`       3.48      4.02
+   *   `bg-background-alt` `#2c2e3b`    4.28      4.94   ← the transcript column
+   *   that row, tinted `#373845`       3.68      4.25
    *   panel `#343746`                  3.75      4.33
    *   panel row `#3e414f` (ToolCallCard) 3.22    3.72
    *
    * So `#ff6e6e` is the better value everywhere — it gains 0.59 to 0.68 over
-   * `#ff5555` — but it does NOT "hold 4.5": 4.47 on a page-tinted row, 4.02 on
+   * `#ff5555` — but it does NOT "hold 4.5": 4.47 on a page-tinted row, 4.25 on
    * the transcript column's own tint, and 3.72 inside `ToolCallCard`, which is
    * where a diff actually renders for a tool call. `#ff6e6e` is the brightest
    * red the spec publishes, so no spec red reaches 4.5 on those rows; this is a
    * reported shortfall, not a pass. Stated plainly because a comment claiming
-   * the floor was met is exactly what stops the next reader measuring. */
+   * the floor was met is exactly what stops the next reader measuring.
+   * (The bare transcript column row read 4.67 and its tint 4.02 while
+   * `--color-background-alt` mixed at 60%; lowering that to 33% darkened the
+   * column to `#2c2e3b` and put the BARE row back over 4.5 at 4.94. The tinted
+   * rows are what still fail — `bg-surface`'s 5% white is what does that, not
+   * the column's own step.) */
   --color-diff-added: #50fa7b;
   --color-diff-added-foreground: #282a36;
   --color-diff-removed: #ff6e6e; /* AnsiBrightRed */

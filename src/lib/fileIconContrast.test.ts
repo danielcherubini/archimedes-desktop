@@ -258,8 +258,8 @@ const LIGHT_BG = "#f8f8f8"; // .theme-zai-light --color-background
  *  descriptor must clear 3:1 there. Where those descriptors live: the
  *  TRANSCRIPT COLUMN (a `FileChip` inside a transcript row — `TRANSCRIPT_ROW`
  *  carries no background, so the chip shows the column behind it, which is
- *  `bg-background-alt`, i.e. the palette's `--color-background-win-alt` at 60%
- *  over the page: `#2f3240` under Dracula, `#222222` under zai dark) and the
+ *  `bg-background-alt`, i.e. the palette's `--color-background-win-alt` at 33%
+ *  over the page: `#2c2e3b` under Dracula, `#222222` under zai dark) and the
  *  panel (the code-block header, and the `bg-panel` tool/detail panels). Both
  *  composite DARKER than the panel, so the panel row below is the binding one
  *  for the dark palettes; the page row is kept because `--color-background-alt`

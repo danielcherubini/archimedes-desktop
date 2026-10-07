@@ -27,7 +27,7 @@ import { Reasoning, ReasoningTrigger, ReasoningContent } from "./Reasoning";
 function SkillBlockCard({ block }: { block: SkillBlock }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="rounded-lg border border-input-border bg-input px-3 py-2">
+    <div className="rounded-lg bg-input px-3 py-2">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -147,13 +147,13 @@ const CODE_BODY_CLASS = "overflow-x-auto p-3 font-mono text-sm";
  * is the SAME token a `FileChip` uses, and a `FileChip` rides the transcript
  * column — its row (`TRANSCRIPT_ROW`) carries no background of its own, but the
  * column it sits in is `bg-background-alt` (`ChatStream.tsx`), so the chip's
- * actual surface is that composited colour (`#2f3240` under Dracula), not the
+ * actual surface is that composited colour (`#2c2e3b` under Dracula), not the
  * page `#282a36`. Either way it is at or below the floating step, whereas the
  * card is the raised `#424450` — and 7 of the 25 descriptors fall below the 3:1
  * non-text floor on that one surface (`file-ts`/`file-py` 2.50, `file-html`
  * 2.55, `file-sass`/`file-graphql` 2.57, `file-java` 2.62, `file-php` 2.63)
  * while all 25 clear it on the page (worst 3.69), on `bg-background-alt` (worst
- * 3.30) and on the panel (worst 3.06). The hues are IDENTITY colours that a
+ * 3.49) and on the panel (worst 3.06). The hues are IDENTITY colours that a
  * palette must not re-hue, so the surface is what moves. Header/body separation
  * survives: a `#343746` header over Shiki's `#282A36` paper is a 1.21 step plus
  * the existing `border-b`. `src/lib/fileIconContrast.test.ts` pins both surfaces.
