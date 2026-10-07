@@ -395,6 +395,35 @@ export interface FontSettings {
 }
 
 /**
+ * (ADR 0030) What happens to a file access that goes BEYOND the boundary.
+ * The wire values are the Rust `AccessPolicy`'s serde renames — the UI
+ * label for `"allow"` is "Don't ask me" (the label never rides the wire).
+ */
+export type AccessPolicy =
+  /** Refuse it (a tool-result error, never a prompt). */
+  | "sandboxed"
+  /** Prompt the user. */
+  | "ask"
+  /** Allow it silently — THE derived default in every direction. */
+  | "allow";
+
+/**
+ * (ADR 0030) The per-direction file-access policies (the Settings UI's
+ * three selects). Every direction defaults to `"allow"`: a pre-feature
+ * `settings.json` has no `filePolicy` key and the backend serves
+ * all-`allow`, so the UI renders "Don't ask me" everywhere on a fresh
+ * install (the UI reads the field nullishly, so a document that predates
+ * the field — or a bare mock — still renders the honest default rather than
+ * an empty select).
+ */
+export interface FilePolicy {
+  reads: AccessPolicy;
+  writes: AccessPolicy;
+  /** `bash`. */
+  shell: AccessPolicy;
+}
+
+/**
  * The persisted app settings (`settings.json` in the config dir).
  * Mirrors the Rust `Settings` struct's camelCase shape exactly (a
  * `saveSettings` round-trip loses no field).
@@ -421,6 +450,8 @@ export interface AppSettings {
   subagentModels: Record<string, string>;
   /** The working-indicator spinner style (a `braille-loader` variant name, e.g. `"typing"` / `"pendulum"`); `null` = the `typing` default. */
   spinnerStyle: string | null;
+  /** (ADR 0030) The per-direction file-access policies. The backend ALWAYS emits it (`#[serde(default)]` fills all-`allow` for a pre-feature file), so it is required here; the UI still falls back to all-`allow` if the key is ever absent. */
+  filePolicy: FilePolicy;
 }
 
 /** The effective catalog's model (the Default-model select + provider discovery status). */
@@ -579,6 +610,17 @@ export async function listTools(): Promise<string[]> {
 /** The known-providers catalog (the Settings' picker's data source — ADR 0024). */
 export async function listKnownProviders(): Promise<KnownProvider[]> {
   return invoke<KnownProvider[]>("list_known_providers");
+}
+
+/**
+ * (ADR 0030) Whether a `Sandboxed` shell can actually be confined HERE:
+ * Linux + a kernel that enforces Landlock. `false` means every confined
+ * command FAILS CLOSED, so the Settings page greys the tier out and says
+ * why (it is the same signal the executor checks — the UI can never offer
+ * a choice that only produces errors).
+ */
+export async function shellSandboxAvailable(): Promise<boolean> {
+  return invoke<boolean>("shell_sandbox_available");
 }
 
 /** The user-level discovered agent definitions (the Settings page's Subagents section — ADR 0023). */

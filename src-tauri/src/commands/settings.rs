@@ -140,6 +140,16 @@ pub async fn auth_mcp_server(name: String, entry: Value) -> Result<String, Strin
     crate::agent::mcp::manager::authenticate_server(&name, &def).await
 }
 
+/// (ADR 0030 Task 5) Whether a `Sandboxed` `bash` can actually be confined
+/// here: Linux + a kernel that enforces Landlock. Everywhere else `false`
+/// (the sandbox module is not even compiled), and the tier FAILS CLOSED — so
+/// Settings must grey the option out and say why rather than offer a choice
+/// that only produces errors. STATELESS (the `list_tools` pattern).
+#[tauri::command]
+pub async fn shell_sandbox_available() -> Result<bool, String> {
+    Ok(crate::agent::tools::shell_sandbox_available())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -266,6 +276,24 @@ mod tests {
         .await
         .expect("the fake server answers");
         assert_eq!(count, 3);
+    }
+
+    /// (ADR 0030 Task 5) The Settings grey-out's source: on Linux it is the
+    /// kernel probe's answer (the SAME signal `exec_bash` fails closed on —
+    /// a UI that offered a tier the executor refuses would be a lie, and
+    /// hiding a working one equally wrong); off Linux it is `false`
+    /// unconditionally, because the sandbox is not compiled in there.
+    #[tokio::test]
+    async fn shell_sandbox_available_mirrors_the_kernel_probe() {
+        let available = shell_sandbox_available().await.expect("stateless");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            available,
+            crate::agent::tools::sandbox::landlock_available(),
+            "on Linux the command reports the kernel's Landlock support"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(!available, "off Linux there is no sandbox to offer");
     }
 
     #[test]

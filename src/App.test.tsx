@@ -33,6 +33,7 @@ vi.mock("./lib/tauri", async () => {
       defaultThinkingLevels: {},
       subagentModels: {},
       spinnerStyle: null,
+      filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),

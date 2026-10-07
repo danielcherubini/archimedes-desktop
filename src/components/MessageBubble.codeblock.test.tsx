@@ -48,6 +48,7 @@ const SETTINGS_FIXTURE: AppSettings = {
   defaultThinkingLevels: {},
   subagentModels: {},
   spinnerStyle: null,
+  filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
 };
 
 /** Seed the settings store with the fixture under the given palette. */

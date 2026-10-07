@@ -122,16 +122,52 @@ struct Harness {
     sink_rx: mpsc::UnboundedReceiver<(String, Value)>,
     pending: PendingPermissions,
     store: SessionStore,
+    /// The loop's settings dir (kept alive so the file the loop re-reads
+    /// every turn stays on disk for the whole test — `None` = the loop has
+    /// no `config_dir` at all).
+    _config_dir: Option<TempDir>,
+}
+
+/// A temp dir removed on drop (the settings fixture must outlive the loop's
+/// construction, not just its `AgentLoop::new`).
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Build the loop (a mock `Provider` + a temp `Db`) and spawn its
-/// `run()` task.
+/// `run()` task, with NO `config_dir` (no `settings.json` layer — the loop
+/// runs on the all-`Allow` file-access default, ADR 0030).
 async fn build_harness(
     provider: MockProvider,
     retry: RetryPolicy,
     compaction: CompactionConfig,
     model: Model,
 ) -> (Harness, tokio::task::JoinHandle<()>) {
+    build_harness_with_settings(provider, retry, compaction, model, None).await
+}
+
+/// The same, with a `settings.json` written into a fresh temp `config_dir`
+/// (the file-access policy a test needs to pin — the gate decides from the
+/// SETTINGS now, so a test about prompting must say which policy is in
+/// force). `None` = no `config_dir` at all.
+async fn build_harness_with_settings(
+    provider: MockProvider,
+    retry: RetryPolicy,
+    compaction: CompactionConfig,
+    model: Model,
+    settings: Option<&str>,
+) -> (Harness, tokio::task::JoinHandle<()>) {
+    let config_dir = settings.map(|_| {
+        let d = std::env::temp_dir().join(format!("harness-loop-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    });
+    if let (Some(dir), Some(json)) = (config_dir.as_ref(), settings) {
+        std::fs::write(dir.join("settings.json"), json).unwrap();
+    }
     let dir = std::env::temp_dir().join(format!("harness-loop-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = Arc::new(Db::open(&dir.join("db.sqlite")).unwrap());
@@ -186,7 +222,7 @@ async fn build_harness(
         None, // subagent (not exercised)
         SudoDeps::default(),
         retry,
-        None, // config_dir (no desktop MCP layer in the test)
+        config_dir.clone(),
     );
     let task = tokio::spawn(loop_.run());
     (
@@ -196,6 +232,7 @@ async fn build_harness(
             sink_rx,
             pending,
             store,
+            _config_dir: config_dir.map(TempDir),
         },
         task,
     )
@@ -334,9 +371,17 @@ async fn text_response_emits_normalized_events_and_persists_transcript() {
 
 // ── (b) a tool call: gate → execute → loop → settle ───────────────────
 
+/// (ADR 0030) The policy this test pins: `ask` in every direction. The
+/// gate's decision is now the SETTINGS' (all-`Allow` by default — pi's
+/// posture), so a test about the permission round-trip must say so
+/// explicitly; under the default this very `bash` would dispatch with no
+/// prompt at all (`tool_call_gates…` would have nothing to round-trip).
+const ASK_EVERYTHING: &str =
+    r#"{ "filePolicy": { "reads": "ask", "writes": "ask", "shell": "ask" } }"#;
+
 #[tokio::test]
 async fn tool_call_gates_executes_loops_and_settles() {
-    let (mut h, task) = build_harness(
+    let (mut h, task) = build_harness_with_settings(
         MockProvider::with(vec![
             MockResponse::Stream(vec![
                 ProviderEvent::ToolCall(archimedes_lib::agent::harness::ToolCall {
@@ -351,6 +396,7 @@ async fn tool_call_gates_executes_loops_and_settles() {
         RetryPolicy::new(),
         CompactionConfig::default(),
         test_model(128000),
+        Some(ASK_EVERYTHING),
     )
     .await;
     h.prompt_tx
@@ -418,7 +464,10 @@ async fn tool_call_gates_executes_loops_and_settles() {
         .map(|(_, p)| p.clone())
         .expect("a permission-request frame");
     assert_eq!(perm["requestId"], "call_1");
-    assert!(perm["request"]["toolCall"]["title"].is_string());
+    assert_eq!(
+        perm["request"]["toolCall"]["title"], "bash echo hi",
+        "the prompt names the command (ADR 0030: the title is the thing being approved)"
+    );
 
     // The provider transcript: user, assistant (tool_calls), tool
     // (the result, `tool_call_id` intact), and the FINAL assistant

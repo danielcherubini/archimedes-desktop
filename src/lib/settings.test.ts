@@ -60,6 +60,7 @@ function settingsFixture(overrides: Partial<AppSettings> = {}): AppSettings {
     defaultThinkingLevels: {},
     subagentModels: {},
     spinnerStyle: null,
+    filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
     ...overrides,
   };
 }
@@ -142,6 +143,7 @@ describe("loadAndApplySettings", () => {
       defaultThinkingLevels: {},
       subagentModels: {},
       spinnerStyle: null,
+      filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
     });
     stubMatchMedia(true); // OS is dark → "system" resolves to zai-dark
     const settings = await loadAndApplySettings();

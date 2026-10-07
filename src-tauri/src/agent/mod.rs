@@ -2,6 +2,7 @@
 //! drive the session lifecycle, the interactive channel, the subagent
 //! manager.
 
+pub mod boundary;
 pub mod crashlog;
 pub mod debuglog;
 mod errors;
@@ -13,6 +14,7 @@ pub mod mcp;
 mod normalize;
 mod permission;
 pub mod persist;
+pub mod policy;
 mod session;
 pub mod subagent;
 pub mod todo;

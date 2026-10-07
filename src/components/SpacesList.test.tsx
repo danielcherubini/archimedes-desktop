@@ -31,6 +31,7 @@ vi.mock("../lib/tauri", async () => {
       font: { sizePx: 14, uiFamily: null, codeFamily: null },
       defaultThinkingLevels: {},
       subagentModels: {},
+      filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
     }),
     startSession: vi.fn().mockResolvedValue({
       sessionId: "new1",

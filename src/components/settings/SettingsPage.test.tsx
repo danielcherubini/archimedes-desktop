@@ -1,5 +1,12 @@
 import { describe, expect, it, vi, beforeAll, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  cleanup,
+  within,
+} from "@testing-library/react";
 import SettingsPage from "./SettingsPage";
 import {
   authMcpServer,
@@ -7,10 +14,12 @@ import {
   listAgentDefinitions,
   listModels,
   saveSettings,
+  shellSandboxAvailable,
   testMcpServer,
   type AppSettings,
 } from "@/lib/tauri";
 import { brailleLoaderVariants } from "@/lib/braille-loader";
+import { getAppInfo } from "@/lib/version";
 import { humanizeVariant } from "./primitives";
 
 // The page's single source of truth (the `getSettings` fixture): a full
@@ -41,10 +50,21 @@ const baseSettings: AppSettings = {
   defaultThinkingLevels: {},
   subagentModels: {},
   spinnerStyle: null,
+  filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
 };
 
+vi.mock("@/lib/version", () => ({
+  // The OS the app runs on (the Shell `Sandboxed` tier is Linux-only). Linux
+  // by default so the option is offered; the non-Linux test overrides it
+  // with `mockResolvedValueOnce`.
+  getAppInfo: vi
+    .fn()
+    .mockResolvedValue({ version: "0.1.0", platform: "linux" }),
+}));
+
 vi.mock("../../lib/tauri", async () => {
-  const actual = await vi.importActual<Record<string, unknown>>("../../lib/tauri");
+  const actual =
+    await vi.importActual<Record<string, unknown>>("../../lib/tauri");
   return {
     ...actual,
     // Inlined (NOT the `baseSettings` const): the factory is hoisted above
@@ -74,10 +94,16 @@ vi.mock("../../lib/tauri", async () => {
       defaultThinkingLevels: {},
       subagentModels: {},
       spinnerStyle: null,
+      filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
     }),
     // The discovered agent definitions (ADR 0023 — the Subagents section's
     // data source): empty by default (the tests override per case).
     listAgentDefinitions: vi.fn().mockResolvedValue([]),
+    // (ADR 0030) Whether THIS kernel can confine a shell (Landlock).
+    // AVAILABLE by default so the existing tests keep their meaning (the
+    // tier is offered); the grey-out test overrides with
+    // `mockResolvedValueOnce(false)`.
+    shellSandboxAvailable: vi.fn().mockResolvedValue(true),
     // The effective catalog (Task 2's `ModelDto` camelCase shape): two
     // models advertising OVERLAPPING thinking levels (the union is
     // deduped in FIRST-SEEN order — `medium` / `high` appear in both;
@@ -104,29 +130,152 @@ vi.mock("../../lib/tauri", async () => {
     // `KnownProviderDto` wire shape). Inlined (the factory hoisting rule —
     // see the `getSettings` note above).
     listKnownProviders: vi.fn().mockResolvedValue([
-      { id: "zai", name: "Z.ai", baseUrl: "https://api.z.ai/api/anthropic", api: "anthropic-messages", keyUrl: "https://z.ai/manage-apikey/apikey-list" },
-      { id: "zai-api", name: "Z.ai API", baseUrl: "https://api.z.ai/api/paas/v4", api: "openai-completions", keyUrl: "https://z.ai/manage-apikey/apikey-list" },
-      { id: "bigmodel", name: "BigModel", baseUrl: "https://open.bigmodel.cn/api/anthropic", api: "anthropic-messages", keyUrl: "https://bigmodel.cn/coding-plan/personal/overview" },
-      { id: "bigmodel-api", name: "BigModel API", baseUrl: "https://open.bigmodel.cn/api/paas/v4", api: "openai-completions", keyUrl: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys" },
-      { id: "kimi", name: "Kimi", baseUrl: "https://api.moonshot.cn/anthropic", api: "anthropic-messages", keyUrl: "https://platform.kimi.com/console/api-keys" },
-      { id: "minimax", name: "MiniMax", baseUrl: "https://api.minimaxi.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.minimaxi.com/console/access?tab=api-keys" },
-      { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.deepseek.com/api_keys" },
-      { id: "alibaba-cn", name: "Alibaba Cloud (China)", baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic", api: "anthropic-messages", keyUrl: "https://bailian.console.aliyun.com/cn-beijing?tab=model" },
-      { id: "alibaba-intl", name: "Alibaba Cloud (Global)", baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", api: "openai-completions", keyUrl: "https://modelstudio.console.aliyun.com/ap-southeast-1?tab=dashboard" },
-      { id: "xiaomi-mimo", name: "Xiaomi MiMo", baseUrl: "https://api.xiaomimimo.com/anthropic", api: "anthropic-messages", keyUrl: "https://platform.xiaomimimo.com/" },
-      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", api: "openai-responses", keyUrl: "https://platform.openai.com/api-keys" },
-      { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", api: "anthropic-messages", keyUrl: "https://console.anthropic.com/settings/keys" },
-      { id: "xai", name: "xAI", baseUrl: "https://api.x.ai/v1", api: "openai-responses", keyUrl: "https://console.x.ai" },
-      { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api", api: "anthropic-messages", keyUrl: "https://openrouter.ai/keys" },
-      { id: "opencode-go-chat", name: "OpenCode Go (Chat)", baseUrl: "https://opencode.ai/zen/go/v1", api: "openai-completions", keyUrl: "https://opencode.ai/auth" },
-      { id: "opencode-go-anthropic", name: "OpenCode Go (Anthropic)", baseUrl: "https://opencode.ai/zen/go/v1", api: "anthropic-messages", keyUrl: "https://opencode.ai/auth" },
-      { id: "opencode-go-responses", name: "OpenCode Go (Responses)", baseUrl: "https://opencode.ai/zen/go/v1", api: "openai-responses", keyUrl: "https://opencode.ai/auth" },
-      { id: "opencode-zen-chat", name: "OpenCode Zen (Chat)", baseUrl: "https://opencode.ai/zen/v1", api: "openai-completions", keyUrl: "https://opencode.ai/auth" },
-      { id: "opencode-zen-anthropic", name: "OpenCode Zen (Anthropic)", baseUrl: "https://opencode.ai/zen/v1", api: "anthropic-messages", keyUrl: "https://opencode.ai/auth" },
-      { id: "opencode-zen-responses", name: "OpenCode Zen (Responses)", baseUrl: "https://opencode.ai/zen/v1", api: "openai-responses", keyUrl: "https://opencode.ai/auth" },
+      {
+        id: "zai",
+        name: "Z.ai",
+        baseUrl: "https://api.z.ai/api/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://z.ai/manage-apikey/apikey-list",
+      },
+      {
+        id: "zai-api",
+        name: "Z.ai API",
+        baseUrl: "https://api.z.ai/api/paas/v4",
+        api: "openai-completions",
+        keyUrl: "https://z.ai/manage-apikey/apikey-list",
+      },
+      {
+        id: "bigmodel",
+        name: "BigModel",
+        baseUrl: "https://open.bigmodel.cn/api/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://bigmodel.cn/coding-plan/personal/overview",
+      },
+      {
+        id: "bigmodel-api",
+        name: "BigModel API",
+        baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+        api: "openai-completions",
+        keyUrl: "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+      },
+      {
+        id: "kimi",
+        name: "Kimi",
+        baseUrl: "https://api.moonshot.cn/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://platform.kimi.com/console/api-keys",
+      },
+      {
+        id: "minimax",
+        name: "MiniMax",
+        baseUrl: "https://api.minimaxi.com/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://platform.minimaxi.com/console/access?tab=api-keys",
+      },
+      {
+        id: "deepseek",
+        name: "DeepSeek",
+        baseUrl: "https://api.deepseek.com/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://platform.deepseek.com/api_keys",
+      },
+      {
+        id: "alibaba-cn",
+        name: "Alibaba Cloud (China)",
+        baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://bailian.console.aliyun.com/cn-beijing?tab=model",
+      },
+      {
+        id: "alibaba-intl",
+        name: "Alibaba Cloud (Global)",
+        baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api: "openai-completions",
+        keyUrl:
+          "https://modelstudio.console.aliyun.com/ap-southeast-1?tab=dashboard",
+      },
+      {
+        id: "xiaomi-mimo",
+        name: "Xiaomi MiMo",
+        baseUrl: "https://api.xiaomimimo.com/anthropic",
+        api: "anthropic-messages",
+        keyUrl: "https://platform.xiaomimimo.com/",
+      },
+      {
+        id: "openai",
+        name: "OpenAI",
+        baseUrl: "https://api.openai.com/v1",
+        api: "openai-responses",
+        keyUrl: "https://platform.openai.com/api-keys",
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        baseUrl: "https://api.anthropic.com/v1",
+        api: "anthropic-messages",
+        keyUrl: "https://console.anthropic.com/settings/keys",
+      },
+      {
+        id: "xai",
+        name: "xAI",
+        baseUrl: "https://api.x.ai/v1",
+        api: "openai-responses",
+        keyUrl: "https://console.x.ai",
+      },
+      {
+        id: "openrouter",
+        name: "OpenRouter",
+        baseUrl: "https://openrouter.ai/api",
+        api: "anthropic-messages",
+        keyUrl: "https://openrouter.ai/keys",
+      },
+      {
+        id: "opencode-go-chat",
+        name: "OpenCode Go (Chat)",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+        api: "openai-completions",
+        keyUrl: "https://opencode.ai/auth",
+      },
+      {
+        id: "opencode-go-anthropic",
+        name: "OpenCode Go (Anthropic)",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+        api: "anthropic-messages",
+        keyUrl: "https://opencode.ai/auth",
+      },
+      {
+        id: "opencode-go-responses",
+        name: "OpenCode Go (Responses)",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+        api: "openai-responses",
+        keyUrl: "https://opencode.ai/auth",
+      },
+      {
+        id: "opencode-zen-chat",
+        name: "OpenCode Zen (Chat)",
+        baseUrl: "https://opencode.ai/zen/v1",
+        api: "openai-completions",
+        keyUrl: "https://opencode.ai/auth",
+      },
+      {
+        id: "opencode-zen-anthropic",
+        name: "OpenCode Zen (Anthropic)",
+        baseUrl: "https://opencode.ai/zen/v1",
+        api: "anthropic-messages",
+        keyUrl: "https://opencode.ai/auth",
+      },
+      {
+        id: "opencode-zen-responses",
+        name: "OpenCode Zen (Responses)",
+        baseUrl: "https://opencode.ai/zen/v1",
+        api: "openai-responses",
+        keyUrl: "https://opencode.ai/auth",
+      },
     ]),
     // The native harness's tool names (the enabled-tools checkbox list).
-    listTools: vi.fn().mockResolvedValue(["bash", "read", "write", "edit", "subagent"]),
+    listTools: vi
+      .fn()
+      .mockResolvedValue(["bash", "read", "write", "edit", "subagent"]),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     // The one-shot MCP test (ADR 0019): 0 tools by default (the tests
     // override per case).
@@ -165,7 +314,9 @@ async function loaded(): Promise<void> {
 }
 
 /** Navigate to a section (click its sidebar button) and wait for it. */
-async function go(section: "Appearance" | "Providers" | "Subagents" | "MCP"): Promise<void> {
+async function go(
+  section: "Appearance" | "Providers" | "Subagents" | "MCP",
+): Promise<void> {
   fireEvent.click(screen.getByRole("button", { name: section }));
   if (section === "Appearance") await screen.findByText("Theme");
   else if (section === "Providers")
@@ -285,7 +436,9 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
       uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
     ).toBe("Fira Sans");
     fireEvent.click(uiTrigger);
-    fireEvent.click(screen.getByRole("option", { name: "Default (Noto Sans)" }));
+    fireEvent.click(
+      screen.getByRole("option", { name: "Default (Noto Sans)" }),
+    );
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
     expect(
       uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
@@ -400,7 +553,9 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     ).toBeTruthy();
     // The status + the refresh + the remove remain in the row.
     expect(screen.getByRole("button", { name: "Refresh models" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Remove provider" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove provider" }),
+    ).toBeTruthy();
   });
 
   it("remove_provider_confirms_then_saves", async () => {
@@ -474,7 +629,9 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     // The union across the two models (deduped, FIRST-SEEN order — NOT
     // lexicographic): the overlapping `medium` / `high` appear once, in
     // the first model's advertised order, then `xhigh` from the second.
-    expect(await screen.findByRole("option", { name: "Model default" })).toBeTruthy();
+    expect(
+      await screen.findByRole("option", { name: "Model default" }),
+    ).toBeTruthy();
     const options = await screen.findAllByRole("option");
     expect(options.map((o) => o.textContent)).toEqual([
       "Model default",
@@ -604,6 +761,218 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     expect(saved.enabledTools).toEqual([]);
   });
 
+  // ---------------------------------------------------------------------
+  // The file-access policy (ADR 0030): three selects — Reads / Writes /
+  // Shell — above the Trust switch. All three DEFAULT to `allow`
+  // ("Don't ask me"), so the row copy is the safety story: it must state
+  // the free pass plainly (never phrase the default as a restriction).
+  // ---------------------------------------------------------------------
+
+  /** The `SettingsRow` hosting the named control (label + description +
+   * control share one row element — `SettingsRow` renders the control as
+   * the trigger's accessible name source). */
+  function rowOf(controlName: string): HTMLElement {
+    const trigger = screen.getByRole("combobox", { name: controlName });
+    const row = trigger.closest(".border-t");
+    expect(row).toBeTruthy();
+    return row as HTMLElement;
+  }
+
+  /** Open the named select and return its offered option labels. */
+  async function openSelect(controlName: string): Promise<HTMLElement> {
+    const trigger = await screen.findByRole("combobox", { name: controlName });
+    fireEvent.click(trigger);
+    await screen.findAllByRole("option");
+    return trigger;
+  }
+
+  /** Close the open Radix select (one at a time — an open select
+   * `aria-hidden`s the rest of the document, so the trigger must be the
+   * element reference captured BEFORE it opened). */
+  async function closeSelect(trigger: HTMLElement): Promise<void> {
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let Radix un-`aria-hide`
+  }
+
+  /** The labels of the currently open select's options. */
+  function optionLabels(): string[] {
+    return screen.getAllByRole("option").map((o) => o.textContent ?? "");
+  }
+
+  it("the_three_file_access_selects_default_to_don_t_ask_me", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    for (const name of ["Reads", "Writes", "Shell"]) {
+      const trigger = await screen.findByRole("combobox", { name });
+      // The trigger DISPLAYS the selected policy (a fresh install is
+      // all-`allow` — nothing may fall back to a placeholder).
+      expect(
+        trigger.querySelector("[data-slot=select-value]")?.textContent,
+      ).toBe("Don't ask me");
+    }
+    // The three rows sit above the Trust switch (the plan's layout).
+    const rows = document.querySelectorAll(".border-t");
+    const index = (label: string): number =>
+      [...rows].findIndex((r) =>
+        [...r.querySelectorAll("div")].some((d) => d.textContent === label),
+      );
+    expect(index("Reads")).toBeGreaterThanOrEqual(0);
+    expect(index("Reads")).toBeLessThan(index("Writes"));
+    expect(index("Writes")).toBeLessThan(index("Shell"));
+    expect(index("Shell")).toBeLessThan(index("Trust new Spaces by default"));
+  });
+
+  it("the_file_access_rows_state_the_honest_default (the copy carries the all-allow posture)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // Writes + Shell: the default is a FREE PASS — the copy must name
+    // "anywhere" and the absence of a prompt (a user who only ever sees
+    // the default must not mistake it for a restriction).
+    for (const name of ["Writes", "Shell"]) {
+      const text = rowOf(name).textContent ?? "";
+      expect(text).toContain("anywhere");
+      expect(text).toContain("with no prompt");
+    }
+    // Writes also names the ONE carve-out that survives every policy.
+    expect(rowOf("Writes").textContent ?? "").toContain("agent-definition");
+    // Reads: `Don't ask me` means no prompt AND no log.
+    expect(rowOf("Reads").textContent ?? "").toContain("no prompt and no log");
+    // The boundary-relative promise for `Ask me` / `Sandboxed` (the
+    // policy decides ONLY the beyond-boundary case).
+    expect(rowOf("Reads").textContent ?? "").toContain("outside the boundary");
+  });
+
+  it("changing_the_reads_select_to_ask_me_saves_the_complete_document", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    fireEvent.click(await screen.findByRole("combobox", { name: "Reads" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Ask me" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    // The saved document carries the new policy AND every other field
+    // (the whole-document save pattern — the backend passes it through).
+    expect(saved.filePolicy.reads).toBe("ask");
+    expect(saved.filePolicy.writes).toBe("allow");
+    expect(saved.filePolicy.shell).toBe("allow");
+    expect(saved.theme).toBe("dark");
+    expect(saved.providers).toHaveLength(1);
+    expect(saved.font).toEqual(baseSettings.font);
+    // The select reloads from the saved document (the trigger shows the
+    // choice — the optimistic state matches what was written).
+    const trigger = screen.getByRole("combobox", { name: "Reads" });
+    expect(trigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
+      "Ask me",
+    );
+  });
+
+  it("the_shell_sandboxed_option_is_hidden_off_linux", async () => {
+    vi.mocked(getAppInfo).mockResolvedValueOnce({
+      version: "0.1.0",
+      platform: "windows",
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // Reads still offers all three tiers…
+    const reads = await openSelect("Reads");
+    expect(optionLabels()).toEqual(["Sandboxed", "Ask me", "Don't ask me"]);
+    await closeSelect(reads);
+    // …the Shell row offers only two (there is no sandbox to choose —
+    // Landlock is Linux-only).
+    const shell = await openSelect("Shell");
+    expect(optionLabels()).toEqual(["Ask me", "Don't ask me"]);
+    expect(screen.queryByRole("option", { name: "Sandboxed" })).toBeNull();
+    await closeSelect(shell);
+    // Nothing was saved by merely looking.
+    expect(saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("the_shell_sandboxed_option_is_greyed_out_when_the_kernel_has_no_landlock", async () => {
+    // Linux (so the tier IS offered — hiding it would hide a real choice)
+    // but the kernel cannot confine: the option stays VISIBLE and greyed,
+    // with the reason stated in one line. A silently-selectable tier whose
+    // commands all fail closed is the failure mode this guards.
+    vi.mocked(shellSandboxAvailable).mockResolvedValueOnce(false);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    // The row is captured BEFORE the select opens (an open Radix select
+    // `aria-hidden`s the rest of the document, so the trigger is
+    // unqueryable while it is open).
+    const shellRow = rowOf("Shell");
+    const shell = await openSelect("Shell");
+    const option = await screen.findByRole("option", { name: "Sandboxed" });
+    expect(option.getAttribute("data-disabled")).not.toBeNull();
+    expect(option.getAttribute("aria-disabled")).toBe("true");
+    // The reason is in the row (not only in the disabled option).
+    expect(shellRow.textContent ?? "").toContain("Landlock");
+    // Clicking the greyed option changes nothing.
+    fireEvent.click(option);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(saveSettings).not.toHaveBeenCalled();
+    await closeSelect(shell);
+  });
+
+  it("the_shell_sandboxed_option_is_selectable_when_the_kernel_can_confine", async () => {
+    // CONTRAST (so the grey-out above cannot pass vacuously): with the
+    // probe reporting Landlock ( the suite default), the tier is enabled.
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const shellRow = rowOf("Shell");
+    const shell = await openSelect("Shell");
+    const option = await screen.findByRole("option", { name: "Sandboxed" });
+    // The probe has to have SETTLED before this is meaningful (the page's
+    // pre-probe state is deliberately "not supported"), hence `waitFor`.
+    await waitFor(() =>
+      expect(option.getAttribute("data-disabled")).toBeNull(),
+    );
+    expect(option.getAttribute("aria-disabled")).not.toBe("true");
+    expect(shellRow.textContent ?? "").not.toContain("cannot run");
+    fireEvent.keyDown(shell, { key: "Escape" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("a_stored_sandboxed_shell_on_non_linux_does_not_render_an_empty_select", async () => {
+    // Off Linux the `Sandboxed` item is HIDDEN, but a stored
+    // `shell: "sandboxed"` value survives the platform change — the trigger
+    // must never render blank for a value whose option is gone (a
+    // placeholder stands in; the value itself is preserved on save).
+    vi.mocked(getAppInfo).mockResolvedValueOnce({
+      version: "0.1.0",
+      platform: "windows",
+    });
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      filePolicy: { reads: "allow", writes: "allow", shell: "sandboxed" },
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const trigger = await screen.findByRole("combobox", { name: "Shell" });
+    const value = trigger
+      .querySelector("[data-slot=select-value]")
+      ?.textContent?.trim();
+    expect(value).toBe("Sandboxed (unavailable here)");
+    // NOT the freer-sounding label: a stored `sandboxed` fails every
+    // command closed, and "Don't ask me" would hide that.
+    expect(value).not.toBe("Don't ask me");
+  });
+
+  it("a_pre_feature_document_without_file_policy_renders_don_t_ask_me (never an empty select)", async () => {
+    // A `settings.json` written before ADR 0030 has no `filePolicy` key;
+    // the backend fills the default, but the UI must not render an empty
+    // select if the key is ever absent.
+    const preFeature = { ...baseSettings } as Partial<AppSettings>;
+    delete preFeature.filePolicy;
+    vi.mocked(getSettings).mockResolvedValueOnce(preFeature as AppSettings);
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    for (const name of ["Reads", "Writes", "Shell"]) {
+      const trigger = await screen.findByRole("combobox", { name });
+      expect(
+        trigger.querySelector("[data-slot=select-value]")?.textContent,
+      ).toBe("Don't ask me");
+    }
+  });
+
   it("the_default_agent_select_is_gone", async () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -611,7 +980,9 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     // "Default agent" control is absent (and the agent-catalog data source
     // is gone from the module — nothing to fetch).
     expect(screen.queryByText("Default agent")).toBeNull();
-    expect(screen.queryByRole("combobox", { name: "Default agent" })).toBeNull();
+    expect(
+      screen.queryByRole("combobox", { name: "Default agent" }),
+    ).toBeNull();
   });
 
   it("the_update_round_trip_preserves_the_default_thinking_levels", async () => {
@@ -668,7 +1039,9 @@ describe("SettingsPage (the MCP section — ADR 0019)", () => {
     const nameInput = screen.getByPlaceholderText("Server name");
     fireEvent.change(nameInput, { target: { value: "My Gateway" } });
     const urlInput = screen.getByPlaceholderText("https://example.com/mcp");
-    fireEvent.change(urlInput, { target: { value: "https://gw.example.com/mcp" } });
+    fireEvent.change(urlInput, {
+      target: { value: "https://gw.example.com/mcp" },
+    });
     const headers = screen.getByPlaceholderText("Authorization=Bearer $TOKEN");
     fireEvent.change(headers, { target: { value: "Authorization=Bearer k" } });
     const bearer = screen.getByPlaceholderText("MY_TOKEN");
@@ -775,7 +1148,10 @@ describe("SettingsPage (the MCP section — ADR 0019)", () => {
     );
     // The one-shot test (the entry as saved) + the result badge.
     expect(await screen.findByText("3 tools")).toBeTruthy();
-    expect(testMcpServer).toHaveBeenCalledWith({ url: "https://tama/mcp" }, "tama");
+    expect(testMcpServer).toHaveBeenCalledWith(
+      { url: "https://tama/mcp" },
+      "tama",
+    );
   });
 
   it("test_mcp_server_surfaces_the_error", async () => {
@@ -828,7 +1204,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: {},
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
       { name: "builder", description: "", model: null, scope: "user" },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
@@ -867,7 +1248,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { scout: "gone/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -894,7 +1280,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
 
   it("selecting_a_model_saves_the_subagent_models_entry", async () => {
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -924,7 +1315,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { scout: "p/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -940,10 +1336,9 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
         expect.objectContaining({ subagentModels: {} }),
       ),
     );
-    const saved =
-      vi.mocked(saveSettings).mock.calls[
-        vi.mocked(saveSettings).mock.calls.length - 1
-      ]?.[0] as AppSettings;
+    const saved = vi.mocked(saveSettings).mock.calls[
+      vi.mocked(saveSettings).mock.calls.length - 1
+    ]?.[0] as AppSettings;
     // The key is ABSENT (not `null` / `""` — deleted).
     expect("scout" in saved.subagentModels).toBe(false);
     expect(saved.subagentModels).toEqual({});
@@ -959,15 +1354,21 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { ghost: "p/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Subagents");
     // The orphan row: the muted name + the stale copy.
     expect(await screen.findByText("ghost")).toBeTruthy();
-    expect(screen.getByText("No longer discovered (stale override)"))
-      .toBeTruthy();
+    expect(
+      screen.getByText("No longer discovered (stale override)"),
+    ).toBeTruthy();
     // The discovered agent is still listed (the orphan is ADDITIONAL).
     expect(screen.getByText("scout")).toBeTruthy();
     // Remove: deletes the key (immediate save, the complete document).
@@ -979,10 +1380,9 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
         expect.objectContaining({ subagentModels: {} }),
       ),
     );
-    const saved =
-      vi.mocked(saveSettings).mock.calls[
-        vi.mocked(saveSettings).mock.calls.length - 1
-      ]?.[0] as AppSettings;
+    const saved = vi.mocked(saveSettings).mock.calls[
+      vi.mocked(saveSettings).mock.calls.length - 1
+    ]?.[0] as AppSettings;
     expect("ghost" in saved.subagentModels).toBe(false);
   });
 
@@ -997,7 +1397,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { Scout: "gone/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -1030,7 +1435,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { Ghost: "p/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "ghost", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "ghost",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -1060,7 +1470,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { Scout: "gone/m1", scout: "p/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "scout", description: "Fast recon", model: "p/m1", scope: "user" },
+      {
+        name: "scout",
+        description: "Fast recon",
+        model: "p/m1",
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -1076,10 +1491,9 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
         expect.objectContaining({ subagentModels: { scout: "openai/GPT-5" } }),
       ),
     );
-    const saved =
-      vi.mocked(saveSettings).mock.calls[
-        vi.mocked(saveSettings).mock.calls.length - 1
-      ]?.[0] as AppSettings;
+    const saved = vi.mocked(saveSettings).mock.calls[
+      vi.mocked(saveSettings).mock.calls.length - 1
+    ]?.[0] as AppSettings;
     // EXACTLY ONE key for the agent — the canonical `def.name` key (no
     // `Scout` twin left behind).
     expect(Object.keys(saved.subagentModels)).toEqual(["scout"]);
@@ -1100,7 +1514,12 @@ describe("SettingsPage (the Subagents section — ADR 0023)", () => {
       subagentModels: { "É-claude": "p/m1" },
     });
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([
-      { name: "é-claude", description: "Fast recon", model: null, scope: "user" },
+      {
+        name: "é-claude",
+        description: "Fast recon",
+        model: null,
+        scope: "user",
+      },
     ]);
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
@@ -1134,7 +1553,9 @@ describe("SettingsPage (the known-providers picker + the provider api field — 
     expect(options).toHaveLength(21);
     expect(options[0].textContent).toBe("Add a known provider…");
     // The label is `name — apiLabel(api)` (the wire's human label).
-    expect(screen.getByRole("option", { name: "Anthropic — Anthropic" })).toBeTruthy();
+    expect(
+      screen.getByRole("option", { name: "Anthropic — Anthropic" }),
+    ).toBeTruthy();
     expect(
       screen.getByRole("option", { name: "OpenAI — OpenAI Responses" }),
     ).toBeTruthy();
@@ -1220,9 +1641,7 @@ describe("SettingsPage (the known-providers picker + the provider api field — 
     // Switch the wire to `anthropic-messages` (the three-wire select).
     const trigger = await screen.findByRole("combobox", { name: "API" });
     fireEvent.click(trigger);
-    fireEvent.click(
-      await screen.findByRole("option", { name: "Anthropic" }),
-    );
+    fireEvent.click(await screen.findByRole("option", { name: "Anthropic" }));
     // Immediate save (the `commitProviderField` pattern — the patch is a
     // `Partial<ProviderConfig>`).
     await waitFor(() =>
@@ -1375,7 +1794,9 @@ describe("Appearance: palette", () => {
     await loaded();
     await go("Appearance");
     fireEvent.click(await screen.findByRole("combobox", { name: "Palette" }));
-    fireEvent.click(await screen.findByRole("option", { name: "Zai (default)" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: "Zai (default)" }),
+    );
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
     const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
     expect(saved.palette).toBeNull();
@@ -1395,7 +1816,10 @@ describe("Appearance: palette", () => {
       [null, "Zai (default)"],
       ["dracula", "Dracula"],
     ] as const) {
-      vi.mocked(getSettings).mockResolvedValueOnce({ ...baseSettings, palette });
+      vi.mocked(getSettings).mockResolvedValueOnce({
+        ...baseSettings,
+        palette,
+      });
       const { unmount } = render(<SettingsPage onBack={vi.fn()} />);
       await loaded();
       await go("Appearance");
@@ -1553,9 +1977,9 @@ describe("a stored value the option list does not offer", () => {
     await loaded();
     await go("Appearance");
     const uiTrigger = await screen.findByRole("combobox", { name: "UI font" });
-    expect(uiTrigger.querySelector("[data-slot=select-value]")?.textContent).toBe(
-      "Georgia",
-    );
+    expect(
+      uiTrigger.querySelector("[data-slot=select-value]")?.textContent,
+    ).toBe("Georgia");
     // It is a real, selected option — and the list still offers the default, so
     // the user can leave the off-list family.
     fireEvent.click(uiTrigger);
@@ -1580,13 +2004,16 @@ describe("a stored value the option list does not offer", () => {
     render(<SettingsPage onBack={vi.fn()} />);
     await loaded();
     await go("Appearance");
-    const codeTrigger = await screen.findByRole("combobox", { name: "Code font" });
+    const codeTrigger = await screen.findByRole("combobox", {
+      name: "Code font",
+    });
     expect(
       codeTrigger.querySelector("[data-slot=select-value]")?.textContent,
     ).toBe("Iosevka");
   });
 
-  it("treats a blank stored font family as absent (the default label, one option)", async () => {    // `"uiFamily": ""` is not a font; it must read as the default (and must not
+  it("treats a blank stored font family as absent (the default label, one option)", async () => {
+    // `"uiFamily": ""` is not a font; it must read as the default (and must not
     // add a second empty-valued option, which Radix rejects).
     vi.mocked(getSettings).mockResolvedValueOnce({
       ...baseSettings,
@@ -1628,9 +2055,9 @@ describe("a stored value the option list does not offer", () => {
     );
     fireEvent.click(trigger);
     expect(
-      (await screen.findByRole("option", { name: "OpenAI-compatible" })).getAttribute(
-        "data-state",
-      ),
+      (
+        await screen.findByRole("option", { name: "OpenAI-compatible" })
+      ).getAttribute("data-state"),
     ).toBe("checked");
     // Every offered wire is still there to switch to.
     expect(screen.getByRole("option", { name: "Anthropic" })).toBeTruthy();

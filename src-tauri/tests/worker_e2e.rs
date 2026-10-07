@@ -315,7 +315,8 @@ fn tool_execution_end(
 /// The `StartEnv` builder (the e2e's common shape: a wiremock provider
 /// model + a catalog of the given models + a temp `config_dir`; the
 /// `enabled_tools` rides the HARNESS convention verbatim — `Some(v)` =
-/// exactly `v`).
+/// exactly `v`). NO `settings.json` is written, so the Worker runs on the
+/// all-`Allow` file-access default (ADR 0030).
 fn start_env(
     session_id: &str,
     cwd: &Path,
@@ -325,7 +326,46 @@ fn start_env(
     enabled_tools: Option<Vec<String>>,
     subagent_enabled: bool,
 ) -> StartEnv {
+    start_env_with_file_policy(
+        session_id,
+        cwd,
+        model,
+        catalog,
+        trusted,
+        enabled_tools,
+        subagent_enabled,
+        None,
+    )
+}
+
+/// The `StartEnv` builder with a file-access policy: the `settings.json`
+/// is written into the temp `config_dir` BEFORE the env is returned, so the
+/// Worker's per-turn read (ADR 0030 Deviation 4) sees the pinned policy from
+/// its first tool call. `None` = no file at all (the default).
+// The Worker's start envelope IS 8 positional knobs; a struct would obscure
+// which `StartEnv` field each test pins (and this mirrors `start_env`).
+#[allow(clippy::too_many_arguments)]
+fn start_env_with_file_policy(
+    session_id: &str,
+    cwd: &Path,
+    model: Model,
+    catalog: ModelCatalog,
+    trusted: bool,
+    enabled_tools: Option<Vec<String>>,
+    subagent_enabled: bool,
+    file_policy: Option<archimedes_lib::agent::policy::FilePolicy>,
+) -> StartEnv {
     let config_dir = temp_dir();
+    if let Some(policy) = file_policy {
+        std::fs::write(
+            config_dir.join("settings.json"),
+            format!(
+                r#"{{ "filePolicy": {} }}"#,
+                serde_json::to_string(&policy).expect("a FilePolicy serializes")
+            ),
+        )
+        .expect("the settings file is written");
+    }
     StartEnv::from_parts(
         session_id.to_string(),
         cwd.display().to_string(),
@@ -652,7 +692,7 @@ async fn permission_round_trip_real_worker() {
     )
     .await;
     let cwd = temp_dir();
-    let env = start_env(
+    let env = start_env_with_file_policy(
         "e2e-perm",
         &cwd,
         wire_model(&server, "e2e-model"),
@@ -663,6 +703,16 @@ async fn permission_round_trip_real_worker() {
         false, // a NON-trusted Space (the gate prompts)
         Some(vec!["bash".to_string()]),
         true,
+        // (ADR 0030) `ask` in every direction: the gate's decision is the
+        // SETTINGS' now, and the default is all-`Allow` (no prompt at all),
+        // so a permission round-trip test must pin `ask` explicitly —
+        // otherwise the Worker would run the `bash` ungated and the
+        // `PermissionRequest` below would never arrive.
+        Some(archimedes_lib::agent::policy::FilePolicy {
+            reads: archimedes_lib::agent::policy::AccessPolicy::Ask,
+            writes: archimedes_lib::agent::policy::AccessPolicy::Ask,
+            shell: archimedes_lib::agent::policy::AccessPolicy::Ask,
+        }),
     );
     h.attach(env).await;
     // The `ready` handshake is completed by `attach` ITSELF (the
@@ -699,9 +749,9 @@ async fn permission_round_trip_real_worker() {
     );
     assert_eq!(payload["sessionId"], "e2e-perm", "the payload's sessionId");
     assert_eq!(payload["requestId"], "call_1");
-    assert!(
-        payload["request"]["toolCall"]["title"].is_string(),
-        "the payload's toolCall title, got {payload:?}"
+    assert_eq!(
+        payload["request"]["toolCall"]["title"], "bash echo gated",
+        "the title names the command (ADR 0030: a prompt names the thing being approved), got {payload:?}"
     );
     let options = payload["request"]["options"]
         .as_array()

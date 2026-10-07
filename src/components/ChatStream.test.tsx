@@ -36,6 +36,7 @@ const SETTINGS_FIXTURE: AppSettings = {
   defaultThinkingLevels: {},
   subagentModels: {},
   spinnerStyle: null,
+  filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
 };
 
 // jsdom exposes a non-callable `window.matchMedia` (the `"matchMedia" in

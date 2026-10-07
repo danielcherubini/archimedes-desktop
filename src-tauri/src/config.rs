@@ -8,9 +8,11 @@
 //! migration needed). A corrupt file yields the defaults + a logged warning
 //! — a bad file must never block app startup.
 //!
-//! LAYERING: this module is a LEAF (std + serde only, no `agent` /
-//! `commands` / `storage` imports) — the domain (`agent`) and the IPC layer
-//! (`commands`) both depend on it, never the other way.
+//! LAYERING: this module is a LEAF (std + serde + exactly two `agent`
+//! vocabulary imports — `agent::harness::WireApi` and
+//! `agent::policy::FilePolicy`; no `commands` / `storage` imports) — the
+//! domain (`agent`) and the IPC layer (`commands`) both depend on it, never
+//! the other way.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::harness::WireApi;
+use crate::agent::policy::FilePolicy;
 
 /// A user-managed LLM provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +101,14 @@ pub struct Settings {
     /// Whether to trust new Spaces by default.
     #[serde(default)]
     pub default_trust_new_spaces: bool,
+    /// (ADR 0030) The per-direction file-access policies. `#[serde(default)]`
+    /// — a pre-feature file parses to `FilePolicy::default()` (all `Allow`),
+    /// so no migration runs. NOTE: that default is WIDER than the pre-feature
+    /// hardcoded behavior — out of the box a session reads and writes anywhere
+    /// and runs `bash` with no prompt, including in an untrusted Space (this
+    /// makes ADR 0010's prompt opt-in). Intentional; see the plan's Deviation 2.
+    #[serde(default)]
+    pub file_policy: FilePolicy,
     /// `"provider/id"`; `None` = system default.
     #[serde(default)]
     pub default_model: Option<String>,
@@ -153,6 +164,7 @@ impl Default for Settings {
             palette: None,
             pane_layout: Value::Object(Default::default()),
             default_trust_new_spaces: false,
+            file_policy: FilePolicy::default(),
             default_model: None,
             default_thinking_level: None,
             enabled_tools: Vec::new(),
@@ -414,6 +426,7 @@ pub const KNOWN_PROVIDERS: &[KnownProvider] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::policy::AccessPolicy;
 
     #[test]
     fn default_settings_are_dark_with_empty_layout() {
@@ -482,6 +495,59 @@ mod tests {
         assert!(json.contains("\"palette\""), "missing palette in {json}");
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.palette, Some("dracula".to_string()));
+    }
+
+    #[test]
+    fn file_policy_defaults_to_allow_in_every_direction() {
+        // (ADR 0030) All three policies default to `Allow` (pi's posture — the
+        // UI's "Don't ask me"). This is WIDER than the pre-feature hardcoded
+        // behavior (the product decision, plan Deviation 2), so what is pinned
+        // here is the widening itself — never parity with the old behavior.
+        let all_allow = FilePolicy {
+            reads: AccessPolicy::Allow,
+            writes: AccessPolicy::Allow,
+            shell: AccessPolicy::Allow,
+        };
+        assert_eq!(FilePolicy::default(), all_allow);
+        assert_eq!(Settings::default().file_policy, all_allow);
+        // A pre-feature file (no `filePolicy` key at all) parses to the same
+        // (`#[serde(default)]` — no migration).
+        let pre_feature: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(pre_feature.file_policy, all_allow);
+        // An EMPTY `filePolicy` object parses to the same too (the
+        // container-level `#[serde(default)]` fills the three fields).
+        let empty_object: Settings =
+            serde_json::from_value(serde_json::json!({ "filePolicy": {} })).unwrap();
+        assert_eq!(empty_object.file_policy, all_allow);
+        // A PARTIAL object leaves the directions the file omits at `Allow`.
+        let partial: Settings =
+            serde_json::from_value(serde_json::json!({ "filePolicy": { "reads": "ask" } }))
+                .unwrap();
+        assert_eq!(partial.file_policy.reads, AccessPolicy::Ask);
+        assert_eq!(partial.file_policy.writes, AccessPolicy::Allow);
+        assert_eq!(partial.file_policy.shell, AccessPolicy::Allow);
+    }
+
+    #[test]
+    fn file_policy_serializes_under_the_camel_case_file_policy_key() {
+        // The settings' wire key is `filePolicy` (Settings is camelCase); the
+        // direction values are the lowercase `AccessPolicy` wire names (pinned
+        // in `agent::policy`'s own tests).
+        let settings = Settings {
+            file_policy: FilePolicy {
+                reads: AccessPolicy::Sandboxed,
+                writes: AccessPolicy::Ask,
+                shell: AccessPolicy::Allow,
+            },
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains(r#""filePolicy":{"reads":"sandboxed","writes":"ask","shell":"allow"}"#),
+            "got {json}"
+        );
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
     }
 
     #[test]
@@ -658,6 +724,11 @@ mod tests {
                 "tama/m-1".to_string(),
             )]),
             spinner_style: Some("marquee".to_string()),
+            file_policy: FilePolicy {
+                reads: AccessPolicy::Sandboxed,
+                writes: AccessPolicy::Ask,
+                shell: AccessPolicy::Allow,
+            },
         };
         let json = serde_json::to_string(&settings).unwrap();
         for key in [
@@ -673,10 +744,33 @@ mod tests {
             "\"defaultThinkingLevels\"",
             "\"subagentModels\"",
             "\"spinnerStyle\"",
+            "\"filePolicy\"",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
         let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn file_policy_round_trips_through_the_settings_file() {
+        // A non-default policy survives `write_settings` → `load_settings`
+        // (the file exists here, so the missing-file defaults-write path is
+        // not what is under test).
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            file_policy: FilePolicy {
+                reads: AccessPolicy::Sandboxed,
+                writes: AccessPolicy::Ask,
+                shell: AccessPolicy::Allow,
+            },
+            ..Settings::default()
+        };
+        write_settings(dir.path(), &settings).unwrap();
+        let raw = fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(raw.contains("\"filePolicy\""), "camelCase key: {raw}");
+        let back = load_settings(dir.path());
+        assert_eq!(back.file_policy, settings.file_policy);
         assert_eq!(back, settings);
     }
 

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { applySettingsToDocument } from "@/lib/settings";
+import { getAppInfo } from "@/lib/version";
 import {
   getSettings,
   listAgentDefinitions,
@@ -17,6 +18,7 @@ import {
   listModels,
   listTools,
   saveSettings,
+  shellSandboxAvailable,
   type AgentDefinitionDto,
   type AppSettings,
   type McpServerEntry,
@@ -105,6 +107,17 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
   const [agentDefs, setAgentDefs] = useState<AgentDefinitionDto[] | null>(null);
   // The native harness's tool names (the enabled-tools checkbox list).
   const [tools, setTools] = useState<string[]>([]);
+  // (ADR 0030) The OS the app runs on — the Shell `Sandboxed` tier is
+  // Landlock, i.e. Linux only, so the option is hidden elsewhere. `null`
+  // until the load lands (treated as "not offered": an option is never
+  // shown on an assumption).
+  const [platform, setPlatform] = useState<string | null>(null);
+  // (ADR 0030 Task 5) Whether THIS kernel can confine a shell (the
+  // `shell_sandbox_available` probe). On Linux `false` greys the tier out
+  // with the reason (confined commands fail closed here — offering it as a
+  // live choice would be a lie). `null` until the load lands, treated as
+  // unsupported: never advertise a capability on an assumption.
+  const [sandboxSupported, setSandboxSupported] = useState<boolean | null>(null);
   // The MCP add/edit dialog draft (`null` = closed — a fresh draft per open
   // so a Cancel never leaks the draft into the next open).
   const [mcpDialog, setMcpDialog] = useState<McpDraft | null>(null);
@@ -132,6 +145,12 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
     listTools()
       .then(setTools)
       .catch(() => {});
+    void getAppInfo()
+      .then((info) => setPlatform(info.platform))
+      .catch(() => setPlatform(null));
+    void shellSandboxAvailable()
+      .then(setSandboxSupported)
+      .catch(() => setSandboxSupported(false));
     listKnownProviders()
       .then(setKnownProviders)
       .catch((error) => {
@@ -320,6 +339,8 @@ export default function SettingsPage({ onBack }: { onBack: () => void }): ReactE
       tools={tools}
       thinkingLevelUnion={thinkingLevelUnion}
       storedLevelOutsideUnion={storedLevelOutsideUnion}
+      shellSandboxAvailable={platform === "linux"}
+      shellSandboxSupported={sandboxSupported === true}
       onSave={update}
       onToggleTool={toggleTool}
     />

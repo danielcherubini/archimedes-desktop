@@ -36,6 +36,7 @@ const FULL_SETTINGS: AppSettings = {
   defaultThinkingLevels: {},
   subagentModels: {},
   spinnerStyle: null,
+  filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
 };
 
 describe("useSettings store", () => {
