@@ -138,7 +138,18 @@ const tokens = (body: string): Record<string, string> =>
  *  header moved off `bg-card` for exactly the reason this file documents. If a
  *  new raw-descriptor site is added on a surface not in `DARK_SURFACES`, the
  *  `forbidden` rows below are where it fails. */
-const ROLE_CHIPS = ["file-node", "file-node-hover", "file-node-foreground"];
+const ROLE_CHIPS = ["file-node", "file-node-hover", "file-node-foreground"];/** EVERY `--color-*` in a block, comments stripped so a doc-comment that QUOTES
+ *  a value cannot be mistaken for a declaration. `tokens` above deliberately
+ *  sees only `file-*` (its whole job is to make a descriptor impossible to miss);
+ *  surface rows need the rest, and giving them the descriptor-only parser is how
+ *  a surface would silently read as undeclared. */
+const blockTokens = (body: string): Record<string, string> =>
+  Object.fromEntries(
+    [...body
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .matchAll(/--([a-z][a-z0-9-]*)\s*:\s*([^;]+);/g)]
+      .map((m) => [m[1]!, m[2]!.trim()]),
+  );
 
 const parseHex = (h: string): [number, number, number] => {
   const n = parseInt(h.slice(1), 16);
@@ -254,16 +265,26 @@ const LIGHT_BG = "#f8f8f8"; // .theme-zai-light --color-background
  *  SURFACE it paints a descriptor on (`kind: "rendered"`) and one per surface it
  *  must never paint a descriptor on (`kind: "forbidden"` — see below).
  *
+ *  SURFACES ARE NAMED BY TOKEN, NOT BY HEX, and that is the whole point of
+ *  `surfaceHex` below. An earlier revision hardcoded the hexes, and it drifted
+ *  twice: it stayed green while the island layout moved `--color-panel` from
+ *  `#343746` to `#21222c` (the row went on grading a surface `bg-panel` had
+ *  stopped painting), and before that it described the transcript column as a
+ *  33% mix when the mix had already become a literal step. A palette that moves
+ *  a surface must move the test with it, so the token is the source of truth
+ *  and a hex appears only as the resolved reading of a derived token.
+ *
  *  `rendered` = a descriptor really does ride this surface today, so EVERY
- *  descriptor must clear 3:1 there. Where those descriptors live: the
- *  TRANSCRIPT COLUMN (a `FileChip` inside a transcript row — `TRANSCRIPT_ROW`
- *  carries no background, so the chip shows the column behind it, which is
- *  `bg-background-alt`, i.e. the palette's `--color-background-win-alt` at 33%
- *  over the page: `#2c2e3b` under Dracula, `#222222` under zai dark) and the
- *  panel (the code-block header, and the `bg-panel` tool/detail panels). Both
- *  composite DARKER than the panel, so the panel row below is the binding one
- *  for the dark palettes; the page row is kept because `--color-background-alt`
- *  is a derivation, not a constant, and a palette could move it above the panel.
+ *  descriptor must clear 3:1 there. Where they live: the SLAB (`FileChip` inside
+ *  a transcript row — `TRANSCRIPT_ROW` carries no background, so the chip shows
+ *  the column behind it, which is `bg-chat`), the chrome page, and
+ *  `bg-panel` (the code-block header, the `bg-panel` tool/subagent cards).
+ *  WHICH ROW BINDS DEPENDS ON THE PALETTE, which is why all three are listed
+ *  rather than the one that happens to be worst today: under Dracula the SLAB is
+ *  now the brightest rendered surface (`#343746`, worst `file-py` 3.06) because
+ *  `--color-panel` recessed to `#21222c` (worst 4.09). Before the island layout
+ *  it was the panel at `#343746` — the same number on a different token, which
+ *  is a good illustration of why the token, not the number, belongs in the table.
  *
  *  `forbidden` = a surface the descriptors CANNOT clear, pinned so that "the
  *  hues do not work there" is a fact in the file rather than an accident.
@@ -277,31 +298,71 @@ const DARK_SURFACES = [
     block: /^\.theme-zai-dark\s*\{/m,
     name: ".theme-zai-dark",
     surfaces: [
-      { kind: "rendered", label: "background", hex: "#161616" },
-      { kind: "rendered", label: "panel", hex: "#202020" },
-      { kind: "forbidden", label: "card", hex: "#2b2b2b" },
+      { kind: "rendered", label: "background", token: "color-background" },
+      // zai's slab is a `color-mix()` over its own page, so it is RESOLVED by
+      // the same machinery that resolves the descriptors — not hardcoded here.
+      // An earlier comment claimed `#222222`; the actual composite is `#232323`,
+      // which is precisely the kind of recalled-not-measured number this file
+      // keeps having to take back.
+      { kind: "rendered", label: "chat", token: "color-chat" },
+      { kind: "rendered", label: "panel", token: "color-panel" },
+      { kind: "forbidden", label: "card", token: "color-card" },
     ],
   },
   {
     block: /^\.theme-dracula\s*\{/m,
     name: ".theme-dracula",
     surfaces: [
-      { kind: "rendered", label: "background", hex: "#282a36" },
-      { kind: "rendered", label: "panel", hex: "#343746" },
+      { kind: "rendered", label: "background", token: "color-background" },
+      // THE BINDING ROW for Dracula: the slab is now the palette's brightest
+      // surface that carries a descriptor (`file-py` 3.06 against the floor of
+      // 3.0), because `--color-panel` recessed below it. Two whole points of
+      // headroom — the tightest surface in the app.
+      { kind: "rendered", label: "chat", token: "color-chat" },
+      { kind: "rendered", label: "panel", token: "color-panel" },
       // The raised step, which is what the code-block header used to ride. NOTE
       // `--color-secondary` and `--color-tag` are the SAME `#424450` now, so
       // this row also covers a `bg-secondary` badge.
-      { kind: "forbidden", label: "card", hex: "#424450" },
-      { kind: "forbidden", label: "selection", hex: "#44475a" },
+      { kind: "forbidden", label: "card", token: "color-card" },
+      { kind: "forbidden", label: "selection", token: "color-card-selected" },
     ],
   },
 ];
 
 const BASE = tokens(BLOCK(/^@theme\s*\{/m));
-const PALETTES = DARK_SURFACES.map((s) => ({
-  ...s,
-  overrides: tokens(BLOCK(s.block)),
-}));
+/** Every token of the `@theme` base, prefixed-keyed so `resolveToHex`'s `var()`
+ *  hop can find a target (it looks up `color-<name>`, while `tokens` above keys
+ *  descriptors bare because descriptors never use `var()`). */
+const THEME_ALL = blockTokens(BLOCK(/^@theme\s*\{/m));
+const PALETTES = DARK_SURFACES.map((s) => {
+  const overrides = tokens(BLOCK(s.block));
+  /** The block's FULL token set over the `@theme` base — the cascade the browser
+   *  actually resolves for `<html class="dark theme-…">`. */
+  const all = { ...THEME_ALL, ...blockTokens(BLOCK(s.block)) };
+  /** Resolve one surface TOKEN to the colour it actually paints. A literal hex
+   *  is its own answer; a derived token (`color-mix(…)`, a `var()` alias) is
+   *  composited over the palette's `--color-background`, because that is the
+   *  plane the slab sits on in the DOM. Reuses `resolveToHex` so a surface and a
+   *  descriptor go through ONE model of compositing — two models is how a table
+   *  starts agreeing with itself and not with the browser. */
+  const page = all["color-background"];
+  if (page === undefined) {
+    throw new Error(`${s.name} declares no --color-background: cannot composite its derived surfaces`);
+  }
+  return {
+    ...s,
+    overrides,
+    surfaces: s.surfaces.map((surface) => {
+      const raw = all[surface.token];
+      if (raw === undefined) {
+        throw new Error(
+          `--${surface.token} is not declared in ${s.name} or @theme: a surface row must name a token that really exists`,
+        );
+      }
+      return { ...surface, hex: resolveToHex(surface.token, raw, all, page) };
+    }),
+  };
+});
 
 /** The descriptor → ratio failures that are ACCEPTED on a `forbidden` surface,
  *  as `"<palette> <surface>: <descriptor> (<hex>) <ratio>"`. Pinned as an exact
@@ -413,6 +474,39 @@ describe("the file-type descriptor palette", () => {
       );
     }
   }
+
+  it("resolves every surface token to a real reading (the table cannot drift)", () => {
+    // The surfaces are named by TOKEN so the palette owns them. That is only
+    // safer than hardcoding hexes if the resolution itself is graded — a
+    // resolver that quietly fell back to the `@theme` base would grade every
+    // descriptor against the wrong surface and still go green, which is the
+    // exact failure this file was rewritten to stop. So the RESOLVED readings
+    // are pinned here: this is a check on the machinery, not a second source of
+    // truth for the palette, and it is expected to need updating whenever a
+    // surface deliberately moves.
+    const readings = PALETTES.flatMap((p) =>
+      p.surfaces.map((s) => `${p.name} ${s.label} = ${s.hex}`),
+    );
+    expect(readings).toEqual([
+      // zai dark
+      ".theme-zai-dark background = #161616",
+      // The interesting one: a `color-mix()` RESOLVED over the page, not read
+      // off the block. `#2b2b2b` at 60% over `#161616` is `#232323` — the
+      // `#222222` a previous comment here asserted was off by one on every
+      // channel, which is why nothing in this file hardcodes a composite.
+      ".theme-zai-dark chat = #232323",
+      ".theme-zai-dark panel = #202020",
+      ".theme-zai-dark card = #2b2b2b",
+      // Dracula: the island scheme. The slab is the literal Background Light
+      // step and the panel sits BELOW it, which is what makes a borderless card
+      // inside the slab visible.
+      ".theme-dracula background = #282a36",
+      ".theme-dracula chat = #343746",
+      ".theme-dracula panel = #21222c",
+      ".theme-dracula card = #424450",
+      ".theme-dracula selection = #44475a",
+    ]);
+  });
 
   it("holds the forbidden surfaces to their pinned failure set (no new hue may be dropped there)", () => {
     // A `forbidden` surface is not "a surface we did not look at" — every

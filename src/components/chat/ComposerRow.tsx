@@ -94,7 +94,14 @@ export default function ComposerRow({
   const countsLabel = countsText ? `Context used: ${countsText}` : undefined;
   return (
     <div
-      className="relative m-3 rounded-2xl bg-input p-3"
+      data-testid="composer-island"
+      // `shrink-0` is LOAD-BEARING. The island is now a flex ITEM of the center
+      // column (it used to be a child of the `main`). Flex shrink is weighted by
+      // flex-basis, and the `main` has `flex-1` (basis 0) while this has
+      // `basis: auto` — so under pressure the `main` cannot shrink at all and
+      // the composer absorbs the entire shortfall (a long transcript squashes
+      // the input to nothing instead of scrolling).
+      className="relative m-1 shrink-0 rounded-xl bg-composer p-3"
       onDrop={handleDrop}
     >
       <ComposerSkills

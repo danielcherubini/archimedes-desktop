@@ -450,7 +450,7 @@ export default function ChatStream() {
 
   if (!activeSessionId) {
     return (
-      <main className="m-1 flex min-w-0 min-h-0 flex-1 items-center justify-center rounded-xl bg-background-alt">
+      <main className="m-1 flex min-w-0 min-h-0 flex-1 items-center justify-center rounded-xl bg-chat">
         <p className="text-ui-base text-foreground-subtle">
           No active session — open a Space from the tabs above
         </p>
@@ -840,15 +840,26 @@ export default function ChatStream() {
   const units = groupConsecutiveFileWrites(messages);
 
   return (
-    // The `min-h-0` is LOAD-BEARING (the classic flexbox `min-height: auto`
-    // trap): the `main` is a `flex-1` item of the center column (a
-    // `flex-col`) with `overflow: visible`, so its automatic minimum size
-    // is the CONTENT's height — without `min-h-0` a long transcript grows
-    // the `main` past the column (the composer is pushed off the bottom
-    // of the window) and the inner `overflow-y-auto` div never scrolls.
-    // (`min-h-0` zeroes the automatic minimum, so the `main` stays at the
-    // column's height and the inner div scrolls.)
-    <main className="m-1 flex min-w-0 min-h-0 flex-1 flex-col rounded-xl bg-background-alt">
+    // THE CENTER COLUMN IS THREE ISLANDS, NOT ONE (the composer used to live
+    // INSIDE the `main`). Chrome (`#282a36`) frames each island, and the gap
+    // between islands IS the separation: two surfaces of the SAME fill read as
+    // distinct when they are SIBLINGS with chrome between them, and read as ONE
+    // surface when one is nested in the other. That distinction is why the
+    // composer is a sibling here — as a child of a `bg-chat` main it
+    // would have had to be a different colour to be visible at all, and as a
+    // sibling it can wear the same `#343746` as the transcript and still read
+    // as its own island. `rounded-xl` + `m-1` match the transcript and the side
+    // pane exactly, so the three islands are one visual family.
+    //
+    // The `min-h-0` on the `main` is still LOAD-BEARING (the classic flexbox
+    // `min-height: auto` trap): it is a `flex-1` item of the center column (a
+    // `flex-col`) with `overflow: visible`, so its automatic minimum size is the
+    // CONTENT's height — without `min-h-0` a long transcript grows the `main`
+    // past the column and the inner `overflow-y-auto` div (owned by
+    // `MessageList`, NOT the composer) never scrolls. Moving the composer out
+    // does not relax this: the transcript is still the tall child.
+    <>
+      <main className="m-1 flex min-w-0 min-h-0 flex-1 flex-col rounded-xl bg-chat">
       {/* The old header row (session title + space chip + `Live`
           conversation selector + `...` menu + side-pane toggle) is gone:
           the Spaces are the top TABS (`SpaceTabs`, above this component —
@@ -885,6 +896,10 @@ export default function ChatStream() {
         spinnerStyle={spinnerStyle}
         quip={quip}
       />
+      </main>
+      {/* The composer island (see the column comment): a SIBLING of the
+          transcript, not its child. It stays LAST in DOM order, so tab order
+          and the "composer is at the bottom" reading order are unchanged. */}
       <ComposerRow
         composerRef={composerRef}
         draft={draft}
@@ -919,6 +934,6 @@ export default function ChatStream() {
         confirmRequests={confirmRequests}
         passwordRequests={passwordRequests}
       />
-    </main>
+    </>
   );
 }

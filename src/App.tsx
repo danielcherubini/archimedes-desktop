@@ -17,11 +17,12 @@ import { discardSessionMessages, useSessions } from "./store/sessions";
 import { usePermissions } from "./store/permissions";
 import { useInteractive } from "./store/interactive";
 import { useSubagents } from "./store/subagents";
-import { getLeftPaneCollapsed, LEFT_PANE_WIDTH, subscribeLeftPane, setLeftPaneCollapsed } from "./lib/leftPaneState";
-import { getSidePaneCollapsed, subscribeSidePane, setSidePaneCollapsed } from "./lib/sidePaneState";
-import { useHasPendingRequest } from "./hooks/useHasPendingRequest";
-import { PanelLeftIcon, PanelRightIcon } from "lucide-react";
-import { Button } from "./components/ui/button";
+import {
+  getLeftPaneCollapsed,
+  LEFT_PANE_RAIL,
+  LEFT_PANE_WIDTH,
+  subscribeLeftPane,
+} from "./lib/leftPaneState";
 import SpacesList from "./components/SpacesList";
 import SpaceTabs from "./components/SpaceTabs";
 import ChatStream from "./components/ChatStream";
@@ -191,24 +192,16 @@ function App() {
   // `SpacesList` / `ChatStream` / `SidePane` re-read them on remount.
   const [view, setView] = useState<"workspace" | "settings">("workspace");
   // The panes' collapsed flags (the shared `leftPaneState` /
-  // `sidePaneState` modules — the chrome bar's collapse buttons consume
-  // the SAME flags the panes read, so the buttons + the panes agree
-  // without event guessing). The left logo segment is the sidebar's
-  // width (the tabs start where the center column begins; it follows
-  // the sidebar's collapse state: 260px expanded, 0px collapsed — the
-  // label hides while collapsed, the logo only, clipped away). The
-  // buttons' `bg-warning` dot: the shared `useHasPendingRequest`
-  // (the active session's prompts / `ask` / `confirm` / `password`
-  // requests + pending subagent requests).
+  // `leftPaneState` module — the SAME flag the pane reads, so the pane's own
+  // toggle and this segment agree without event guessing. The left logo
+  // segment is the sidebar's width, so the tabs start exactly where the centre
+  // column begins: it follows the sidebar's collapse state (260px expanded,
+  // `LEFT_PANE_RAIL` collapsed) and MUST use the rail, not 0, or the tabs
+  // would drift 40px left of the content column's edge while collapsed.
   const sidebarCollapsed = useSyncExternalStore(
     subscribeLeftPane,
     getLeftPaneCollapsed,
   );
-  const sidePaneCollapsed = useSyncExternalStore(
-    subscribeSidePane,
-    getSidePaneCollapsed,
-  );
-  const hasPendingRequest = useHasPendingRequest();
   useEffect(() => {
     Promise.all([listSessions(true), listSpaces()])
       .then(([rows, spaces]) => {
@@ -221,7 +214,7 @@ function App() {
   }, []);
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl bg-background text-foreground">
+    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl bg-frame text-foreground">
       {/* Frameless window chrome (the window is `decorations: false` in
           tauri.conf.json, so this bar replaces the native titlebar).
           BROWSER-STYLE: the Space tabs live HERE (the window titlebar
@@ -237,17 +230,17 @@ function App() {
           still block it and stay clickable. The left segment's width
           is the sidebar's width (the tabs start where the center column
           begins; it follows the sidebar's collapse state: 260px expanded,
-          0px collapsed — the icon clips away with it). The LEFT collapse button (the
-          sidebar's old footer control, moved up) sits left of the tabs;
-          the RIGHT collapse button (the `SidePane`'s old footer toggle,
-          moved up) sits at the tab bar's rightmost area, before the
-          window controls. The gear stays in the sidebar footer (only
-          the collapse buttons moved up). In the settings view (the
+          0px collapsed — the icon clips away with it). Each pane owns its own
+          collapse toggle in its INNER-bottom corner while it is open (see
+          `SpacesList` / `SidePane`); the bar carries a pane control ONLY while
+          that pane is collapsed, because the collapsed pane clips its own
+          toggle away and no keyboard shortcut exists to bring it back. The
+          gear stays in the sidebar footer. In the settings view (the
           workspace unmounts) the segment is `flex-1` (full width — the
-          old chrome-bar layout; no tabs, no collapse buttons). */}
+          old chrome-bar layout; no tabs, no pane controls). */}
       <div
         data-tauri-drag-region="deep"
-        className="flex h-10 shrink-0 items-center bg-background pr-2"
+        className="flex h-10 shrink-0 items-center bg-frame pr-2"
         data-testid="chrome-bar"
       >
         {view === "settings" ? (
@@ -262,7 +255,7 @@ function App() {
         ) : (
           <>
             <div
-              style={{ width: sidebarCollapsed ? 0 : LEFT_PANE_WIDTH }}
+              style={{ width: sidebarCollapsed ? LEFT_PANE_RAIL : LEFT_PANE_WIDTH }}
               className="flex h-full shrink-0 items-center pl-3"
             >
               <img
@@ -272,47 +265,11 @@ function App() {
                 draggable={false}
               />
             </div>
-            {/* The LEFT collapse button (the sidebar's old footer control
-                moved up — left of the tabs; the tabs shift right to
-                accommodate it) + the `bg-warning` pending-request dot.
-                (The gear stays in the sidebar footer — only the collapse
-                buttons moved up.) */}
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-              aria-pressed={!sidebarCollapsed}
-              onClick={() => setLeftPaneCollapsed(!sidebarCollapsed)}
-              className="relative"
-            >
-              <PanelLeftIcon className="size-4" />
-              {hasPendingRequest && (
-                <span
-                  className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
-                  aria-hidden
-                />
-              )}
-            </Button>
+            {/* Pane controls live at the BOTTOM of their own panes in BOTH states
+                (see `SpacesList` / `SidePane`) — a collapsed pane keeps a sliver of
+                width so its toggle stays under the cursor, so the chrome bar holds no
+                pane control at all. */}
             <SpaceTabs />
-            {/* The RIGHT collapse button (the `SidePane`'s old footer
-                toggle moved up — the tab bar's rightmost area, before
-                the window controls) + the `bg-warning` dot. */}
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Toggle side pane"
-              aria-pressed={!sidePaneCollapsed}
-              onClick={() => setSidePaneCollapsed(!sidePaneCollapsed)}
-              className="relative"
-            >
-              <PanelRightIcon className="size-4" />
-              {hasPendingRequest && (
-                <span
-                  className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
-                  aria-hidden
-                />
-              )}
-            </Button>
           </>
         )}
         <WindowControls />

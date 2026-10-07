@@ -40,6 +40,41 @@ export default function SpaceTabs() {
       {spaces.map((s) => {
         const name = basenameOfPath(s.path) || s.path;
         const active = s.path === activeSpacePath;
+        // THE BRIDGE TAB. The active tab is not a pill floating in the chrome
+        // — it is the top edge of the chat sheet, so it has to be the SHEET'S
+        // OWN FILL (`--color-tab-active` aliases `--color-chat`) AND
+        // physically touch it, or the 4px frame gap reads as a slit cutting
+        // one shape into two.
+        //
+        // The geometry (the bar is `h-10`; the chat `main` carries `m-1`, so
+        // the sheet's top edge sits 44px below the top of the bar):
+        //   `h-10`               the tab spans the bar — the Chrome idiom,
+        //                        active fills the strip and inactive tabs are
+        //                        inset pills.
+        //   `shadow-[0_5px_0_0]` THE BRIDGE ITSELF, and deliberately not a
+        //                        `translate-y`: a solid same-colour offset
+        //                        shadow extends the FILL 5px below the box
+        //                        (4px of frame gap + 1px of overlap, so no
+        //                        subpixel rounding can re-open the seam)
+        //                        while the box stays exactly where it was.
+        //                        Translating instead would have dragged the
+        //                        LABEL 5px out of line with the inactive
+        //                        tabs, and moved what the pointer hits.
+        //                        Blur 0 / spread 0 keeps it a hard rectangle;
+        //                        it inherits `rounded-t-md`, so its own top
+        //                        corners hide behind the box and only the
+        //                        square bottom band shows — which is the
+        //                        merge we want.
+        //   `rounded-t-md`       square BOTTOM corners: a rounded bottom would
+        //                        notch the seam instead of merging it.
+        //   `relative z-20`      the fill now leaves the bar's box and must
+        //                        paint over the slab, a LATER sibling with a
+        //                        plain background. Without a transform there
+        //                        is no paint-order accident to lean on, so the
+        //                        stacking context is stated, not inherited.
+        //
+        // Inactive pills keep `rounded-md` and stay inset — they are objects
+        // IN the chrome. Only the active one is the sheet.
         return (
           <button
             key={s.path}
@@ -48,10 +83,10 @@ export default function SpaceTabs() {
             aria-selected={active}
             onClick={() => selectSpace(s.path)}
             title={s.path}
-            className={`h-8 max-w-48 truncate rounded-md px-3 text-ui-base ${
+            className={`max-w-48 truncate px-3 text-ui-base ${
               active
-                ? "bg-surface font-medium text-foreground"
-                : "text-foreground-subtle hover:bg-surface-hover"
+                ? "relative z-20 h-10 rounded-t-md bg-tab-active font-medium text-foreground shadow-[0_5px_0_0_var(--color-tab-active)]"
+                : "h-8 rounded-md bg-surface text-foreground-subtle hover:bg-surface-hover"
             }`}
           >
             {name}

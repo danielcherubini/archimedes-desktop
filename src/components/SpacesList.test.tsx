@@ -4,7 +4,11 @@ import { deleteSession, listSkills, setSessionArchived, startSession } from "../
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
 import { useInteractive } from "../store/interactive";
-import { setLeftPaneCollapsed } from "../lib/leftPaneState";
+import {
+  getLeftPaneCollapsed,
+  LEFT_PANE_RAIL,
+  setLeftPaneCollapsed,
+} from "../lib/leftPaneState";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
 import SpacesList from "./SpacesList";
 
@@ -608,34 +612,86 @@ describe("SpacesList (archive, ADR 0016)", () => {
   // -- menubar — the old footer controls are gone; the chrome bar's
   // -- buttons consume the same shared flags) --
 
-  it("holds NO collapse button (it moved to the chrome bar) but keeps the gear in the footer", () => {
+  // -- The pane's OWN collapse toggle (bottom-inner corner = bottom right for
+  // -- the left pane, pointing at the chat). Collapsed, it hands off to the
+  // -- chrome bar — see `App.test.tsx` for the handoff. --
+
+  it("holds its own collapse toggle in the footer's inner corner, with the gear beside it", () => {
     const { container } = render(<SpacesList />);
-    expect(screen.queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Expand sidebar" })).toBeNull();
-    // The gear (the settings entry point) stays in the footer — only the
-    // collapse button moved up. It is the frame's last child (the footer
-    // — bottom right).
+    const footer = (container.firstChild as HTMLElement).lastElementChild!;
+    const collapse = screen.getByRole("button", { name: "Collapse sidebar" });
     const gear = screen.getByRole("button", { name: "Settings" });
-    expect((container.firstChild as HTMLElement).lastElementChild!.contains(gear)).toBe(true);
+    // Both live in the footer row (the pane's bottom edge).
+    expect(footer.contains(collapse)).toBe(true);
+    expect(footer.contains(gear)).toBe(true);
+    // The TOGGLE is the inner-most (last/rightmost) child: for the left pane
+    // the inner side is the one facing the chat, so it takes the corner and
+    // the gear sits outboard of it. The gear is NOT pushed out of the
+    // right-hand cluster — it is one slot left, not moved to the far side.
+    expect(footer.lastElementChild).toBe(collapse);
+    const kids = [...footer.children];
+    expect(kids.indexOf(gear)).toBeLessThan(kids.indexOf(collapse));
+    // The cluster is RIGHT-aligned (`justify-end`, never `justify-between`):
+    // the gear stays immediately outboard of the toggle. `justify-between`
+    // keeps both assertions above true while flinging the gear to the pane's
+    // OUTER edge — so the alignment is asserted, not inferred from order.
+    expect(footer.className).toMatch(/\bjustify-end\b/);
+    expect(footer.className).not.toMatch(/\bjustify-between\b/);
+    // The pane's own toggle is NOT the chrome bar's collapsed control.
+    expect(screen.queryByRole("button", { name: "Expand sidebar" })).toBeNull();
+  });
+
+  it("KEEPS its toggle while collapsed, in the sliver, and it is the control that re-expands (it never moves to the chrome bar)", () => {
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    const { container } = render(<SpacesList />);
+    // The STABLE hook, not the label: the label flips with the state, so a
+    // name query would miss on exactly the collapsed side this test checks.
+    const collapse = screen.getByTestId("left-pane-toggle");
+    // The pane is NOT gone: it keeps a rail wide enough to hold the toggle,
+    // so the control the user just used is still under their cursor.
+    expect((container.firstChild as HTMLElement).style.width).toBe(`${LEFT_PANE_RAIL}px`);
+    // One control does both jobs — no second button appeared, and the label
+    // flipped to the direction it now performs.
+    expect(container.querySelectorAll('[data-testid="left-pane-toggle"]').length).toBe(1);
+    expect(collapse.getAttribute("aria-label")).toBe("Expand sidebar");
+    // aria-pressed flips to report the collapsed state.
+    expect(collapse.getAttribute("aria-pressed")).toBe("false");
+    // The gear is NOT rendered while collapsed. Clipping it with
+    // `overflow-hidden` instead would leave a ~4px sliver of its icon poking
+    // into the rail (measured: the footer's natural content is 68px — 2x24
+    // buttons + 4 gap + 2x8 padding — against a 40px rail, so 28px of the gear
+    // survives), which reads as a rendering glitch. The gear is also
+    // unreachable at this width, and was equally unreachable when the pane
+    // collapsed to 0, so hiding it costs nothing.
+    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+    // The toggle survives, and `shrink-0` is what keeps it a real 24px target:
+    // in a 40px rail, flex would otherwise squeeze BOTH footer buttons to fit
+    // rather than clip one, and a 12px-wide toggle is not a 24px hit area.
+    expect(collapse.className).toMatch(/\bshrink-0\b/);
+    act(() => {
+      fireEvent.click(collapse);
+    });
+    expect(getLeftPaneCollapsed()).toBe(false);
   });
 
   it("the_gear_icon_opens_settings", () => {
     const onOpenSettings = vi.fn();
     render(<SpacesList onOpenSettings={onOpenSettings} />);
-    // The footer's gear icon (bottom right) exists and fires the
-    // callback.
+    // The footer's gear icon exists and fires the callback.
     const gear = screen.getByRole("button", { name: "Settings" });
     fireEvent.click(gear);
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
   });
 
-  it("collapses to width 0 (the content stays mounted, clipped — the chrome bar's button is the re-expand control)", () => {
+  it("collapses to the sliver (the content stays mounted, clipped — the pane keeps its own toggle)", () => {
     act(() => {
       setLeftPaneCollapsed(true);
     });
     const { container } = render(<SpacesList />);
     const frame = container.firstChild as HTMLElement;
-    expect(frame.style.width).toBe("0px");
+    expect(frame.style.width).toBe(`${LEFT_PANE_RAIL}px`);
     // The content (the `Sessions` label) is clipped (width 0 +
     // `overflow: hidden`) — NOT unmounted (the list's local state
     // survives a collapse; the `fixed` dialogs escape the clipping).
@@ -661,5 +717,15 @@ describe("SpacesList (archive, ADR 0016)", () => {
     });
     const { container } = render(<SpacesList />);
     expect(container.querySelector(".bg-warning")).toBeNull();
+  });
+
+  it("the left rail is WIDE ENOUGH to show its toggle (the sliver is a guarantee, not a vibe)", () => {
+    // The entire design rests on one number: a collapsed pane keeps a sliver
+    // of width so its bottom toggle stays on screen. jsdom never clips, so NO
+    // DOM assertion here can notice a rail that shrank below the button — the
+    // toggle would silently vanish while every test stayed green and the pane
+    // became unopenable (no keyboard shortcut exists). Hence arithmetic:
+    //   24px button (`size-6`) + 8px inset/padding + 8px clear of the edge.
+    expect(LEFT_PANE_RAIL).toBeGreaterThanOrEqual(24 + 8 + 8);
   });
 });

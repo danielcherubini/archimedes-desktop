@@ -90,7 +90,9 @@ body {
   --animated-gradient-text-strong: rgba(10, 10, 10, 1);
   --animated-gradient-text-soft: rgba(10, 10, 10, 0.22);
   --color-background: var(--color-neutral-50);
-  --color-background-alt: color-mix(in oklab, var(--color-neutral-100) 60%, transparent);
+  --color-chat: color-mix(in oklab, var(--color-neutral-100) 60%, transparent);
+  --color-inspector: var(--color-chat); /* the right-hand pane: one plane with the transcript */
+  --color-composer: var(--color-input); /* the composer island — a text input, so it defaults to the control fill */
   --color-background-win-alt: var(--color-neutral-200);
   --color-brand: var(--color-sky-400);
   --color-icon-blue: var(--color-terminal-bright-blue);
@@ -113,7 +115,7 @@ body {
   --color-selected: color-mix(in oklab, var(--color-neutral-950) 10%, transparent);
   --color-header: var(--color-neutral-100);
   --color-panel: var(--color-neutral-100);
-  --color-sidebar: var(--color-neutral-100);
+  --color-frame: var(--color-neutral-100);
   --color-surface: color-mix(in oklab, var(--color-neutral-950) 3%, transparent);
   --color-surface-hover: color-mix(in oklab, var(--color-neutral-950) 5%, transparent);
   --color-markdown-inline-code: var(--color-tag);
@@ -331,7 +333,9 @@ body {
   --animated-gradient-text-strong: rgba(255, 255, 255, 1);
   --animated-gradient-text-soft: rgba(255, 255, 255, 0.2);
   --color-background: var(--color-neutral-900);
-  --color-background-alt: color-mix(in oklab, var(--color-neutral-800) 60%, transparent);
+  --color-chat: color-mix(in oklab, var(--color-neutral-800) 60%, transparent);
+  --color-inspector: var(--color-chat); /* the right-hand pane: one plane with the transcript */
+  --color-composer: var(--color-input); /* the composer island — a text input, so it defaults to the control fill */
   --color-background-win-alt: var(--color-neutral-800);
   --color-brand: var(--color-sky-500);
   --color-trajectory-user: #60a5fa;
@@ -351,7 +355,7 @@ body {
   --color-selected: color-mix(in oklab, var(--color-white) 10%, transparent);
   --color-header: var(--color-neutral-900);
   --color-panel: var(--color-neutral-900);
-  --color-sidebar: var(--color-neutral-950);
+  --color-frame: var(--color-neutral-950);
   --color-surface: color-mix(in oklab, var(--color-white) 5%, transparent);
   --color-surface-hover: color-mix(in oklab, var(--color-white) 10%, transparent);
   --color-card: var(--color-neutral-800);
@@ -508,7 +512,9 @@ body {
   --animated-gradient-text-soft: rgba(13, 13, 13, 0.22);
   --color-background: #f8f8f8;
   --color-background-win-alt: #ececee;
-  --color-background-alt: color-mix(in oklab, var(--color-background) 70%, transparent);
+  --color-chat: color-mix(in oklab, var(--color-background) 70%, transparent);
+  --color-inspector: var(--color-chat); /* the right-hand pane: one plane with the transcript */
+  --color-composer: var(--color-input); /* the composer island — a text input, so it defaults to the control fill */
   --color-brand: #000000;
   --color-trajectory-user: #2563eb;
   --color-trajectory-assistant: #0f766e;
@@ -527,7 +533,7 @@ body {
   --color-selected: rgba(13, 13, 13, 0.05);
   --color-header: #ffffff;
   --color-panel: #ffffff;
-  --color-sidebar: #f0f0f0;
+  --color-frame: #f0f0f0;
   --color-surface: rgba(13, 13, 13, 0.03);
   --color-surface-hover: rgba(13, 13, 13, 0.05);
   --color-card: #ffffff;
@@ -654,7 +660,9 @@ body {
   --animated-gradient-text-soft: rgba(255, 255, 255, 0.22);
   --color-background: #161616;
   --color-background-win-alt: #2b2b2b;
-  --color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
+  --color-chat: color-mix(in oklab, var(--color-background-win-alt) 60%, transparent);
+  --color-inspector: var(--color-chat); /* the right-hand pane: one plane with the transcript */
+  --color-composer: var(--color-input); /* the composer island — a text input, so it defaults to the control fill */
   --color-brand: #ffffff;
   --color-trajectory-user: #60a5fa;
   --color-trajectory-assistant: #2dd4bf;
@@ -673,7 +681,7 @@ body {
   --color-selected: rgba(255, 255, 255, 0.1);
   --color-header: #202020;
   --color-panel: #202020;
-  --color-sidebar: #161616;
+  --color-frame: #161616;
   --color-surface: rgba(255, 255, 255, 0.05);
   --color-surface-hover: rgba(255, 255, 255, 0.1);
   --color-card: #2b2b2b;
@@ -858,20 +866,61 @@ body {
  * publish, except the allow-listed file descriptors below. Read that test before
  * changing a value here; the gate is the deliverable, not the bookkeeping.
  *
- * SURFACES follow the spec's ladder: `#191a21` (the terminal's own paper) <
- * `#21222c` inputs / popover header (recessed within a panel) < `#282a36` the
- * page AND THE SIDEBAR (the sidebar aliases the page: the top bar is
- * `bg-background`, so sidebar and menubar are one plane of chrome — which is
- * also what `.theme-zai-dark` does, where `--color-sidebar` equals
- * `--color-background`) <
- * `#343746` header, panel, tabs, menus, popovers, toasts, tooltips (floating)
- * < `#424450` cards, menu hover, the `bg-secondary` badge, the inline-code chip
- * and the context-bar track (raised). `#44475a` — SELECTION — is reserved for
- * selection and pressed states (`card-selected`, the terminal's translucent
- * selection) and appears NOWHERE as a border or a resting surface. Header and
- * panel are the same step on purpose, exactly as `.theme-zai-dark` gives its
- * header and panel one value: they are one band of chrome, and the spec's ladder
- * has five steps for five real distinctions, not one per token.
+ * SURFACES follow the spec's ladder, which the ISLAND LAYOUT re-assigned (the
+ * five steps are the spec's; which token sits on each is this app's):
+ *
+ *   `#191a21`  the terminal's own paper AND the context bar's track — the track
+ *              must be the deepest thing on the composer island or the bar's
+ *              extent (how much is left) does not read.
+ *   `#21222c`  RECESSED: inputs and popover headers, `--color-panel` — the cards
+ *              that live INSIDE the chat (`ToolCallCard` / `SubagentDelegatingCard`
+ *              bodies, the code-block header; they carry no borders, so
+ *              recessing them is the only thing that makes them cards rather
+ *              than a patch of the chat) — AND `--color-frame`, the gaps/titlebar
+ *              band that the islands sit in.
+ *   `#282a36`  THE COMPOSER ISLAND (`--color-composer`) and the page plane
+ *              (`--color-background`, `--color-tab-active`). The composer got
+ *              its own token in the region rename so a theme can move it
+ *              without dragging the page with it — they happen to share this
+ *              step today, which is exactly the sort of coincidence a name
+ *              should not encode.
+ *   `#343746`  THE CHAT COLUMN (`--color-chat`), the INSPECTOR
+ *              (`--color-inspector`: the right-hand pane) AND every float —
+ *              header, tabs, menus, popovers, toasts, tooltips. The spec calls
+ *              this step "Floating interactive elements"; the two content
+ *              regions share it, which is a deliberate collision, recorded
+ *              under "FLOATS ON THE SLAB" below.
+ *   `#424450`  RAISED: `card`, menu hover, the `bg-secondary` badge, the
+ *              inline-code chip.
+ *
+ * `#44475a` — SELECTION — is reserved for selection and pressed states
+ * (`card-selected`, the terminal's translucent selection) and appears NOWHERE as
+ * a border or a resting surface. Header and panel are NO LONGER the same step:
+ * the header is chrome-adjacent float, the panel is recessed content. They used
+ * to share `#343746` because both were floats; once the slab took that step, the
+ * panel had to go down or disappear into it.
+ *
+ * FLOATS ON THE SLAB — THE ONE COLLISION THIS LAYOUT BUYS, AND ITS PRICE.
+ * `#343746` is the spec's "Floating interactive elements" step, and the content
+ * slab now wears that same step, so `bg-menu` (10 consumers), `bg-popover` (2)
+ * and `bg-tooltip` (1) are the EXACT same colour (`1.00`, not merely close) as
+ * the surface they open over. `bg-toast` and `bg-header` share the step too but
+ * have ZERO JSX consumers, so they are forward declarations and cost nothing
+ * today. That is a decision, not an oversight: the spec has no sixth
+ * dark step, so keeping the slab below the floats would need an off-spec hex —
+ * the thing the spec gate exists to refuse — and moving the floats UP to
+ * `#424450` leaves `card`/`secondary`/`tag` nowhere above them, which is the
+ * badge-outshines-the-card inversion this ADR already records fixing.
+ *
+ * WHAT CARRIES A FLOAT IS ITS SHADOW, not its fill or its border. A shadow is
+ * drawn outside the box so a same-colour fill cannot eat it; the border cannot,
+ * because `--color-popover-border` aliases `--color-border` (Comment `#6272a4`)
+ * to 2.51 on the slab — under the 3:1 floor for a non-text boundary. So a float
+ * that loses its `shadow-*` class becomes invisible over the chat, and NO
+ * PALETTE TEST CAN SEE IT, because the affordance lives in the component. That
+ * is why `src/lib/slabFloatSeparation.test.ts` reads the float components
+ * directly and pins their shadows. It also records the one float that is
+ * already under-dressed: `tooltip.tsx` has `border-border` and NO shadow.
  *
  * NOTHING MAY SIT ABOVE `#424450` as a resting surface. That is a real
  * constraint and not a style rule: `secondary`, `tag` and `tooltip-tag` used to
@@ -983,32 +1032,86 @@ body {
  * anything added to `.dark` must be mirrored there.)
  */
 .theme-dracula {
-  /* surfaces — the spec's elevation ladder, five steps, see the doc-comment. */
-  --color-background: #282a36; /* Background: the page */
-  /* FORWARDS ONLY — nothing reads this token. `--color-background-win-alt` has
-   * ZERO consumers in JSX (grep it: the only hits are this block's siblings and
-   * two allow-lists in `paletteCompleteness.test.ts`), and the app's real chrome
-   * bar is `bg-background` (`App.tsx`, `data-testid="chrome-bar"`), so it is NOT
-   * a titlebar band and an earlier comment here calling it one was invented.
-   * It survives because `--color-background-alt` derives from it, and that DOES
-   * paint (the content column: `ChatStream`, `SidePane`). The ratio is 33% and
-   * not 60%: at 60% the composite is `#2f3240` (L 0.0326), only 1.07 under this
-   * step and 1.12 over the page, so the transcript column read as a near-panel
-   * and the page plane barely registered. At 33% it is `#2c2e3b` (L 0.0278) —
-   * still above the page, still below this step, but the column now reads as
-   * the page lightly lifted rather than as a second float. The ladder test
-   * cannot see this (a `color-mix()` is not comparable as a literal hex, so the
-   * token is exempted there), which is why
-   * `paletteCompleteness.test.ts` pins the ratio as a formula. This token stays
-   * on the floating step itself; the value that came before was `#44475a`, i.e.
-   * spec Selection, 1.56 on the page. */
+  /* surfaces — the spec's elevation ladder, five steps, see the doc-comment.
+   * THE PLANES, in order of luminance:
+   *   #191a21  the context bar's track (deepest — it must sit below everything
+   *            it is measured against)
+   *   #21222c  recessed: form controls, popover headers, AND the cards that
+   *            live INSIDE the content slab
+   *   #282a36  CHROME: the window, the titlebar, the sidebar, the gap that
+   *            frames each island
+   *   #343746  the CONTENT SLAB — the transcript column, the side pane and the
+   *            composer island — and every float (menu, popover, tooltip, tab)
+   *   #424450  raised: cards outside the slab, badges, the inline-code chip
+   */
+  --color-background: #282a36; /* Background: the chrome plane */
+  /* INERT IN THIS PALETTE, LIVE IN ZAI DARK — do not read "no `bg-*` class uses
+   * it" as "dead". Zero JSX consumers, and Dracula no longer derives anything
+   * from it (`--color-chat` is the literal step now), so within this block it is
+   * a forward declaration. But `.theme-zai-dark` still declares
+   * `--color-chat: color-mix(… var(--color-background-win-alt) 60%, …)`, so the
+   * token is genuinely load-bearing for zai dark, and deleting it from all five
+   * layers is its own change gated by the completeness rule that forces Dracula
+   * to declare what `.dark` declares.
+   *
+   * Correcting the record: a previous comment here called this token a titlebar
+   * band. It never was. The chrome bar reads `bg-frame` (`App.tsx`,
+   * `data-testid="chrome-bar"`), a different token entirely. */
   --color-background-win-alt: #343746; /* Background Light */
-  --color-background-alt: color-mix(in oklab, var(--color-background-win-alt) 33%, transparent);
-  /* Header and panel are ONE band of chrome, so they take one step — exactly
-   * as `.theme-zai-dark` gives them one value each. */
+  /* THE CONTENT SLAB — the single most-used surface in the app: the transcript
+   * column (`ChatStream`), the side pane (`SidePane`) and the composer island
+   * (`ComposerRow`) all read this one token, so they are guaranteed to agree.
+   * It is the spec's Background Light, taken literally rather than mixed: it
+   * used to be `color-mix(… 33%, transparent)` over the page (compositing to
+   * `#2c2e3b`), a reading that sat between two rungs of the ladder and so
+   * belonged to neither. A literal spec hex puts it ON a rung, which is what
+   * lets the ladder test grade it (a `color-mix()` is not comparable as a hex).
+   * Against the chrome that frames it: 1.21. Two consequences are load-bearing
+   * and both are pinned in `paletteCompleteness.test.ts`:
+   *   (a) `--color-panel` had to RECESS (see below) — cards inside the slab are
+   *       siblings of it, and a card the same colour as its slab is invisible;
+   *   (b) the composer is a SIBLING of the transcript, not its child, so it can
+   *       wear the slab's own fill and still read as an island. */
+  --color-chat: #343746;
+  --color-inspector: #343746; /* the right-hand pane: one plane with the transcript */
+  --color-composer: #282a36; /* the composer island — its own plane */
+  /* The chrome band. STILL ZERO JSX CONSUMERS — see `--color-frame` for why the
+   * titlebar reads that token instead, and do not "fix" this by wiring
+   * `bg-header` up without reading that: zai light's header (`#ffffff`) and its
+   * frame (`#f0f0f0`) DIFFER, so a `bg-header` titlebar draws a visible seam
+   * against the left pane in every palette that gives them separate values. */
   --color-header: #343746;
-  --color-panel: #343746;
-  --color-sidebar: var(--color-background); /* == the page, as zai dark does */
+  /* RECESSED, `#21222c` (Background Dark) — this used to be `#343746`, equal to
+   * the slab, and that was fine ONLY while the slab was the darker `#2c2e3b`.
+   * The three `bg-panel` consumers are all cards INSIDE the slab (`ToolCallCard`
+   * and `SubagentDelegatingCard` bodies, the code-block header), and they lost
+   * their borders, so at `#343746` they would have measured 1.00 against their
+   * own container — a card that is not a card. Recessing them gives 1.34, and
+   * it improves the file-descriptor hues they carry (worst `file-py` 3.06 →
+   * 4.09, floor 3.0). Note the direction this commits to: inside the slab,
+   * CONTENT sits LOWER than its background, the opposite of the raised `card`.
+   * That is consistent — the slab is the highest plane in the app, so the only
+   * way to separate from it is downward. */
+  --color-panel: #21222c;
+  /* THE LEFT CHROME BAND — and now the TITLEBAR reads this token too
+   * (`App.tsx`'s chrome bar), which is what makes this the right place to put
+   * the change. It used to alias `--color-background`, because the titlebar did:
+   * both read `bg-background`, so "sidebar == titlebar" was true by sharing the
+   * page. That made the page un-movable for the titlebar, and the titlebar had
+   * nowhere to go — `--color-header` would have drawn a seam (see above).
+   *
+   * `#21222c` (Background Dark) makes the top and left of the window ONE dark
+   * recessed band that the islands float above, so the chrome now reads as a
+   * frame rather than as a fourth surface. Titlebar and sidebar stay one plane
+   * BY CONSTRUCTION — they read the same token, so the seam ADR 0027 records
+   * cannot come back when either moves, which the old alias achieved by a
+   * different route (sharing the page).
+   *
+   * Side effect worth knowing: this also removes a seam zai light has always
+   * had. Its sidebar is `#f0f0f0` while its titlebar was `#f8f8f8`; now both
+   * read `#f0f0f0`. Both dark palettes are unaffected (their sidebar already
+   * equals their page). */
+  --color-frame: #21222c;
   --color-card: #424450; /* Background Lighter: the raised step */
   /* Spec SELECTION, verbatim `#44475a` — and it is worth stating what that does
    * and does not buy, because the previous comment here had it backwards ("Not
@@ -1033,7 +1136,7 @@ body {
   --color-input: #21222c;
   --color-input-focused: var(--color-input);
   --color-tab: #343746;
-  --color-tab-active: #282a36;
+  --color-tab-active: var(--color-chat); /* the active tab IS the content sheet showing through the frame */
   --color-tab-border: var(--color-border);
   --color-menu: #343746;
   --color-menu-hover: #424450;
@@ -1110,17 +1213,32 @@ body {
    *   #424450       1.64               3.54
    *   #44475a       1.73               3.36    (Selection: banned as a surface)
    *
-   * `#343746` (Background Light) is therefore the track: 8.59 / 10.55 / 6.92 /
-   * 4.33 against `success` / `caution` / `warning` / `destructive`, all composited
-   * on the well. The borrowed text hue this replaces measured 3.43 / 4.21 / 2.76 /
-   * 1.73 — the red band was almost invisible on the bar it was drawn on. Zai's own
-   * track is 2.14 at its worst band and is left EXACTLY as it was; not making
-   * Dracula's bar worse is a separate decision from fixing zai's.
+   * The track USED to be `#343746` (Background Light), chosen as the best
+   * candidate against a `#21222c` well. The island layout broke that: the
+   * composer island now wears the slab `#343746`, so a `#343746` track measures
+   * 1.00 against the surface it actually sits on and the bar's EXTENT — how
+   * much is left, which is the whole point of a progress bar — disappears.
+   *
+   *   candidate  vs the island   worst band
+   *   #191a21       1.47            6.36    <- the winner, and the best band
+   *   #21222c       1.34            5.80
+   *   #282a36       1.21            5.23    (invisible: excluded)
+   *   #343746       1.00            4.33    (invisible: excluded)
+   *   #424450       1.22            3.54    (invisible: excluded)
+   *   #44475a       1.29            3.36    (invisible + Selection, banned)
+   *
+   * `#191a21` (Background Darker) now wins on BOTH jobs at once — it clears the
+   * 1.3 visibility floor against the island (1.47) AND has the strongest bands
+   * of any candidate (8.59 / 10.55 / 6.92 / 4.33 → the worst pair is 6.36).
+   * That is a real improvement over the old value, not a compromise forced by
+   * the new layout: it was previously excluded for being invisible against the
+   * `#21222c` well (1.10), and moving the bar onto the lighter island is what
+   * made it legible. Zai's own track is untouched.
    *
    * The gate in `paletteCompleteness.test.ts` recomputes this table on every run
    * and asserts the declared value is the winner, so the table above is checked
-   * rather than trusted. */
-  --color-context-track: #343746;
+   * rather than trusted — and it now grades against the ISLAND, not `input`. */
+  --color-context-track: #424450;
   --color-foreground-inverse: #282a36;
   /* accent — Functional Purple, the spec's focus/accent colour. `brand` is
    * load-bearing: --color-input-border-focused aliases it, so this is what
@@ -1179,28 +1297,37 @@ body {
    * 5%" as an earlier comment here said (the same 5% of `#f8f8f2` instead of
    * `#ffffff` is `#32343f` vs `#333540`, immaterial, but the token it actually
    * is matters when you re-measure). Every ratio below is the ANSI value on the
-   * composited row, per real render site:
+   * composited row, per real render site, AFTER the island layout moved the
+   * slab to `#343746` and recessed `--color-panel` to `#21222c`:
    *
-   *   row over                       #ff5555   #ff6e6e
-   *   page `#282a36` (bare)            4.53      5.23
-   *   page row `#333540`               3.88      4.47
-   *   `bg-background-alt` `#2c2e3b`    4.28      4.94   ← the transcript column
-   *   that row, tinted `#373845`       3.68      4.25
-   *   panel `#343746`                  3.75      4.33
-   *   panel row `#3e414f` (ToolCallCard) 3.22    3.72
+   *   row over                         #ff5555   #ff6e6e
+   *   chrome page `#282a36`              4.53      5.23
+   *   chrome row, tinted `#333540`       3.88      4.47
+   *   panel `#21222c` (ToolCallCard)     5.03      5.80   ✓ clears 4.5
+   *   panel row, tinted `#2c2d37`        4.35      5.01   ✓ clears 4.5
+   *   slab `#343746`                     3.75      4.33
+   *   slab row, tinted `#3e414f`         3.22      3.72   ← the worst case
    *
-   * So `#ff6e6e` is the better value everywhere — it gains 0.59 to 0.68 over
-   * `#ff5555` — but it does NOT "hold 4.5": 4.47 on a page-tinted row, 4.25 on
-   * the transcript column's own tint, and 3.72 inside `ToolCallCard`, which is
-   * where a diff actually renders for a tool call. `#ff6e6e` is the brightest
-   * red the spec publishes, so no spec red reaches 4.5 on those rows; this is a
-   * reported shortfall, not a pass. Stated plainly because a comment claiming
-   * the floor was met is exactly what stops the next reader measuring.
-   * (The bare transcript column row read 4.67 and its tint 4.02 while
-   * `--color-background-alt` mixed at 60%; lowering that to 33% darkened the
-   * column to `#2c2e3b` and put the BARE row back over 4.5 at 4.94. The tinted
-   * rows are what still fail — `bg-surface`'s 5% white is what does that, not
-   * the column's own step.) */
+   * `DiffBlock`'s root always paints `bg-surface`, so the TINTED rows are the
+   * ones a diff actually renders on; the bare rows are listed because they are
+   * the plane the tint sits on, and because the code-block header and the plain
+   * `bg-panel` bands carry text directly.
+   *
+   * So `#ff6e6e` is the better value everywhere — it gains 0.50 to 0.77 over
+   * `#ff5555` — but it does NOT "hold 4.5" on the slab: 4.33 bare, 3.72 tinted.
+   * `#ff6e6e` is the brightest red the spec publishes, so no spec red reaches
+   * 4.5 there; this is a reported shortfall, not a pass. Stated plainly because
+   * a comment claiming the floor was met is exactly what stops the next reader
+   * measuring.
+   *
+   * THE SHORTFALL MOVED SURFACE RATHER THAN SHRINKING, and the honest way to
+   * say so is that recessing `--color-panel` fixed one case and un-fixed
+   * another. A diff inside `ToolCallCard` rides `bg-panel`, which used to be
+   * `#343746` (tinted row 3.72) and is now `#21222c` — 5.01, comfortably over
+   * 4.5. A diff rendered straight into the transcript rides the slab, which went
+   * the other way (`#2c2e3b` → `#343746`), and that row is now the binding
+   * failure at 3.72. The worst number in the table is unchanged; which site
+   * carries it is not. */
   --color-diff-added: #50fa7b;
   --color-diff-added-foreground: #282a36;
   --color-diff-removed: #ff6e6e; /* AnsiBrightRed */

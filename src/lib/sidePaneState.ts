@@ -23,6 +23,16 @@ let collapsed =
 
 const listeners = new Set<() => void>();
 
+/**
+ * The width the side pane keeps while COLLAPSED — a sliver, NOT 0. The pane's
+ * collapse toggle lives in its own inner-bottom corner (bottom LEFT) and stays
+ * there in both states, so the sliver is the room that keeps it on screen
+ * (24px button + 8px inset + 8px of breathing room). Collapsing to 0 would
+ * clip the toggle away with the pane, and no keyboard shortcut exists — see
+ * `LEFT_PANE_RAIL` for the same decision on the left pane.
+ */
+export const SIDE_PANE_RAIL = 40;
+
 export function getSidePaneCollapsed(): boolean {
   return collapsed;
 }

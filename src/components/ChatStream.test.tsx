@@ -539,23 +539,48 @@ describe("ChatStream", () => {
     expect(screen.queryByText("−1")).toBeNull();
   });
 
-  it("renders the composer shell as a BORDERLESS recessed well", () => {
-    // The frame used to be `border border-input-border`, i.e. Dracula's Comment
-    // `#6272a4` — a slate VIOLET that reads as a purple outline around the chat
-    // (and `focus-within:border-input-border-focused` put Functional Purple
-    // `#815cd6` on it while typing). Dropped: the well is defined by its FILL
-    // (`bg-input` `#21222c` against the column `#2c2e3b`, 1.17) and by its
-    // radius, not by a rule. Pinned as a negative because the token is shared
-    // with `input.tsx`/`select.tsx`/`ModelPicker`, which KEEP their borders —
-    // this is a per-site decision, and only a class assertion can tell the two
-    // apart.
+  it("renders the composer as a borderless ISLAND wearing the content surface", () => {
+    // Two decisions, both pinned as negatives because both are one-keyboard
+    // away from being silently reverted.
+    //
+    // NO BORDER: the frame used to be `border border-input-border`, i.e.
+    // Dracula's Comment `#6272a4` — a slate VIOLET that reads as a purple
+    // outline around the chat (`focus-within:border-input-border-focused` put
+    // Functional Purple `#815cd6` on it while typing). The token is SHARED with
+    // `input.tsx`/`select.tsx`/`ModelPicker`, which KEEP their borders, so this
+    // is a per-site decision and only a class assertion can tell the two apart.
+    //
+    // SAME FILL AS THE TRANSCRIPT: the island is `bg-chat`, the same
+    // token the transcript column and the side pane wear. That is only legible
+    // because it is a SIBLING of the `main` with chrome between them — see the
+    // next test. As a child it would have been invisible at 1.00.
     seedLiveSession();
     const { container } = render(<ChatStream />);
-    const shell = container.querySelector(".rounded-2xl");
+    const shell = container.querySelector('[data-testid="composer-island"]');
     expect(shell).toBeTruthy();
-    expect(shell!.className).toContain("bg-input");
+    expect(shell!.className).toContain("bg-composer");
     expect(shell!.className).not.toContain("border-input-border");
     expect(shell!.className).not.toMatch(/(^|\s)border(\s|$)/);
+  });
+
+  it("keeps the composer a SIBLING of the transcript, not its child", () => {
+    // THE LOAD-BEARING STRUCTURE of the island layout. Chrome frames each
+    // island, so the gap between them IS the separation: siblings of the same
+    // fill read as two surfaces, a nested one reads as one. If the composer is
+    // ever moved back inside the `main`, `bg-chat` on both collapses
+    // to a single invisible plane (CR 1.00) — and with the border gone there is
+    // nothing left to show the boundary.
+    seedLiveSession();
+    const { container } = render(<ChatStream />);
+    const main = container.querySelector("main")!;
+    const island = container.querySelector('[data-testid="composer-island"]')!;
+    expect(main.contains(island)).toBe(false);
+    // Same visual family as the transcript and the side pane: same radius, same
+    // 4px margin, and `shrink-0` so the island never absorbs the column's
+    // height shortfall (the `main` is `flex-1`/basis-0 and cannot shrink).
+    expect(island.className).toContain("rounded-xl");
+    expect(island.className).toContain("shrink-0");
+    expect(main.className).toContain("rounded-xl");
   });
 
   it("the root main carries min-h-0 (a vertical flex item must be allowed to shrink — the transcript scrolls internally, not the window)", () => {
@@ -668,7 +693,7 @@ describe("ChatStream", () => {
   it("renders the composer's bottom row for a closed (history-only) session (the context bar + model/thinking selects — the `isLive` gates are gone)", () => {
     seedStoredSession();
     const { container } = render(<ChatStream />);
-    const composer = container.querySelector(".rounded-2xl")!;
+    const composer = container.querySelector('[data-testid="composer-island"]')!;
     // The context bar renders (an empty 0% track — the session's context is
     // dropped on close and re-emits on resume; the label waits for data).
     const bar = composer.querySelector(
@@ -999,7 +1024,7 @@ describe("ChatStream", () => {
     const { container } = render(<ChatStream />);
     // ZCode's composer carries the model/thought controls in its toolbar
     // (left of the send button).
-    const composer = container.querySelector(".rounded-2xl")!;
+    const composer = container.querySelector('[data-testid="composer-island"]')!;
     expect(composer.querySelector('[aria-label="Model"]')).toBeTruthy();
     expect(composer.querySelector('[aria-label="Thinking"]')).toBeTruthy();
     // The model trigger shows the BARE id + the provider suffix (the
@@ -1061,7 +1086,7 @@ describe("ChatStream", () => {
     });
     const { container } = render(<ChatStream />);
     // 53760 / 128000 = 42% — inside the composer (NOT the header).
-    const composer = container.querySelector(".rounded-2xl")!;
+    const composer = container.querySelector('[data-testid="composer-island"]')!;
     const group = composer.querySelector(
       '[data-testid="context-usage-bar"]',
     ) as HTMLElement | null;
@@ -1799,7 +1824,7 @@ describe("ChatStream", () => {
     }
     // The composer thumbnail is GONE after success (released + cleared —
     // scoped to the composer: the transcript now renders the image too).
-    const composer = container.querySelector(".rounded-2xl")!;
+    const composer = container.querySelector('[data-testid="composer-island"]')!;
     const remaining = screen.getAllByAltText("s.png");
     expect(remaining.some((el) => composer.contains(el))).toBe(false);
     // …while the transcript renders it (the `data:` URL, read-only).
@@ -1825,7 +1850,7 @@ describe("ChatStream", () => {
     await waitFor(() => expect(screen.getByText("boom")).toBeTruthy());
     // The attachment was NOT released/cleared (a failed send keeps it) —
     // the composer thumbnail is still present.
-    const composer = container.querySelector(".rounded-2xl")!;
+    const composer = container.querySelector('[data-testid="composer-island"]')!;
     const matches = screen.getAllByAltText("s.png");
     expect(matches.some((el) => composer.contains(el))).toBe(true);
   });

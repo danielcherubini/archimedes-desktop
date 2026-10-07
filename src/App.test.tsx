@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import App from "./App";
-import { getLeftPaneCollapsed, setLeftPaneCollapsed } from "./lib/leftPaneState";
+import { getLeftPaneCollapsed, LEFT_PANE_RAIL, setLeftPaneCollapsed } from "./lib/leftPaneState";
 import { getSidePaneCollapsed, setSidePaneCollapsed } from "./lib/sidePaneState";
 
 // Mock the Tauri IPC layer (the `importActual` pattern from
@@ -130,56 +130,74 @@ describe("App (the gear icon + settings view swap)", () => {
     act(() => {
       setLeftPaneCollapsed(true);
     });
-    expect(logo.style.width).toBe("0px");
+    expect(logo.style.width).toBe(`${LEFT_PANE_RAIL}px`);
   });
 
-  it("the chrome bar holds the left collapse button LEFT of the tabs (the tabs shift right to accommodate it) — and NO gear (the gear stays in the sidebar footer)", () => {
+  it("the chrome bar NEVER holds a pane control — expanded or collapsed (the toggles stay at the bottom of their panes in both states)", () => {
     render(<App />);
     const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
-    const collapse = screen.getByRole("button", { name: "Collapse sidebar" });
-    const tabs = screen.getByTestId("space-tabs");
-    // The collapse button is a direct child of the chrome bar, LEFT of
-    // the tabs (the tabs shift right to accommodate it).
-    const children = [...chrome.children];
-    expect(children.indexOf(collapse)).toBeGreaterThan(-1);
-    expect(children.indexOf(collapse)).toBeLessThan(children.indexOf(tabs));
-    // The gear is NOT in the chrome bar (it stays in the sidebar footer
-    // — only the collapse buttons moved up). The sidebar's footer gear
-    // IS rendered (a different button in the content row).
+    // Query by a STABLE hook, not the label: the label FLIPS with the state
+    // (`Collapse sidebar` ↔ `Expand sidebar`) for screen-reader correctness,
+    // so a name-based query would silently stop matching on one side of the
+    // collapse — the exact vacuity this file has been bitten by twice.
+    const TOGGLES = ["left-pane-toggle", "right-pane-toggle"];
+    for (const id of TOGGLES) {
+      expect(screen.getByTestId(id), `${id} belongs to the content row`).toBeTruthy();
+      expect(chrome.contains(screen.getByTestId(id)), id).toBe(false);
+    }
+    // Collapsed: STILL nothing in the chrome bar. This is the regression this
+    // pins — the collapsed state used to hand the control back to the top.
+    act(() => {
+      setLeftPaneCollapsed(true);
+      setSidePaneCollapsed(true);
+    });
+    expect(chrome.querySelectorAll("[data-testid='left-pane-toggle']").length).toBe(0);
+    expect(chrome.querySelectorAll("[data-testid='right-pane-toggle']").length).toBe(0);
+    // …and each pane still exposes its OWN control at the bottom, collapsed,
+    // now labelled for the direction it performs.
+    expect(screen.getByTestId("left-pane-toggle").getAttribute("aria-label")).toBe("Expand sidebar");
+    expect(screen.getByTestId("right-pane-toggle").getAttribute("aria-label")).toBe("Expand side pane");
     expect(chrome.querySelectorAll('[aria-label="Settings"]').length).toBe(0);
-    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
   });
 
-  it("the chrome bar's left collapse button flips the shared left-pane flag", () => {
+  it("one toggle does both jobs from the same place, and its aria-label flips with the state", () => {
     render(<App />);
-    const collapse = screen.getByRole("button", { name: "Collapse sidebar" });
-    expect(collapse.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(collapse);
+    const left = screen.getByTestId("left-pane-toggle");
+    expect(left.getAttribute("aria-label")).toBe("Collapse sidebar");
+    expect(left.getAttribute("aria-pressed")).toBe("true"); // pressed = open
+    fireEvent.click(left);
     expect(getLeftPaneCollapsed()).toBe(true);
-    expect(collapse.getAttribute("aria-pressed")).toBe("false");
+    // The SAME element — no second control to hand off to, and no keyboard
+    // shortcut exists, so one control must do both jobs from the bottom.
+    expect(screen.getByTestId("left-pane-toggle")).toBe(left);
+    expect(left.getAttribute("aria-label")).toBe("Expand sidebar");
+    expect(left.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(left);
+    expect(getLeftPaneCollapsed()).toBe(false);
+    expect(left.getAttribute("aria-label")).toBe("Collapse sidebar");
   });
 
-  it("the chrome bar holds the right collapse button RIGHT of the tabs (the rightmost area, before the window controls) and flips the shared flag", () => {
+  it("the right pane's toggle does both jobs from the same place too", () => {
     render(<App />);
-    const chrome = document.querySelector('[data-testid="chrome-bar"]')!;
-    const collapse = screen.getByRole("button", { name: "Toggle side pane" });
-    const tabs = screen.getByTestId("space-tabs");
-    // The right collapse button is a direct child of the chrome bar,
-    // positioned AFTER the tabs (the tab bar's rightmost area — before
-    // the window controls).
-    const children = [...chrome.children];
-    expect(children.indexOf(collapse)).toBeGreaterThan(-1);
-    expect(children.indexOf(collapse)).toBeGreaterThan(children.indexOf(tabs));
-    fireEvent.click(collapse);
+    const right = screen.getByTestId("right-pane-toggle");
+    expect(right.getAttribute("aria-label")).toBe("Collapse side pane");
+    fireEvent.click(right);
     expect(getSidePaneCollapsed()).toBe(true);
+    expect(screen.getByTestId("right-pane-toggle")).toBe(right);
+    fireEvent.click(right);
+    expect(getSidePaneCollapsed()).toBe(false);
   });
 
   it("the settings view renders NO tabs and NO collapse buttons in the chrome bar (the logo segment spans full width)", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.queryByTestId("space-tabs")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Toggle side pane" })).toBeNull();
+    // EVERY pane-control name, expanded or collapsed: the old version of this
+    // test queried a name that had been renamed, so it passed forever without
+    // checking anything. A rename must be chased into these negatives too.
+    for (const id of ["left-pane-toggle", "right-pane-toggle"]) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
     const logo = screen.getByAltText("Archimedes").parentElement!;
     // No inline width — the segment is `flex-1` (full width, the old
     // chrome-bar behavior), icon only (the word was removed).

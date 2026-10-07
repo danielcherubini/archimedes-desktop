@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { PanelRightIcon } from "lucide-react";
+import { useHasPendingRequest } from "../hooks/useHasPendingRequest";
 import { basenameOfPath } from "../lib/paths";
 import { useSessions } from "../store/sessions";
-import { getSidePaneCollapsed, setSidePaneCollapsed, subscribeSidePane } from "../lib/sidePaneState";
+import {
+  getSidePaneCollapsed,
+  setSidePaneCollapsed,
+  SIDE_PANE_RAIL,
+  subscribeSidePane,
+} from "../lib/sidePaneState";
 import TodoBoardPanel, { useMainOpenTodoCount } from "./TodoBoardPanel";
 import { SubagentModals } from "./SubagentModals";
 
@@ -42,19 +49,21 @@ function initialWidth(): number {
  *   The logic is EDGE-TRIGGERED (a `prevVisible` ref): a MANUAL
  *   collapse/expand while `visible` is unchanged is respected — a count
  *   change without the edge never flips the flag.
- * - **Collapse mechanism: the frame's `width: 0` + `overflow: hidden`
- *   — NOT `display: none`, NOT a transform, NOT unmount.** The content
- *   stays mounted and `fixed` overlays escape `overflow` clipping, so a
- *   collapsed pane never hides a pending `SudoConfirmModal`/
+ * - **Collapse mechanism: the frame's `SIDE_PANE_RAIL` (a sliver, NOT 0) +
+ *   `overflow: hidden` — NOT `display: none`, NOT a transform, NOT unmount.**
+ *   The content stays mounted and `fixed` overlays escape `overflow`
+ *   clipping, so a collapsed pane never hides a pending `SudoConfirmModal`/
  *   `SudoPasswordModal` (rendered by `SubagentModals` at the frame root).
- *   The collapse control lives in the CHROME BAR (the top menubar — the
- *   old footer toggle moved up), so no rail is needed: the pane just
- *   vanishes, and the chrome bar's button (always visible) re-expands
- *   it. The collapsed flag is shared via `sidePaneState`: the module
- *   seeds the flag from `localStorage` at import (it is the single
- *   persistence owner) — `SidePane` READS it via `useSyncExternalStore`
- *   and WRITES it only from the auto open/close edge (the chrome bar's
- *   button writes it itself).
+ *   The pane owns its collapse toggle at the frame's INNER-BOTTOM corner
+ *   (bottom LEFT — the side facing the chat) and keeps it in BOTH states: the
+ *   sliver is exactly the room that keeps it on screen, so the control never
+ *   migrates to the chrome bar (and there is no keyboard shortcut, so it could
+ *   not come back any other way). It stays INSET from the left edge so the 4px
+ *   resize handle stays grabbable there. The collapsed flag is shared via
+ *   `sidePaneState`: the module seeds the flag from `localStorage` at import
+ *   (it is the single persistence owner) — `SidePane` READS it via
+ *   `useSyncExternalStore` and WRITES it from its own toggle and from the auto
+ *   open/close edge.
  * - **Resize:** a 4px drag handle on the frame's left edge (a `w-1`
  *   `cursor-col-resize` div, transparent hit area — a 2px
  *   `bg-foreground-subtlest/50` line shows on hover/while dragging). The
@@ -202,6 +211,8 @@ export default function SidePane() {
   // count change without the edge never flips the flag). The pane is
   // driven by TODOS ONLY (a subagent session never opens it — the
   // subagents live under the "Delegating" card + the dedicated modal).
+  // The `bg-warning` dot on the collapsed toggle (see the toggle below).
+  const hasPendingRequest = useHasPendingRequest();
   const visible = mainTodoCount > 0;
   const prevVisibleRef = useRef(visible);
   useEffect(() => {
@@ -217,8 +228,8 @@ export default function SidePane() {
     // collapse control lives in the chrome bar (the top menubar), so no
     // rail is needed — the pane just vanishes.
     <div
-      style={{ width: collapsed ? 0 : width }}
-      className="relative m-1 flex shrink-0 flex-col overflow-hidden rounded-xl bg-background-alt"
+      style={{ width: collapsed ? SIDE_PANE_RAIL : width }}
+      className="relative m-1 flex shrink-0 flex-col overflow-hidden rounded-xl bg-inspector"
     >
       {/* The 4px drag handle (left edge): transparent hit area, a 2px
           `bg-foreground-subtlest/50` line on hover / while dragging.
@@ -265,6 +276,36 @@ export default function SidePane() {
           <TodoBoardPanel sessionId={activeSessionId} />
         </div>
       </div>
+      {/* The pane's OWN collapse toggle, at the frame's inner-bottom corner
+          (bottom LEFT for a right-hand pane — it points back at the chat).
+          `left-2` (8px) is not cosmetic: the 4px resize handle spans the
+          frame's full height, and a toggle flush on the edge would make the
+          pane unresizable in that band. Inside `overflow-hidden` but clear of
+          the `rounded-xl` corner arc, so nothing clips it.
+
+          Rendered ONLY while open — collapsed it would be clipped away with
+          the pane, and the chrome bar owns the control. No `bg-warning`
+          pending dot: that rides the chrome-bar control, the only one visible
+          once the pane is gone. */}
+      <button
+        type="button"
+        data-testid="right-pane-toggle"
+        aria-label={collapsed ? "Expand side pane" : "Collapse side pane"}
+        aria-pressed={!collapsed}
+        onClick={() => setSidePaneCollapsed(!collapsed)}
+        className="absolute bottom-2 left-2 z-10 rounded-md size-6 hover:bg-surface-hover"
+      >
+        <PanelRightIcon className="size-4" />
+        {/* The `bg-warning` dot shows ONLY while collapsed: its meaning is
+            "something needs you behind the hidden pane", so it would be noise
+            while the pane is open and its contents are already visible. */}
+        {collapsed && hasPendingRequest && (
+          <span
+            className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
+            aria-hidden
+          />
+        )}
+      </button>
       {/* The interactive sudo modals for the entries (at the frame ROOT —
           `fixed` overlays, NOT inside the scrollable content: a collapsed
           pane never hides a pending modal). */}

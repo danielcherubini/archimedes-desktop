@@ -20,11 +20,23 @@ const STORAGE_KEY = "left-pane-collapse";
 /**
  * The sidebar's expanded width — shared with the `App` chrome bar: the
  * chrome bar's logo segment (the drag region) is the sidebar's width,
- * so the tabs start where the center column begins; the segment follows
- * the sidebar's collapse state (260px expanded, 0px collapsed — the
- * collapse control lives in the chrome bar, so no rail is needed).
+ * so the tabs start where the center column begins; the segment follows the
+ * sidebar's collapse state (260px expanded, `LEFT_PANE_RAIL` collapsed).
  */
 export const LEFT_PANE_WIDTH = 260;
+
+/**
+ * The width the sidebar keeps while COLLAPSED — a sliver, NOT 0.
+ *
+ * The collapse toggle lives in the sidebar's own inner-bottom corner and
+ * stays there in both states; the sliver is the room that keeps it on screen
+ * (24px `size-6` button + the footer's 8px `p-2` + 8px of breathing room).
+ * Collapsing to 0 would clip the toggle away with the pane, and there is no
+ * keyboard shortcut for this pane — which is why the control used to live in
+ * the chrome bar. It does not go back to the top: the pane keeps its control
+ * at the bottom, in the place the user just used it.
+ */
+export const LEFT_PANE_RAIL = 40;
 
 let collapsed =
   typeof localStorage !== "undefined" &&

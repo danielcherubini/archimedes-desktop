@@ -7,19 +7,27 @@ import {
   FolderOpenIcon,
   MessageCirclePlusIcon,
   MoreHorizontalIcon,
+  PanelLeftIcon,
   SettingsIcon,
   SparklesIcon,
   Trash2Icon,
 } from "lucide-react";
 import { type SessionInfo } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
-import { getLeftPaneCollapsed, LEFT_PANE_WIDTH, subscribeLeftPane } from "../lib/leftPaneState";
+import {
+  getLeftPaneCollapsed,
+  LEFT_PANE_RAIL,
+  LEFT_PANE_WIDTH,
+  setLeftPaneCollapsed,
+  subscribeLeftPane,
+} from "../lib/leftPaneState";
 import {
   useSessions,
   spaceViewFor,
   type Message,
 } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
+import { useHasPendingRequest } from "../hooks/useHasPendingRequest";
 import { useInteractive } from "../store/interactive";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
@@ -143,6 +151,8 @@ export default function SpacesList({
   // top menubar — the old footer button moved up); this component only
   // reads the flag for its width (0 while collapsed — the chrome bar's
   // button is the re-expand control, so no rail is needed).
+  // The `bg-warning` dot on the collapsed toggle (see the footer).
+  const hasPendingRequest = useHasPendingRequest();
   const collapsed = useSyncExternalStore(
     subscribeLeftPane,
     getLeftPaneCollapsed,
@@ -197,13 +207,19 @@ export default function SpacesList({
   }, [handleNewSession, handleOpenSpace]);
 
   return (
-    // Collapse = `width: 0` + `overflow: hidden` (the content stays
-    // mounted, clipped; the `fixed` dialogs escape the clipping). The
-    // collapse control lives in the chrome bar (the top menubar), so no
-    // rail is needed — the pane just vanishes.
+    // Collapse = `LEFT_PANE_RAIL` + `overflow: hidden` (a SLIVER, not 0 — the
+    // content stays mounted, clipped; the `fixed` dialogs escape clipping).
+    // The pane owns its collapse toggle in the footer's INNER corner (bottom
+    // right — the side facing the chat) and keeps it in BOTH states: the
+    // sliver is precisely the room that keeps it on screen, so the control
+    // never migrates to the chrome bar and the user's cursor never has to
+    // travel to the top of the window to undo what they just did. The rail is
+    // narrower than the footer's content, so the gear clips away and only the
+    // toggle remains — the toggle's `shrink-0` is what makes it clip rather
+    // than be squeezed.
     <aside
-      style={{ width: collapsed ? 0 : LEFT_PANE_WIDTH }}
-      className="flex shrink-0 flex-col overflow-hidden bg-sidebar"
+      style={{ width: collapsed ? LEFT_PANE_RAIL : LEFT_PANE_WIDTH }}
+      className="flex shrink-0 flex-col overflow-hidden bg-frame"
     >
       <div className="flex flex-col gap-2 p-3">
         <button
@@ -319,18 +335,53 @@ export default function SpacesList({
         />
       )}
       {/* The footer (the ZCode `WorkspaceSidebarFooter` position — bottom
-          right): the gear icon opens the settings page as a full
-          content-area view (the parent swaps the workspace out). The
-          collapse button moved to the chrome bar (the top menubar) — the
-          footer is the gear only. */}
-      <div className="flex justify-end p-2">
+          right). ORDER matters: the gear first, then the pane's own collapse
+          toggle LAST, so the toggle occupies the inner-most corner (bottom
+          right = the edge facing the chat, pointing at what it closes) and the
+          gear stays in the same right-hand cluster, one slot outboard. */}
+      <div className="flex justify-end gap-1 p-2">
+        {/* The gear is NOT rendered while collapsed — NOT merely clipped: the
+            footer's natural content is 68px against a 40px rail, so
+            `overflow-hidden` would leave a ~4px sliver of the icon poking into
+            the rail, which reads as a rendering glitch. It is also
+            unreachable at that width, and was equally unreachable when the
+            pane collapsed to 0 — so hiding it costs nothing. */}
+        {!collapsed && (
+          <button
+            type="button"
+            aria-label="Settings"
+            onClick={() => onOpenSettings?.()}
+            className="shrink-0 rounded-md size-6 hover:bg-surface-hover"
+          >
+            <SettingsIcon className="size-4" />
+          </button>
+        )}
+        {/* The pane's OWN collapse toggle — only while open. No `bg-warning`
+            pending dot here (unlike the old chrome-bar button): the collapsed
+            chrome-bar control carries it, since that is the only control
+            visible when the pane is gone. */}
+        {/* The pane's OWN collapse toggle — rendered in BOTH states. Its
+            label and `aria-pressed` flip with the state (pressed = the pane
+            is OPEN) because it performs the opposite action when collapsed;
+            `data-testid` is the stable hook tests query, since the label
+            moves. The `bg-warning` dot shows ONLY while collapsed: its
+            meaning is "something needs you behind the hidden pane", so it
+            would be noise while the pane is open and visible. */}
         <button
           type="button"
-          aria-label="Settings"
-          onClick={() => onOpenSettings?.()}
-          className="rounded-md size-6 hover:bg-surface-hover"
+          data-testid="left-pane-toggle"
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-pressed={!collapsed}
+          onClick={() => setLeftPaneCollapsed(!collapsed)}
+          className="relative shrink-0 rounded-md size-6 hover:bg-surface-hover"
         >
-          <SettingsIcon className="size-4" />
+          <PanelLeftIcon className="size-4" />
+          {collapsed && hasPendingRequest && (
+            <span
+              className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-warning"
+              aria-hidden
+            />
+          )}
         </button>
       </div>
     </aside>
@@ -341,7 +392,7 @@ export default function SpacesList({
  * One session row: leading 16px slot (live + in-turn → the circular
  * `LoaderIcon` spinner, else an empty placeholder), the title with a
  * gradient-fade mask (applied to the text ITSELF — background-agnostic, so
- * it works over `bg-sidebar` / `bg-selected` / `bg-surface-hover` alike;
+ * it works over `bg-frame` / `bg-selected` / `bg-surface-hover` alike;
  * the text is NOT `truncate`-ellipsized, it overflows under the fade), and
  * the right slot: the relative time of last activity, the green "Waiting"
  * attention pill (a pending permission prompt OR a pending interactive

@@ -443,15 +443,17 @@ describe("the .theme-dracula palette block (ADR 0027 completeness)", () => {
     expect(diff(DARK, new Set(INHERITED)).filter((n) => !DRACULA.has(n))).toEqual([]);
   });
 
-  it("is 115 declarations: 84 structural + 25 descriptors + 6 ramp", () => {
-    // The arithmetic that proves nothing was double-counted: 84 structural
-    // (the 61 original + the 22 terminal tokens Dracula owns + the
-    // `--color-context-track` role split) + 6 ramp = the 90 tokens `.dark`
-    // declares once INHERITED is removed, plus the 25 descriptors that `.dark`
-    // never declares at all = 115.
-    expect([...DRACULA].length).toBe(115);
-    expect(diff(DARK, new Set(INHERITED)).length).toBe(90);
-    expect(ZAI_DARK.size).toBe(168);
+  it("is 117 declarations: 86 structural + 25 descriptors + 6 ramp", () => {
+    // The arithmetic that proves nothing was double-counted: 86 structural + 6
+    // ramp = the 92 tokens `.dark` declares once INHERITED is removed, plus the
+    // 25 descriptors `.dark` never declares at all = 117. The REGION RENAME
+    // (`sidebar`->`frame`, `background-alt`->`chat`) is count-neutral, and the
+    // two NEW tokens `--color-inspector` / `--color-composer` are declared in
+    // EVERY layer (aliased in the four non-dracula ones, so zai renders
+    // byte-identically), which is why all four counts below moved by two.
+    expect([...DRACULA].length).toBe(117);
+    expect(diff(DARK, new Set(INHERITED)).length).toBe(92);
+    expect(ZAI_DARK.size).toBe(170);
     // And the two directions of the difference add up the same way: zai dark
     // withholds 59 from Dracula, Dracula adds the 6 ramp tokens zai dark
     // leaves to `.dark`, so the block sizes differ by 59 − 6.
@@ -613,9 +615,9 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
       ),
     );
     expect(offSpec.length).toBe(24);
-    // And the gate really does look at the block: it sees 115 declarations, not
+    // And the gate really does look at the block: it sees 117 declarations, not
     // zero. (A parser that returned {} would pass the offender scan outright.)
-    expect(Object.keys(DRACULA_VALUES).length).toBe(115);
+    expect(Object.keys(DRACULA_VALUES).length).toBe(117);
   });
 
   it.each([
@@ -629,7 +631,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     ["color-input", "#21222c"],
     ["color-secondary", "#424450"], // Background Lighter — never Selection
     ["color-tag", "#424450"],
-    ["color-context-track", "#343746"], // the visible track that maximises the worst band
+    ["color-context-track", "#424450"], // Background Darker: the deepest step, so the bar's extent reads ON the #343746 island
     // De-emphasis TEXT is no longer Comment: `#6272a4` scored 2.05–3.36 across
     // the surfaces its 88 consumers actually paint. See the token's comment.
     ["color-foreground-subtlest", "color-mix(in oklab, #f8f8f2 55%, transparent)"],
@@ -649,76 +651,96 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     );
   });
 
-  it("sits the transcript column BELOW the floating step, not just under it", () => {
-    // `--color-background-alt` is the ONLY token that paints the reading
-    // surface — `bg-background-alt` on the transcript column (`ChatStream.tsx`)
-    // and the side pane (`SidePane.tsx`) — and it is a DERIVATION, not a hex:
-    // the floating step over the page at a ratio. Asserted as the formula so
-    // the gate survives either half moving, exactly as the subtle-text test
-    // above does.
+  it("puts the content slab on the spec's Background Light step", () => {
+    // `--color-chat` is the most-used surface in the app: the
+    // transcript column (`ChatStream.tsx`), the side pane (`SidePane.tsx`) and
+    // the composer island (`ComposerRow.tsx`) all read it, so one declaration
+    // keeps the three islands in agreement by construction.
     //
-    // THE RATIO IS THE DECISION. At 60% the composite is `#2f3240` (L 0.0326),
-    // which sits 1.12 off the page and only 1.07 under the floating step — so
-    // the column read as a near-panel, and the page plane barely registered.
-    // At 33% it is `#2c2e3b` (L 0.0278): still strictly above the page, still
-    // strictly below the floating step, but the column now reads as the page's
-    // own plane lightly lifted rather than as a second float. The ladder test
-    // does NOT cover this token (it is exempted there because a `color-mix()`
-    // is not comparable as a literal hex), so this is the only gate on it —
-    // which is why the ratio is pinned numerically and not left to review.
-    expect(DRACULA_VALUES["color-background-alt"]).toBe(
-      "color-mix(in oklab, var(--color-background-win-alt) 33%, transparent)",
-    );
+    // IT USED TO BE A DERIVATION — `color-mix(var(--color-background-win-alt)
+    // 33%, transparent)`, compositing to `#2c2e3b` — and that formulation had a
+    // cost nobody noticed at the time: a `color-mix()` is not comparable as a
+    // hex, so the ladder test had to EXEMPT it. The app's primary surface sat
+    // outside the gate that exists to police surfaces. Taking the spec's step
+    // literally puts it ON a rung and back inside the ladder, which is why the
+    // exemption is gone from the ladder test and must not come back.
+    expect(DRACULA_VALUES["color-chat"]).toBe("#343746");
 
-    // And the composite must land between the two rungs it is defined against.
-    // Transparent-alpha compositing is linear in sRGB channel space, so the
-    // blend is computed here the way the browser resolves it.
-    const hex = (v: string) => {
-      const n = parseInt(v.slice(1), 16);
-      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-    };
-    const blend = (over: string, under: string, alpha: number) =>
-      "#" +
-      hex(over)
-        .map((c, i) => Math.round(c * alpha + hex(under)[i]! * (1 - alpha)).toString(16).padStart(2, "0"))
-        .join("");
+    // The slab is the TOP resting plane, so everything the app treats as
+    // recessed or as chrome must sit below it and everything raised above.
+    // These are the relationships the island layout now depends on.
     const lum = (v: string) => {
-      const [r, g, b] = hex(v).map((c) => {
+      const n = parseInt(v.slice(1), 16);
+      const f = (c: number) => {
         const s = c / 255;
         return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
-      });
-      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      };
+      const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+      return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
     };
-    const composite = blend("#343746", "#282a36", 0.33);
-    expect(composite).toBe("#2c2e3b");
-    expect(lum(composite), "the column must stay above the page plane").toBeGreaterThan(
-      lum("#282a36"),
+    const slab = DRACULA_VALUES["color-chat"]!;
+    // Chrome frames the islands, so it must be DARKER than them or the islands
+    // stop being islands. 1.21 measured.
+    expect(lum(slab), "the slab must read above the chrome").toBeGreaterThan(
+      lum(DRACULA_VALUES["color-background"]!),
     );
-    expect(lum(composite), "the column must stay below the floating step").toBeLessThan(
-      lum("#343746"),
+    // A card INSIDE the slab must separate from it. The three `bg-panel`
+    // consumers have no borders, so this is the only thing that makes a card a
+    // card. Recessing gives 1.34; the old `#343746` measured exactly 1.00.
+    const panel = DRACULA_VALUES["color-panel"]!;
+    expect(lum(panel), "a borderless card inside the slab would be invisible").toBeLessThan(
+      lum(slab),
     );
-    // zai dark keeps its own reading untouched (its `--color-background-alt`
-    // derives from ITS `--color-background-win-alt` at 60%, i.e. `#222222`).
+    // zai dark is NOT part of the island scheme and must not move (its slab is
+    // still a 60% mix of `#2b2b2b` over its own `#161616` page, i.e. `#232323`).
     const ZAI = values(block(/^\.theme-zai-dark\s*\{/m));
-    expect(ZAI["color-background-alt"]).toBe(
+    expect(ZAI["color-chat"]).toBe(
       "color-mix(in oklab, var(--color-background-win-alt) 60%, transparent)",
     );
   });
 
-  it("keeps the sidebar on the same plane as the window chrome", () => {
-    // The top bar is `bg-background` (App.tsx), and `SpacesList` is the ONLY
-    // consumer of `bg-sidebar`, so the sidebar and the menubar are one visual
-    // plane and must read as one. `.theme-zai-dark` already models this: its
-    // `--color-sidebar` (`#161616`) is identical to its `--color-background`.
-    // The first Dracula cut put the sidebar on `#21222c` (Background Dark,
-    // "recessed") which broke that house pattern and drew a visible seam under
-    // the titlebar. Asserted as an alias rather than a hex so the pairing
-    // cannot drift if the page colour ever changes.
-    expect(DRACULA_VALUES["color-sidebar"]).toBe("var(--color-background)");
-    // Recessing is still available where it is earned — the composer well and
-    // the popover header sit BELOW the page.
-    expect(DRACULA_VALUES["color-input"]).toBe("#21222c");
-    expect(DRACULA_VALUES["color-popover-header"]).toBe("#21222c");
+  it("keeps the titlebar and the left sidebar on ONE plane", () => {
+    // THE INVARIANT IS "SAME TOKEN", NOT "SAME HEX AS THE PAGE".
+    //
+    // This test used to assert `--color-frame: var(--color-background)`, and
+    // its comment blamed the seam on the sidebar sitting on `#21222c`. That
+    // diagnosis was wrong, and the wrongness is worth keeping: the seam was
+    // never caused by WHICH step the sidebar was on, it was caused by the
+    // titlebar and the sidebar reading DIFFERENT tokens (`bg-background` vs
+    // `bg-frame`). The alias hid that by making the two tokens accidentally
+    // equal, so the invariant was enforced by a coincidence rather than by
+    // construction.
+    //
+    // It is now enforced structurally: `App.tsx`'s chrome bar reads
+    // `bg-frame`, the same token `SpacesList` reads, so the two CANNOT drift
+    // apart whatever the palette says. That is what the JSX half of this test
+    // pins, and it is why moving the chrome band to `#21222c` draws no seam.
+    const app = readFileSync("src/App.tsx", "utf8");
+    // Match the bar's OWN opening tag: its className sits on the line before
+    // `data-testid`, and `[^>]*` cannot cross the tag's closing `>`. A wider
+    // [\s\S] window reaches FORWARD past the bar into the settings branch's
+    // div and pins the wrong element — which is what this regex did first.
+    const chromeBar = app.match(/className="([^"]+)"[^>]*data-testid="chrome-bar"/);
+    expect(chromeBar, "chrome bar not found in App.tsx — update this test").toBeTruthy();
+    expect(chromeBar![1], "the titlebar must read the same token as the sidebar").toMatch(
+      /(^|\s)bg-frame(\s|$)/,
+    );
+
+    // The band itself: `#21222c` (Background Dark), i.e. the chrome now reads as
+    // the RECESSED plane and the islands float above it. Pinned as a hex because
+    // unlike the pairing above, this value IS a free choice and could drift.
+    expect(DRACULA_VALUES["color-frame"]).toBe("#21222c");
+    // The same step as the other recessed surfaces, so the recess is ONE step
+    // and not two. Asserted against them rather than a literal so the whole
+    // recessed band moves together if it ever has to.
+    expect(DRACULA_VALUES["color-frame"]).toBe(DRACULA_VALUES["color-input"]);
+    expect(DRACULA_VALUES["color-frame"]).toBe(DRACULA_VALUES["color-popover-header"]);
+    // And it must stay BELOW the page: chrome above the content would invert the
+    // frame the islands sit in.
+    expect(
+      DRACULA_VALUES["color-frame"],
+      "the chrome band must not out-shine the page it frames",
+    ).not.toBe(DRACULA_VALUES["color-background"]);
   });
 
   it("reserves Selection for selection, never as a border", () => {
@@ -770,36 +792,71 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
      * is the brightest step. It is therefore asserted as strictly brighter than
      * every resting surface rather than as a rung, and pinned to appearing
      * nowhere else at all.
+     *
+     * THE ISLAND LAYOUT MOVED THREE TOKENS, and one of them is now graded that
+     * used to be invisible to this test:
+     *   `color-chat` — the content slab — WAS `color-mix(…)`, which is
+     *   not comparable as a hex, so it was EXEMPTED below. It is now the literal
+     *   `#343746`, so the exemption is removed and the slab is classified with
+     *   the floats. That is the whole point of taking the spec's step literally:
+     *   the most-used surface in the app is now inside the gate instead of
+     *   outside it.
+     *   `color-panel` moved from the floating step DOWN to recessed, because its
+     *   three consumers are cards INSIDE the slab and they have no borders.
+     *   `color-context-track` sits on the RAISED step. It has now been on three
+     *   steps across two layout changes and the reason keeps being the same: the
+     *   track must differ from whatever the composer island wears, and the island
+     *   moved twice. On `#191a21` it measured 1.47 against the `#343746` island;
+     *   once the island became `#282a36` that fell to 1.218, under the 1.3 floor,
+     *   and `#424450` became the only non-Selection candidate that reads.
+     *
+     * THE REGION RENAME added `color-frame` and `color-composer`, and both land
+     * on EXISTING steps rather than inventing rungs: `frame` (the gaps, the
+     * titlebar, the session list) shares the recessed step, and `composer` shares
+     * the page step. That is the point of naming regions — five spec steps still
+     * cover every region, so a new theme assigns hues to places without needing a
+     * sixth step.
      */
     const LADDER: Array<{ label: string; tokens: string[] }> = [
-      { label: "terminal paper", tokens: ["color-terminal-bg"] }, // #191a21 Background Darker
+      { label: "deepest (terminal paper)", tokens: ["color-terminal-bg"] }, // #191a21 Background Darker
       {
-        label: "recessed (composer well, popover header)",
-        tokens: ["color-input", "color-input-focused", "color-popover-header"],
-      }, // #21222c Background Dark
-      { label: "the page (and the sidebar)", tokens: ["color-background", "color-tab-active"] }, // #282a36 Background
-      {
-        label: "floating (header, panel, tabs, menus, popovers, toasts, tooltips, the context-bar track)",
+        label: "recessed (form controls, popover header, cards inside the chat, the FRAME the islands sit in)",
         tokens: [
-          "color-header",
+          "color-input",
+          "color-input-focused",
+          "color-popover-header",
           "color-panel",
+          "color-frame",
+        ],
+      }, // #21222c Background Dark
+      {
+        label: "the page plane AND the composer island (the inspector's backdrop, tabs' active state)",
+        tokens: ["color-background", "color-composer"],
+      }, // #282a36 Background
+      {
+        label: "the chat column, the inspector AND every float (header, tabs, menus, popovers, toasts, tooltips) — and the ACTIVE TAB, which is the chat sheet showing through the frame",
+        tokens: [
+          "color-chat",
+          "color-inspector",
+          "color-header",
           "color-background-win-alt",
           "color-tab",
+          "color-tab-active",
           "color-menu",
           "color-popover",
           "color-toast",
           "color-tooltip",
-          "color-context-track",
         ],
-      }, // #343746 Background Light / Floating
+      }, // #343746 Background Light == Floating interactive elements
       {
-        label: "raised (cards, badges, the inline-code chip, menu hover)",
+        label: "raised (cards, badges, the inline-code chip, menu hover, the context bar's track)",
         tokens: [
           "color-card",
           "color-secondary",
           "color-tag",
           "color-tooltip-tag",
           "color-menu-hover",
+          "color-context-track",
         ],
       }, // #424450 Background Lighter
     ];
@@ -850,10 +907,14 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // Selection — so the ladder cannot be widened past this test by adding a
     // surface token nobody classified.
     const SURFACE_SUFFIX =
-      /^(color-(background|background-win-alt|background-alt|header|panel|sidebar|card|card-selected|popover|popover-header|input|input-focused|tab|tab-active|menu|menu-hover|toast|tooltip|tooltip-tag|secondary|tag|context-track|terminal-bg))$/;
+      /^(color-(background|background-win-alt|chat|inspector|composer|frame|header|panel|card|card-selected|popover|popover-header|input|input-focused|tab|tab-active|menu|menu-hover|toast|tooltip|tooltip-tag|secondary|tag|context-track|terminal-bg))$/;
     const unclassified = Object.keys(DRACULA_VALUES)
       .filter((t) => SURFACE_SUFFIX.test(t))
-      .filter((t) => !seen.has(t) && t !== "color-card-selected" && t !== "color-sidebar" && t !== "color-background-alt")
+      // `card-selected` is Selection (asserted above the ladder, not on it) and
+      // nothing else is exempt any more: every region token — `frame`, `chat`,
+      // `inspector`, `composer` included — is classified above, so a new region
+      // token cannot slip in ungraded and a renamed one cannot quietly vanish.
+      .filter((t) => !seen.has(t) && t !== "color-card-selected")
       .sort();
     expect(unclassified, "surface tokens missing from the ladder").toEqual([]);
 
@@ -1088,7 +1149,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // clears the floor (asserted above, per surface); the bar gets its own
     // token, declared per palette, so zai keeps the track it has always had and
     // Dracula gets one chosen for band separation.
-    expect(DRACULA_VALUES["color-context-track"]).toBe("#343746");
+    expect(DRACULA_VALUES["color-context-track"]).toBe("#424450");
     // The text token must no longer be the border/Comment colour, or the split
     // did not happen — it is one declaration and the two roles are back.
     expect(DRACULA_VALUES["color-foreground-subtlest"]).not.toBe(
@@ -1140,9 +1201,15 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // the only thing separating it from the unfilled remainder is the track.
     // Graded against the four fills the component actually emits
     // (`ChatStream.tsx`: `bg-success` / `bg-caution` / `bg-warning` /
-    // `bg-destructive`), on the composited background the track really paints
-    // on — the composer well, `bg-input`.
-    const well = DRACULA_VALUES["color-input"]!;
+    // `bg-destructive`), on the surface the track really paints on.
+    //
+    // THAT SURFACE MOVED. The bar used to sit in a `bg-input` `#21222c` well; the
+    // island layout moved the composer onto the content slab, so the track now
+    // paints on `--color-chat`. Reading the wrong token here would
+    // grade a real relationship against a surface that no longer exists at that
+    // site — which is exactly the failure the ADR's amendments keep recording —
+    // so it is derived from the token the composer island actually wears.
+    const well = DRACULA_VALUES["color-composer"]!;
     const track = DRACULA_VALUES["color-context-track"]!;
     const lumOf = (hex: string) => {      const n = parseInt(hex.slice(1), 16);
       const f = (v: number) => {
@@ -1177,34 +1244,41 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
       contrast(track, well),
       `the track ${track} is invisible against the composer well ${well}`,
     ).toBeGreaterThanOrEqual(1.3);
-    // WHY `#343746`, stated as a measurable criterion rather than as taste.
+    // WHY `#191a21`, stated as a measurable criterion rather than as taste.
     //
     // The track has TWO jobs, and they pull in opposite directions:
     //   (a) separate the band fill from the unfilled remainder  → wants the track
     //       DARK (the darkest value in the block, the terminal's `#191a21`, gives
     //       the best bands: 12.63 / 15.52 / 10.18 / 6.36), and
     //   (b) be visible itself, so the bar's EXTENT reads           → wants the
-    //       track BRIGHT (against the `#21222c` well, `#191a21` measures 1.10 —
-    //       i.e. no visible track at all, and the dark end of the ladder is
-    //       exactly where every candidate fails).
+    //       track FAR FROM THE SURFACE IT SITS ON.
     // So the criterion is two-stage, and the order matters: FILTER to tracks that
-    // read against the well (>= 1.3), then MAXIMISE THE WORST BAND among them.
+    // read against the island (>= 1.3), then MAXIMISE THE WORST BAND among them.
     // Doing it the other way round (maximising the weakest link) degenerates into
-    // "pick the brightest", because track-vs-well is always the binding term —
-    // that formulation selects `#44475a`, which is Selection and banned as a
-    // resting surface, and whose bands (3.36) are worse than the value here.
+    // "pick whichever is furthest from the surface", because track-vs-island is
+    // usually the binding term — that formulation selects `#44475a`, which is
+    // Selection and banned as a resting surface, and whose bands (3.36) are the
+    // worst of any candidate.
     //
-    //   candidate  vs the well   worst band
-    //   #191a21       1.10          6.36     excluded (invisible)
-    //   #21222c       1.00          5.80     excluded (invisible)
-    //   #282a36       1.11          5.23     excluded (invisible)
-    //   #343746       1.34          4.33     <- winner
-    //   #424450       1.64          3.54
-    //   #44475a       1.73          3.36     Selection: not a resting surface
+    // THE TABLE FLIPPED when the composer island took the slab. Against the old
+    // `#21222c` well the DARK end was invisible and the bright end won on
+    // visibility, so `#343746` was the compromise. Against the `#343746` island
+    // the bright end is now the invisible one (it IS the island) and the dark end
+    // clears the floor outright — so `#191a21` wins BOTH jobs instead of
+    // splitting them. This is the rare case where a layout change made a token
+    // strictly better rather than forcing a trade-off.
+    //
+    //   candidate  vs the island  worst band
+    //   #191a21       1.47           6.36    <- winner
+    //   #21222c       1.34           5.80
+    //   #282a36       1.21           5.23    excluded (invisible)
+    //   #343746       1.00           4.33    excluded (invisible: it IS the slab)
+    //   #424450       1.22           3.54    excluded (invisible)
+    //   #44475a       1.29           3.36    excluded + Selection: not a resting surface
     const candidates = Object.entries(DRACULA_VALUES).filter(
       ([t, v]) =>
         /^#[0-9a-f]{6}$/i.test(v) &&
-        /^color-(card|panel|background|input|popover-header|terminal-bg|secondary|tag|tooltip|toast|menu|header|card-selected)$/.test(
+        /^color-(card|panel|background|chat|composer|frame|input|popover-header|terminal-bg|secondary|tag|tooltip|toast|menu|header|card-selected)$/.test(
           t,
         ),
     );
