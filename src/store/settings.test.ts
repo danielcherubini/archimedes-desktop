@@ -37,6 +37,7 @@ const FULL_SETTINGS: AppSettings = {
   subagentModels: {},
   spinnerStyle: null,
   filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+  mcpMentionsEnabled: false,
 };
 
 describe("useSettings store", () => {

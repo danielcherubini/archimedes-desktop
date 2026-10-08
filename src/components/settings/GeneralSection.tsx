@@ -220,6 +220,24 @@ export default function GeneralSection({
           />
         }
       />
+      {/* The `#` MCP-mention trigger (ADR 0031's follow-up). OFF by default,
+          and the copy says WHY: `#` is the one prefix that collides with the
+          text a coding user pastes, so an accidental mention is the failure
+          mode here rather than a missing feature. It gates the TRIGGER only —
+          a message already sent with a `#` mention keeps rendering its chip. */}
+      <SettingsRow
+        label="Mention MCP servers with #"
+        description="Type # to name an MCP server in a message. # collides with pasted text such as #include or an issue number #123, so it is off by default: an accidental mention can fire whenever a server shares such a name. The $ and @ mentions are always on."
+        control={
+          <Switch
+            checked={settings.mcpMentionsEnabled}
+            aria-label="Mention MCP servers with #"
+            onCheckedChange={(checked) =>
+              onSave({ mcpMentionsEnabled: checked })
+            }
+          />
+        }
+      />
       <SettingsRow
         label="Default model"
         description="The model new sessions start with (the system default when unset)"

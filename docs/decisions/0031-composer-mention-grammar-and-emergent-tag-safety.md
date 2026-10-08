@@ -1,7 +1,7 @@
 ---
 status: accepted
 date: 2026-10-07
-superseded-by:
+superseded-by: 0032-mcp-mention-is-opt-in.md
 ---
 
 # The composer mention grammar (`$` / `#` / `@`), the hard/soft split, and emergent tag safety

@@ -101,6 +101,15 @@ pub struct Settings {
     /// Whether to trust new Spaces by default.
     #[serde(default)]
     pub default_trust_new_spaces: bool,
+    /// Whether the composer's `#` MCP-server mention is live (ADR 0031's
+    /// follow-up). `#[serde(default)]` = `false`, so a pre-feature
+    /// `settings.json` ships `#` OFF: `#` is the one mention prefix that
+    /// collides with pasted text (`#include`, `#123`, `#hashtag` all match
+    /// the token grammar), so it is opt-in while `$` and `@` are always on.
+    /// Gates the TRIGGER only — the display side still parses a persisted
+    /// `<mcp>` block, and the MCP catalog command stays available.
+    #[serde(default)]
+    pub mcp_mentions_enabled: bool,
     /// (ADR 0030) The per-direction file-access policies. `#[serde(default)]`
     /// — a pre-feature file parses to `FilePolicy::default()` (all `Allow`),
     /// so no migration runs. NOTE: that default is WIDER than the pre-feature
@@ -164,6 +173,7 @@ impl Default for Settings {
             palette: None,
             pane_layout: Value::Object(Default::default()),
             default_trust_new_spaces: false,
+            mcp_mentions_enabled: false,
             file_policy: FilePolicy::default(),
             default_model: None,
             default_thinking_level: None,
@@ -440,6 +450,7 @@ mod tests {
         assert!(settings.providers.is_empty());
         assert_eq!(settings.font, FontSettings::default());
         assert!(settings.subagent_models.is_empty());
+        assert!(!settings.mcp_mentions_enabled);
     }
 
     #[test]
@@ -458,6 +469,50 @@ mod tests {
         assert!(settings.subagent_models.is_empty());
         assert_eq!(settings.spinner_style, None);
         assert_eq!(settings.palette, None);
+        // (ADR 0031 follow-up) `#` ships OFF: a file written before the
+        // setting existed must NOT silently enable the one trigger that
+        // collides with pasted text.
+        assert!(!settings.mcp_mentions_enabled);
+    }
+
+    #[test]
+    fn mcp_mentions_enabled_defaults_off_and_round_trips() {
+        // (ADR 0031 follow-up) The `#` MCP-server mention is OPT-IN: the
+        // default is `false` (`#[serde(default)]`), so a pre-feature
+        // `settings.json` — and a fresh first-run file — ship `#` OFF while
+        // `$` and `@` stay always-on. An explicit `true` survives the
+        // write/read cycle under the camelCase wire key.
+        assert!(!Settings::default().mcp_mentions_enabled);
+        let file: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
+        assert!(!file.mcp_mentions_enabled);
+        // The explicit ON value round-trips through the JSON shape.
+        let on: Settings = serde_json::from_str(r#"{ "mcpMentionsEnabled": true }"#).unwrap();
+        assert!(on.mcp_mentions_enabled);
+        let settings = Settings {
+            mcp_mentions_enabled: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"mcpMentionsEnabled\":true"),
+            "camelCase key: {json}"
+        );
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        // And through the real file (write_settings → load_settings).
+        let dir = tempfile::tempdir().unwrap();
+        write_settings(dir.path(), &settings).unwrap();
+        let raw = fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(
+            raw.contains("\"mcpMentionsEnabled\""),
+            "camelCase key on disk: {raw}"
+        );
+        let back = load_settings(dir.path());
+        assert!(back.mcp_mentions_enabled);
+        assert_eq!(back, settings);
+        // A first-run file (no file at all) writes the defaults: `#` OFF.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(!load_settings(fresh.path()).mcp_mentions_enabled);
     }
 
     #[test]
@@ -724,6 +779,7 @@ mod tests {
                 "tama/m-1".to_string(),
             )]),
             spinner_style: Some("marquee".to_string()),
+            mcp_mentions_enabled: true,
             file_policy: FilePolicy {
                 reads: AccessPolicy::Sandboxed,
                 writes: AccessPolicy::Ask,
@@ -745,6 +801,7 @@ mod tests {
             "\"subagentModels\"",
             "\"spinnerStyle\"",
             "\"filePolicy\"",
+            "\"mcpMentionsEnabled\"",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }

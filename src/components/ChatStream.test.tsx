@@ -40,7 +40,42 @@ const SETTINGS_FIXTURE: AppSettings = {
   subagentModels: {},
   spinnerStyle: null,
   filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+  mcpMentionsEnabled: false,
 };
+
+/**
+ * Seed the settings store with the `#` MCP-mention trigger ENABLED.
+ * The trigger is OFF by default (it collides with pasted developer text), so
+ * every test that exercises the shipped `#` behavior opts in explicitly here —
+ * the same seeding path the spinner-style tests use, so the gate is read from
+ * the same store the composer reads.
+ */
+function seedMcpMentionsOn(): void {
+  useSettings
+    .getState()
+    .setSettings({ ...SETTINGS_FIXTURE, mcpMentionsEnabled: true });
+}
+
+/**
+ * Seed the settings store with the `#` MCP-mention trigger EXPLICITLY off
+ * (the default when nothing is seeded is also off — `settings === null` —
+ * so this pins the flag itself rather than the not-yet-loaded fallback).
+ */
+function seedMcpMentionsOff(): void {
+  useSettings
+    .getState()
+    .setSettings({ ...SETTINGS_FIXTURE, mcpMentionsEnabled: false });
+}
+
+/** The `<mcp>` block `expandMentions` produces for the `postgres` fixture
+ * server (a message PERSISTED while the `#` trigger was on). */
+const PERSISTED_MCP_MESSAGE =
+  "query #postgres\n\n" +
+  '<mcp name="postgres">' +
+  '\nThe user has explicitly named the MCP server "postgres" for this' +
+  '\nrequest. Connect to it via the mcp tool (mcp({ connect: "postgres" }))' +
+  "\nand use its tools. (Server summary: npx -y x-mcp.)" +
+  "\n</mcp>";
 
 // jsdom exposes a non-callable `window.matchMedia` (the `"matchMedia" in
 // window` guard in the `BrailleLoader`'s `usePrefersReducedMotion` passes,
@@ -2326,6 +2361,7 @@ describe("ChatStream", () => {
 
   it("typing # opens the picker with the MCP rows (# badge)", async () => {
     seedLiveSession();
+    seedMcpMentionsOn();
     render(<ChatStream />);
     // `#` → the ACTIVE prefix's catalog is the effective MCP servers (the
     // `listMcpServersEffective` mock). `findByText` awaits the async fetch.
@@ -2353,6 +2389,7 @@ describe("ChatStream", () => {
 
   it("a mixed draft lists only the prefix of the token at the caret", async () => {
     seedLiveSession();
+    seedMcpMentionsOn();
     render(<ChatStream />);
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     // The caret is at the END of what is typed (where a user's caret sits
@@ -2507,6 +2544,7 @@ describe("ChatStream", () => {
   it("send expands a # MCP mention into the soft mcp block",
     async () => {
       seedLiveSession();
+      seedMcpMentionsOn();
       render(<ChatStream />);
       await waitForCatalog();
       fireEvent.change(screen.getByRole("textbox"), {
@@ -2526,6 +2564,7 @@ describe("ChatStream", () => {
   it("send expands a mixed $ / @ / # draft into blocks in first-mention order",
     async () => {
       seedLiveSession();
+      seedMcpMentionsOn();
       render(<ChatStream />);
       await waitForCatalog();
       fireEvent.change(screen.getByRole("textbox"), {
@@ -2769,6 +2808,7 @@ describe("ChatStream", () => {
 
   it("enter selects an MCP row and inserts the #-token", async () => {
     seedLiveSession();
+    seedMcpMentionsOn();
     render(<ChatStream />);
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: "#" } });
@@ -2795,6 +2835,7 @@ describe("ChatStream", () => {
 
   it("an unknown # token leaves the picker closed and the draft untouched", async () => {
     seedLiveSession();
+    seedMcpMentionsOn();
     render(<ChatStream />);
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     // `#nosauch` matches no server in the catalog → no rows → the picker is
@@ -2880,6 +2921,7 @@ describe("ChatStream", () => {
   it("a mouse click on a # row inserts the token (mousedown, not click)",
     async () => {
       seedLiveSession();
+      seedMcpMentionsOn();
       render(<ChatStream />);
       const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
       fireEvent.change(textarea, { target: { value: "#" } });
@@ -2900,6 +2942,7 @@ describe("ChatStream", () => {
   it("a # row's description (the MCP summary) renders as a title tooltip",
     async () => {
       seedLiveSession();
+      seedMcpMentionsOn();
       render(<ChatStream />);
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "#" } });
       const row = (await screen.findByText("postgres")).closest("button")!;
@@ -2942,5 +2985,147 @@ describe("ChatStream", () => {
       const desc = row.querySelector("[title]")!;
       expect(desc.getAttribute("title")).toBe("Fast recon.");
       expect(desc.textContent).toBe("Fast recon.");
+    });
+
+  // ---------------------------------------------------------------------
+  // The `#` MCP-mention toggle (ADR 0031's follow-up). `#` is the ONE prefix
+  // that collides with pasted developer text (`#include`, `#123`, `#hashtag`
+  // all satisfy the token grammar), so the trigger is opt-in. The gate is
+  // expressed as an EMPTY MCP catalog: the picker and the expansion are
+  // already catalog-gated, so no new code path exists. The DISPLAY side
+  // (`splitMentionBlocks`) is deliberately NOT gated — a message persisted
+  // while the trigger was on keeps rendering its chip.
+  // ---------------------------------------------------------------------
+
+  it("the # trigger is OFF by default: typing # opens no picker", async () => {
+    seedLiveSession();
+    seedMcpMentionsOff();
+    render(<ChatStream />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "#" } });
+    // The MCP fetch HAS run (the fetch is NOT gated — gating it would make a
+    // live toggle require a remount), but no rows are fed to the picker.
+    await waitFor(() =>
+      expect(vi.mocked(listMcpServersEffective)).toHaveBeenCalled(),
+    );
+    await flush();
+    expect(screen.queryByTestId("mention-picker")).toBeNull();
+    expect(screen.queryByText("postgres")).toBeNull();
+  });
+
+  it("with the # trigger OFF, a matching # token is sent BYTE-IDENTICAL (no expansion)",
+    async () => {
+      seedLiveSession();
+      seedMcpMentionsOff();
+      render(<ChatStream />);
+      await waitForCatalog();
+      // `postgres` IS in the catalog — the OFF state must still leave the text
+      // untouched (the empty-catalog gate hits `expandMentions`, which then
+      // finds no match and returns the text verbatim: invariant 1).
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "query #postgres " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "query #postgres");
+      const userMsg = useSessions
+        .getState()
+        .messages["s1"]?.find((m) => m.kind === "user");
+      expect(userMsg?.kind === "user" ? userMsg.text : null).toBe(
+        "query #postgres",
+      );
+      // And the bubble renders no chip (the text carried no block).
+      expect(screen.queryByText("named by the user")).toBeNull();
+    });
+
+  it("with the # trigger OFF, Enter with a bare # draft SENDS it (no swallowed keys)",
+    async () => {
+      seedLiveSession();
+      seedMcpMentionsOff();
+      render(<ChatStream />);
+      await waitForCatalog();
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "#123" } });
+      await flush();
+      // No picker → the keyboard branches (all gated on `filtered.length > 0`)
+      // are inert, so Enter is a plain send. `#123` is exactly the pasted-issue
+      // number that must reach the agent untouched.
+      textarea.setSelectionRange(4, 4);
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "#123");
+    });
+
+  it("with the # trigger OFF, the $ and @ triggers still pick and expand (only # is gated)",
+    async () => {
+      seedLiveSession();
+      seedMcpMentionsOff();
+      render(<ChatStream />);
+      await waitForCatalog();
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // The pickers: `@` still opens (the `@` catalog is untouched).
+      fireEvent.change(textarea, { target: { value: "@" } });
+      expect(await screen.findByText("scout")).toBeTruthy();
+      // And a MIXED draft expands `$` + `@` but NOT `#` — one block per
+      // ENABLED kind, in first-mention order, with the `#` token left verbatim
+      // in the user's text.
+      fireEvent.change(textarea, {
+        target: { value: "x $debug @scout #postgres " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      const sent = vi.mocked(sendPrompt).mock.calls[0]![1] as string;
+      expect(sent.startsWith("x $debug @scout #postgres")).toBe(true);
+      expect(sent).toContain('<skill name="debug"');
+      expect(sent).toContain('<agent name="scout">');
+      expect(sent).not.toContain('<mcp name="postgres">');
+    });
+
+  it("the # trigger is gated while the settings are still loading (the fail-safe default)",
+    async () => {
+      // No settings seeded at all (`settings === null`) — the composer must
+      // behave as OFF, never as ON (`settings?.mcpMentionsEnabled ?? false`).
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "query #postgres " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "query #postgres");
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+    });
+
+  it("flipping the setting while the # picker is open feeds the rows without a remount",
+    async () => {
+      // The `filtered` memo's deps include the flag: the picker is open on `#`
+      // (no rows, so nothing renders), and flipping the store to ON makes the
+      // row appear with NO further keystroke and NO remount.
+      seedLiveSession();
+      seedMcpMentionsOff();
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "#" } });
+      await waitFor(() =>
+        expect(vi.mocked(listMcpServersEffective)).toHaveBeenCalled(),
+      );
+      await flush();
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+      await act(async () => {
+        seedMcpMentionsOn();
+      });
+      expect((await screen.findByText("postgres")).closest("button")).toBeTruthy();
+    });
+
+  it("a persisted <mcp> block still renders its chip with the # trigger OFF (display is not gated)",
+    () => {
+      // The gate is on the TRIGGER, not the display: a message sent while the
+      // toggle was ON keeps rendering its soft-hint chip after the toggle goes
+      // OFF (the record is unchanged, and `mergeDedupeKey` must stay stable).
+      seedLiveSession();
+      seedMcpMentionsOff();
+      useSessions
+        .getState()
+        .addUserMessage("s1", PERSISTED_MCP_MESSAGE);
+      render(<ChatStream />);
+      expect(screen.getByText("named by the user")).toBeTruthy();
+      expect(screen.getByText("postgres")).toBeTruthy();
+      // The user's own text renders without the block prose.
+      expect(screen.queryByText(/Connect to it via the mcp tool/)).toBeNull();
     });
 });

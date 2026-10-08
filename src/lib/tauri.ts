@@ -452,6 +452,20 @@ export interface AppSettings {
   spinnerStyle: string | null;
   /** (ADR 0030) The per-direction file-access policies. The backend ALWAYS emits it (`#[serde(default)]` fills all-`allow` for a pre-feature file), so it is required here; the UI still falls back to all-`allow` if the key is ever absent. */
   filePolicy: FilePolicy;
+  /**
+   * (ADR 0031 follow-up) Whether the composer's `#` trigger names an MCP
+   * server. OFF by default: `#` is the ONE prefix that collides with pasted
+   * developer text — `#include`, an issue number `#123` and `#hashtag` all
+   * satisfy the token grammar, so an accidental expansion lands whenever a
+   * server shares such a name. `$` and `@` stay always on.
+   *
+   * Gates the TRIGGER only (the picker rows + the send-path expansion, both
+   * fed an EMPTY MCP catalog when off). It does NOT gate the DISPLAY: a
+   * message persisted while the trigger was on keeps rendering its `<mcp>`
+   * chip. The backend emits it with `#[serde(default)]`, so a pre-feature
+   * `settings.json` reads as `false`.
+   */
+  mcpMentionsEnabled: boolean;
 }
 
 /** The effective catalog's model (the Default-model select + provider discovery status). */

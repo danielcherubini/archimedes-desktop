@@ -61,6 +61,7 @@ function settingsFixture(overrides: Partial<AppSettings> = {}): AppSettings {
     subagentModels: {},
     spinnerStyle: null,
     filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+    mcpMentionsEnabled: false,
     ...overrides,
   };
 }
@@ -144,6 +145,7 @@ describe("loadAndApplySettings", () => {
       subagentModels: {},
       spinnerStyle: null,
       filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+      mcpMentionsEnabled: false,
     });
     stubMatchMedia(true); // OS is dark → "system" resolves to zai-dark
     const settings = await loadAndApplySettings();

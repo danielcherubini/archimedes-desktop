@@ -34,6 +34,7 @@ vi.mock("./lib/tauri", async () => {
       subagentModels: {},
       spinnerStyle: null,
       filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+      mcpMentionsEnabled: false,
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),

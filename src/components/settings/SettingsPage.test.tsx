@@ -51,6 +51,7 @@ const baseSettings: AppSettings = {
   subagentModels: {},
   spinnerStyle: null,
   filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+  mcpMentionsEnabled: false,
 };
 
 vi.mock("@/lib/version", () => ({
@@ -95,6 +96,7 @@ vi.mock("../../lib/tauri", async () => {
       subagentModels: {},
       spinnerStyle: null,
       filePolicy: { reads: "allow", writes: "allow", shell: "allow" },
+      mcpMentionsEnabled: false,
     }),
     // The discovered agent definitions (ADR 0023 — the Subagents section's
     // data source): empty by default (the tests override per case).
@@ -986,8 +988,6 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
   });
 
   it("the_update_round_trip_preserves_the_default_thinking_levels", async () => {
-    // (ADR 0015) The loaded document remembers a per-model thinking level
-    // (`"<provider>/<id>"` → level).
     vi.mocked(getSettings).mockResolvedValueOnce({
       ...baseSettings,
       defaultThinkingLevels: { "tama/Qwen3.8": "xhigh" },
@@ -1004,6 +1004,76 @@ describe("SettingsPage (the ZCode port — sections + immediate save)", () => {
     // The `{ ...settings, ...patch }` round-trip loses no field — the
     // per-model memory rides along untouched (no new UI, ADR 0015).
     expect(saved.defaultThinkingLevels).toEqual({ "tama/Qwen3.8": "xhigh" });
+  });
+});
+
+// The `#` MCP-mention toggle (ADR 0031's follow-up): the trigger is OFF by
+// default because `#` collides with pasted developer text (`#include`, `#123`).
+describe("SettingsPage (the # MCP-mention toggle)", () => {
+  it("the toggle renders from the setting (off by default, on when stored)", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const toggle = await screen.findByRole("switch", {
+      name: "Mention MCP servers with #",
+    });
+    // The loaded document has it off → the switch is off (no save happened just
+    // from opening the page).
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(saveSettings).not.toHaveBeenCalled();
+    cleanup();
+
+    vi.mocked(getSettings).mockResolvedValueOnce({
+      ...baseSettings,
+      mcpMentionsEnabled: true,
+    });
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    expect(
+      screen
+        .getByRole("switch", { name: "Mention MCP servers with #" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+  });
+
+  it("flipping the toggle saves the complete document with the flag", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    fireEvent.click(
+      await screen.findByRole("switch", {
+        name: "Mention MCP servers with #",
+      }),
+    );
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveSettings).mock.calls[0][0] as AppSettings;
+    // ONE save of the COMPLETE document with the new flag (the whole-document
+    // save pattern — nothing else moved).
+    expect(saved.mcpMentionsEnabled).toBe(true);
+    expect(saved.theme).toBe("dark");
+    expect(saved.providers).toHaveLength(1);
+    expect(saved.filePolicy).toEqual(baseSettings.filePolicy);
+    expect(saved.font).toEqual(baseSettings.font);
+    // The switch reflects the saved document (optimistic state = what was written).
+    expect(
+      screen
+        .getByRole("switch", { name: "Mention MCP servers with #" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+  });
+
+  it("the toggle's description states the collision honestly", async () => {
+    render(<SettingsPage onBack={vi.fn()} />);
+    await loaded();
+    const toggle = await screen.findByRole("switch", {
+      name: "Mention MCP servers with #",
+    });
+    const row = toggle.closest(".border-t");
+    expect(row).toBeTruthy();
+    const text = row!.textContent ?? "";
+    // The copy names the two concrete collisions and says the default is off —
+    // a user must learn WHY without opening a doc.
+    expect(text).toContain("#include");
+    expect(text).toContain("#123");
+    expect(text).toContain("off by default");
   });
 });
 

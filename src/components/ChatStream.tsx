@@ -122,6 +122,36 @@ export default function ChatStream() {
   const spinnerStyle = normalizeVariant(
     useSettings((s) => s.settings?.spinnerStyle ?? "typing"),
   );
+  /**
+   * (ADR 0031's follow-up) Whether the `#` trigger names an MCP server. The
+   * fail-safe default is OFF — `settings` is `null` until the first load
+   * lands, and `#` is the prefix that collides with pasted developer text
+   * (`#include`, `#123`), so an unknown state must behave like "off", never
+   * like "on".
+   *
+   * THE GATE IS THE CATALOG, NOT A FLAG PARAMETER. Both the picker and the
+   * send-path expansion are ALREADY catalog-gated (a token expands only if the
+   * catalog has that exact name — the load-bearing invariant of ADR 0031), so
+   * feeding the mention code an EMPTY MCP catalog switches `#` off completely
+   * with NO new code path: `expandMentions` finds no match and returns the
+   * text BYTE-IDENTICAL (its verbatim invariant), and `filtered` yields no
+   * rows, so the picker renders nothing and every keyboard branch (gated on
+   * `filtered.length > 0`) stays inert — Enter still sends, no keys are
+   * swallowed. The `$` / `@` catalogs are untouched.
+   *
+   * The DISPLAY side is deliberately NOT gated: `MessageBubble` splits the
+   * persisted text with `splitMentionBlocks`, so a message sent while the
+   * trigger was ON keeps rendering its `<mcp>` chip after the toggle goes OFF
+   * (the record is unchanged, and the content-based `mergeDedupeKey` resume
+   * merge stays byte-stable).
+   *
+   * The `useMentionCatalogs` FETCH below is NOT gated either — it is a cheap
+   * config read, and gating it would make a live toggle require a remount
+   * before the rows appear.
+   */
+  const mcpMentionsEnabled = useSettings(
+    (s) => s.settings?.mcpMentionsEnabled ?? false,
+  );
   // A `blocked` agent is mid-turn AWAITING a request response
   // (`inTurn` is true) — the SEND must stay disabled for the whole wait
   // (pre-branch, `main`'s composer locked on `inTurn`): the harness is
@@ -364,6 +394,8 @@ export default function ChatStream() {
   // the left pane share ONE skills fetch (same key — the skills row reuses
   // `useSkillCatalog` verbatim).
   const spacePath = liveSession?.cwd ?? historySession?.cwd ?? null;
+  // The MCP catalog FETCH is deliberately NOT gated on `mcpMentionsEnabled`
+  // (a cheap config read; gating it would make a live toggle need a remount).
   const { skills, agents, mcpServers } = useMentionCatalogs(spacePath);
   // The `$`/`#`/`@`-trigger picker state (the active token (incl. its prefix)
   // + the highlighted row).
@@ -386,9 +418,16 @@ export default function ChatStream() {
     // (skills/agents carry `description`, the MCP servers carry their one-line
     // `summary`).
     const prefix = picker?.prefix ?? "$";
+    // The `#` gate: with the trigger off, the MCP catalog is EMPTY, so `#`
+    // yields no rows → the picker renders nothing and the keyboard branches
+    // (gated on `filtered.length > 0`) never intercept a key — Enter still
+    // sends. `mcpMentionsEnabled` is a DEP below, so flipping the setting
+    // re-derives the rows LIVE (no remount, and the catalog FETCH is not
+    // gated — see the `mcpMentionsEnabled` note above).
+    const mcpCatalog = mcpMentionsEnabled ? mcpServers : [];
     const rows: MentionRow[] =
       prefix === "#"
-        ? mcpServers.map((s) => ({
+        ? mcpCatalog.map((s) => ({
             key: s.name,
             prefix: "#",
             name: s.name,
@@ -410,7 +449,7 @@ export default function ChatStream() {
     return rows.filter((r) =>
       r.name.toLowerCase().includes((picker?.query ?? "").toLowerCase()),
     );
-  }, [skills, agents, mcpServers, picker]);
+  }, [skills, agents, mcpServers, mcpMentionsEnabled, picker]);
   // The highlighted row index, DERIVED (not clamped in place): the raw
   // `picker.index` can go stale (a Space switch refetches `skills` while the
   // picker is open with a non-zero `index`), and `filtered[staleIndex]` would
@@ -572,7 +611,14 @@ export default function ChatStream() {
       // unchanged `if (!text)` a "used before its declaration" error;
       // semantically it's safe — expansion maps `""`→`""`, so `!text` is
       // identical to `!rawText`).
-      const text = expandMentions(rawText, { skills, agents, mcpServers });
+      // The `#` gate (see the `mcpMentionsEnabled` note above): an EMPTY MCP
+      // catalog means a `#` token matches nothing, so the text stays
+      // BYTE-IDENTICAL — the existing verbatim path, not a special case.
+      const text = expandMentions(rawText, {
+        skills,
+        agents,
+        mcpServers: mcpMentionsEnabled ? mcpServers : [],
+      });
       // Every staged image was removed during the read (the composer isn't
       // locked until `beginTurn`, so a thumbnail can be removed during the
       // read): with no text there's nothing meaningful left to send; with
