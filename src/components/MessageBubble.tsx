@@ -147,24 +147,26 @@ const CODE_BODY_CLASS = "overflow-x-auto p-3 font-mono text-sm";
  * is the SAME token a `FileChip` uses, and a `FileChip` rides the transcript
  * column — its row (`TRANSCRIPT_ROW`) carries no background of its own, so the
  * chip shows the column behind it, which is `bg-chat` (`ChatStream.tsx`)
- * = the content slab `#343746` under Dracula. The card is the raised `#424450`,
- * and 7 of the 25 descriptors fall below the 3:1 non-text floor on that ONE
- * surface (`file-ts`/`file-py` 2.50, `file-html` 2.55, `file-sass`/`file-graphql`
- * 2.57, `file-java` 2.62, `file-php` 2.63) while all 25 clear it on the chrome
- * page (worst `file-py` 3.69), on the slab (worst 3.06) and on the panel (worst
- * 4.09). The hues are IDENTITY colours that a palette must not re-hue, so the
- * surface is what moves — which is exactly what the island layout did: it
- * recessed `--color-panel` to `#21222c`, so the header now has MORE headroom
- * for these hues than it had at `#343746` (3.06 → 4.09).
+ * = the content slab `#282a36` under Dracula. The raised card is `#343746`
+ * and the recessed panel is `#191a21`.
  *
- * Header/body separation is the one thing that got WEAKER, and it is worth
- * stating rather than glossing: the header used to sit ABOVE Shiki's inline
- * `#282A36` paper (`#343746`, a 1.21 step) and now sits BELOW it (`#21222c`, a
- * 1.11 step). The direction inverted and the magnitude shrank by about a tenth.
- * It survives because `border-b` is still there and because 1.11 is still a
- * visible edge between a band and a body, but this is the cost side of the
- * recess, not a free win. `src/lib/fileIconContrast.test.ts` pins both surfaces
- * by TOKEN, so a future move re-measures instead of re-asserting.
+ * The one-step-down shift (amendment to ADR 0027) darkened the raised card
+ * enough that all 25 descriptors now clear the 3:1 non-text floor on it (worst
+ * `file-py` 3.06) — the seven that failed on the old `#424450` (2.50) now
+ * pass. So the header being a recessed `bg-panel` is no longer a legibility
+ * requirement: every surface the descriptor can land on clears 3:1 (worst
+ * `file-py` 4.50 on the panel `#191a21`, 3.69 on the slab `#282a36`, 3.06 on
+ * the raised card `#343746`). The recess is a deliberate band, not a fix. The
+ * hues are IDENTITY colours that a palette must not re-hue, so if a palette
+ * ever brightens the card again, the surface is what moves — and
+ * `fileIconContrast.test.ts` pins both surfaces by TOKEN, so a future move
+ * re-measures instead of re-asserting.
+ *
+ * Header/body separation: the header sits BELOW Shiki's inline `#282A36` paper
+ * (`#191a21`, a 1.22 step). It survives because `border-b` is still there and
+ * because 1.22 is a visible edge between a band and a body. It is the cost side
+ * of the recess, not a free win. `src/lib/fileIconContrast.test.ts` pins both
+ * surfaces by TOKEN, so a future move re-measures instead of re-asserting.
  *
  * Ported from ZCode's code block, HEADER ONLY: line numbers, the wrap toggle,
  * Mermaid, the fullscreen viewer and i18n are all out of scope here, and the

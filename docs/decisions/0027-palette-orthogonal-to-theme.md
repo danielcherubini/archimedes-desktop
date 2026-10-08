@@ -215,3 +215,84 @@ checked. Count it, do not recall it. Where a claim is load-bearing it now lives
 in a test that measures the stylesheet (`paletteCompleteness.test.ts`,
 `themeTokens.test.ts`, `fileIconContrast.test.ts`) rather than in prose — which
 is the only form of this correction that stops repeating itself.
+
+**Amendment (the ladder, re-anchored one step down — everything a touch darker)**
+
+A user reviewed the shipped Dracula palette and asked for the chrome/titlebar/
+left pane and the gaps to read `#191A21`, the composer `#21222C`, and the chat
+and right sidebar `#282A36` — "everything a touch darker." Those three regions
+were moved, and because the user chose to shift the WHOLE ladder rather than
+only the named regions, the spec's five steps re-anchored one rung down. The
+DECISION is untouched (palette orthogonal to mode, the island layout, the
+slab-float collision carried by shadow, the identity-hue rule); only the rung a
+token sits on moved. Every value below is measured, not recalled.
+
+| token | was | now | the spec's name of the new rung |
+| --- | --- | --- | --- |
+| `--color-frame` (titlebar, left sidebar, the gaps) | `#21222c` | `#191a21` | Background Darker |
+| `--color-input` / `-popover-header` / `-panel` | `#21222c` | `#191a21` | Background Darker |
+| `--color-background` (the page) / `--color-composer` | `#282a36` / `#282a36` | `#21222c` / `#21222c` | Background Dark |
+| `--color-chat` / `--color-inspector` and every float | `#343746` | `#282a36` | Background |
+| `--color-card` / `-secondary` / `-tag` / `-menu-hover` / `-context-track` | `#424450` | `#343746` | Background Light |
+| `--color-card-selected` | `#44475a` | `#424450` | Background Lighter |
+
+Consequences, all of them measured:
+
+1. **The two deepest rungs merged.** Background Darker `#191a21` and Background
+   Dark `#21222c` were adjacent rungs; a one-step-down shift of the whole
+   content put the chrome (`frame`) and the recessed controls onto the SAME
+   `#191a21`. The ladder test therefore grades four rungs, not five, and the
+   merged plateau is asserted as one group. This is the app's choice of which
+   token sits on which rung, not a change to the spec's ladder — the spec's
+   `#191a21` and `#21222c` still exist; the app no longer uses `#21222c` for
+   the chrome (it is now the page plane).
+2. **The slab-float collision survived, one rung darker.** The slab and every
+   float both read `#282a36`, so the fill-only separation is still exactly
+   1.00 and the shadow is still the thing that carries a float
+   (`slabFloatSeparation.test.ts` pins the slab at `#282a36`). Nothing about
+   the island layout changed; only the colour the slab and its floats share.
+3. **Selection is no longer spec Selection.** `card-selected` moved from
+   `#44475a` (spec Selection) to `#424450` (spec Background Lighter). The
+   selected state is still the brightest resting surface and still strictly
+   above the raised card `#343746`. `#44475a` survives in exactly one place:
+   the terminal's TRANSLUCENT selection overlay (`color-mix(… 55%,
+   transparent)`), which sits over whatever the cell painted and is therefore
+   not a resting surface. The selection-gate in
+   `paletteCompleteness.test.ts` now names the terminal overlay as the sole
+   raw-`#44475a` carrier.
+4. **The context-bar track is `#343746`, not `#191a21`.** The composer island
+   is the page plane `#21222c`, and against it the dark end (`#191a21`,
+   1.10) falls below the 1.3 visibility floor while `#343746` (1.34) clears
+   it — so the best-VISIBLE track is `#343746`, the same value the island
+   layout picked before this shift. The track's gate recomputes the table and
+   asserts the winner; it grades against `--color-composer`, not `--color-input`.
+5. **Every text floor still holds; one exemption dropped off.** On the resting
+   raised step `#343746`, `foreground-subtlest` (Foreground at 55%) now CLEARS
+   4.5 (4.57), so it is no longer exempted there and the gate's "delete it
+   from the floor" guard enforces that. It still cannot clear 4.5 on the
+   selection STATE `#424450` (4.01), as can `destructive` (3.54); those two
+   keep their exemptions on the selection state only. `destructive` also keeps
+   its 4.3 exemption on the resting raised step (4.33) — the brightest red the
+   spec publishes still cannot reach 4.5 there.
+6. **The file-descriptor forbidden set shrank to one row.** The raised card
+   `#343746` now clears 3:1 for ALL 25 descriptors (worst `file-py` 3.06), so
+   the seven that failed on the old `#424450` (2.50) pass and `fileIconContrast.test.ts`
+   lists no card failures. The selection state `#424450` remains the one
+   forbidden surface with failures (7 of 25). The rendered surfaces (page
+   `#21222c`, slab `#282a36`, panel `#191a21`) all clear 3:1, worst `file-py`
+   3.69 on the slab.
+7. **The terminal ANSI table did NOT move.** The 22 `--color-terminal-*` values
+   are the spec's fixed 16-colour table plus `bg` = Background Darker; they
+   are a protocol, not the UI ladder, and a one-step re-anchor of the UI must
+   not re-hue a shell's red. `terminal-bg` stays `#191a21` and
+   `terminal-black`/`cursor-accent` stay `#21222c` (spec AnsiBlack), so the
+   terminal's paper and the app's chrome happen to share `#191a21` by the
+   spec's own table rather than by design.
+
+The `SPEC_HEX` gate is unchanged in strength: every resting surface still
+resolves to a value the specification publishes (Background Darker / Dark /
+Background / Light / Lighter), just mapped one rung down, and `#44475a` is
+still spec-published (Selection) so its surviving use as the terminal's
+translucent overlay is legal. The gate's job was never "use the ladder in the
+order the spec prints it" — it was "use only the spec's published values," and
+this shift does that.

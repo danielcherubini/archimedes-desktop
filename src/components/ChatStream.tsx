@@ -841,14 +841,15 @@ export default function ChatStream() {
 
   return (
     // THE CENTER COLUMN IS THREE ISLANDS, NOT ONE (the composer used to live
-    // INSIDE the `main`). Chrome (`#282a36`) frames each island, and the gap
+    // INSIDE the `main`). Chrome (`#191a21`) frames each island, and the gap
     // between islands IS the separation: two surfaces of the SAME fill read as
     // distinct when they are SIBLINGS with chrome between them, and read as ONE
     // surface when one is nested in the other. That distinction is why the
     // composer is a sibling here — as a child of a `bg-chat` main it
     // would have had to be a different colour to be visible at all, and as a
-    // sibling it can wear the same `#343746` as the transcript and still read
-    // as its own island. `rounded-xl` + `m-1` match the transcript and the side
+    // sibling it wears its own page-plane fill (`#21222c`) while the transcript
+    // beside it is `#282a36`, and the two still read as distinct islands.
+    // `rounded-xl` + `m-1` match the transcript and the side
     // pane exactly, so the three islands are one visual family.
     //
     // The `min-h-0` on the `main` is still LOAD-BEARING (the classic flexbox

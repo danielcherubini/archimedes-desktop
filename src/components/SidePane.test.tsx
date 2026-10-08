@@ -323,6 +323,68 @@ describe("SidePane (the status panel)", () => {
     expect(frame.style.width).toBe("320px");
   });
 
+  it("paints the tick/dot overview while collapsed, and NOT while open", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    useInteractive.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [
+        { content: "a", status: "completed" },
+        { content: "b", status: "in_progress" },
+        { content: "c", status: "pending" },
+      ],
+    });
+    const { rerender } = render(<SidePane />);
+    // Open: the board is the readout — no duplicate strip.
+    expect(screen.queryByTestId("todo-rail")).toBeNull();
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    rerender(<SidePane />);
+    // Collapsed: the marks are the only thing the sliver can show, so they
+    // appear — one per todo.
+    expect(screen.getAllByTestId("todo-mark")).toHaveLength(3);
+  });
+
+  it("hides the board's text in the sliver (the one-character-per-line column) while keeping it mounted", () => {
+    useSessions.setState({ activeSessionId: "main1" });
+    useInteractive.getState().applyTodoUpdate("main1", {
+      source: "main",
+      todos: [{ content: "a very long todo label", status: "pending" }],
+    });
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    const { container } = render(<SidePane />);
+    // The scroller is `invisible` while collapsed: `visibility: hidden` takes
+    // an element AND ITS SCROLLBAR out of the paint without touching layout, so
+    // the content stays mounted (the mount-preserving collapse this pane is
+    // built on) and no scrollbar is left in the sliver. `hidden`/`display:none`
+    // would unlayout it; clipping alone (the old behavior) left both the
+    // wrapped text and its scrollbar bleeding into the 40px column.
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    expect(scroller).toBeTruthy();
+    expect(scroller.className).toContain("invisible");
+    // Still mounted, and still the only copy of the text (the rail is
+    // text-free), so a screen reader gets one summary, not a label and a copy.
+    expect(screen.getByText("a very long todo label")).toBeTruthy();
+    expect(screen.getByTestId("todo-rail").textContent).toBe("");
+    // And it comes back when the pane opens.
+    act(() => {
+      setSidePaneCollapsed(false);
+    });
+    expect(
+      (container.querySelector(".overflow-y-auto") as HTMLElement).className,
+    ).not.toContain("invisible");
+  });
+
+  it("shows NO overview strip when there are no todos (the rail is just the rail)", () => {
+    act(() => {
+      setSidePaneCollapsed(true);
+    });
+    render(<SidePane />);
+    expect(screen.queryByTestId("todo-rail")).toBeNull();
+  });
+
   it("flushes the drag width to localStorage on mouseup only (not on every mousemove)", () => {
     const { container } = render(<SidePane />);
     const handle = container.querySelector(".cursor-col-resize") as HTMLElement;

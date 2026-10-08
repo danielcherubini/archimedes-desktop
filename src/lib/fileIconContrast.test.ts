@@ -315,13 +315,13 @@ const DARK_SURFACES = [
     surfaces: [
       { kind: "rendered", label: "background", token: "color-background" },
       // THE BINDING ROW for Dracula: the slab is now the palette's brightest
-      // surface that carries a descriptor (`file-py` 3.06 against the floor of
-      // 3.0), because `--color-panel` recessed below it. Two whole points of
-      // headroom — the tightest surface in the app.
+      // surface that carries a descriptor (`file-py` 3.69 against the floor of
+      // 3.0), because `--color-panel` recessed below it to `#191a21`. Roughly
+      // half a point of headroom — the tightest rendered surface in the app.
       { kind: "rendered", label: "chat", token: "color-chat" },
       { kind: "rendered", label: "panel", token: "color-panel" },
       // The raised step, which is what the code-block header used to ride. NOTE
-      // `--color-secondary` and `--color-tag` are the SAME `#424450` now, so
+      // `--color-secondary` and `--color-tag` are the SAME `#343746` now, so
       // this row also covers a `bg-secondary` badge.
       { kind: "forbidden", label: "card", token: "color-card" },
       { kind: "forbidden", label: "selection", token: "color-card-selected" },
@@ -376,19 +376,12 @@ const FORBIDDEN_SURFACE_FAILURES = [
   // Zai dark's card. One descriptor only, and it is the hue zai dark itself
   // re-reads for the page (`#7e57c2`, 3.47 on `#161616`, 3.13 on the panel).
   ".theme-zai-dark card: color-file-css (#7e57c2)",
-  // Dracula's raised step: 7 of 25. All seven clear 3:1 on the page (>= 3.69)
-  // and on the panel (>= 3.06), which is what makes moving the surface the fix.
-  ".theme-dracula card: color-file-ts (#0288d1)",
-  ".theme-dracula card: color-file-py (#0288d1)",
-  ".theme-dracula card: color-file-html (#e65100)",
-  ".theme-dracula card: color-file-sass (#ec407a)",
-  ".theme-dracula card: color-file-graphql (#ec407a)",
-  ".theme-dracula card: color-file-java (#f44336)",
-  ".theme-dracula card: color-file-php (#1e88e5)",
-  // Dracula's Selection step — the brightest surface in the palette, and
+  // Dracula's Selection state — the brightest surface in the palette, and
   // therefore the worst one for a dark-ish identity hue. Listed rather than
-  // assumed: `#44475a` is legal for `card-selected`/`terminal-selection`, so
-  // nothing but this row stops a descriptor landing on it.
+  // assumed: `#424450` is legal for `card-selected`, so nothing but this row
+  // stops a descriptor landing on it. (The raised card `#343746` now clears
+  // 3:1 for every descriptor — the one-step-down shift is what fixed the seven
+  // that `#424450` failed before — so it no longer appears here.)
   ".theme-dracula selection: color-file-ts (#0288d1)",
   ".theme-dracula selection: color-file-py (#0288d1)",
   ".theme-dracula selection: color-file-html (#e65100)",
@@ -396,8 +389,6 @@ const FORBIDDEN_SURFACE_FAILURES = [
   ".theme-dracula selection: color-file-graphql (#ec407a)",
   ".theme-dracula selection: color-file-java (#f44336)",
   ".theme-dracula selection: color-file-php (#1e88e5)",
-  ".theme-dracula selection: color-file-yaml (#ff5252)",
-  ".theme-dracula selection: color-file-svelte (#ff5722)",
 ];
 
 describe("the file-type descriptor palette", () => {
@@ -497,14 +488,14 @@ describe("the file-type descriptor palette", () => {
       ".theme-zai-dark chat = #232323",
       ".theme-zai-dark panel = #202020",
       ".theme-zai-dark card = #2b2b2b",
-      // Dracula: the island scheme. The slab is the literal Background Light
-      // step and the panel sits BELOW it, which is what makes a borderless card
-      // inside the slab visible.
-      ".theme-dracula background = #282a36",
-      ".theme-dracula chat = #343746",
-      ".theme-dracula panel = #21222c",
-      ".theme-dracula card = #424450",
-      ".theme-dracula selection = #44475a",
+      // Dracula: the island scheme, one step down (amendment to ADR 0027). The
+      // slab is the literal Background step and the panel sits BELOW it, which
+      // is what makes a borderless card inside the slab visible.
+      ".theme-dracula background = #21222c",
+      ".theme-dracula chat = #282a36",
+      ".theme-dracula panel = #191a21",
+      ".theme-dracula card = #343746",
+      ".theme-dracula selection = #424450",
     ]);
   });
 

@@ -625,14 +625,14 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     ["color-border-hover", "#0081d6"], // spec: interactive borders use functional colors
     ["color-brand", "#815cd6"], // spec: focus rings use Functional Purple
     ["color-primary", "#815cd6"],
-    ["color-card", "#424450"], // Background Lighter
-    ["color-card-selected", "#44475a"], // Selection, used for selection
-    ["color-popover", "#343746"], // Floating interactive elements
-    ["color-input", "#21222c"],
-    ["color-secondary", "#424450"], // Background Lighter — never Selection
-    ["color-tag", "#424450"],
-    ["color-context-track", "#424450"], // Background Darker: the deepest step, so the bar's extent reads ON the #343746 island
-    // De-emphasis TEXT is no longer Comment: `#6272a4` scored 2.05–3.36 across
+    ["color-card", "#343746"], // Background Light: the raised step (ladder shifted one step down)
+    ["color-card-selected", "#424450"], // Background Lighter: the selection state
+    ["color-popover", "#282a36"], // Floating interactive elements
+    ["color-input", "#191a21"],
+    ["color-secondary", "#343746"], // Background Light — with the raised card
+    ["color-tag", "#343746"],
+    ["color-context-track", "#343746"], // best visible track against the `#21222c` island (1.34, worst band 4.33)
+    // De-emphasis TEXT is no longer Comment: `#6272a4` scored 2.51–3.68 across
     // the surfaces its 88 consumers actually paint. See the token's comment.
     ["color-foreground-subtlest", "color-mix(in oklab, #f8f8f2 55%, transparent)"],
   ])("maps %s to the spec value %s", (token, expected) => {
@@ -651,7 +651,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     );
   });
 
-  it("puts the content slab on the spec's Background Light step", () => {
+  it("puts the content slab on the spec's Background step, one rung down", () => {
     // `--color-chat` is the most-used surface in the app: the
     // transcript column (`ChatStream.tsx`), the side pane (`SidePane.tsx`) and
     // the composer island (`ComposerRow.tsx`) all read it, so one declaration
@@ -663,8 +663,11 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // hex, so the ladder test had to EXEMPT it. The app's primary surface sat
     // outside the gate that exists to police surfaces. Taking the spec's step
     // literally puts it ON a rung and back inside the ladder, which is why the
-    // exemption is gone from the ladder test and must not come back.
-    expect(DRACULA_VALUES["color-chat"]).toBe("#343746");
+    // exemption is gone from the ladder test and must not come back. The slab
+    // was Background Light `#343746`; the one-step-down shift (amendment to
+    // ADR 0027) re-anchored it to the spec's Background `#282a36`, with
+    // everything else following one rung down.
+    expect(DRACULA_VALUES["color-chat"]).toBe("#282a36");
 
     // The slab is the TOP resting plane, so everything the app treats as
     // recessed or as chrome must sit below it and everything raised above.
@@ -680,7 +683,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     };
     const slab = DRACULA_VALUES["color-chat"]!;
     // Chrome frames the islands, so it must be DARKER than them or the islands
-    // stop being islands. 1.21 measured.
+    // stop being islands. 1.35 measured (slab `#282a36` vs chrome `#191a21`).
     expect(lum(slab), "the slab must read above the chrome").toBeGreaterThan(
       lum(DRACULA_VALUES["color-background"]!),
     );
@@ -714,7 +717,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // It is now enforced structurally: `App.tsx`'s chrome bar reads
     // `bg-frame`, the same token `SpacesList` reads, so the two CANNOT drift
     // apart whatever the palette says. That is what the JSX half of this test
-    // pins, and it is why moving the chrome band to `#21222c` draws no seam.
+    // pins, and it is why moving the chrome band to `#191a21` draws no seam.
     const app = readFileSync("src/App.tsx", "utf8");
     // Match the bar's OWN opening tag: its className sits on the line before
     // `data-testid`, and `[^>]*` cannot cross the tag's closing `>`. A wider
@@ -726,10 +729,11 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
       /(^|\s)bg-frame(\s|$)/,
     );
 
-    // The band itself: `#21222c` (Background Dark), i.e. the chrome now reads as
-    // the RECESSED plane and the islands float above it. Pinned as a hex because
-    // unlike the pairing above, this value IS a free choice and could drift.
-    expect(DRACULA_VALUES["color-frame"]).toBe("#21222c");
+    // The band itself: `#191a21` (Background Darker), i.e. the chrome now reads
+    // as the DEEPEST recessed plane and the islands float above it. Pinned as a
+    // hex because unlike the pairing above, this value IS a free choice and
+    // could drift.
+    expect(DRACULA_VALUES["color-frame"]).toBe("#191a21");
     // The same step as the other recessed surfaces, so the recess is ONE step
     // and not two. Asserted against them rather than a literal so the whole
     // recessed band moves together if it ever has to.
@@ -796,9 +800,11 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
      * THE ISLAND LAYOUT MOVED THREE TOKENS, and one of them is now graded that
      * used to be invisible to this test:
      *   `color-chat` — the content slab — WAS `color-mix(…)`, which is
-     *   not comparable as a hex, so it was EXEMPTED below. It is now the literal
-     *   `#343746`, so the exemption is removed and the slab is classified with
-     *   the floats. That is the whole point of taking the spec's step literally:
+     *   not comparable as a hex, so it was EXEMPTED below. It is now a literal
+     *   spec step (first `#343746`, then re-anchored to `#282a36` by the
+     *   one-step-down shift), so the exemption is gone and the slab is
+     *   classified with the floats. That is the whole point of taking the
+     *   spec's step literally:
      *   the most-used surface in the app is now inside the gate instead of
      *   outside it.
      *   `color-panel` moved from the floating step DOWN to recessed, because its
@@ -818,21 +824,21 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
      * sixth step.
      */
     const LADDER: Array<{ label: string; tokens: string[] }> = [
-      { label: "deepest (terminal paper)", tokens: ["color-terminal-bg"] }, // #191a21 Background Darker
       {
-        label: "recessed (form controls, popover header, cards inside the chat, the FRAME the islands sit in)",
+        label: "the deepest AND the recessed plane — the terminal's paper, form controls, popover header, the cards inside the chat, and the FRAME the islands sit in (Background Darker + Background Dark merged: a one-step-down shift of the whole content collapsed the chrome and the recessed controls onto the deepest rung)",
         tokens: [
+          "color-terminal-bg",
           "color-input",
           "color-input-focused",
           "color-popover-header",
           "color-panel",
           "color-frame",
         ],
-      }, // #21222c Background Dark
+      }, // #191a21 Background Darker
       {
         label: "the page plane AND the composer island (the inspector's backdrop, tabs' active state)",
         tokens: ["color-background", "color-composer"],
-      }, // #282a36 Background
+      }, // #21222c Background Dark
       {
         label: "the chat column, the inspector AND every float (header, tabs, menus, popovers, toasts, tooltips) — and the ACTIVE TAB, which is the chat sheet showing through the frame",
         tokens: [
@@ -847,7 +853,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
           "color-toast",
           "color-tooltip",
         ],
-      }, // #343746 Background Light == Floating interactive elements
+      }, // #282a36 Background == Floating interactive elements
       {
         label: "raised (cards, badges, the inline-code chip, menu hover, the context bar's track)",
         tokens: [
@@ -858,7 +864,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
           "color-menu-hover",
           "color-context-track",
         ],
-      }, // #424450 Background Lighter
+      }, // #343746 Background Light
     ];
 
     const seen = new Map<string, string>();
@@ -937,16 +943,18 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
   });
 
   it("uses spec Selection for selection ONLY — never a border, never a resting surface", () => {
-    // `#44475a` is spec Selection (1.56 on the page). The border half of this was
-    // already pinned; the SURFACE half is what `secondary`/`tag` violated — a
-    // resting fill that happens to be the selection colour is a selection affordance
-    // painted on everything at once. Asserted as an EXACT SET of the tokens that
-    // may carry it, so adding one fails by name.
+    // With the ladder shifted one step down, `#44475a` (the spec's Selection)
+    // is no longer the app's selected-state step (that is `#424450`); it survives
+    // only as the terminal's TRANSLUCENT selection overlay, which sits over
+    // whatever the cell painted and so is not a resting surface. The border half
+    // is kept (a `var()` alias makes the exact-set test blind to a border that
+    // ALIASES a Selection-valued token). Asserted as an EXACT SET of the tokens
+    // that may carry the raw `#44475a`, so adding one fails by name.
     const carriers = Object.entries(DRACULA_VALUES)
       .filter(([, v]) => v.toLowerCase().includes("#44475a"))
       .map(([t]) => t)
       .sort();
-    expect(carriers).toEqual(["color-card-selected", "color-terminal-selection"]);
+    expect(carriers).toEqual(["color-terminal-selection"]);
     // The border assertions, kept (a `var()` alias makes the exact-set test blind
     // to a border that ALIASES a Selection-valued token).
     for (const token of [
@@ -962,14 +970,13 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
         /var\(--color-(card-selected|secondary|tag)\)/,
       );
     }
-    // Non-vacuous: the set really is a subset of the block, and Selection really
-    // is still declared where its NAME says it belongs. NOT "where it is used":
-    // neither carrier paints today — no JSX reads `bg-card-selected`, and there
-    // is no terminal surface for `--color-terminal-selection`. What this
-    // assertion gates is that Selection stays confined to the two tokens named
-    // for selection, so a future consumer cannot acquire it by accident.
-    expect(carriers.length).toBe(2);
-    expect(DRACULA_VALUES["color-card-selected"]).toBe("#44475a");
+    // Non-vacuous: the set really is a subset of the block, and `#44475a` really
+    // still lives where its NAME says it belongs — the terminal's translucent
+    // selection overlay. What this gates is that the raw Selection hex stays
+    // confined to that one token, so a future consumer cannot acquire it.
+    expect(carriers.length).toBe(1);
+    // And the app's selected-state step is the spec's Background Lighter.
+    expect(DRACULA_VALUES["color-card-selected"]).toBe("#424450");
   });
 
   it("keeps text tokens legible on EVERY surface their consumers actually paint", () => {
@@ -1026,23 +1033,43 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
       "color-success": 4.5,
       "color-warning": 4.5,
     };
-    const RAISED = new Set(["color-card", "color-card-selected", "color-menu-hover"]);
+    const RAISED = new Set(["color-card", "color-menu-hover"]);
+    // The selection STATE — `card-selected` `#424450`, a transient above every
+    // resting surface. It is graded on its own because, being the brightest
+    // resting value, it is the one surface where the de-emphasis and status
+    // tokens fall below 4.5 (the resting raised step `#343746` is one rung
+    // below and clears 4.5 for them).
+    const SELECTED = new Set(["color-card-selected"]);
     /**
-     * The two tokens that cannot clear 4.5 on the RAISED step, pinned to the
-     * number they DO reach, with the reason. This is a reported shortfall, not a
-     * fudge — and it is the reason the code-block header moved off `bg-card`.
+     * The one token that cannot clear 4.5 on the RESTING RAISED step `#343746`,
+     * pinned to the number it DOES reach, with the reason. This is a reported
+     * shortfall, not a fudge — and it is the reason the code-block header moved
+     * off `bg-card`.
      *
-     * - `destructive` `#ff6e6e` (3.54 / 3.36): the brightest red the
-     *   specification publishes. Nothing spec-published reaches 4.5 on `#424450`,
-     *   and the alternative that would — AnsiBrightMagenta `#ff92df` — is Pink, a
-     *   syntax hue this palette uses for strings.
-     * - `foreground-subtlest` (4.01 / 3.86): it could be lightened further and
-     *   clear, but it would then be indistinguishable from `foreground-subtle`
-     *   (at 60% the two separate by only 1.23 on the panel; the 55% reading
-     *   separates by 1.39), and a de-emphasis token that is not de-emphasised is
-     *   a different bug than a 0.4 shortfall on a surface it rarely renders on.
+     * - `destructive` `#ff6e6e` (4.33): the brightest red the specification
+     *   publishes. Nothing spec-published reaches 4.5 on `#343746`, and the
+     *   alternative that would — AnsiBrightMagenta `#ff92df` — is Pink, a syntax
+     *   hue this palette uses for strings.
+     *
+     * `foreground-subtlest` is NO LONGER exempted on the resting raised step:
+     * the one-step-down shift moved the raised step from `#424450` to `#343746`
+     * (one rung darker), and at 55% it now clears 4.5 there (4.57), which the
+     * "delete it from RAISED_FLOOR" guard below is what enforces.
      */
     const RAISED_FLOOR: Record<string, number> = {
+      "color-destructive": 4.3,
+    };
+    /**
+     * The two tokens that cannot clear 4.5 on the SELECTION STATE `#424450`.
+     * Same reasoning as above, one rung higher: `destructive` `#ff6e6e` reaches
+     * 3.54 there, and `foreground-subtlest` (55%) reaches 4.01. A 60% reading
+     * would clear it (4.45 is still short; the next whole step is what would),
+     * but it would then be indistinguishable from `foreground-subtle` (at 60%
+     * the two separate by only 1.11 on `#424450`), and a de-emphasis token that
+     * is not de-emphasised is a different bug than a 0.5 shortfall on a
+     * transient state it rarely renders on.
+     */
+    const SELECTED_FLOOR: Record<string, number> = {
       "color-destructive": 3.3,
       "color-foreground-subtlest": 3.8,
     };
@@ -1079,7 +1106,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
       const raw = DRACULA_VALUES[token];
       expect(raw, `${token} is undeclared`).toBeTruthy();
       for (const [surfaceToken, bg] of Object.entries(surfaces)) {
-        if (RAISED.has(surfaceToken)) continue;
+        if (RAISED.has(surfaceToken) || SELECTED.has(surfaceToken)) continue;
         const fg = composite(raw!, bg);
         const c = contrast(fg, bg);
         report.push(`${token} on ${surfaceToken} ${bg}: ${Math.round(c * 100) / 100}`);
@@ -1088,37 +1115,47 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
         );
       }
     }
-    // Every text token is graded on the raised step too — at 4.5 unless it is
-    // exempted above, so the exemptions are the ONLY sub-4.5 readings allowed.
+    // Every text token is graded on the RESTING RAISED step `#343746` too — at
+    // 4.5 unless it is exempted above, so the exemptions are the ONLY sub-4.5
+    // readings allowed there.
     for (const token of Object.keys(TEXT_TOKENS)) {
       const floor = RAISED_FLOOR[token] ?? 4.5;
-      if (RAISED_FLOOR[token] === undefined) continue;
-      for (const surfaceToken of [...RAISED]) {
-        const bg = surfaces[surfaceToken];
-        if (bg === undefined) continue;
-        const c = contrast(composite(DRACULA_VALUES[token]!, bg), bg);
-        report.push(`${token} on ${surfaceToken} ${bg}: ${Math.round(c * 100) / 100} (raised floor)`);
-        expect(c, `${token} on the raised ${surfaceToken} (${bg})`).toBeGreaterThanOrEqual(
-          floor,
-        );
-        // And the exemption must not silently become the norm: if the value ever
-        // DOES clear 4.5 here, the entry in RAISED_FLOOR is stale and must go.
-        expect(
-          c,
-          `${token} now clears 4.5 on ${surfaceToken} — delete it from RAISED_FLOOR`,
-        ).toBeLessThan(4.5);
-      }
-    }
-    for (const token of Object.keys(TEXT_TOKENS)) {
-      if (RAISED_FLOOR[token] !== undefined) continue;
       for (const surfaceToken of [...RAISED]) {
         const bg = surfaces[surfaceToken];
         if (bg === undefined) continue;
         const c = contrast(composite(DRACULA_VALUES[token]!, bg), bg);
         report.push(`${token} on ${surfaceToken} ${bg}: ${Math.round(c * 100) / 100} (raised)`);
         expect(c, `${token} on the raised ${surfaceToken} (${bg})`).toBeGreaterThanOrEqual(
-          4.5,
+          floor,
         );
+        // The exemption must not silently become the norm: if an exempted value
+        // ever clears 4.5 here, its entry in RAISED_FLOOR is stale and must go.
+        if (RAISED_FLOOR[token] !== undefined) {
+          expect(
+            c,
+            `${token} now clears 4.5 on ${surfaceToken} — delete it from RAISED_FLOOR`,
+          ).toBeLessThan(4.5);
+        }
+      }
+    }
+    // And on the SELECTION STATE `#424450` too — at 4.5 unless exempted in
+    // SELECTED_FLOOR.
+    for (const token of Object.keys(TEXT_TOKENS)) {
+      const floor = SELECTED_FLOOR[token] ?? 4.5;
+      for (const surfaceToken of [...SELECTED]) {
+        const bg = surfaces[surfaceToken];
+        if (bg === undefined) continue;
+        const c = contrast(composite(DRACULA_VALUES[token]!, bg), bg);
+        report.push(`${token} on ${surfaceToken} ${bg}: ${Math.round(c * 100) / 100} (selected)`);
+        expect(c, `${token} on the selected ${surfaceToken} (${bg})`).toBeGreaterThanOrEqual(
+          floor,
+        );
+        if (SELECTED_FLOOR[token] !== undefined) {
+          expect(
+            c,
+            `${token} now clears 4.5 on ${surfaceToken} — delete it from SELECTED_FLOOR`,
+          ).toBeLessThan(4.5);
+        }
       }
     }
     // Non-vacuity: seven tokens over the non-raised surfaces plus the pinned
@@ -1136,7 +1173,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // dropdown/select labels and `data-disabled:` items, the
     // `SessionConfigSelect` trigger value, `ToolCallCardHeader` metadata, the
     // `SubagentDelegatingCard` metadata line), and Comment `#6272a4` scored
-    // 3.03 on the page, 3.36 on `bg-input`, 2.51 on the panel and 2.05 on the
+    // 3.36 on the page, 3.68 on `bg-input`, 3.03 on the panel and 2.51 on the
     // card — under the 4.5 text floor on every one of them.
     //
     // As a FILL it was the context bar's track, where its job is the OPPOSITE:
@@ -1149,7 +1186,7 @@ describe("the .theme-dracula block follows the official Dracula spec", () => {
     // clears the floor (asserted above, per surface); the bar gets its own
     // token, declared per palette, so zai keeps the track it has always had and
     // Dracula gets one chosen for band separation.
-    expect(DRACULA_VALUES["color-context-track"]).toBe("#424450");
+    expect(DRACULA_VALUES["color-context-track"]).toBe("#343746");
     // The text token must no longer be the border/Comment colour, or the split
     // did not happen — it is one declaration and the two roles are back.
     expect(DRACULA_VALUES["color-foreground-subtlest"]).not.toBe(

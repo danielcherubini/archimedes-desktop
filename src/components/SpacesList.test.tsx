@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { deleteSession, listSkills, setSessionArchived, startSession } from "../lib/tauri";
 import { useSessions } from "../store/sessions";
 import { usePermissions } from "../store/permissions";
@@ -62,6 +62,19 @@ vi.mock("../lib/tauri", async () => {
 const mockedStartSession = vi.mocked(startSession);
 const mockedListSkills = vi.mocked(listSkills);
 const mockedDeleteSession = vi.mocked(deleteSession);
+
+/**
+ * Whether a node is PAINTED — i.e. neither it nor any ancestor carries
+ * `visibility: hidden` (Tailwind's `invisible`). jsdom resolves no CSS, so
+ * "does this text bleed into the 40px sliver?" is read off the class list the
+ * component renders, which is exactly what the collapse controls.
+ */
+function painted(node: HTMLElement): boolean {
+  for (let el: HTMLElement | null = node; el; el = el.parentElement) {
+    if (el.classList.contains("invisible")) return false;
+  }
+  return true;
+}
 
 /**
  * Fixture: two spaces. `alpha` holds a live session `s1` (in-turn, with a
@@ -659,14 +672,26 @@ describe("SpacesList (archive, ADR 0016)", () => {
     expect(collapse.getAttribute("aria-label")).toBe("Expand sidebar");
     // aria-pressed flips to report the collapsed state.
     expect(collapse.getAttribute("aria-pressed")).toBe("false");
-    // The gear is NOT rendered while collapsed. Clipping it with
-    // `overflow-hidden` instead would leave a ~4px sliver of its icon poking
-    // into the rail (measured: the footer's natural content is 68px — 2x24
-    // buttons + 4 gap + 2x8 padding — against a 40px rail, so 28px of the gear
-    // survives), which reads as a rendering glitch. The gear is also
-    // unreachable at this width, and was equally unreachable when the pane
-    // collapsed to 0, so hiding it costs nothing.
-    expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
+    // Settings is STILL reachable while collapsed, through exactly ONE door —
+    // the rail's icon, not the footer's. The footer gear is not rendered:
+    // clipping it with `overflow-hidden` instead would leave a ~4px sliver of
+    // its icon poking into the rail (measured: the footer's natural content is
+    // 68px — 2x24 buttons + 4 gap + 2x8 padding — against a 40px rail, so 28px
+    // of the gear survives), which reads as a rendering glitch.
+    //
+    // This assertion used to read `queryByRole("Settings")).toBeNull()` on the
+    // reasoning that "hiding it costs nothing". That was never true: the gear
+    // was Settings' ONLY door, so collapsing the pane locked the user out of
+    // Settings until they re-expanded it. The rail now carries the command, so
+    // the door moved rather than closed — and it is asserted as exactly ONE,
+    // because two gears (rail + a permanent chrome-bar one) was the alternative.
+    const gears = screen.getAllByRole("button", { name: "Settings" });
+    expect(gears).toHaveLength(1);
+    expect(
+      screen
+        .getByTestId("session-rail-tail-actions")
+        .contains(gears[0] as HTMLElement),
+    ).toBe(true);
     // The toggle survives, and `shrink-0` is what keeps it a real 24px target:
     // in a 40px rail, flex would otherwise squeeze BOTH footer buttons to fit
     // rather than clip one, and a 12px-wide toggle is not a 24px hit area.
@@ -718,6 +743,169 @@ describe("SpacesList (archive, ADR 0016)", () => {
     });
     const { container } = render(<SpacesList />);
     expect(container.querySelector(".bg-warning")).toBeNull();
+  });
+
+  it("collapses to the sliver: the session marks show, and NO text bleeds in", () => {
+    // The two defects the rail replaces, both from one cause: the collapse is
+    // width + `overflow: hidden` with the content kept MOUNTED, so the list
+    // painted INTO the 40px sliver — the action buttons wrapped to one word per
+    // line ("O / Sp / Se / Sk"), the `Sessions` header became "Sess", and the
+    // scroller grew a scrollbar in a 40px column.
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    const { container } = render(<SpacesList />);
+    const frame = container.firstChild as HTMLElement;
+    expect(frame.style.width).toBe(`${LEFT_PANE_RAIL}px`);
+    // The rail: the ACTIVE space's sessions, one mark each (the fixture's
+    // `alpha` = live `s1` in-turn + stored `h1`).
+    const rail = screen.getByTestId("session-rail");
+    expect(screen.getAllByTestId("session-row")).toHaveLength(2);
+    // Running first (the list's own order: live, then stored) — the SPINNER,
+    // the glyph the open row uses for the same fact.
+    expect(rail.querySelector('[role="status"]')).toBeTruthy();
+    expect(rail.textContent).toBe("");
+    expect(screen.getByRole("img", { name: "Sessions 2, 1 running" })).toBeTruthy();
+    // Nothing that carries text is painted in the sliver: `visibility: hidden`
+    // takes the content AND ITS SCROLLBAR out of the paint while leaving it
+    // mounted (`hidden` would unlayout it, and clipping alone is what produced
+    // the wrapped text and the stray scrollbar).
+    for (const label of ["Open Space", "New Session", "Skills", "Sessions", "Archived"]) {
+      const node = screen.queryByText(label);
+      if (node) {
+        expect(painted(node), `${label} bleeds into the sliver`).toBe(false);
+      }
+    }
+    // …and the rail is NOT hidden — the assertion that makes the loop above
+    // mean something rather than passing on a blanket `invisible` root.
+    expect(painted(rail)).toBe(true);
+    // Content stays MOUNTED (not unmounted): the row's title node is still in
+    // the tree, just not painted.
+    expect(screen.getByText("Fix the login bug")).toBeTruthy();
+    // Expanding restores the list and drops the rail.
+    act(() => {
+      setLeftPaneCollapsed(false);
+    });
+    expect(painted(screen.getByText("Sessions"))).toBe(true);
+    expect(screen.queryByTestId("session-rail")).toBeNull();
+  });
+
+  it("shows the marks ONLY while collapsed (the open list is the readout)", () => {
+    render(<SpacesList />);
+    expect(screen.queryByTestId("session-rail")).toBeNull();
+  });
+
+  it("marks a session WAITING in the rail with the app's attention cue", () => {
+    // The cue that matters most behind a collapsed pane: a session blocked on
+    // the user. Same `bg-warning` as the toggle dots, and it outranks the
+    // spinner (a blocked session is not working — see `useSessionStatus`).
+    usePermissions.setState({
+      prompts: { s1: [{ requestId: "r1", toolTitle: "bash", options: [] }] },
+    });
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    render(<SpacesList />);
+    const dot = screen.getByTestId("session-rail").querySelector('[data-dot="waiting"]');
+    expect(dot).toBeTruthy();
+    expect(dot!.className).toContain("bg-warning");
+    expect(screen.getByRole("img", { name: "Sessions 2, 1 waiting" })).toBeTruthy();
+  });
+
+  // -- The rail's action strip: the pane's commands survive the collapse --
+
+  it("offers all four commands as icons while collapsed, and they WORK", () => {
+    const onOpenSettings = vi.fn();
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    render(<SpacesList onOpenSettings={onOpenSettings} />);
+    // The same four the open pane offers — collapsing must not cost you the
+    // pane's commands (see `SessionRail`'s doc: `Skills`/`Settings` have no
+    // shortcut, and the footer gear is `!collapsed`, so a collapsed sidebar
+    // used to lock you out of Settings entirely). Asserted across BOTH strips,
+    // because each sits where its button sits while the pane is open: the
+    // list's three at the head, the footer's gear at the tail.
+    for (const label of ["Open Space", "New Session", "Skills", "Settings"]) {
+      expect(
+        screen.getAllByRole("button", { name: label }).length,
+        label,
+      ).toBeGreaterThan(0);
+    }
+    expect(
+      within(screen.getByTestId("session-rail-actions")).getAllByRole("button"),
+    ).toHaveLength(3);
+    expect(
+      within(
+        screen.getByTestId("session-rail-tail-actions"),
+      ).getByRole("button", { name: "Settings" }),
+    ).toBeTruthy();
+  });
+
+  it("wires each rail icon to the SAME handler the labelled button uses", () => {
+    // Split from the presence test on purpose: `Skills` and `Open Space` open
+    // MODALS, and a modal `aria-hidden`s the rest of the app — so a second
+    // query against the rail after one opens fails for the correct reason
+    // (testing-library honours it) and would read as a broken rail.
+    const onOpenSettings = vi.fn();
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    render(<SpacesList onOpenSettings={onOpenSettings} />);
+    fireEvent.click(screen.getByTitle("Settings"));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTitle("New Session"));
+    expect(mockedStartSession).toHaveBeenCalledWith("/tmp/alpha");
+    // The Skills modal renders, and it renders even though the pane's content
+    // region is `invisible` — the dialogs sit OUTSIDE that region on purpose
+    // (`visibility: hidden` inherits into `fixed` descendants).
+    fireEvent.click(screen.getByTitle("Skills"));
+    expect(screen.getByPlaceholderText("Search skills…")).toBeTruthy();
+  });
+
+  it("opens the Open Space dialog from the rail icon", () => {
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    render(<SpacesList />);
+    fireEvent.click(screen.getByTitle("Open Space"));
+    expect(screen.getByText("New space")).toBeTruthy();
+  });
+
+  it("has EXACTLY ONE Settings door in either state (no gear is ever doubled)", () => {
+    // The whole reason the gear lives in the pane and not the chrome bar: a
+    // chrome-bar gear would be permanent (this repo's shell decision forbids a
+    // control that teleports in when a pane collapses), and the rail already
+    // carries one while collapsed — so the window would show two gears ~60px
+    // apart. One door, which moves between the footer and the rail.
+    render(<SpacesList />);
+    expect(screen.getAllByRole("button", { name: "Settings" })).toHaveLength(1);
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    expect(screen.getAllByRole("button", { name: "Settings" })).toHaveLength(1);
+  });
+
+  it("renders NO action strip while open (the labelled buttons are the controls)", () => {
+    render(<SpacesList />);
+    expect(screen.queryByTestId("session-rail-actions")).toBeNull();
+  });
+
+  it("keeps the commands available with NO sessions (an empty rail is not an inert rail)", () => {
+    // The rail used to render only when the list had rows; the commands are
+    // exactly what a user with an empty/fresh space needs (and `New Session`
+    // routes to the Open Space dialog when no space is selected).
+    useSessions.setState({ activeSpacePath: "/tmp/nonexistent" });
+    act(() => {
+      setLeftPaneCollapsed(true);
+    });
+    render(<SpacesList />);
+    expect(screen.queryByTestId("session-rail-marks")).toBeNull();
+    expect(
+      within(screen.getByTestId("session-rail-actions")).getByRole("button", {
+        name: "New Session",
+      }),
+    ).toBeTruthy();
   });
 
   it("the left rail is WIDE ENOUGH to show its toggle (the sliver is a guarantee, not a vibe)", () => {

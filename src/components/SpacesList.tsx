@@ -26,15 +26,16 @@ import {
   spaceViewFor,
   type Message,
 } from "../store/sessions";
-import { usePermissions } from "../store/permissions";
 import { useHasPendingRequest } from "../hooks/useHasPendingRequest";
-import { useInteractive } from "../store/interactive";
+import { useSessionStatus } from "../hooks/useSessionStatus";
+import { useSessionStatuses } from "../hooks/useSessionStatus";
 import { useStartNewConversation } from "../hooks/useStartNewConversation";
 import { useSkillCatalog } from "../hooks/useSkillCatalog";
 import NewSpaceDialog from "./NewSpaceDialog";
 import SkillsDialog from "./SkillsDialog";
 import DeleteSessionDialog from "./DeleteSessionDialog";
 import { Spinner } from "./ui/spinner";
+import SessionRail, { type SessionRailAction } from "./SessionRail";
 import { Kbd } from "./ui/kbd";
 import { Button } from "./ui/button";
 import {
@@ -123,6 +124,21 @@ export default function SpacesList({
   // view, so the routing is the only behavior that matters here.)
   const activeView = views.find((v) => v.path === activeSpacePath);
   const newSession = useStartNewConversation(activeView);
+  // The rail's statuses, derived by the SAME rule the rows use (one
+  // subscription for the whole list — see `useSessionStatuses`). Read
+  // unconditionally: the rail only paints while collapsed, but the ids are the
+  // active view's either way and a hook cannot be conditional.
+  const railIds = useMemo(
+    () =>
+      activeView
+        ? [
+            ...(activeView.liveSessionId ? [activeView.liveSessionId] : []),
+            ...activeView.storedSessionIds,
+          ]
+        : [],
+    [activeView],
+  );
+  const statuses = useSessionStatuses(railIds);
 
   // The active space's path for the skill catalog (a Session's `cwd` IS
   // the Space's folder — CONTEXT.md): the SELECTED space (the tab), or
@@ -176,6 +192,46 @@ export default function SpacesList({
   }, [activeView, newSession]);
   const handleOpenSpace = useCallback(() => setDialogOpen(true), []);
 
+  // The collapsed rail's command strips. These are the SAME handlers the open
+  // pane's labelled buttons call — one closure each, referenced from both, so
+  // the two renderings of a command cannot drift apart. The icons are the open
+  // buttons' icons verbatim (the rail is the same control at the same size, not
+  // a new control), and the labels are carried as `aria-label` + `title`
+  // because a 40px column has no room for text.
+  //
+  // `Settings` is a STRIP OF ITS OWN at the rail's bottom, because that is
+  // where the gear lives when the pane is open (the footer, beside the collapse
+  // toggle): collapsing moves it one surface, not one row up the screen. The
+  // other three sit at the head, above the session marks.
+  const railActions: SessionRailAction[] = [
+    {
+      id: "open",
+      label: "Open Space",
+      icon: <FolderOpenIcon className="size-4" />,
+      onClick: handleOpenSpace,
+    },
+    {
+      id: "new",
+      label: "New Session",
+      icon: <MessageCirclePlusIcon className="size-4" />,
+      onClick: handleNewSession,
+    },
+    {
+      id: "skills",
+      label: "Skills",
+      icon: <SparklesIcon className="size-4" />,
+      onClick: () => setSkillsOpen(true),
+    },
+  ];
+  const railTailActions: SessionRailAction[] = [
+    {
+      id: "settings",
+      label: "Settings",
+      icon: <SettingsIcon className="size-4" />,
+      onClick: () => onOpenSettings?.(),
+    },
+  ];
+
   // ⌘N / Ctrl+N → New Session, ⌘O / Ctrl+O → Open Space. Ignored while the
   // key is pressed in an input, textarea, editable element, or dialog (e.g.
   // the composer or NewSpaceDialog's fields) so native shortcuts keep
@@ -219,8 +275,26 @@ export default function SpacesList({
     // than be squeezed.
     <aside
       style={{ width: collapsed ? LEFT_PANE_RAIL : LEFT_PANE_WIDTH }}
-      className="flex shrink-0 flex-col overflow-hidden bg-frame"
+      className="relative flex shrink-0 flex-col overflow-hidden bg-frame"
     >
+      {/* THE CONTENT REGION — the action buttons, the `Sessions` header and the
+          list. `invisible` WHILE COLLAPSED is load-bearing, and it fixes two
+          defects at once. The collapse is width + `overflow: hidden` with the
+          content kept MOUNTED (the `fixed` dialogs escape clipping, and the
+          list's local state — the Archived section's open flag, the scroll
+          position — survives), so clipping alone let the content paint INTO the
+          40px sliver: the buttons wrapped to one word per line
+          ("O / Sp / Se / Sk"), the `Sessions` header became "Sess", and the
+          scroller grew a SCROLLBAR in a 40px column. `visibility: hidden` takes
+          the text AND ITS SCROLLBAR out of the paint while leaving the layout
+          untouched — `hidden` would unlayout it. It is applied to the WRAPPER,
+          not the scroller, because the buttons and the header are siblings of
+          the scroller and bled just the same. The session marks below are what
+          shows instead; the footer's toggle is OUTSIDE this region, so it stays
+          on screen (that is what the rail exists to keep). */}
+      <div
+        className={`flex min-h-0 flex-1 flex-col ${collapsed ? "invisible" : ""}`}
+      >
       <div className="flex flex-col gap-2 p-3">
         <button
           type="button"
@@ -274,6 +348,8 @@ export default function SpacesList({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      {/* The list scroller (inside the content region above, which is what
+          hides it while collapsed — see the note there). */}
       <div className="flex-1 overflow-y-auto">
         {views.length === 0 && (
           <p className="p-3 text-ui-sm text-foreground-subtlest">
@@ -312,6 +388,33 @@ export default function SpacesList({
           onDelete={setDeleteTarget}
         />
       </div>
+      {/* CLOSES the content region here, and that boundary is not cosmetic:
+          `visibility: hidden` INHERITS into `fixed` descendants, so the dialogs
+          below must sit OUTSIDE it or collapsing the pane would open a dialog
+          and see nothing. The footer's toggle is outside for the same class of
+          reason — it is the one control the sliver exists to keep. */}
+      </div>
+      {/* The collapsed rail's session overview: marks only, because a 40px
+          sliver can hold the SHAPE of a list and nothing else. It mirrors the
+          list it replaces (the ACTIVE space's sessions, in the list's own
+          order — live first, then stored, which is why the ids come from the
+          SAME `railIds` memo the statuses are derived from: two constructions
+          of that order is two things that can drift, and a rail whose Nth mark
+          is not the Nth row is worse than no rail).
+          Rendered only while collapsed. No mark for the Space itself: the tabs
+          are the space list, and the active one is lit directly above this
+          column (the strip's `pl-1` aligns them). */}
+      {collapsed && (
+        <SessionRail
+          rows={railIds.map((id) => ({
+            key: id,
+            status: statuses[id] ?? ("stored" as const),
+            active: id === activeSessionId,
+          }))}
+          actions={railActions}
+          tailActions={railTailActions}
+        />
+      )}
       {dialogOpen && <NewSpaceDialog onClose={() => setDialogOpen(false)} />}
       {skillsOpen && (
         <SkillsDialog skills={skills} onClose={() => setSkillsOpen(false)} />
@@ -414,18 +517,11 @@ function SessionRow({
 }) {
   const messages = useSessions((s) => s.messages[sessionId]);
   const isLive = useSessions((s) => s.sessions.some((x) => x.sessionId === sessionId));
-  const inTurn = useSessions((s) => !!s.inTurn[sessionId]);
   const archiveSession = useSessions((s) => s.archiveSession);
-  // Selectors return stable references (no fresh `[]` fallbacks INSIDE the
-  // selector) or Zustand re-renders forever.
-  const prompts = usePermissions((s) => s.prompts[sessionId]) ?? [];
-  const interactiveRequests = useInteractive((s) => s.requests[sessionId]) ?? [];
-
-  const waiting =
-    prompts.length > 0 ||
-    interactiveRequests.some(
-      (r) => r.method === "ask" || r.method === "confirm" || r.method === "password",
-    );
+  // The row's status (spinner / "Waiting" pill) comes from the SAME rule the
+  // collapsed rail marks with — see `useSessionStatus`.
+  const status = useSessionStatus(sessionId);
+  const waiting = status === "waiting";
   const time = relativeTimeFor(messages);
   const title = titleFor(messages, spaceName);
 
@@ -452,7 +548,7 @@ function SessionRow({
         active ? "bg-selected" : "hover:bg-surface-hover"
       }`}
     >
-      {isLive && inTurn ? (
+      {status === "running" ? (
         <Spinner className="size-4 shrink-0 text-foreground-subtle" />
       ) : (
         <span className="size-4 shrink-0" />

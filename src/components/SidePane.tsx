@@ -10,7 +10,8 @@ import {
   SIDE_PANE_RAIL,
   subscribeSidePane,
 } from "../lib/sidePaneState";
-import TodoBoardPanel, { useMainOpenTodoCount } from "./TodoBoardPanel";
+import TodoBoardPanel, { useMainOpenTodoCount, useMainTodoItems } from "./TodoBoardPanel";
+import TodoRail from "./TodoRail";
 import { SubagentModals } from "./SubagentModals";
 
 const WIDTH_KEY = "side-pane-width";
@@ -171,6 +172,10 @@ export default function SidePane() {
   // session (the SAME derivation the Todos section's visibility uses).
   const activeSessionId = useSessions((s) => s.activeSessionId);
   const mainTodoCount = useMainOpenTodoCount(activeSessionId);
+  // The FULL main list (completed included) for the collapsed rail's overview
+  // — the open count drives the pane, the whole list drives the strip, so a
+  // finished board still reads as a row of ticks in the sliver.
+  const mainTodoItems = useMainTodoItems(activeSessionId);
 
   // The session title (the top section — the old chat header's title moved
   // here, the header is gone): the first `user` message truncated to ~80
@@ -223,10 +228,12 @@ export default function SidePane() {
   }, [visible]);
 
   return (
-    // Collapse = `width: 0` + `overflow: hidden` (the content stays
-    // mounted, clipped; the `fixed` overlays escape the clipping). The
-    // collapse control lives in the chrome bar (the top menubar), so no
-    // rail is needed — the pane just vanishes.
+    // Collapse = `SIDE_PANE_RAIL` (a 40px sliver, NOT 0) + `overflow: hidden`
+    // — the content stays MOUNTED (so the `fixed` sudo modals survive a
+    // collapse and the pane keeps its scroll position) and is CLIPPED. The
+    // sliver is not merely empty space: it is the room that keeps the pane's
+    // own toggle on screen, and while collapsed the toggle is joined by the
+    // todo overview (`TodoRail`), because the clipped board cannot render in 40px.
     <div
       style={{ width: collapsed ? SIDE_PANE_RAIL : width }}
       className="relative m-1 flex shrink-0 flex-col overflow-hidden rounded-xl bg-inspector"
@@ -251,8 +258,19 @@ export default function SidePane() {
           treatment): the data-gated sections stacked in one content
           area (no tabs). ALWAYS MOUNTED — collapse clips it (the 40px
           rail + `overflow: hidden`), it is NOT unmounted (the local UI
-          state — section open/closed, scroll — survives a collapse). */}
-      <div className="flex-1 overflow-y-auto p-3">
+          state — section open/closed, scroll — survives a collapse).
+
+          `invisible` WHILE COLLAPSED is load-bearing. Clipping alone let the
+          board paint INTO the 40px sliver: labels wrapped to one character per
+          line ("th / so / is / s …") inside their own `overflow-y-auto`, which
+          then grew a SCROLLBAR in the sliver. `visibility: hidden` takes the
+          element AND ITS SCROLLBAR out of the paint while leaving the layout
+          untouched, so the content stays mounted (and its scroll position
+          survives) — `hidden` would unlayout it. The overview strip below is
+          what shows in its place. */}
+      <div
+        className={`flex-1 overflow-y-auto p-3 ${collapsed ? "invisible" : ""}`}
+      >
         <div className="flex flex-col gap-4">
           {/* The session title (the old header's title — the header is
               gone, the title lives here): the first `user` message
@@ -306,6 +324,11 @@ export default function SidePane() {
           />
         )}
       </button>
+      {/* The collapsed rail's todo overview: ticks and dots only, because a
+          40px sliver can hold the SHAPE of a board and nothing else. Rendered
+          only while collapsed (the open pane already shows the board, and a
+          second copy of it would be a second thing to keep in sync). */}
+      {collapsed && <TodoRail items={mainTodoItems} />}
       {/* The interactive sudo modals for the entries (at the frame ROOT —
           `fixed` overlays, NOT inside the scrollable content: a collapsed
           pane never hides a pending modal). */}

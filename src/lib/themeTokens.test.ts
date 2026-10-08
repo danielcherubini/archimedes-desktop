@@ -518,7 +518,7 @@ describe("the ramp tokens (--color-caution + --color-thinking-*)", () => {
 
   it("keeps the Dracula ramp legible as a glyph on both surfaces it renders on", () => {
     // The ramp's own floors, re-measured for the palette that owns them. The
-    // thinking glyph rides the composer's config row (`bg-input`, `#21222c` under
+    // thinking glyph rides the composer's config row (`bg-input`, `#191a21` under
     // Dracula) and the page; a glyph is non-text UI, so 3:1 is the floor. The
     // previous ramp's hottest level sat at 4.53 on the page and 3.75 on a panel,
     // so the numbers below are the ones the re-hue was chosen against.

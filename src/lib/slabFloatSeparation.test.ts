@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest";
  * THE ONE COLLISION THE ISLAND LAYOUT BUYS ON PURPOSE (ADR 0027, option B).
  *
  * The content slab — the transcript column, the side pane and the composer
- * chat column and the inspector, both reading the same Background Light step,
- * `#343746`. That step is ALSO what the spec assigns to "Floating interactive
+ * chat column and the inspector, both reading the same Background step,
+ * `#282a36`. That step is ALSO what the spec assigns to "Floating interactive
  * elements", so every float (`bg-menu`, `bg-popover`, `bg-tooltip`) is now the
  * EXACT SAME COLOUR as the surface it floats over: 1.00, not 1.0X — identical.
  *
@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
  *   - keep the slab below the float step: the spec has no sixth dark step, so it
  *     would need an off-spec hex, which is the exact sin the spec-gate in
  *     `paletteCompleteness.test.ts` was written to reject;
- *   - move the floats UP to `#424450`: then `card`, `secondary` and `tag` have
+ *   - move the floats UP to `#343746`: then `card`, `secondary` and `tag` have
  *     nowhere above them, and re-merging badges with the float that contains
  *     them is the elevation INVERSION this same ADR records fixing once already.
  *
@@ -82,7 +82,7 @@ describe("floats over the content slab (the accepted collision)", () => {
     // Asserted as a fact, not hoped away. If a future change gives the floats
     // their own step, THIS test is what says the trade-off has been paid off —
     // and it fails, pointing at the comment that needs deleting.
-    expect(slab).toBe("#343746");
+    expect(slab).toBe("#282a36");
     for (const token of floats) {
       expect(dracula(token), `--color-${token}`).toBe(slab);
     }
@@ -174,72 +174,53 @@ describe("floats over the content slab (the accepted collision)", () => {
 });
 
 /**
- * The ACTIVE TAB is the one surface that is not a float — it is the top edge
- * of the chat sheet, so it must touch it. That makes an invariant no palette
- * test can see: the tab's fill reaches the slab by exactly the frame gap, and
- * the gap is declared in a DIFFERENT file (`ChatStream.tsx`'s `m-1`). Widen
- * that margin and the tab silently floats again, every colour test still
- * green. Hence the numbers are read from both sources and compared, never
- * asserted as literals.
+ * SPACE TABS — ACTIVE AND INACTIVE ARE ONE KIND OF OBJECT. The active tab used
+ * to BE the chat sheet's top edge: a full-height `h-10` tab with a hard 5px
+ * same-colour shadow that extended its fill across the frame gap and merged
+ * it into the slab (the "bridge" design). It worked, but next to its pill
+ * siblings it read as a different kind of object — a tab that was not a tab —
+ * and the user asked for it to be the same pill, lifted. It now is: the same
+ * `h-8 rounded-md` inset pill, one step brighter (`bg-surface-hover` over the
+ * inactive `bg-surface`), full-contrast text, `font-medium`. This block pins
+ * that contract AND that the bridge geometry does not creep back in, because
+ * the old seam logic is the sort of thing that looks "intentional" in a diff
+ * review and survives a colour-only test.
  */
-describe("the bridge tab (the active tab IS the chat sheet)", () => {
+describe("the space tabs (active and inactive are one kind of object: pills)", () => {
   const tabs = () => code("src/components/SpaceTabs.tsx");
-  const chat = () => code("src/components/ChatStream.tsx");
 
-  /** Tailwind's spacing unit, which the CSS declares as 0.25rem = 4px. */
-  const SPACING_PX = 4;
+  /** The two branches of the tab's class ternary, read from the source. */
+  const branches = (): [string, string] => {
+    const m = tabs().match(/active\s*\?\s*"([^"]+)"\s*:\s*"([^"]+)"/);
+    if (!m) throw new Error("the tab's class ternary changed shape — update this reader");
+    return [m[1]!, m[2]!];
+  };
 
-  it("wears the chat's own fill, so tab and sheet are one colour", () => {
-    // An ALIAS, not a copied hex: if the slab moves, the tab follows it. A
-    // duplicated literal would pass a colour test today and drift tomorrow.
-    expect(dracula("tab-active")).toBe("var(--color-chat)");
+  it("active and inactive share the pill geometry (h-8, rounded-md, inset in the bar)", () => {
+    const [activeCls, inactiveCls] = branches();
+    for (const [label, cls] of [
+      ["active", activeCls],
+      ["inactive", inactiveCls],
+    ] as const) {
+      expect(cls, `${label} tab lost the pill geometry`).toMatch(/(^|\s)h-8(\s|$)/);
+      expect(cls, `${label} tab lost the pill corners`).toMatch(/(^|\s)rounded-md(\s|$)/);
+    }
   });
 
-  it("bridges the frame gap, and the bridge is sized FROM that gap", () => {
-    // The margin the chat sheet carries is the gap the tab must cross. Read
-    // it rather than hardcoding 4, so changing `m-1` to `m-2` moves the
-    // requirement instead of quietly breaking the tab.
-    //
-    // EVERY chat surface, not the first one: `ChatStream` renders two — the
-    // empty state and the real transcript. Reading the first meant a mutation
-    // of the second went unseen, which is how this gate passed while the real
-    // sheet had grown its gap. Both must agree, and the tab must clear the
-    // LARGEST of them.
-    const margins = [...chat().matchAll(/<main className="(m-(\d+))[^"]*bg-chat/g)];
-    expect(margins.length, "no `bg-chat` sheet found — has the markup changed?").toBeGreaterThan(0);
-    const sizes = new Set(margins.map((m) => Number(m[2])));
-    expect(
-      sizes.size,
-      `the chat sheets disagree on their margin (${[...sizes]}); the tab can only bridge one`,
-    ).toBe(1);
-    const gapPx = Number(margins[0]![2]) * SPACING_PX;
-
-    // The bridge is a zero-blur, zero-spread offset shadow: it extends the
-    // FILL without moving the box, so the label stays in line with the
-    // inactive tabs and the hit area is unchanged.
-    const bridge = tabs().match(
-      /shadow-\[0_(\d+)px_0_0_var\(--color-tab-active\)\]/,
-    );
-    expect(
-      bridge,
-      "the active tab lost its bridge shadow — it floats above the sheet again",
-    ).toBeTruthy();
-    const reach = Number(bridge![1]);
-    expect(
-      reach,
-      `the bridge reaches ${reach}px but the frame gap is ${gapPx}px — the seam is open`,
-    ).toBeGreaterThanOrEqual(gapPx + 1);
+  it("the active tab is the same pill one step lifted: surface-hover over surface, full-contrast text", () => {
+    const [activeCls, inactiveCls] = branches();
+    expect(activeCls, "the active tab is not a lifted pill").toMatch(/(^|\s)bg-surface-hover(\s|$)/);
+    expect(activeCls).toMatch(/(^|\s)text-foreground(\s|$)/);
+    expect(activeCls).toMatch(/(^|\s)font-medium(\s|$)/);
+    expect(inactiveCls, "the inactive pill changed its fill").toMatch(/(^|\s)bg-surface(\s|$)/);
+    expect(inactiveCls).toMatch(/(^|\s)text-foreground-subtle(\s|$)/);
   });
 
-  it("meets the sheet with SQUARE bottom corners and paints above it", () => {
+  it("the bridge is gone: no h-10, no rounded-top, no bridge shadow, no paint-order hack", () => {
     const cls = tabs();
-    // A rounded bottom would notch the seam: the merge needs a flat edge.
-    expect(cls).toMatch(/rounded-t-md/);
-    expect(cls, "a rounded bottom corner would notch the seam").not.toMatch(
-      /rounded-b/,
-    );
-    // The slab is a LATER sibling with a plain background, so the bridge must
-    // declare its stacking context rather than hope for a paint-order accident.
-    expect(cls).toMatch(/relative z-\d+/);
+    expect(cls, "the bridge shadow is back — the active tab is the sheet again").not.toMatch(/shadow-\[0_\d+px_0_0/);
+    expect(cls, "a full-height tab is not an inset pill").not.toMatch(/(^|\s)h-10(\s|$)/);
+    expect(cls, "a rounded-top tab is the sheet's edge, not a pill").not.toMatch(/rounded-t-md/);
+    expect(cls, "the paint-order hack is back with the bridge").not.toMatch(/relative z-\d+/);
   });
 });
