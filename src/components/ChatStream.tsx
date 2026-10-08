@@ -12,10 +12,9 @@ import {
   readFileBytes,
   sendPrompt,
   setSessionConfigOption,
-  type SkillInfo,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
-import { activeSkillToken, expandSkillMentions } from "../lib/skills";
+import { activeMentionToken, expandMentions } from "../lib/skills";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
@@ -31,12 +30,13 @@ import { useInteractive } from "../store/interactive";
 import { useSettings } from "../store/settings";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
-import { useSkillCatalog } from "../hooks/useSkillCatalog";
+import { useMentionCatalogs } from "../hooks/useMentionCatalogs";
 import { normalizeVariant } from "../lib/braille-loader";
 import SessionStalledBanner from "./SessionStalledBanner";
 import MessageList from "./chat/MessageList";
 import ComposerRow from "./chat/ComposerRow";
 import ComposerModals, { WorkingIndicator } from "./chat/ComposerModals";
+import type { MentionRow } from "./chat/ComposerMentions";
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -348,22 +348,27 @@ export default function ChatStream() {
     return () => window.removeEventListener("resize", apply);
   }, [draft]);
 
-  // --- Skills (Task 5): the `$`-trigger picker + the send-path expansion. ---
+  // --- The three-prefix mention picker (`$` skills / `#` MCP servers /
+  // `@` agents) + the send-path expansion. ---
   // ALL of the hooks below live in the UNCONDITIONAL top block (before the
   // `!activeSessionId` early return further down) — placing any of them after
   // the early return would change the hook count across the session/no-session
   // transition and crash React (the same bug the `usePendingSubagentRequests`
-  // comment above warns about). Plain (non-hook) functions like `selectSkill`
+  // comment above warns about). Plain (non-hook) functions like `selectMention`
   // are placement-flexible (the file's own comment says so for the attachment
   // handlers) and live with the other handlers below.
   // The Space path is the active session's `cwd` (CONTEXT.md: a Session's
-  // `cwd` IS the Space's folder) — live first, then stored (the same
-  // derivation as Task 4's `SpacesList`). `useSkillCatalog` caches per Space,
-  // so the composer and the left pane share ONE fetch (same key).
+  // `cwd` IS the Space's folder) — derivation UNCHANGED from the `$`-only
+  // picker: live first, then stored (the same derivation as Task 4's
+  // `SpacesList`). `useMentionCatalogs` caches per Space, so the composer and
+  // the left pane share ONE skills fetch (same key — the skills row reuses
+  // `useSkillCatalog` verbatim).
   const spacePath = liveSession?.cwd ?? historySession?.cwd ?? null;
-  const skills = useSkillCatalog(spacePath);
-  // The `$`-trigger picker state (the active token + the highlighted row).
+  const { skills, agents, mcpServers } = useMentionCatalogs(spacePath);
+  // The `$`/`#`/`@`-trigger picker state (the active token (incl. its prefix)
+  // + the highlighted row).
   const [picker, setPicker] = useState<{
+    prefix: "$" | "#" | "@";
     query: string;
     index: number;
   } | null>(null);
@@ -375,18 +380,42 @@ export default function ChatStream() {
   // bare `picker.query` would be a TS18047 compile error under `strict: true`
   // (and a `picker!` "fix" would crash at render whenever the picker is
   // closed, i.e. nearly every render).
-  const filtered = useMemo(
-    () =>
-      skills.filter((s) =>
-        s.name.toLowerCase().includes((picker?.query ?? "").toLowerCase()),
-      ),
-    [skills, picker],
-  );
+  const filtered = useMemo(() => {
+    // ONE picker, filtered to the ACTIVE prefix's catalog only (a `$`/`#`/`@`
+    // never mixes in one open list): map the matching catalog to `MentionRow`
+    // (skills/agents carry `description`, the MCP servers carry their one-line
+    // `summary`).
+    const prefix = picker?.prefix ?? "$";
+    const rows: MentionRow[] =
+      prefix === "#"
+        ? mcpServers.map((s) => ({
+            key: s.name,
+            prefix: "#",
+            name: s.name,
+            description: s.summary,
+          }))
+        : prefix === "@"
+          ? agents.map((a) => ({
+              key: a.name,
+              prefix: "@",
+              name: a.name,
+              description: a.description,
+            }))
+          : skills.map((s) => ({
+              key: s.name,
+              prefix,
+              name: s.name,
+              description: s.description,
+            }));
+    return rows.filter((r) =>
+      r.name.toLowerCase().includes((picker?.query ?? "").toLowerCase()),
+    );
+  }, [skills, agents, mcpServers, picker]);
   // The highlighted row index, DERIVED (not clamped in place): the raw
   // `picker.index` can go stale (a Space switch refetches `skills` while the
   // picker is open with a non-zero `index`), and `filtered[staleIndex]` would
-  // be `undefined` → a `selectSkill(undefined)` crash on Enter. `Math.max(0, …)`
-  // is belt-and-braces: the picker UI and the keyboard branch are both guarded
+  // be `undefined` → a `selectMention(undefined)` crash on Enter (the rows are
+  // `MentionRow`s). `Math.max(0, …)` is belt-and-braces: the picker UI and the keyboard branch are both guarded
   // by `filtered.length > 0`, so `filtered.length - 1` is ≥ 0 there.
   const activeIndex = picker
     ? Math.min(picker.index, Math.max(0, filtered.length - 1))
@@ -397,10 +426,12 @@ export default function ChatStream() {
   // the LIVE draft (a render closure would be stale for fast events).
   useEffect(() => {
     const onInsertSkill = (e: Event) => {
-      // Close the `$`-trigger picker: the insert comes from OUTSIDE the
+      // Close the mention picker: the insert comes from OUTSIDE the
       // picker (a SkillsDialog row — the v1.1 flow), so a picker open at
       // insert time is stale (it would linger rendered until the next
       // keydown, and a token active at the caret would be spliced INTO).
+      // The dialog inserts a `$`-prefixed SKILL token, so the picker this
+      // closes is the skills one (`$` is the skill prefix).
       setPicker(null);
       const text = (e as CustomEvent<string>).detail;
       if (typeof text !== "string") return;
@@ -530,7 +561,7 @@ export default function ChatStream() {
       // compares the RAW text (expansion is re-derived from the FRESH draft
       // below, so comparing expanded texts would be wrong).
       if (draftRef.current.trim() !== rawText) return;
-      // EXPANSION: expand `$name` mentions into pi-format `<skill>` blocks
+      // EXPANSION: expand `$` / `@` / `#` mentions into their block forms
       // BEFORE both `addUserMessage` and `sendPrompt` (the REFINEMENT — the
       // live bubble, the persisted record, and the agent's input must all
       // carry the SAME text, so the content-based dedupe key in
@@ -541,7 +572,7 @@ export default function ChatStream() {
       // unchanged `if (!text)` a "used before its declaration" error;
       // semantically it's safe — expansion maps `""`→`""`, so `!text` is
       // identical to `!rawText`).
-      const text = expandSkillMentions(rawText, skills);
+      const text = expandMentions(rawText, { skills, agents, mcpServers });
       // Every staged image was removed during the read (the composer isn't
       // locked until `beginTurn`, so a thumbnail can be removed during the
       // read): with no text there's nothing meaningful left to send; with
@@ -807,21 +838,21 @@ export default function ChatStream() {
     setAttachments(next);
   };
 
-  // Select a skill from the `$`-trigger picker: replace the active token
-  // (the `$`-prefixed span at the caret — the shared `activeSkillToken`
-  // helper) with `$<name> ` (LOWERcased — the case policy: a picker-selected
-  // skill ALWAYS expands on send, and the mention regex is lowercase-only;
-  // the expansion keeps the frontmatter name verbatim in the block's `name`
-  // attribute). The `requestAnimationFrame` re-focus + caret-set is REQUIRED:
-  // `setDraft` re-renders the controlled textarea, which would otherwise drop
-  // focus/caret.
-  const selectSkill = (skill: SkillInfo) => {
+  // Select a mention from the `$`/`#`/`@`-trigger picker: replace the active
+  // token (the `$`/`#`/`@`-prefixed span at the caret — the shared
+  // `activeMentionToken` helper) with `<prefix><name> ` (LOWER-cased — the
+  // case policy: a picker-selected mention ALWAYS expands on send, and the
+  // mention regex is lowercase-only; the expansion keeps the catalog name
+  // verbatim in the block's `name` attribute). The `requestAnimationFrame`
+  // re-focus + caret-set is REQUIRED: `setDraft` re-renders the controlled
+  // textarea, which would otherwise drop focus/caret.
+  const selectMention = (row: MentionRow) => {
     if (!picker) return;
     const el = composerRef.current;
     const caret = el?.selectionStart ?? draft.length;
-    const token = activeSkillToken(draft, caret);
+    const token = activeMentionToken(draft, caret);
     if (!token) return;
-    const inserted = `$${skill.name.toLowerCase()} `;
+    const inserted = `${row.prefix}${row.name.toLowerCase()} `;
     const next = draft.slice(0, token.start) + inserted + draft.slice(caret);
     setPicker(null);
     setDraft(next);
@@ -909,7 +940,7 @@ export default function ChatStream() {
         setPicker={setPicker}
         filtered={filtered}
         activeIndex={activeIndex}
-        selectSkill={selectSkill}
+        selectMention={selectMention}
         attachments={attachments}
         removeAttachment={removeAttachment}
         handlePaste={handlePaste}

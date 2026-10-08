@@ -471,6 +471,14 @@ export interface AgentDefinitionDto {
   scope: "space" | "user";
 }
 
+/** One effective MCP server (camelCase over IPC — the Rust `McpServerInfo`). */
+export interface McpServerInfo {
+  name: string;
+  kind: "http" | "stdio";
+  /** The `url` (HTTP) or `command + args` (stdio). */
+  summary: string;
+}
+
 /** One discovered skill (camelCase over IPC — the Rust `SkillInfo`). */
 export interface SkillInfo {
   name: string;
@@ -665,6 +673,16 @@ export async function spaceForPath(path: string): Promise<SpaceCheck> {
 /** The skill catalog for a Space (`null` = user-level skills only). */
 export async function listSkills(spacePath: string | null): Promise<SkillInfo[]> {
   return invoke<SkillInfo[]>("list_skills", { spacePath: spacePath ?? null });
+}
+
+/** The agent-definition catalog for a Space (`null` = user-level only). */
+export async function listAgentDefinitionsForSpace(spacePath: string | null): Promise<AgentDefinitionDto[]> {
+  return invoke<AgentDefinitionDto[]>("list_agent_definitions_for_space", { cwd: spacePath ?? null });
+}
+
+/** The effective MCP servers for a Space (`null` = user-level only). */
+export async function listMcpServersEffective(spacePath: string | null): Promise<McpServerInfo[]> {
+  return invoke<McpServerInfo[]>("list_mcp_servers_effective", { cwd: spacePath ?? null });
 }
 
 // ---------------------------------------------------------------------------

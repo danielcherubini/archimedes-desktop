@@ -3,15 +3,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { createHighlighter, type Highlighter } from "shiki";
 import {
+  BotIcon,
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  ServerIcon,
   WandSparklesIcon,
 } from "lucide-react";
 import type { Message } from "../store/sessions";
 import { useSettings } from "../store/settings";
 import type { AppPalette } from "../lib/theme";
-import { splitSkillBlocks, type SkillBlock } from "../lib/skills";
+import { splitMentionBlocks, type MentionBlock, type SkillBlock } from "../lib/skills";
 import { fileIconFor } from "../lib/fileIcons";
 import ToolCallCard from "./ToolCallCard";
 import SubagentDelegatingCard from "./SubagentDelegatingCard";
@@ -53,6 +55,37 @@ function SkillBlockCard({ block }: { block: SkillBlock }) {
           {block.body}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * One `@`-agent / `#`-MCP block: the SOFT hint the user's mention injected.
+ *
+ * Deliberately a compact SINGLE-LINE chip and NOT a collapsible card like
+ * `SkillBlockCard`: the block body is a two-sentence nudge ("the user NAMED
+ * this resource — the agent may still reason it isn't needed"), not a
+ * document worth hiding, so there is no chevron, no expand, and the body is
+ * NOT rendered at all (the chip says what happened; the agent's own
+ * dispatch/connect row in the transcript is the proof it acted on it).
+ */
+function NamedResourceChip({ block }: { block: MentionBlock }) {
+  // `block.body` is parsed but deliberately NOT rendered: the block is a soft
+  // pointer for the AGENT, and the chip only tells the user what they named —
+  // expanding the prose hint in the UI would add noise.
+  const Icon = block.kind === "agent" ? BotIcon : ServerIcon;
+  return (
+    <div className="flex items-center gap-2 rounded-lg bg-input px-3 py-2">
+      <Icon className="size-4 shrink-0 text-foreground-subtle" />
+      <span className="shrink-0 whitespace-nowrap font-medium text-foreground-subtlest">
+        {block.kind === "agent" ? "Agent" : "MCP"}
+      </span>
+      <span className="min-w-0 truncate font-mono text-ui-sm text-foreground-subtle">
+        {block.name}
+      </span>
+      <span className="text-ui-xs text-foreground-subtlest">
+        named by the user
+      </span>
     </div>
   );
 }
@@ -464,21 +497,26 @@ export default memo(
     switch (message.kind) {
       case "user": {
         // The design reference: a plain row — no bubble, no avatar.
-        // `expandSkillMentions` appends `<skill>` blocks after the user's
-        // text; render the blocks as collapsible cards (collapsed by
-        // default) instead of raw text — display-only, the persisted/sent
-        // text is unchanged. Images render as a read-only thumbnail grid
-        // (the transcript is history — NO remove buttons). `data:` URLs are
-        // safe here: the transcript is local.
-        const { text, blocks } = splitSkillBlocks(message.text);
+        // `expandMentions` appends `<skill>` / `<agent>` / `<mcp>` blocks
+        // after the user's text; render the blocks as a collapsible card
+        // (skill — collapsed by default) or a compact soft-hint chip
+        // (agent / MCP) instead of raw text — display-only, the
+        // persisted/sent text is unchanged. Images render as a read-only
+        // thumbnail grid (the transcript is history — NO remove buttons).
+        // `data:` URLs are safe here: the transcript is local.
+        const { text, blocks } = splitMentionBlocks(message.text);
         return (
           <div className="whitespace-pre-wrap text-ui-base text-foreground">
             {text}
             {blocks.length > 0 && (
               <div className="mt-2 flex flex-col gap-2">
-                {blocks.map((block, i) => (
-                  <SkillBlockCard key={i} block={block} />
-                ))}
+                {blocks.map((block, i) =>
+                  block.kind === "skill" ? (
+                    <SkillBlockCard key={i} block={block} />
+                  ) : (
+                    <NamedResourceChip key={i} block={block} />
+                  ),
+                )}
               </div>
             )}
             {message.images && message.images.length > 0 && (

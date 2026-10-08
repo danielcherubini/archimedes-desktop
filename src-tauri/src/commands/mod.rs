@@ -2,6 +2,7 @@ pub mod agents;
 pub mod clipboard;
 pub mod files;
 pub mod history;
+pub mod mcp;
 pub mod sessions;
 pub mod settings;
 pub mod skills;

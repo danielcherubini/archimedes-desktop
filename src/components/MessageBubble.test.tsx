@@ -3,8 +3,12 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import ReactMarkdown from "react-markdown";
 import MessageBubble from "./MessageBubble";
 import { Message } from "../store/sessions";
-import { expandSkillMentions } from "../lib/skills";
-import type { SkillInfo } from "../lib/tauri";
+import { expandMentions, expandSkillMentions } from "../lib/skills";
+import type {
+  AgentDefinitionDto,
+  McpServerInfo,
+  SkillInfo,
+} from "../lib/tauri";
 import { useSubagents } from "../store/subagents";
 
 /** A full `SkillInfo` fixture (mirrors the `skills.test.ts` factory). */
@@ -16,6 +20,27 @@ function makeSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
     dir: "/s/.agents/skills/debug",
     scope: "space",
     body: "Step 1. Step 2.",
+    ...overrides,
+  };
+}
+
+/** An `AgentDefinitionDto` fixture (the `@`-mention catalog row). */
+function makeAgent(overrides: Partial<AgentDefinitionDto> = {}): AgentDefinitionDto {
+  return {
+    name: "scout",
+    description: "Fast recon.",
+    model: null,
+    scope: "user",
+    ...overrides,
+  };
+}
+
+/** An `McpServerInfo` fixture (the `#`-mention catalog row). */
+function makeMcp(overrides: Partial<McpServerInfo> = {}): McpServerInfo {
+  return {
+    name: "postgres",
+    kind: "stdio",
+    summary: "npx -y x-mcp",
     ...overrides,
   };
 }
@@ -273,4 +298,129 @@ describe("MessageBubble", () => {
     expect(screen.queryByText("A body")).toBeNull();
     expect(screen.queryByText("B body")).toBeNull();
   });
+
+  // --- Task 6 (composer-mentions): the `@` agent / `#` MCP soft-hint chip.
+  // These blocks are SHORT hints (unlike a skill body), so they render as a
+  // compact SINGLE-LINE chip — no collapse affordance at all.
+
+  it("an_agent_block_renders_the_named_by_the_user_chip",
+    () => {
+      const message: Message = {
+        kind: "user",
+        text: expandMentions("ping @scout", {
+          skills: [],
+          agents: [makeAgent()],
+          mcpServers: [],
+        }),
+        at: 1,
+      };
+      const { container } = render(<MessageBubble message={message} />);
+      // The user's text renders verbatim (the `@scout` token stays in it).
+      expect(screen.getByText("ping @scout")).toBeTruthy();
+      // The chip: the kind label + the name + the soft-hint suffix.
+      expect(screen.getByText("Agent")).toBeTruthy();
+      expect(screen.getByText("scout")).toBeTruthy();
+      expect(screen.getByText("named by the user")).toBeTruthy();
+      // NO collapse affordance: the chip is not a button (no chevron, no
+      // expand) …
+      expect(screen.queryByRole("button")).toBeNull();
+      // … and the block's HINT BODY is not rendered anywhere.
+      expect(
+        screen.queryByText(/Dispatch a subagent with agentName/),
+      ).toBeNull();
+      // Exactly one chip row.
+      expect(container.querySelectorAll(".bg-input")).toHaveLength(1);
+    });
+
+  it("an_mcp_block_renders_the_named_by_the_user_chip", () => {
+    const message: Message = {
+      kind: "user",
+      text: expandMentions("query #postgres", {
+        skills: [],
+        agents: [],
+        mcpServers: [makeMcp()],
+      }),
+      at: 1,
+    };
+    const { container } = render(<MessageBubble message={message} />);
+    expect(screen.getByText("query #postgres")).toBeTruthy();
+    expect(screen.getByText("MCP")).toBeTruthy();
+    expect(screen.getByText("postgres")).toBeTruthy();
+    expect(screen.getByText("named by the user")).toBeTruthy();
+    // No collapse affordance, and the hint body is not rendered.
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.queryByText(/Connect to it via the mcp tool/)).toBeNull();
+    expect(container.querySelectorAll(".bg-input")).toHaveLength(1);
+  });
+
+  it("a_skill_block_still_renders_the_collapsible_card",
+    () => {
+      // Regression: the skill card (icon / collapse behaviour) is UNCHANGED
+      // by the generalization — only the block SPLITTER is new.
+      const message: Message = {
+        kind: "user",
+        text: expandMentions("fix $debug", {
+          skills: [makeSkill()],
+          agents: [],
+          mcpServers: [],
+        }),
+        at: 1,
+      };
+      render(<MessageBubble message={message} />);
+      expect(screen.getByText("Skill")).toBeTruthy();
+      expect(screen.getByText("debug")).toBeTruthy();
+      // NO soft-hint suffix on a skill card (the skill is a HARD
+      // instruction, not a hint).
+      expect(screen.queryByText("named by the user")).toBeNull();
+      // Collapsed by default; the header toggles it.
+      const header = screen.getByRole("button");
+      expect(header.getAttribute("aria-expanded")).toBe("false");
+      expect(screen.queryByText("Step 1. Step 2.")).toBeNull();
+      act(() => {
+        fireEvent.click(header);
+      });
+      expect(screen.getByText("Step 1. Step 2.")).toBeTruthy();
+    });
+
+  it("a_mixed_message_renders_the_card_and_both_chips_in_order",
+    () => {
+      const message: Message = {
+        kind: "user",
+        text: expandMentions("x $debug @scout #postgres", {
+          skills: [makeSkill()],
+          agents: [makeAgent()],
+          mcpServers: [makeMcp()],
+        }),
+        at: 1,
+      };
+      const { container } = render(<MessageBubble message={message} />);
+      expect(screen.getByText("x $debug @scout #postgres")).toBeTruthy();
+      // First-mention order: the skill card, then the agent chip, then the
+      // MCP chip (the block rows are the `.bg-input` elements).
+      const rows = [...container.querySelectorAll(".bg-input")];
+      expect(rows).toHaveLength(3);
+      expect(rows[0]!.textContent).toContain("Skill");
+      expect(rows[0]!.textContent).toContain("debug");
+      expect(rows[1]!.textContent).toContain("Agent");
+      expect(rows[1]!.textContent).toContain("scout");
+      expect(rows[2]!.textContent).toContain("MCP");
+      expect(rows[2]!.textContent).toContain("postgres");
+      // Both chips carry the soft-hint suffix; the card does not collapse
+      // anything but the skill body (collapsed by default).
+      expect(screen.getAllByText("named by the user")).toHaveLength(2);
+      expect(screen.queryByText("Step 1. Step 2.")).toBeNull();
+      // Only the skill card is a button (the chips have no affordance).
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+    });
+
+  it("a_message_with_no_mention_blocks_renders_verbatim",
+    () => {
+      // Regression for the `mergeDedupeKey` display invariant: no blocks →
+      // the text renders byte-identically and no chip/card shows up.
+      const message: Message = { kind: "user", text: "just text @not-an-agent", at: 1 };
+      render(<MessageBubble message={message} />);
+      expect(screen.getByText("just text @not-an-agent")).toBeTruthy();
+      expect(screen.queryByText("named by the user")).toBeNull();
+      expect(screen.queryByRole("button")).toBeNull();
+    });
 });

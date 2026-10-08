@@ -9,15 +9,17 @@ import {
 } from "../ui/tooltip";
 import SessionConfigSelect from "../SessionConfigSelect";
 import AttachmentStrip from "./AttachmentStrip";
-import ComposerSkills from "./ComposerSkills";
-import { activeSkillToken } from "../../lib/skills";
+import ComposerMentions, { type MentionRow } from "./ComposerMentions";
+import { activeMentionToken } from "../../lib/skills";
 import type { ChatComposerAttachment } from "../../lib/chatAttachments";
-import type { SessionConfigOption, SkillInfo } from "../../lib/tauri";
+import type { SessionConfigOption } from "../../lib/tauri";
 
 /**
- * The composer: the outer rounded box (drop target), the `$`-trigger skill
- * picker, the staged-attachment strip, the controlled textarea (with the
- * `$`-token `onChange` / `onKeyDown` logic) and the bottom toolbar row (the
+ * The composer: the outer rounded box (drop target), the three-prefix
+ * mention picker (`$` skills / `#` MCP servers / `@` agents), the
+ * staged-attachment strip, the controlled textarea (with the three-prefix
+ * mention-token `onChange` / `onKeyDown` logic — `$` skills / `#` MCP servers /
+ * `@` agents) and the bottom toolbar row (the
  * `+` attach button, the context-usage bar, the model / thinking selectors
  * and the Send button).
  *
@@ -25,8 +27,8 @@ import type { SessionConfigOption, SkillInfo } from "../../lib/tauri";
  * `picker` and `attachments` state, the `composerRef` the auto-grow and
  * skill-insert effects need, `send`, and the attachment handlers). The
  * `onChange` / `onKeyDown` closures live here VERBATIM (they are pure given
- * these props: `activeSkillToken` is a free function, the `draft` / `picker`
- * setters and the `send` / `selectSkill` callbacks are props). Extracted
+ * these props: `activeMentionToken` is a free function, the `draft` / `picker`
+ * setters and the `send` / `selectMention` callbacks are props). Extracted
  * verbatim from `ChatStream` (identical DOM).
  */
 export default function ComposerRow({
@@ -37,7 +39,7 @@ export default function ComposerRow({
   setPicker,
   filtered,
   activeIndex,
-  selectSkill,
+  selectMention,
   attachments,
   removeAttachment,
   handlePaste,
@@ -59,13 +61,13 @@ export default function ComposerRow({
   composerRef: RefObject<HTMLTextAreaElement | null>;
   draft: string;
   setDraft: (value: string) => void;
-  picker: { query: string; index: number } | null;
+  picker: { prefix: "$" | "#" | "@"; query: string; index: number } | null;
   setPicker: (
-    picker: { query: string; index: number } | null,
+    picker: { prefix: "$" | "#" | "@"; query: string; index: number } | null,
   ) => void;
-  filtered: SkillInfo[];
+  filtered: MentionRow[];
   activeIndex: number;
-  selectSkill: (skill: SkillInfo) => void;
+  selectMention: (row: MentionRow) => void;
   attachments: ChatComposerAttachment[];
   removeAttachment: (id: string) => void;
   handlePaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
@@ -104,25 +106,30 @@ export default function ComposerRow({
       className="relative m-1 shrink-0 rounded-xl bg-composer p-3"
       onDrop={handleDrop}
     >
-      <ComposerSkills
+      <ComposerMentions
         open={picker !== null}
         filtered={filtered}
         activeIndex={activeIndex}
-        onSelect={selectSkill}
+        onSelect={selectMention}
       />
       <AttachmentStrip attachments={attachments} onRemove={removeAttachment} />
       <textarea
         ref={composerRef}
         value={draft}
         onChange={(e) => {
-          // The `$`-trigger: a bare `$` (empty token remainder) opens the
-          // picker with the FULL list, any non-`$` span closes it.
-          const token = activeSkillToken(
+          // The `$`/`#`/`@`-trigger: a bare prefix (empty token remainder)
+          // opens the picker with the FULL list for that prefix, any
+          // non-token span closes it.
+          const token = activeMentionToken(
             e.target.value,
             e.target.selectionStart ?? e.target.value.length,
           );
           setDraft(e.target.value);
-          setPicker(token ? { query: token.remainder, index: 0 } : null);
+          setPicker(
+            token
+              ? { prefix: token.prefix, query: token.remainder, index: 0 }
+              : null,
+          );
         }}
         onPaste={handlePaste}
         onKeyDown={(e) => {
@@ -132,13 +139,13 @@ export default function ComposerRow({
           // (only recomputed in `onChange`) can be STALE — the caret may
           // no longer be on the token.
           const el = e.currentTarget;
-          const token = activeSkillToken(
+          const token = activeMentionToken(
             el.value,
             el.selectionStart ?? el.value.length,
           );
           if (picker && !token) {
             // The caret left the token: CLOSE the picker instead of
-            // `selectSkill`'s silent early-return — a stale picker must
+            // `selectMention`'s silent early-return — a stale picker must
             // never swallow keys (Enter sends, arrows move the caret, Tab
             // falls through to the textarea default).
             setPicker(null);
@@ -178,12 +185,12 @@ export default function ComposerRow({
             }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              selectSkill(filtered[activeIndex]!);
+              selectMention(filtered[activeIndex]!);
               return;
             }
             if (e.key === "Tab" && !e.shiftKey) {
               e.preventDefault();
-              selectSkill(filtered[activeIndex]!);
+              selectMention(filtered[activeIndex]!);
               return;
             }
             if (e.key === "Escape") {

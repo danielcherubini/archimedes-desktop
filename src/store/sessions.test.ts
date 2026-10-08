@@ -11,6 +11,8 @@ import {
   type Message,
 } from "./sessions";
 import { useSubagents } from "./subagents";
+import { expandMentions } from "../lib/skills";
+import type { AgentDefinitionDto, McpServerInfo } from "../lib/tauri";
 import { loadHistory, setSessionArchived, setSpaceTrusted, deleteSpace } from "../lib/tauri";
 import type {
   CloseReasonStr,
@@ -1453,6 +1455,160 @@ describe("resumeSession (history reload race)", () => {
     // is present.
     expect(hi.some((m) => m.at > 1)).toBe(true);
   });
+
+  it("dedupes a resumed prompt whose text carries <agent>/<mcp> mention blocks (the merge key is byte-identical across a reload)",
+    async () => {
+      // The `send()` REFINEMENT: the live bubble, the persisted record, and
+      // the agent's input all carry the SAME EXPANDED text, so
+      // `mergeDedupeKey`'s user case (`user|<text>|<images>`) matches across
+      // a resume reload EVEN for the multi-line `<agent>` / `<mcp>` blocks
+      // (em dashes, curly quotes, blank lines). Any normalization on either
+      // side (a trim, a `splitMentionBlocks` render-then-persist, a
+      // re-join) would change the key and render the prompt TWICE.
+      const agent: AgentDefinitionDto = {
+        name: "scout",
+        description: "Fast recon.",
+        model: null,
+        scope: "user",
+      };
+      const mcp: McpServerInfo = {
+        name: "postgres",
+        kind: "stdio",
+        summary: "npx -y x-mcp",
+      };
+      // The REAL expanded shape (built by the production builder, not a
+      // hand-written literal).
+      const expanded = expandMentions("ping @scout and #postgres", {
+        skills: [],
+        agents: [agent],
+        mcpServers: [mcp],
+      });
+      // Precondition: the fixture really is the block shape (two blocks, one
+      // per new kind) — otherwise this test would degrade to the plain-text
+      // case already covered above.
+      expect(expanded).toContain('<agent name="scout">');
+      expect(expanded).toContain('<mcp name="postgres">');
+
+      useSessions.setState({
+        activeSessionId: "s1",
+        historySessions: [
+          {
+            sessionId: "s1",
+            cwd: "/x",
+            capabilities: { loadSession: true },
+            archived: false,
+          },
+        ],
+        messages: { s1: [{ kind: "user", text: "one", at: 1 }] },
+      });
+      let resolveRows: (rows: MessageRow[]) => void = () => {};
+      vi.mocked(loadHistory).mockImplementationOnce(
+        () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+      );
+      await useSessions.getState().resumeSession("s1");
+      // The live row the send appended (the EXPANDED text — `send()` calls
+      // `addUserMessage(id, expandMentions(rawText, …))`).
+      useSessions.getState().addUserMessage("s1", expanded);
+      const addedAt =
+        useSessions.getState().messages.s1[
+          useSessions.getState().messages.s1.length - 1
+        ].at;
+      // The persisted row `record_message` committed for the SAME message
+      // (`payloadJson.text` is the sent text verbatim — the persistence path
+      // stores what it is handed, no reshaping).
+      resolveRows([
+        {
+          id: 1,
+          sessionId: "s1",
+          kind: "user",
+          messageKey: null,
+          payloadJson: JSON.stringify({ text: "one" }),
+          createdAt: 1,
+        },
+        {
+          id: 2,
+          sessionId: "s1",
+          kind: "user",
+          messageKey: null,
+          payloadJson: JSON.stringify({ text: expanded }),
+          createdAt: addedAt,
+        },
+      ]);
+      await new Promise((r) => setTimeout(r, 0));
+      const msgs = useSessions.getState().messages.s1;
+      // DEDUPED: the locally-added copy is dropped against the reloaded row
+      // (same `mergeDedupeKey`, reloaded `createdAt` >= the local `at`), so
+      // the mention-expanded prompt renders ONCE.
+      expect(msgs).toHaveLength(2);
+      const ping = msgs.filter(
+        (m) => m.kind === "user" && m.text.startsWith("ping @scout"),
+      );
+      expect(ping).toHaveLength(1);
+      // The surviving row is byte-identical to the expansion (the transcript
+      // keeps the blocks — the split is DISPLAY-only).
+      expect(ping[0]!.kind === "user" ? ping[0]!.text : null).toBe(expanded);
+    });
+
+  it("does NOT dedupe a mention prompt when the reloaded row holds the UNEXPANDED text (the key is byte-exact)",
+    async () => {
+      // The negative control for the test above (and the reason it is not a
+      // tautology): a live row carrying the EXPANDED text and a persisted row
+      // carrying the RAW `@`/`#` text are DIFFERENT keys, so both survive.
+      // If the dedupe key were normalized (e.g. the blocks stripped by
+      // `splitMentionBlocks` before hashing), this pair would collapse and
+      // the test above would pass for the wrong reason.
+      const agent: AgentDefinitionDto = {
+        name: "scout",
+        description: "Fast recon.",
+        model: null,
+        scope: "user",
+      };
+      const expanded = expandMentions("ping @scout", {
+        skills: [],
+        agents: [agent],
+        mcpServers: [],
+      });
+      useSessions.setState({
+        activeSessionId: "s1",
+        historySessions: [
+          {
+            sessionId: "s1",
+            cwd: "/x",
+            capabilities: { loadSession: true },
+            archived: false,
+          },
+        ],
+        messages: { s1: [] },
+      });
+      let resolveRows: (rows: MessageRow[]) => void = () => {};
+      vi.mocked(loadHistory).mockImplementationOnce(
+        () => new Promise<MessageRow[]>((r) => (resolveRows = r)),
+      );
+      await useSessions.getState().resumeSession("s1");
+      useSessions.getState().addUserMessage("s1", expanded);
+      const addedAt =
+        useSessions.getState().messages.s1[
+          useSessions.getState().messages.s1.length - 1
+        ].at;
+      resolveRows([
+        {
+          id: 1,
+          sessionId: "s1",
+          kind: "user",
+          messageKey: null,
+          // The RAW draft (NOT what `send()` persisted) — a divergence the
+          // dedupe must catch.
+          payloadJson: JSON.stringify({ text: "ping @scout" }),
+          createdAt: addedAt,
+        },
+      ]);
+      await new Promise((r) => setTimeout(r, 0));
+      const msgs = useSessions.getState().messages.s1;
+      expect(msgs).toHaveLength(2);
+      expect(
+        msgs.filter((m) => m.kind === "user" && m.text === expanded),
+      ).toHaveLength(1);
+    });
 });
 
 describe("archivedSessions (sticky, ADR 0016)", () => {

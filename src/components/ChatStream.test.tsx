@@ -9,16 +9,19 @@ import {
   readFileBytes,
   cancelSession,
   listSkills,
+  listMcpServersEffective,
+  listAgentDefinitionsForSpace,
 } from "../lib/tauri";
 import { open as openFilePicker } from "@tauri-apps/plugin-dialog";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
+import { clearMentionCatalogsCache } from "../hooks/useMentionCatalogs";
 import { useSessions } from "../store/sessions";
 import { useInteractive } from "../store/interactive";
 import { usePermissions } from "../store/permissions";
 import { useSubagents } from "../store/subagents";
 import { useSettings } from "../store/settings";
 import { generateFrames, getVariantGridSize } from "../lib/braille-loader";
-import type { AppSettings } from "../lib/tauri";
+import type { AgentDefinitionDto, AppSettings } from "../lib/tauri";
 import { setSidePaneCollapsed } from "../lib/sidePaneState";
 
 /** A full settings fixture (the spinner-style tests seed the store with it). */
@@ -112,6 +115,21 @@ vi.mock("../lib/tauri", async () => {
         dir: "/s/.agents/skills/beta",
         scope: "space",
         body: "B body",
+      },
+    ]),
+    listAgentDefinitionsForSpace: vi.fn().mockResolvedValue([
+      {
+        name: "scout",
+        description: "Fast recon.",
+        model: null,
+        scope: "user",
+      },
+    ]),
+    listMcpServersEffective: vi.fn().mockResolvedValue([
+      {
+        name: "postgres",
+        kind: "stdio",
+        summary: "npx -y x-mcp",
       },
     ]),
   };
@@ -288,6 +306,7 @@ beforeEach(() => {
   // `listSkills` mock moot: the hook would serve the cached value and never
   // re-fetch).
   clearSkillCatalogCache();
+  clearMentionCatalogsCache();
   useSessions.setState({
     activeSessionId: null,
     sessions: [],
@@ -2282,9 +2301,12 @@ describe("ChatStream", () => {
     expect(vi.mocked(sendPrompt)).not.toHaveBeenCalled();
   });
 
-  // --- Skills: the `$`-trigger picker + the send-path expansion (Task 5). ---
+  // --- Mentions: the `$`/`#`/`@`-trigger picker + the send-path expansion.
+  // One picker, filtered to the active prefix's catalog; rows carry a prefix
+  // badge. The send-path expansion assertions below are the `expandMentions`
+  // regressions (all three catalogs).
 
-  it("typing $ opens the skill picker", async () => {
+  it("typing $ opens the mention picker with the skill rows ($ badge)", async () => {
     seedLiveSession();
     render(<ChatStream />);
     // A bare `$` (empty token remainder) opens the picker with the FULL list.
@@ -2293,6 +2315,59 @@ describe("ChatStream", () => {
     // the fetch and the render.
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "$" } });
     await screen.findByText("debug");
+    // One row per skill, each with a `$` prefix badge (the generalization's
+    // only visual delta vs the old skill picker).
+    const picker = screen.getByTestId("mention-picker");
+    expect(picker.querySelectorAll("button")).toHaveLength(2);
+    // The prefix badge is the `text-ui-xs` span (the only such span per row).
+    const firstBadge = picker.querySelector(".text-ui-xs")!;
+    expect(firstBadge.textContent).toBe("$");
+  });
+
+  it("typing # opens the picker with the MCP rows (# badge)", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // `#` → the ACTIVE prefix's catalog is the effective MCP servers (the
+    // `listMcpServersEffective` mock). `findByText` awaits the async fetch.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "#" } });
+    const row = await screen.findByText("postgres");
+    // The `#` badge is on the row (the `@`/`$` glyphs must not mix in).
+    expect(row.closest("button")!.querySelector(".text-ui-xs")!.textContent).toBe("#");
+    // The skill catalog is NOT listed under `#` (no mixing).
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("typing @ opens the picker with the agent rows (@ badge)", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    // `@` → the ACTIVE prefix's catalog is the agent definitions (the
+    // `listAgentDefinitionsForSpace` mock). `findByText` awaits the async fetch.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "@" } });
+    const row = await screen.findByText("scout");
+    // The `@` badge is on the row (the `#`/`$` glyphs must not mix in).
+    expect(row.closest("button")!.querySelector(".text-ui-xs")!.textContent).toBe("@");
+    // Neither the MCP server nor a skill mixes in under `@`.
+    expect(screen.queryByText("postgres")).toBeNull();
+    expect(screen.queryByText("debug")).toBeNull();
+  });
+
+  it("a mixed draft lists only the prefix of the token at the caret", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // The caret is at the END of what is typed (where a user's caret sits
+    // after typing). Caret on the `$a` token → the picker is on the `$`
+    // prefix: the skill row `beta` matches the `a` substring, and NO `#`/
+    // `@` row mixes in (a `$`/`#`/`@` never mixes in one open list).
+    fireEvent.change(textarea, { target: { value: "$a" } });
+    expect(await screen.findByText("beta")).toBeTruthy();
+    expect(screen.queryByText("postgres")).toBeNull();
+    expect(screen.queryByText("scout")).toBeNull();
+    // The user keeps typing to the `#pos` token: the picker flips to the `#`
+    // prefix (the `postgres` server matches `pos`) and the `$` row drops out.
+    fireEvent.change(textarea, { target: { value: "$a #pos" } });
+    expect(await screen.findByText("postgres")).toBeTruthy();
+    expect(screen.queryByText("beta")).toBeNull();
   });
 
   it("the picker filters as the token is typed", async () => {
@@ -2348,7 +2423,7 @@ describe("ChatStream", () => {
     // be the wait signal.
     await waitForCatalog();
     // The trailing space ends the active token → the picker is NOT open and
-    // Enter is NOT intercepted by the picker's `selectSkill` branch. `rawText`
+    // Enter is NOT intercepted by the picker's `selectMention` branch. `rawText`
     // = `draft.trim()` = `fix $debug`.
     fireEvent.change(screen.getByRole("textbox"), {
       target: { value: "fix $debug " },
@@ -2383,7 +2458,7 @@ describe("ChatStream", () => {
     seedLiveSession();
     render(<ChatStream />);
     await waitForCatalog();
-    // `$nope` matches no skill → `expandSkillMentions` finds no match and
+    // `$nope` matches no skill → `expandMentions` finds no match and
     // returns the text UNCHANGED. The trailing space closes the picker.
     fireEvent.change(screen.getByRole("textbox"), {
       target: { value: "hi $nope " },
@@ -2392,6 +2467,107 @@ describe("ChatStream", () => {
     // `rawText` is `hi $nope` and nothing was expanded.
     expect(sendPrompt).toHaveBeenCalledWith("s1", "hi $nope");
   });
+
+  // --- Task 6 (composer-mentions): `send()` expands via the THREE-catalog
+  // `expandMentions` (the `@` agent / `#` MCP soft blocks alongside the
+  // hard `$` skill block). ---
+
+  it("send expands an @ agent mention into the soft agent block",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "ping @scout " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      // The EXACT agent-block literal (Task 3) — the `—` is an EM DASH.
+      const expanded =
+        "ping @scout\n\n" +
+        '<agent name="scout">' +
+        "\nscout \u2014 Fast recon." +
+        '\nThe user has explicitly named the agent definition "scout" for this' +
+        '\nrequest. Dispatch a subagent with agentName "scout" to handle it' +
+        "\n(the definition's frontmatter defines its model, tools, and system" +
+        "\nprompt; your explicit tool params layer over the definition)." +
+        "\n</agent>";
+      // The live bubble and the agent input carry the SAME text (the
+      // `mergeDedupeKey` invariant).
+      const userMsg = useSessions
+        .getState()
+        .messages["s1"]?.find((m) => m.kind === "user");
+      expect(userMsg?.kind === "user" ? userMsg.text : null).toBe(expanded);
+      expect(sendPrompt).toHaveBeenCalledWith("s1", expanded);
+      // End-to-end (the `done-when`): the LIVE bubble the send just appended
+      // renders the soft-hint chip, not the raw block text.
+      expect(screen.getByText("named by the user")).toBeTruthy();
+      expect(screen.queryByText(/Dispatch a subagent with agentName/)).toBeNull();
+    });
+
+  it("send expands a # MCP mention into the soft mcp block",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "query #postgres " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      const expanded =
+        "query #postgres\n\n" +
+        '<mcp name="postgres">' +
+        '\nThe user has explicitly named the MCP server "postgres" for this' +
+        '\nrequest. Connect to it via the mcp tool (mcp({ connect: "postgres" }))' +
+        "\nand use its tools. (Server summary: npx -y x-mcp.)" +
+        "\n</mcp>";
+      expect(sendPrompt).toHaveBeenCalledWith("s1", expanded);
+    });
+
+  it("send expands a mixed $ / @ / # draft into blocks in first-mention order",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "x $debug @scout #postgres " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      const sent = vi.mocked(sendPrompt).mock.calls[0]![1] as string;
+      expect(sent.startsWith("x $debug @scout #postgres")).toBe(true);
+      // One block per kind, appended in TEXT order (first-mention order).
+      const skill = sent.indexOf('<skill name="debug"');
+      const agent = sent.indexOf('<agent name="scout">');
+      const mcp = sent.indexOf('<mcp name="postgres">');
+      expect(skill).toBeGreaterThan(-1);
+      expect(agent).toBeGreaterThan(skill);
+      expect(mcp).toBeGreaterThan(agent);
+    });
+
+  it("an unmatched # token passes through byte-identically into the sent text",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      // `#nope` matches no MCP server → NO block and the token is NOT
+      // stripped (the `mergeDedupeKey` byte-identity invariant).
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "hi #nope " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "hi #nope");
+    });
+
+  it("an unmatched @ token passes through byte-identically into the sent text",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      await waitForCatalog();
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "hi @nope " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "hi @nope");
+    });
 
   it("arrow_down_moves_the_highlight_and_enter_selects_the_second_row", async () => {
     seedLiveSession();
@@ -2476,7 +2652,7 @@ describe("ChatStream", () => {
     await screen.findByText("debug"); // picker open
     // Move the caret AWAY from the token WITHOUT `onChange` (a mouse click
     // or Home does this — no keystroke fires `change`): the picker is now
-    // STALE (it would still `selectSkill` the highlighted `debug` on Enter
+    // STALE (it would still `selectMention` the highlighted `debug` on Enter
     // if the keydown didn't re-evaluate the token at the caret).
     textarea.setSelectionRange(0, 0);
     fireEvent.keyDown(textarea, { key: "Enter" });
@@ -2487,7 +2663,7 @@ describe("ChatStream", () => {
     // (The picker's CLOSED state is asserted via the picker's testid — the
     // skill's NAME now also renders in the sent message's collapsed skill
     // card header, so a text query is no longer a picker-only signal.)
-    expect(screen.queryByTestId("skill-picker")).toBeNull();
+    expect(screen.queryByTestId("mention-picker")).toBeNull();
     expect(textarea.value).toBe("");
     const sent =
       "$debug\n\n" +
@@ -2540,7 +2716,7 @@ describe("ChatStream", () => {
     expect(notPrevented).toBe(true);
     expect(textarea.value).toBe("$de");
     // The picker is still open (no selection happened).
-    expect(screen.getByTestId("skill-picker")).toBeTruthy();
+    expect(screen.getByTestId("mention-picker")).toBeTruthy();
   });
 
   it("the_insert_event_closes_the_picker", async () => {
@@ -2562,7 +2738,7 @@ describe("ChatStream", () => {
     });
     // The stale picker is CLOSED (no lingering popup until the next
     // keydown) …
-    expect(screen.queryByTestId("skill-picker")).toBeNull();
+    expect(screen.queryByTestId("mention-picker")).toBeNull();
     // …and the inserted text was spliced at the caret.
     expect(textarea.value).toBe("$de$beta ");
   });
@@ -2588,4 +2764,183 @@ describe("ChatStream", () => {
     });
     expect(textarea.value).toBe("hello $debug ");
   });
+
+  // --- Task 5 (composer-mentions): the picker generalizes to `#` / `@`. ---
+
+  it("enter selects an MCP row and inserts the #-token", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "#" } });
+    await screen.findByText("postgres"); // catalog ready, picker open
+    textarea.setSelectionRange(1, 1);
+    // Enter selects the highlighted row and inserts `#postgres ` (LOWER-cased —
+    // the inserted token must stay expandable).
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(textarea.value).toBe("#postgres ");
+    expect(screen.queryByText("postgres")).toBeNull();
+  });
+
+  it("tab selects an agent row and inserts the @-token", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "@" } });
+    await screen.findByText("scout"); // catalog ready, picker open
+    textarea.setSelectionRange(1, 1);
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    expect(textarea.value).toBe("@scout ");
+    expect(screen.queryByText("scout")).toBeNull();
+  });
+
+  it("an unknown # token leaves the picker closed and the draft untouched", async () => {
+    seedLiveSession();
+    render(<ChatStream />);
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // `#nosauch` matches no server in the catalog → no rows → the picker is
+    // gated off (the token is untouched — no error, no stripping).
+    fireEvent.change(textarea, { target: { value: "#nosauch" } });
+    await waitFor(() => expect(vi.mocked(listMcpServersEffective)).toHaveBeenCalled());
+    expect(screen.queryByTestId("mention-picker")).toBeNull();
+    expect(textarea.value).toBe("#nosauch");
+  });
+
+  // --- Review follow-ups (F3/F4/F6): the lowercase-insertion policy, the
+  // `filtered` memo's catalog deps, and the picker row affordances. ---
+
+  it("a picker selection inserts the LOWER-cased token even for an uppercase catalog name",
+    async () => {
+      // The case policy: tokens are lowercase-only, so a picker-selected row
+      // must insert `<prefix><name.toLowerCase()> ` or the inserted token
+      // could never expand on send (the regex is lowercase-only). The
+      // catalog name stays VERBATIM only inside the expanded BLOCK.
+      vi.mocked(listAgentDefinitionsForSpace).mockResolvedValueOnce([
+        { name: "Scout", description: "Fast recon.", model: null, scope: "user" },
+      ]);
+      seedLiveSession();
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "@" } });
+      // The ROW shows the catalog name verbatim (`Scout`) …
+      const row = await screen.findByText("Scout");
+      expect(row.closest("button")).toBeTruthy();
+      textarea.setSelectionRange(1, 1);
+      // … but the INSERTED token is lowercased.
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "@scout ",
+      );
+    });
+
+  it("a picker opened while the agents catalog is still loading shows the rows when the fetch resolves (no further keystroke)",
+    async () => {
+      // The `filtered` `useMemo` deps are `[skills, agents, mcpServers,
+      // picker]`. Drop `agents` (or `mcpServers`) and the memo keeps the
+      // EMPTY array it computed while the fetch was in flight — the picker
+      // stays empty until the NEXT keystroke re-runs the memo.
+      let resolveAgents: (rows: AgentDefinitionDto[]) => void = () => {};
+      vi.mocked(listAgentDefinitionsForSpace).mockImplementationOnce(
+        () => new Promise<AgentDefinitionDto[]>((r) => (resolveAgents = r)),
+      );
+      seedLiveSession();
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // Open the picker on the `@` prefix while the agents fetch PENDING.
+      fireEvent.change(textarea, { target: { value: "@" } });
+      await waitFor(() =>
+        expect(vi.mocked(listAgentDefinitionsForSpace)).toHaveBeenCalled(),
+      );
+      // Nothing to show yet (the fetch has not resolved).
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+      // The fetch resolves — and NO further keystroke happens.
+      await act(async () => {
+        resolveAgents([
+          {
+            name: "scout",
+            description: "Fast recon.",
+            model: null,
+            scope: "user",
+          },
+        ]);
+        await Promise.resolve();
+      });
+      const row = screen.getByText("scout");
+      expect(row.closest("button")!.querySelector(".text-ui-xs")!.textContent).toBe(
+        "@",
+      );
+      // And the late row is SELECTABLE (the memo recomputed the rows, not
+      // just the render): Enter inserts it.
+      textarea.setSelectionRange(1, 1);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "@scout ",
+      );
+    });
+
+  it("a mouse click on a # row inserts the token (mousedown, not click)",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "#" } });
+      const row = (await screen.findByText("postgres")).closest("button")!;
+      textarea.focus();
+      textarea.setSelectionRange(1, 1);
+      // The row handles `onMouseDown` with `preventDefault` (so the textarea
+      // never loses focus to the button) — a `click` would NOT select.
+      const notPrevented = fireEvent.mouseDown(row);
+      expect(notPrevented).toBe(false);
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "#postgres ",
+      );
+      // The picker closed after the mouse selection.
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+    });
+
+  it("a # row's description (the MCP summary) renders as a title tooltip",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "#" } });
+      const row = (await screen.findByText("postgres")).closest("button")!;
+      // The `#` catalog has no `description` field — the row's tooltip is the
+      // server's one-line `summary`.
+      const desc = row.querySelector("[title]")!;
+      expect(desc.getAttribute("title")).toBe("npx -y x-mcp");
+      expect(desc.textContent).toBe("npx -y x-mcp");
+    });
+
+  it("a mouse click on an @ row inserts the token (mousedown, not click)",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "@" } });
+      const row = (await screen.findByText("scout")).closest("button")!;
+      textarea.focus();
+      textarea.setSelectionRange(1, 1);
+      // The `@` (agents) twin of the `#` test above: the row handles
+      // `onMouseDown` with `preventDefault` (so the textarea never loses focus
+      // to the button) — a `click` would NOT select.
+      const notPrevented = fireEvent.mouseDown(row);
+      expect(notPrevented).toBe(false);
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "@scout ",
+      );
+      // The picker closed after the mouse selection.
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+    });
+
+  it("an @ row's description (the agent description) renders as a title tooltip",
+    async () => {
+      seedLiveSession();
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "@" } });
+      const row = (await screen.findByText("scout")).closest("button")!;
+      // The `@` catalog DOES have a `description` field — the row's tooltip is
+      // the agent definition's description verbatim.
+      const desc = row.querySelector("[title]")!;
+      expect(desc.getAttribute("title")).toBe("Fast recon.");
+      expect(desc.textContent).toBe("Fast recon.");
+    });
 });

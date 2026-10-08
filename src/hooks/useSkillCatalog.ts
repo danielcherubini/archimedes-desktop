@@ -17,7 +17,10 @@ import { listSkills, type SkillInfo } from "../lib/tauri";
  * - A key change IMMEDIATELY serves `[]` until the new fetch resolves —
  *   the previous space's rows are never served in the gap (the state
  *   tracks the key its rows belong to), so `expandSkillMentions` cannot
- *   inject the wrong space's skill.
+ *   inject the wrong space's skill. (The composer now expands via the
+ *   generalized `expandMentions`; the citation stands because
+ *   `expandSkillMentions` is the retained `$`-only ORACLE for it, so the
+ *   guarantee stated here holds for the path actually in use.)
  * - The LEFT key is evicted from the cache when the effect re-runs for a
  *   DIFFERENT key (tracked via a `useRef`), so a skill created/edited on
  *   disk mid-session is picked up on the next Space switch. An UNCHANGED
