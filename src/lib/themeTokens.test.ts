@@ -31,33 +31,24 @@ import { describe, expect, it } from "vitest";
  * so it is held to the 4.5:1 text floor.
  */
 
-// This app deliberately ships no `@types/node` (its globals stay DOM-only) and
-// Vitest stubs CSS imports (`?raw` resolves to `""`), so the stylesheet is
-// read through Node's `fs` via a COMPUTED specifier — an untyped `any` import
-// that `tsc` accepts without the Node type packages.
-const NODE_FS = "node:" + "fs";
-const { readFileSync } = (await import(NODE_FS)) as {
-  readFileSync: (path: string, encoding: string) => string;
-};
+import { readResolvedIndexCss, stripCssComments } from "./cssSource";
 /**
- * The stylesheet, with every CSS comment removed BEFORE anything is parsed.
- * `paletteCompleteness.test.ts` already did this and its doc-comment explains
- * why: a rule's selector can be matched in PROSE (`.dark`, `@theme` and the
- * ramp tokens are all discussed in comments long before any block opens), and a
- * comment parsed as a block yields ZERO tokens, which makes an absence
- * assertion pass for the wrong reason. The mirror hazard is the positive one: a
- * declaration that is COMMENTED OUT still matches the declaration regex, so
- * `--color-thinking-max` can read as declared with a value the browser never
- * sees. This file used to have both.
+ * The resolved stylesheet (`src/index.css` with its `src/styles/*.css` imports
+ * inlined — see `cssSource.ts`), with every CSS comment removed BEFORE anything
+ * is parsed. `paletteCompleteness.test.ts` already did this and its
+ * doc-comment explains why: a rule's selector can be matched in PROSE (`.dark`,
+ * `@theme` and the ramp tokens are all discussed in comments long before any
+ * block opens), and a comment parsed as a block yields ZERO tokens, which makes
+ * an absence assertion pass for the wrong reason. The mirror hazard is the
+ * positive one: a declaration that is COMMENTED OUT still matches the
+ * declaration regex, so `--color-thinking-max` can read as declared with a
+ * value the browser never sees. This file used to have both.
  */
-const css = readFileSync("src/index.css", "utf8").replace(
-  /\/\*[\s\S]*?\*\//g,
-  "",
-);
+const css = stripCssComments(readResolvedIndexCss());
 
 /** Pin that the strip really is doing work — a no-op regex would silently put
  * the fail-open behaviour back. */
-if (!/\/\*[\s\S]*?\*\//.test(readFileSync("src/index.css", "utf8"))) {
+if (!/\/\*[\s\S]*?\*\//.test(readResolvedIndexCss())) {
   throw new Error("index.css has no comments: the comment-strip guard is vacuous");
 }
 

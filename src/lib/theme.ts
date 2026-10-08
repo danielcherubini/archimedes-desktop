@@ -60,7 +60,8 @@ export function applySettingsTheme(
  *
  * (ADR 0027) At most ONE `.theme-*` class may ever be present: every palette
  * block is a single-class selector of equal specificity, so two co-existing
- * would be resolved by SOURCE ORDER in `index.css` — silently, and it would
+ * would be resolved by SOURCE ORDER in the resolved `index.css` (`src/styles/*.css`,
+ * in the manifest's import order) — silently, and it would
  * flip on any reorder. Hence all four classes are `toggle`d (never `add`ed),
  * each with an explicit boolean.
  */
@@ -75,7 +76,7 @@ export function applyThemeToDocument(
   const dark = dracula || theme === "zai-dark";
   // Mirrors ZCode's useTheme.ts:66-68 — the `dark` class is toggled ALONGSIDE
   // the theme classes because the ported primitives use `dark:` utilities,
-  // which (via the `@custom-variant dark` definition in src/index.css) key off
+  // which (via the `@custom-variant dark` definition in src/styles/base.css) key off
   // the `.dark` class; without the toggle they would never apply.
   root.classList.toggle("dark", dark);
   root.classList.toggle("theme-zai-light", !dracula && theme === "zai-light");

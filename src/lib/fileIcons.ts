@@ -76,7 +76,8 @@ const BY_EXTENSION: Record<string, FileIconSpec> = {
  * neutral default. Pure — unit-testable.
  *
  * The `className` is a FILE-TYPE DESCRIPTOR token (`text-file-*`), never a
- * semantic one — see the token block in `index.css` for why. The extension →
+ * semantic one — see the token block in `src/styles/theme.css` for why (the
+ * rationale: `docs/css-theme-tokens.md`). The extension →
  * glyph/hue mapping follows ZCode's `resolveIconName` so the two apps colour
  * the same file the same way.
  */

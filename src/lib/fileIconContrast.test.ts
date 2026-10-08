@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readResolvedIndexCss, stripCssComments } from "./cssSource";
 
 /**
  * The file-type DESCRIPTOR hues must clear 3:1 against the surface they sit
@@ -31,14 +32,6 @@ import { describe, expect, it } from "vitest";
  * with the token name.
  */
 
-// This app deliberately ships no `@types/node` (its globals stay DOM-only) and
-// Vitest stubs CSS imports (`?raw` resolves to `""`), so the stylesheet is
-// read through Node's `fs` via a COMPUTED specifier — an untyped `any` import
-// that `tsc` accepts without the Node type packages.
-const NODE_FS = "node:" + "fs";
-const { readFileSync } = (await import(NODE_FS)) as {
-  readFileSync: (path: string, encoding: string) => string;
-};
 /**
  * The stylesheet, with every CSS comment removed BEFORE anything is parsed.
  *
@@ -56,14 +49,12 @@ const { readFileSync } = (await import(NODE_FS)) as {
  *    failure this file exists to prevent.
  * `paletteCompleteness.test.ts` already stripped; the siblings kept the bug.
  */
-const css = readFileSync("src/index.css", "utf8").replace(
-  /\/\*[\s\S]*?\*\//g,
-  "",
-);
+
+const css = stripCssComments(readResolvedIndexCss());
 
 /** The strip is load-bearing, so pin that it actually removed something — a
  * no-op regex would silently restore the fail-open behaviour above. */
-if (!/\/\*[\s\S]*?\*\//.test(readFileSync("src/index.css", "utf8"))) {
+if (!/\/\*[\s\S]*?\*\//.test(readResolvedIndexCss())) {
   throw new Error("index.css has no comments: the comment-strip guard is vacuous");
 }
 

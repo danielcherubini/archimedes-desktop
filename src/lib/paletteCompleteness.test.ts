@@ -1,4 +1,24 @@
 import { describe, expect, it } from "vitest";
+import { readResolvedIndexCss } from "./cssSource";
+
+// This app deliberately ships no `@types/node` (its globals stay DOM-only), so
+// Node's `fs` is reached through a COMPUTED specifier — an untyped `any`
+// import that `tsc` accepts without the Node type packages. Used for reading
+// `src/App.tsx` (the chrome-bar JSX gate); the CSS itself comes from
+// `cssSource.ts`.
+const NODE_FS = "node:" + "fs";
+const { readFileSync } = (await import(NODE_FS)) as {
+  readFileSync: (path: string, encoding: string) => string;
+};
+
+/**
+ * The RESOLVED stylesheet — `src/index.css` with its `src/styles/*.css`
+ * imports inlined (see `cssSource.ts`), comments KEPT: the block-order
+ * assertions below read byte offsets in the raw text, and a comment-stripped
+ * copy would shift them. The order is preserved by the inlining, which is the
+ * whole point of `cssSource`.
+ */
+const css = readResolvedIndexCss();
 
 /**
  * A Palette block (ADR 0027) is a DIFF over `.dark`, so the question it must
@@ -36,15 +56,7 @@ import { describe, expect, it } from "vitest";
  * pinned against the spec's own value set — see `OFF_SPEC_ALLOW_LIST`.
  */
 
-// This app deliberately ships no `@types/node` (its globals stay DOM-only) and
-// Vitest stubs CSS imports (`?raw` resolves to `""`), so the stylesheet is
-// read through Node's `fs` via a COMPUTED specifier — an untyped `any` import
-// that `tsc` accepts without the Node type packages.
-const NODE_FS = "node:" + "fs";
-const { readFileSync } = (await import(NODE_FS)) as {
-  readFileSync: (path: string, encoding: string) => string;
-};
-const css = readFileSync("src/index.css", "utf8");
+// The raw (comments-kept) resolved text is read once above; the `declared` / `values` / `CODE` helpers below strip comments per use, which is what lets a doc-comment that spells a token out (`--color-x` in prose) not be mistaken for a declaration of it.
 
 /**
  * Extract a rule's body by COUNTING BRACE DEPTH, with the SELECTOR ANCHORED AT

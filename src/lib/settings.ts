@@ -7,7 +7,7 @@ export const MIN_FONT_PX = 12;
 export const MAX_FONT_PX = 20;
 
 /** The design system's existing font stacks' tails (verbatim from
- * `src/index.css` `@theme`) — a custom family is PREPENDED to the tail so
+ * `src/styles/theme.css` `@theme` (assembled via `src/index.css`) — a custom family is PREPENDED to the tail so
  * the platform fallbacks (incl. the CJK fonts) are always preserved. */
 const SANS_TAIL =
   'ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji"';
@@ -20,7 +20,7 @@ const MONO_TAIL =
  * `style.setProperty`); `--font-sans: "<family>, <tail>"` when `font.uiFamily`
  * is non-null, else `style.removeProperty("--font-sans")` (a PREVIOUSLY-set
  * inline override must be REMOVED when the family goes back to `null` — the
- * `index.css` `@theme` value cannot override a stale inline custom
+ * `index.css`'s `@theme` value (`src/styles/theme.css`) cannot override a stale inline custom
  * property; same for `--font-mono`). An out-of-range `sizePx` (a
  * hand-edited file) is CLAMPED to [12, 20] (the file is not rewritten).
  */

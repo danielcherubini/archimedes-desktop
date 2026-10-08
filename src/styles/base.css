@@ -1,0 +1,66 @@
+/* Base layer — global rules and the Tailwind entry.
+ *
+ * Loaded first in the cascade (see `../index.css` for the order the
+ * `paletteCompleteness.test.ts` layering contract pins):
+ *
+ *   Tailwind (its `@import`s resolve before this file's content)
+ *   -> base (this file: html/body/#root, focus-ring reset, @custom-variant)
+ *   -> theme.css  (@theme, .dark, .theme-zai-light, .theme-zai-dark)
+ *   -> dracula.css (.theme-dracula)
+ *   -> utilities.css
+ *
+ * The `@media (forced-colors: active)` duplicate at the end of this file is
+ * hand-maintained: cascade order makes it win over the out-of-media rule
+ * above for Windows High Contrast, and it is the only rule the high-contrast
+ * mode must override.
+ */
+
+/*
+ * Make `dark:` utilities class-driven instead of OS-preference-driven.
+ * Without this, `dark:` rules compile to `@media (prefers-color-scheme: dark)`
+ * and the ported primitives (tabs/dialog/select/dropdown/button) lose their
+ * dark overrides on OS-light machines, since the app is always Zai Dark.
+ * Keying on the `.dark` class (toggled by applyThemeToDocument) makes the
+ * rendering independent of the OS color scheme.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --ui-font-size: 14px;
+}
+
+/* Frameless transparent window: html/body must be transparent so the
+ * rounded, opaque root (App.tsx) shows the desktop through its corners.
+ * (The window is created `transparent: true` in tauri.conf.json.) */
+html,
+body {
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+#root {
+  /*  Windows 桌面窗口拉伸后，根节点如果只靠内容撑开，Chromium 偶发会把新尺寸区域留给宿主底层。
+   * 这里把 React 挂载点固定成完整动态视口，让桌面/Web/手机端都从根节点开始明确铺满可视区。 */
+  height: 100dvh;
+  overflow: hidden;
+}
+/*
+ *  部分浏览器 / Electron 运行环境会在 focus-visible 时叠加系统级高亮边框，
+ * 表现为和产品主题无关的黄色描边，看起来像“随机冒出来的无障碍样式”。
+ * 这里在全局层同时清掉 outline 和 focus ring 对应的 box-shadow，避免系统高亮和组件局部 ring 混用。
+ */
+*:focus,
+*:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  -webkit-box-shadow: none !important;
+}
+
+@media (forced-colors: active) {
+  *:focus,
+  *:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+  }
+}

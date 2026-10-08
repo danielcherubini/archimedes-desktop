@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readResolvedIndexCss, stripCssComments } from "./cssSource";
 
 /**
  * THE ONE COLLISION THE ISLAND LAYOUT BUYS ON PURPOSE (ADR 0027, option B).
@@ -49,10 +50,7 @@ const contrast = (a: string, b: string) => {
 };
 
 const dracula = (token: string): string => {
-  const css = readFileSync("src/index.css", "utf8").replace(
-    /\/\*[\s\S]*?\*\//g,
-    "",
-  );
+  const css = stripCssComments(readResolvedIndexCss());
   const body = css.match(/^\.theme-dracula\s*\{/m)!;
   const start = css.indexOf(body[0]!);
   const block = css.slice(start, css.indexOf("}", start));
