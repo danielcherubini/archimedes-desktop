@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi, beforeAll } from "vitest";
+import { beforeEach, describe, expect, it, vi, beforeAll, type Mock } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ChatStream from "./ChatStream";
 import {
@@ -3147,10 +3147,11 @@ describe("ChatStream", () => {
   // these tests are written to catch.
   // ---------------------------------------------------------------------
 
-  // The picker's row `<button>` whose PRIMARY line is `name`. A bare
-  // `getByText(path)` is ambiguous here: for a root-level path the row's
-  // SECONDARY line (the basename) is the SAME string, so two elements match —
-  // the primary is the `text-ui-base` span.
+  // The picker's row `<button>` whose PRIMARY line is `name` — the
+  // `text-ui-base` span. A `?` row's button holds TWO spans on the primary
+  // line (the `text-ui-xs` prefix badge and the name), so "the row has one
+  // span" is never the right assertion; single-liness is pinned by the
+  // ABSENCE of the description node (see the single-line test below).
   async function findFileRow(name: string): Promise<HTMLButtonElement> {
     const matches = await screen.findAllByText(name);
     const primary = matches.find((el) => el.classList.contains("text-ui-base"));
@@ -3259,7 +3260,7 @@ describe("ChatStream", () => {
       expect(screen.queryByTestId("mention-picker")).toBeNull();
     });
 
-  it("a file row shows the basename as its secondary line (and tooltip)",
+  it("a file row is a single line: no basename second line, no tooltip, full path still shown",
     async () => {
       seedLiveSession();
       vi.mocked(listSpaceFiles).mockResolvedValue({
@@ -3270,13 +3271,23 @@ describe("ChatStream", () => {
       fireEvent.change(screen.getByRole("textbox"), {
         target: { value: "?src/nested/READ" },
       });
-      // The PRIMARY line is the full relative path (what gets inserted) …
       const row = await findFileRow("src/nested/README.md");
-      // … and the SECONDARY line is the BASENAME (a path is long; the folder is
-      // already in the primary line and the query).
-      const desc = row.querySelector("[title]")!;
-      expect(desc.textContent).toBe("README.md");
-      expect(desc.getAttribute("title")).toBe("README.md");
+      // The PRIMARY line is the full relative path — what gets INSERTED, so it
+      // must never be shortened to the basename (`selectMention` inserts
+      // `row.name`).
+      expect(row.querySelector(".text-ui-base")!.textContent).toBe(
+        "src/nested/README.md",
+      );
+      // And there is NO secondary line. The basename used to be repeated there
+      // — the tail of the path already shown above it — which made every `?`
+      // row two lines tall (≈49px) for ZERO information. `ComposerMentions`
+      // renders the second line only when `description !== ""`, so the
+      // description node, and with it the `title` tooltip, must be absent.
+      expect(row.querySelector("[title]")).toBeNull();
+      expect(row.querySelector(".text-ui-sm")).toBeNull();
+      // Pinned against the wrong "fix" (dropping `name` instead of
+      // `description`): the row still has its prefix badge and its name span.
+      expect(row.querySelector(".text-ui-xs")!.textContent).toBe("?");
     });
 
   it("a truncated listing shows the cap note, which is NOT a selectable row, and Enter still sends",
@@ -3319,16 +3330,17 @@ describe("ChatStream", () => {
   it("a query matching more rows than the render cap trims the list and says so",
     async () => {
       seedLiveSession();
-      // 150 matching entries against the 100-row render cap (`MAX_PICKER_ROWS`):
-      // `fuzzyMatch` is a loose subsequence and the walk cap is 5,000, so an
-      // unbounded picker would re-render thousands of buttons per keystroke.
+      // 150 matching entries against the 10-row render cap (`MAX_PICKER_ROWS`):
+      // `fuzzyMatch` is a loose subsequence and the listing is the whole Space,
+      // so an unbounded picker would re-render thousands of buttons per
+      // keystroke — and 10 single-line rows is ≈308px, a normal dropdown.
       const entries = Array.from({ length: 150 }, (_, i) => `file${i}.ts`);
       vi.mocked(listSpaceFiles).mockResolvedValue({ entries, truncated: false });
       render(<ChatStream />);
       const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
       fireEvent.change(textarea, { target: { value: "?file" } });
       const picker = await screen.findByTestId("mention-picker");
-      await waitFor(() => expect(picker.querySelectorAll("button")).toHaveLength(100));
+      await waitFor(() => expect(picker.querySelectorAll("button")).toHaveLength(10));
       const note = picker.querySelector(
         "[data-testid='mention-picker-note']",
       )!;
@@ -3339,13 +3351,13 @@ describe("ChatStream", () => {
       textarea.setSelectionRange(5, 5);
       fireEvent.keyDown(textarea, { key: "ArrowUp" });
       const buttons = Array.from(picker.querySelectorAll("button"));
-      expect(buttons[99]!.className).toContain("bg-surface-hover");
+      expect(buttons[9]!.className).toContain("bg-surface-hover");
       expect(buttons[0]!.className).not.toContain("bg-surface-hover");
       // And the wrapped row is selectable (no crash on the capped tail).
       fireEvent.keyDown(textarea, { key: "Enter" });
       expect(
         (screen.getByRole("textbox") as HTMLTextAreaElement).value,
-      ).toBe("file99.ts ");
+      ).toBe("file9.ts ");
     });
 
   it("a normal ? picker with matching rows and a whole listing renders NO note",
@@ -3374,7 +3386,7 @@ describe("ChatStream", () => {
       seedLiveSession();
       // The other half of the widened gate: the note is NOT only an
       // empty-picker explanation — it rides along whenever the listing is
-      // capped, rows or not. Below the render cap (5 matches < 100), so the
+      // capped, rows or not. Below the render cap (5 matches < 10), so the
       // wording is the walk-cap one.
       vi.mocked(listSpaceFiles).mockResolvedValue({
         entries: ["a1.ts", "a2.ts", "a3.ts", "a4.ts", "a5.ts"],
@@ -3423,7 +3435,7 @@ describe("ChatStream", () => {
       });
       const picker = await screen.findByTestId("mention-picker");
       await waitFor(() =>
-        expect(picker.querySelectorAll("button")).toHaveLength(100),
+        expect(picker.querySelectorAll("button")).toHaveLength(10),
       );
       const note = screen.getByTestId("mention-picker-note");
       expect(note.textContent).toBe(
@@ -3443,8 +3455,8 @@ describe("ChatStream", () => {
       // The render cap belongs to `?` ALONE (its loose SUBSEQUENCE filter can
       // match nearly a whole 5,000-entry listing). The three Mentions keep the
       // shipped status quo: their filter is a name SUBSTRING, and ADR 0033
-      // promises those pickers are unchanged — a silent 100-row cap there
-      // would make row 101 unreachable with no explanation.
+      // promises those pickers are unchanged — a silent 10-row cap there
+      // would make row 11 unreachable with no explanation.
       // `…Once` (not `…Value`): `beforeEach` only `clearAll`s the mocks, so a
       // PERSISTENT override would leak this catalog into later tests.
       if (prefix === "#") seedMcpMentionsOn();
@@ -3681,5 +3693,235 @@ describe("ChatStream", () => {
       expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
         "@scout ",
       );
+    });
+
+  // ---------------------------------------------------------------------
+  // Picker GEOMETRY: the box clamps its own height and scrolls, and the
+  // highlighted row is scrolled into view as the arrows move it. This is what
+  // bounds the UNCAPPED Mention lists (`$`/`@`/`#` are deliberately not
+  // row-capped — a sliced row is an unreachable row), so the promise "the
+  // picker never dominates the window" is geometry, not a row count.
+  //
+  // What jsdom CAN and cannot check: it has NO layout engine, so row heights
+  // and scroll offsets are unmeasurable here (hence the clamp is a deliberate
+  // ESTIMATE in the component, and these tests assert the CLASSES and the
+  // SCROLL CALL, never a pixel height).
+  // ---------------------------------------------------------------------
+
+  it("the picker clamps its height to the UI font size and scrolls instead of filling the window",
+    async () => {
+      seedLiveSession();
+      // Enough rows that the list is taller than the clamp: `?` is capped at
+      // 10 rows, and the clamp is sized to ≈10 rows, so 10 rows plus the note
+      // line is already more than the box can show.
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: Array.from({ length: 10 }, (_, i) => `file${i}.ts`),
+        truncated: true,
+      });
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "?file" },
+      });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() =>
+        expect(picker.querySelectorAll("button")).toHaveLength(10),
+      );
+      // It must SCROLL: without `overflow-y-auto` a `max-height` just clips.
+      expect(picker.classList.contains("overflow-y-auto")).toBe(true);
+      // And the clamp must track the UI font size, which is a USER setting
+      // applied as an inline px value on `<html>` (`src/lib/settings.ts`) — a
+      // fixed `rem` clamp like `max-h-64` would show FEWER rows for a user who
+      // raised the font size, i.e. it punishes exactly the user who needs the
+      // room. So the class is a `calc()` over `var(--ui-font-size)`.
+      const clamp = Array.from(picker.classList).find((c) =>
+        c.startsWith("max-h-["),
+      );
+      expect(clamp).toBeDefined();
+      expect(clamp).toContain("var(--ui-font-size)");
+    });
+
+  it("arrow-keying the picker scrolls the highlighted row into view",
+    async () => {
+      seedLiveSession();
+      // The UNCAPPED side: the `$` catalog is not row-limited, so this is the
+      // list the clamp actually protects. 40 rows is far more than the box can
+      // show, and every one of them stays keyboard-reachable.
+      const many = Array.from({ length: 40 }, (_, i) => `skill${i}`);
+      vi.mocked(listSkills).mockResolvedValueOnce(
+        many.map((name) => ({
+          name,
+          description: `d ${name}`,
+          path: `/s/${name}/SKILL.md`,
+          dir: `/s/${name}`,
+          scope: "space",
+          body: "B",
+        })),
+      );
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "$" } });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() =>
+        expect(picker.querySelectorAll("button")).toHaveLength(40),
+      );
+      // Which ROW was scrolled is the whole question, and the tool for it is
+      // the file's OWN `beforeAll` stub (`HTMLElement.prototype.scrollIntoView =
+      // vi.fn()`, there for Radix) read through `mock.contexts` — the RECEIVER
+      // of each call. Two alternatives were tried and are wrong here: a bare
+      // "was `scrollIntoView` called" assertion could be satisfied by an
+      // unrelated widget, and a per-row `vi.spyOn` cannot answer WHICH row —
+      // `scrollIntoView` is INHERITED, so 40 spies chain through the same stub
+      // and each records the one call.
+      const scrollStub = HTMLElement.prototype.scrollIntoView as Mock;
+      /** Every element ever asked to scroll, in call order. */
+      const scrolled = (): Element[] =>
+        scrollStub.mock.contexts as unknown as Element[];
+      const buttons = Array.from(
+        picker.querySelectorAll("button"),
+      ) as HTMLButtonElement[];
+      // Settle the in-flight catalogs BEFORE measuring, and wait until the log
+      // goes quiet. The agents / MCP / file fetches land independently of the
+      // skills one, and every resolution re-derives `filtered` — which
+      // legitimately re-runs the effect for whatever row is active AT THAT
+      // MOMENT (still row 0, before any arrow key). That is noise for a test
+      // about what an ARROW KEY does, so the window starts after the quiet
+      // point; there is then no `await` between a keypress and its assertion,
+      // so nothing can interleave.
+      let quietAt = -1;
+      while (quietAt !== scrolled().length) {
+        quietAt = scrolled().length;
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+      }
+      let mark = scrolled().length;
+
+      textarea.setSelectionRange(1, 1);
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+
+      // The row that is NOW highlighted (index 0 → 1) is the one scrolled into
+      // view — focus-follows, so a keyboard user arrowing down a long list
+      // never loses the selection off the top or bottom of the box. ONE scroll,
+      // on the moved-to row, with `block: "nearest"` (what keeps an
+      // already-visible row from jumping).
+      const down = scrolled().slice(mark);
+      expect(down).toEqual([buttons[1]]);
+      expect(scrollStub.mock.calls[mark]![0]).toEqual({ block: "nearest" });
+      expect(buttons[1]!.className).toContain("bg-surface-hover");
+
+      // The row-above case, which is the one a ref-on-the-active-row can get
+      // WRONG: ArrowUp moves the highlight BACK to a row that was mounted the
+      // whole time, so a stale ref would scroll nothing (or the wrong row).
+      mark = scrolled().length;
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      expect(scrolled().slice(mark)).toEqual([buttons[0]]);
+      expect(scrollStub.mock.calls[mark]![0]).toEqual({ block: "nearest" });
+
+      // And the WRAP: ArrowUp from index 0 lands on the LAST row — the one
+      // furthest outside the visible box, so this is the scroll that matters
+      // most.
+      mark = scrolled().length;
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      expect(scrolled().slice(mark)).toEqual([buttons[39]]);
+      expect(buttons[39]!.className).toContain("bg-surface-hover");
+      // Still every row rendered: the clamp is GEOMETRY, never a slice of
+      // `filtered` — nothing here may make a row unreachable.
+      expect(picker.querySelectorAll("button")).toHaveLength(40);
+    });
+
+  it("typing narrows the list under an UNCHANGED index and the newly-active row is the one scrolled",
+    async () => {
+      // The pin for `filtered` being in the scroll effect's dep array (see
+      // `ComposerMentions`' DEPS note). `filtered` is NOT there for the arrow
+      // keys — the test above covers those — it is there for TYPING: `onChange`
+      // resets `picker.index` to 0, so a keystroke that narrows the list leaves
+      // `activeIndex` the SAME NUMBER (0) while `filtered[0]` becomes a
+      // DIFFERENT row. Deps `[activeIndex]` alone therefore never re-run, and
+      // the row the user is now on is never made visible — a silent
+      // keyboard/a11y failure with no other test to catch it (mutation-verified:
+      // dropping `filtered` from the array keeps every other test in this file
+      // green).
+      seedLiveSession();
+      vi.mocked(listSkills).mockResolvedValueOnce([
+        {
+          name: "ab-alpha",
+          description: "d a",
+          path: "/s/ab-alpha/SKILL.md",
+          dir: "/s/ab-alpha",
+          scope: "space",
+          body: "B",
+        },
+        {
+          name: "ab-beta",
+          description: "d b",
+          path: "/s/ab-beta/SKILL.md",
+          dir: "/s/ab-beta",
+          scope: "space",
+          body: "B",
+        },
+        {
+          name: "ac-gamma",
+          description: "d g",
+          path: "/s/ac-gamma/SKILL.md",
+          dir: "/s/ac-gamma",
+          scope: "space",
+          body: "B",
+        },
+      ]);
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "$ab" } });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() =>
+        expect(picker.querySelectorAll("button")).toHaveLength(2),
+      );
+      // The same receiver-reading technique as the arrow test above: the file's
+      // own `beforeAll` stub, read through `mock.contexts`, because
+      // `scrollIntoView` is INHERITED and a per-row `vi.spyOn` records the same
+      // single call for every row.
+      const scrollStub = HTMLElement.prototype.scrollIntoView as Mock;
+      const scrolled = (): Element[] =>
+        scrollStub.mock.contexts as unknown as Element[];
+      // Quiet point: the agents / MCP / file catalogs resolve independently of
+      // skills and each resolution re-runs the effect for the row active AT
+      // THAT MOMENT. Wait the log stops growing, then leave no `await` between
+      // the keystroke and the assertion.
+      let quietAt = -1;
+      while (quietAt !== scrolled().length) {
+        quietAt = scrolled().length;
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+      }
+      const before = Array.from(
+        picker.querySelectorAll("button"),
+      ) as HTMLButtonElement[];
+      // Precondition: index 0 is active and it is `ab-alpha`.
+      expect(before[0]!.className).toContain("bg-surface-hover");
+      const mark = scrolled().length;
+
+      // The keystroke: one more character. `filtered` narrows to ONE row
+      // (`ab-beta` — `ab-alpha` no longer matches) while `activeIndex` stays 0,
+      // so the highlighted row is now a row that was NOT highlighted before.
+      textarea.setSelectionRange(8, 8);
+      fireEvent.change(textarea, { target: { value: "$ab-beta" } });
+
+      const after = Array.from(
+        picker.querySelectorAll("button"),
+      ) as HTMLButtonElement[];
+      expect(after).toHaveLength(1);
+      expect(after[0]!.textContent).toContain("ab-beta");
+      // `activeIndex` is UNCHANGED (still the first row), so this assertion
+      // holds for the buggy and correct code alike — it is here to pin the
+      // precondition, not to do the detecting.
+      expect(after[0]!.className).toContain("bg-surface-hover");
+      // THE pin: exactly one new scroll, and its receiver is the row that is
+      // active NOW (`ab-beta`), not the row that was active before the
+      // keystroke (`ab-alpha`, now gone from the list). Without `filtered` in
+      // the deps this slice is EMPTY — the effect never re-runs — so the test
+      // is red, not vacuously green.
+      expect(scrolled().slice(mark)).toEqual([after[0]]);
+      expect(scrollStub.mock.calls[mark]![0]).toEqual({ block: "nearest" });
+      expect(scrolled().slice(mark)).not.toContain(before[0]!);
     });
 });

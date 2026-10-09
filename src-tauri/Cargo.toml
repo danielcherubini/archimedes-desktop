@@ -39,6 +39,12 @@ tokio = { version = "1", features = ["process", "io-util", "io-std", "sync", "ma
 tokio-util = "0.7"
 # The `exec_find` fallback when `fd` is not installed (walk the cwd tree).
 walkdir = "2"
+# The walker `ripgrep` is built on — a LIBRARY, statically linked, so there is
+# no binary for the user to install. It decides the `?` listing's visibility:
+# the repo's own ignore rules are what prune it (ADR 0034), which is a
+# load-bearing semantic rather than an implementation detail, so the version
+# this design was verified against is recorded here: 0.4.33.
+ignore = "0.4"
 # base64 for the `read` tool's image content blocks (pi's `ImageContent` =
 # `{type: "image", data, mimeType}` — `data` is base64, no `data:` prefix).
 base64 = "0.22"

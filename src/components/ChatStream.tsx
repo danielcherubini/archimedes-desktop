@@ -47,12 +47,24 @@ import type { MentionRow } from "./chat/ComposerMentions";
  * like `?e` can match nearly the whole listing (up to the walk cap), and
  * thousands of `<button>`s re-rendered per keystroke is a real perf gap.
  * Applied INSIDE the rows memo (never in the render), so `activeIndex`, the
- * `% filtered.length` arrow-wrap and the DOM all see ONE bounded list.
+ * `% filtered.length` arrow-wrap and the DOM all see ONE bounded list — a
+ * render-time cap would let the highlight land on a row that is not displayed.
  *
- * The three Mentions (`$` / `@` / `#`) are deliberately NOT capped — see the
- * Mention branch of the rows memo.
+ * WHY TEN, and WHY `?` ONLY. Capping a path query costs little: its catalog is
+ * the ENTIRE Space listing, and two more typed characters collapse a thousand
+ * matches into a handful (`sort_by_file_name` keeps the survivor set
+ * deterministic), while 10 single-line rows are ≈308px at the default 14px UI
+ * font (`--ui-font-size`) — a normal dropdown. The three Mentions
+ * (`$` / `@` / `#`) are deliberately UNCAPPED, and NOT by omission: because
+ * the cap is a slice INSIDE the rows memo, a sliced row is a row no keyboard
+ * user can ever reach, and their catalogs are small and user-owned rather than
+ * the whole filesystem. What bounds that uncapped case is GEOMETRY, not a count
+ * — the picker box clamps its own height (a font-size-relative `max-height`)
+ * and scrolls the active row into view — which is exactly why a count cap here
+ * is about KEYS and PERF and never about height. See the Mention branch of the
+ * rows memo for the same reasoning at the point of the missing slice.
  */
-const MAX_PICKER_ROWS = 100;
+const MAX_PICKER_ROWS = 10;
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -441,8 +453,8 @@ export default function ChatStream() {
     // ONE picker, filtered to the ACTIVE prefix's catalog only (a `$`/`#`/`@`
     // never mixes in one open list): map the matching catalog to `MentionRow`
     // (skills/agents carry `description`, the MCP servers carry their one-line
-    // `summary`, the `?` rows carry the relative path as the name and its
-    // basename as the secondary line).
+    // `summary`, the `?` rows carry the relative path as the name and NO
+    // description, so they render on one line).
     const prefix = picker?.prefix ?? "$";
     // STALE-TOKEN GUARD — what it actually protects (the hazards are easy to
     // overstate). The `picker` state is only recomputed in the textarea's
@@ -479,15 +491,19 @@ export default function ChatStream() {
     // `?` is File completion (ADR 0033) — the ONE non-Mention prefix, listed
     // FIRST so it never falls through to the skills catalog. The `key` carries
     // the trigger (`?` + path) because a path and a skill name could otherwise
-    // collide; `description` is the BASENAME (a path is long and the folder is
-    // already in the primary line and the query).
+    // collide; `description` is EMPTY, so a `?` row renders on ONE line
+    // (`ComposerMentions` renders the secondary line only when it is `""`-free
+    // text). It used to be `basenameOfPath(p)` — the basename is already the
+    // TAIL of the path in the primary line, so that second line repeated what
+    // the row just said and made every row ~50% taller for nothing.
+    // `name` stays the FULL relative path: `selectMention` inserts `row.name`.
     if (prefix === "?") {
       const fileRows: MentionRow[] = files.entries
         .map((p) => ({
           key: `?${p}`,
           prefix: "?" as const,
           name: p,
-          description: basenameOfPath(p),
+          description: "",
         }))
         .filter((r) => fuzzyMatch(query, r.name));
       const matched = fileRows.length;
@@ -520,15 +536,21 @@ export default function ChatStream() {
       r.name.toLowerCase().includes(query.toLowerCase()),
     );
     // NO render cap here — deliberately, and NOT an oversight. The cap exists
-    // for `?`'s unbounded SUBSEQUENCE filter over a 5,000-entry listing; the
-    // Mention catalogs are name-SUBSTRING filters over the (small, user-owned)
-    // skills / agents / MCP catalogs, and this branch keeps the shipped status
-    // quo BYTE-IDENTICAL to before File completion. Capping it here would make
-    // row 101 unreachable forever with no explanation — a silent behavior
-    // change to a surface this feature promised not to touch. It would also
-    // need its own note (the note below is `?`-only), so the Mention side is
-    // UNCAPPED rather than silently capped; if we ever want a cap there, it
-    // deserves its own change with its own note and tests.
+    // for `?`'s unbounded SUBSEQUENCE filter over a whole-Space listing whose
+    // rows are cheap to narrow by typing a couple more characters; the Mention
+    // catalogs are name-SUBSTRING filters over the (small, user-owned) skills /
+    // agents / MCP catalogs, and this branch keeps the shipped status quo
+    // BYTE-IDENTICAL to before File completion. Capping it here would make
+    // every row past the cap unreachable forever with no explanation — the cap
+    // is a slice INSIDE this memo, so a sliced row is a row no keyboard user
+    // can ever reach — a silent behavior change to a surface this feature
+    // promised not to touch. It would also need its own note (the note below is
+    // `?`-only), so the Mention side is UNCAPPED rather than silently capped; if
+    // we ever want a cap there, it deserves its own change with its own note and
+    // tests. What bounds the uncapped case is GEOMETRY, not a count: the picker
+    // box clamps its own height (a font-size-relative `max-height`) and scrolls,
+    // so a long list is a scrollbar instead of a column running off the top of
+    // the window.
     return { rows: matchedRows, matched: matchedRows.length, live: true };
     // `files` is a DEP for the same reason `agents`/`mcpServers` are: a Space
     // switch (or a late first listing) must re-derive the rows LIVE, with no
@@ -545,11 +567,19 @@ export default function ChatStream() {
   // WHY THE TWO ARMS' ADVICE DIFFERS: the render cap trims ROWS but every
   // match is still IN the listing, so narrowing genuinely reveals it — hence
   // "keep typing". The walk cap trims the LISTING itself, and the walk is
-  // deterministic (`sort_by_file_name`), so it holds the alphabetically-FIRST
-  // 5,000 entries: a truncated-away file is unreachable no matter what you
-  // type (and this arm renders ALONE only when the query already matched
-  // ≤ MAX_PICKER_ROWS, i.e. when the list is already narrow). So it states the
-  // LIMITATION instead of giving advice that cannot help.
+  // DETERMINISTIC, so the surviving 5,000 entries are always the SAME set:
+  // a truncated-away file is therefore unreachable no matter what you type
+  // (and this arm renders ALONE only when the query already matched
+  // ≤ MAX_PICKER_ROWS, i.e. when the list is already narrow). So it states
+  // the LIMITATION instead of giving advice that cannot help. WHICH 5,000
+  // survive is the walk's OWN order, NOT the alphabetically-first 5,000
+  // paths: `sort_by_file_name` sorts per DIRECTORY during the depth-first
+  // walk, so a nested `src/a.rs` precedes a root-level `t.txt`
+  // (`src-tauri/src/commands/files.rs`, pinned there by
+  // `collect_files_sorts_display_order_across_directories`). Global
+  // alphabetical order is what a FLAT directory degenerates to, and nothing
+  // more — the determinism is the property the reasoning above needs, the
+  // shape of the order is not.
   const pickerNote =
     picker?.prefix === "?" && pickerRows.live
       ? pickerRows.matched > MAX_PICKER_ROWS
