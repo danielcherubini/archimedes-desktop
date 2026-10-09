@@ -9,6 +9,7 @@ import {
   type MentionCatalogs,
 } from "./skills";
 import type { AgentDefinitionDto, McpServerInfo, SkillInfo } from "./tauri";
+import { fuzzyMatch } from "./fuzzy";
 
 /** A full `SkillInfo` with `debug` defaults; override any field. */
 function makeSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
@@ -535,6 +536,193 @@ describe("activeMentionToken", () => {
   });
   it("a_mid_word_dollar_is_null (the live-caret boundary)", () => {
     expect(activeMentionToken("foo$bar", 7)).toBeNull();
+  });
+
+  // --- regressions: the three Mention prefixes are byte-identical ----------
+  // The ≥1-char rule applies to `?` ONLY, so a bare glyph still opens the
+  // picker with an empty query (ADR 0031 vs ADR 0033).
+
+  it("a_bare_dollar_is_still_an_empty_remainder", () => {
+    expect(activeMentionToken("x $", 3)).toEqual({
+      prefix: "$",
+      remainder: "",
+      start: 2,
+    });
+  });
+  it("a_bare_hash_is_still_an_empty_remainder", () => {
+    expect(activeMentionToken("x #", 3)).toEqual({
+      prefix: "#",
+      remainder: "",
+      start: 2,
+    });
+  });
+});
+
+describe("activeMentionToken — the ? file-path token (ADR 0033)", () => {
+  it("a_question_at_line_start_accepts_uppercase (case is PRESERVED)", () => {
+    expect(activeMentionToken("?README", 7)).toEqual({
+      prefix: "?",
+      remainder: "README",
+      start: 0,
+    });
+  });
+  it("a_question_accepts_a_path_with_slashes", () => {
+    expect(activeMentionToken("?src/comp/Form", 15)).toEqual({
+      prefix: "?",
+      remainder: "src/comp/Form",
+      start: 0,
+    });
+  });
+  it("a_question_accepts_the_full_extended_charset", () => {
+    expect(activeMentionToken("?a_b.c-d/e", 12)).toEqual({
+      prefix: "?",
+      remainder: "a_b.c-d/e",
+      start: 0,
+    });
+  });
+  it("a_bare_question_is_null (the ≥1-char rule)", () => {
+    expect(activeMentionToken("?", 1)).toBeNull();
+  });
+  it("a_bare_question_after_a_space_is_null", () => {
+    expect(activeMentionToken("x ?", 3)).toBeNull();
+  });
+  it("double_question_is_null (git-status porcelain must not open the picker)", () => {
+    expect(activeMentionToken("??", 2)).toBeNull();
+  });
+  it("double_question_after_text_is_null", () => {
+    expect(activeMentionToken("x??", 3)).toBeNull();
+  });
+  it("optional_chaining_is_null", () => {
+    expect(activeMentionToken("a?.b", 4)).toBeNull();
+  });
+  it("a_question_as_an_operator_is_null", () => {
+    expect(activeMentionToken("x ? y", 5)).toBeNull();
+  });
+  it("a_url_query_is_null", () => {
+    expect(activeMentionToken("url?query=1", 11)).toBeNull();
+  });
+  it("a_mid_word_question_is_null", () => {
+    expect(activeMentionToken("foo?bar", 7)).toBeNull();
+  });
+  it("a_space_ends_the_token", () => {
+    expect(activeMentionToken("?a b", 4)).toBeNull();
+  });
+  it("a_question_after_a_space_mid_sentence", () => {
+    expect(activeMentionToken("read ?README.md", 15)).toEqual({
+      prefix: "?",
+      remainder: "README.md",
+      start: 5,
+    });
+  });
+
+  it("a_tilde_never_makes_a_token (ADR 0033: no home-expansion semantics)", () => {
+    // `~` is genuinely OUTSIDE the `?` charset, so the original `?~/.bashrc`
+    // sketch cannot even form a token — no picker opens.
+    expect(activeMentionToken("?~", 2)).toBeNull();
+    expect(activeMentionToken("?~/.bashrc", 10)).toBeNull();
+  });
+
+  it("a leading slash IS a token — the scope guarantee lives in the catalog, not the grammar", () => {
+    // PINNED DELIBERATELY, and it reads against a naive reading of the v1
+    // non-goal on purpose. `/` is IN the `?` charset (`FILE_TOKEN_RE` allows
+    // `. _ /` and case), so `?/etc/hosts` DOES form a token and the picker DOES
+    // open. It lists nothing relevant because every row comes from the
+    // Space-relative walk (ADR 0033) — the SCOPE promise is enforced by WHICH
+    // entries exist, NOT by rejecting the query. An absolute query is therefore
+    // harmless-but-not-rejected: do not add a grammar branch to "fix" it, and
+    // do not describe it as rejected (the roadmap's non-goals line states the
+    // promise the code actually keeps).
+    expect(activeMentionToken("?/etc/hosts", 11)).toEqual({
+      prefix: "?",
+      remainder: "/etc/hosts",
+      start: 0,
+    });
+  });
+
+  it("a dot run IS a token (the charset allows `.`; traversal is bounded by scope)", () => {
+    // Same reasoning: `.` is in the charset because dot-FILES (`.gitignore`,
+    // `.env`) are real completion targets, so `?..` forms a token. Nothing
+    // escapes the Space because the picker offers only Space-relative entries —
+    // again a catalog-side guarantee, not a grammar one.
+    expect(activeMentionToken("?..", 3)).toEqual({
+      prefix: "?",
+      remainder: "..",
+      start: 0,
+    });
+  });
+});
+
+describe("expandMentions — an inserted path obeys the mention grammar like hand-typed text (ADR 0033)", () => {
+  // WHY THIS PIN EXISTS. The `?` charset excludes `$`, but `fuzzyMatch` is a
+  // SUBSEQUENCE match, so `?src/rea` offers a real file named `src/$read.md`;
+  // `selectMention` inserts it VERBATIM; and `expandMentions` then re-scans the
+  // WHOLE draft with `MENTION_RE`, which is deliberately boundary-free on the
+  // LEFT (ADR 0031's asymmetry). So the `$read` INSIDE the completed path
+  // expands, if a skill named `read` exists. A root-level `@agent.md` /
+  // `#mcp.md` fires for the same reason (the insertion follows whitespace).
+  //
+  // THIS IS INTENTIONAL, ACCEPTED, AND PRE-DATES `?`: a user who hand-typed
+  // that path got the byte-identical expansion, so `?` adds convenience, not
+  // capability. It is not tag injection either — the interpolated name is
+  // exact-matched from the catalog, so ADR 0031's tag-safety argument holds. An
+  // unknown name still passes through verbatim (catalog-gating). What this pin
+  // forces is that a future NARROWING of the grammar, or a change to what
+  // `selectMention` inserts, be a conscious decision rather than silent drift
+  // away from what ADR 0033 documents.
+  const catalogs: MentionCatalogs = {
+    skills: [makeSkill({ name: "read" })],
+    agents: [makeAgent({ name: "agent" })],
+    mcpServers: [makeMcp({ name: "mcp" })],
+  };
+
+  it("a completed path whose segment matches a Skill name DOES expand that Mention", () => {
+    const draft = "look at src/$read.md";
+    const result = expandMentions(draft, catalogs);
+    // Both halves of the truth: the path stays in the user's text exactly as
+    // inserted, AND the `$read` inside it becomes a block.
+    expect(result.startsWith(draft)).toBe(true);
+    expect(result).toContain(block(makeSkill({ name: "read" })));
+  });
+
+  it("a root-level completed path matching an Agent or MCP name DOES expand it", () => {
+    // The `(^|\\s)` boundary is satisfied because the insertion follows
+    // whitespace.
+    expect(expandMentions("see @agent.md", catalogs)).toContain(
+      agentBlock(makeAgent({ name: "agent" })),
+    );
+    expect(expandMentions("see #mcp.md", catalogs)).toContain(
+      mcpBlock(makeMcp({ name: "mcp" })),
+    );
+    // Catalog-gating is what keeps this rare: with no such resource the path is
+    // verbatim (ADR 0031), which is the shape almost every real path takes.
+    expect(expandMentions("see @agent.md", emptyCatalogs())).toBe(
+      "see @agent.md",
+    );
+  });
+});
+
+describe("expandMentions — ? NEVER expands (ADR 0033: ? is not a Mention)", () => {
+  const catalogs: MentionCatalogs = {
+    skills: [makeSkill({ name: "readme" })],
+    agents: [makeAgent({ name: "readme" })],
+    mcpServers: [makeMcp({ name: "readme" })],
+  };
+
+  it("question_text_is_returned_byte_identical", () => {
+    for (const text of [
+      "read ?README.md",
+      "??",
+      "x ?? and a?.b",
+      "?readme",
+      "src/components/Form.tsx",
+    ]) {
+      expect(expandMentions(text, catalogs)).toBe(text);
+    }
+  });
+
+  it("splitMentionBlocks_finds_nothing_in_question_text", () => {
+    const text = "read ?README.md and ??";
+    expect(splitMentionBlocks(text)).toEqual({ text, blocks: [] });
   });
 });
 
@@ -1099,5 +1287,337 @@ describe("expandMentions — empty text and adjacent tokens", () => {
     });
     expect(result).toBe("#a#b\n\n" + mcpBlock(a));
     expect(result).not.toContain('<mcp name="b">');
+  });
+});
+
+
+// ===========================================================================
+// ADR 0033 drift pins
+// (docs/decisions/0033-file-completion-inserts-a-path-not-content.md)
+//
+// The `?` File-completion affordance added a FOURTH prefix to a picker that
+// `$` / `@` / `#` already share (`pickerRows`/`filtered`, `activeMentionToken`,
+// `MentionRow`, `selectMention`). The pins below pin the two things that made
+// that safe:
+//
+//   (1) `?` expands NOTHING. It inserts a path and the agent opens it with its
+//       own Boundary/policy-gated `read`. Injecting file contents from the
+//       composer would be a Beyond-boundary policy the user could bypass just by
+//       typing, so "no expansion" is a SECURITY property, not a UX choice.
+//   (2) the three Mention prefixes are UNTOUCHED by sharing the picker.
+//
+// These are regression pins for behavior Tasks 1-4 already shipped, so they pass
+// on arrival. Their job is therefore to be NON-VACUOUS, which is why the
+// fixtures below are chosen to make a fall-through FAIL rather than to be tidy.
+// ===========================================================================
+
+describe("expandMentions — ? expands NOTHING even with every catalog populated (ADR 0033)", () => {
+  // EVERY catalog is non-empty AND every catalog carries an entry whose name is
+  // exactly what a `?` token would resolve to if a `?` ever routed into a Mention
+  // catalog (`readme` for `?README.md`, `file` for `?? file`, `bashrc` / `hosts`
+  // for the path drafts). A prefix leak in the expansion — a `?` hit reaching the
+  // skills map, or a `?`-aware branch being added to `expandMentions` — would
+  // therefore emit a BLOCK here instead of returning the text. Catalogs that were
+  // empty would make this vacuous: the text would come back verbatim for the
+  // trivial reason that nothing matches anything.
+  const catalogs: MentionCatalogs = {
+    skills: [
+      makeSkill({ name: "readme", body: "README body" }),
+      makeSkill({ name: "file", body: "FILE body" }),
+      makeSkill({ name: "bashrc", body: "BASHRC body" }),
+      makeSkill({ name: "hosts", body: "HOSTS body" }),
+      makeSkill(), // `debug` — the REAL Mention the mixed draft below uses
+    ],
+    agents: [
+      makeAgent({ name: "readme" }),
+      makeAgent({ name: "file" }),
+      makeAgent({ name: "hosts" }),
+      makeAgent({ name: "scout" }),
+    ],
+    mcpServers: [
+      makeMcp({ name: "readme", summary: "https://readme.example" }),
+      makeMcp({ name: "file", summary: "npx file-mcp" }),
+      makeMcp({ name: "bashrc", summary: "npx bashrc-mcp" }),
+      makeMcp({ name: "hosts", summary: "npx hosts-mcp" }),
+      makeMcp(), // `postgres`
+    ],
+  };
+
+  it("every ?-shaped draft is returned BYTE-IDENTICAL whatever the catalogs hold", () => {
+    for (const text of [
+      "read ?README.md",
+      "?README.md",
+      "?? file", // git-status porcelain — `??` is not a token at all
+      "?? untracked src/x.ts",
+      "a?.b", // optional chaining — fails the `(^|\s)` boundary
+      "x ? y : z", // ternary — and a `?` token needs >=1 path char
+      "~/.bashrc", // the deliberate v1 non-goal: home-relative
+      "/etc/hosts", // the deliberate v1 non-goal: absolute
+      "edit ~/.bashrc and /etc/hosts",
+      "url?query=1",
+      "src/components/Form.tsx",
+    ]) {
+      expect(expandMentions(text, catalogs)).toBe(text);
+    }
+  });
+
+  it("no ? draft yields ANY block of ANY kind and nothing is stripped", () => {
+    // The same fact restated as the security property, so a red here names the
+    // invariant that broke rather than reading as a string mismatch.
+    for (const text of [
+      "read ?README.md",
+      "?? file",
+      "a?.b",
+      "~/.bashrc /etc/hosts",
+      "/etc/hosts",
+    ]) {
+      const out = expandMentions(text, catalogs);
+      expect(out).toBe(text);
+      expect(out).not.toContain("<skill");
+      expect(out).not.toContain("<agent");
+      expect(out).not.toContain("<mcp");
+      // The path is still the literal the user typed — no content appended to it.
+      expect(out).toContain(text);
+    }
+  });
+
+  it("a mixed draft expands the $ @ # Mentions while the ? path stays untouched", () => {
+    // THE SPLIT, not merely the absence: the SAME call that expands a real `$`
+    // skill, `@` agent and `#` MCP mention must leave the `?` path byte-for-byte
+    // alone. A `?`-only fixture cannot tell "the `?` path does nothing" from
+    // "nothing matches at all", and a `?` branch added to the EXPANSION could hide
+    // behind either reading. This one cannot.
+    const draft = "run $debug @scout #postgres on ?README.md and ?? file";
+    const out = expandMentions(draft, catalogs);
+    expect(out).toBe(
+      draft +
+        "\n\n" +
+        [
+          block(makeSkill()), // `debug` — appended in FIRST-MENTION order …
+          agentBlock(makeAgent({ name: "scout" })),
+          mcpBlock(makeMcp()), // … then the agent, then the MCP server
+        ].join("\n\n"),
+    );
+    // The `?` path rode through expansion untouched, and the `readme` entries that
+    // WOULD have matched a `?`-routed lookup emitted no block.
+    expect(out).toContain("?README.md");
+    expect(out).toContain("?? file");
+    expect(out).not.toContain('<skill name="readme"');
+    expect(out).not.toContain('<agent name="readme">');
+    expect(out).not.toContain('<mcp name="readme">');
+  });
+});
+
+describe("splitMentionBlocks — the three real block literals still round-trip (ADR 0033)", () => {
+  // The block SHAPES are untouched by the `?` work (only the picker grew), and a
+  // `?` path riding along in the user's text is neither a block nor stripped.
+  const catalogs: MentionCatalogs = {
+    skills: [makeSkill()],
+    agents: [makeAgent()],
+    mcpServers: [makeMcp()],
+  };
+
+  it("the skill / agent / mcp blocks round-trip unchanged with a ? path in the text", () => {
+    const draft = "fix $debug with @scout via #postgres in ?README.md";
+    const expanded = expandMentions(draft, catalogs);
+    const { text, blocks } = splitMentionBlocks(expanded);
+    // The user's text is EXACTLY the draft — `?README.md` included, nothing eaten.
+    expect(text).toBe(draft);
+    expect(blocks.map((b) => `${b.kind}:${b.name}`)).toEqual([
+      "skill:debug",
+      "agent:scout",
+      "mcp:postgres",
+    ]);
+    // Each block's body is the untouched literal.
+    expect(blocks[0]!.body).toBe("Step 1. Step 2.");
+    expect(blocks[1]!.body).toContain('Dispatch a subagent with agentName "scout"');
+    expect(blocks[2]!.body).toContain('mcp({ connect: "postgres" })');
+    // And the split is the exact inverse: the text plus the three literals rebuilt.
+    expect(expanded).toBe(
+      text +
+        "\n\n" +
+        [block(makeSkill()), agentBlock(makeAgent()), mcpBlock(makeMcp())].join(
+          "\n\n",
+        ),
+    );
+  });
+
+  it("a ?-only text splits to the input VERBATIM with no blocks", () => {
+    // The display-side twin of the expansion pin: `MessageBubble` renders a `?`
+    // draft byte-identically, which is what the content-based `mergeDedupeKey`
+    // resume-merge contract relies on.
+    for (const text of [
+      "read ?README.md",
+      "~/.bashrc",
+      "/etc/hosts",
+      "?? file",
+      "a?.b",
+      "x ? y : z",
+    ]) {
+      expect(splitMentionBlocks(text)).toEqual({ text, blocks: [] });
+    }
+  });
+});
+
+// --- The picker's TWO filters: why they were deliberately NOT unified. ------
+//
+// The picker is SHARED, the filters are not: `?` filters with `fuzzyMatch` (a
+// SUBSEQUENCE — a path query is path-shaped, so `src/comp/Form` must reach
+// `src/components/Formula.tsx`), while `$` / `@` / `#` keep the case-insensitive
+// name SUBSTRING filter they have always had.
+//
+// WHY NOT UNIFY: a substring match is a SPECIAL CASE of a subsequence
+// (consecutive characters are still "in order"), so `fuzzyMatch` is a strict
+// generalization — swapping the Mention filter to it would break no existing
+// query. It would STILL be a behavior change: `sm` would start matching
+// `skill-manager` and every Mention list would get looser and noisier. The two
+// filters were deliberately NOT unified, and the pins below document WHICH side
+// is the untouched one — the Mention side. Read a red pin here as "the Mention
+// filter changed", NOT as "the test needs updating".
+//
+// HOW THIS PIN IS MADE NON-VACUOUS (and why it reads source at all): the filter
+// lives inside a `useMemo` in `ChatStream.tsx` and is not exported, so there is
+// no call to make from here. The predicate is therefore lifted out of the SHIPPED
+// source and evaluated, so flipping that one line to `fuzzyMatch` turns these
+// tests RED — verified by exactly that experiment when this pin was written.
+// Reading a component's SOURCE is this repo's established pattern for a guarantee
+// with no runtime seam (`paletteCompleteness.test.ts`,
+// `slabFloatSeparation.test.ts`), and this app ships no `@types/node`, so Node's
+// `fs` is reached through a COMPUTED specifier the way those files do it.
+//
+// WHY IT HAS TO BE SOURCE-READING: with the Mention filter flipped to
+// `fuzzyMatch`, the WHOLE `ChatStream.test.tsx` suite (157 tests, incl. the
+// picker's own "filters as the token is typed" and "$ and @ pickers still list
+// and insert" pins) stays GREEN — none of their seeded names disagree under the
+// two filters. This file is therefore the only place in the repo that can see
+// that drift, which is the reason it exists.
+
+const NODE_FS = "node:" + "fs";
+const { readFileSync } = (await import(NODE_FS)) as {
+  readFileSync: (path: string, encoding: string) => string;
+};
+
+const PICKER_SRC = readFileSync("src/components/ChatStream.tsx", "utf8");
+
+/** Lift the `.filter(… => <expr>)` predicate that follows `anchor` out of the
+ *  picker's row derivation and compile it. The anchor is a REGEXP with `\s*`
+ *  between tokens rather than a literal string on purpose: a pin that reddens
+ *  because a formatter re-wrapped an argument is noise, and the anchor must ONLY
+ *  go red when the code it names actually stops existing. The predicate itself is
+ *  extracted PAREN-BALANCED rather than pattern-matched: it comes out whatever it
+ *  is, so a predicate FLIPPED to `fuzzyMatch` still extracts and still EVALUATES —
+ *  the pin goes red on the BEHAVIOR change, not on a failed regex or a NameError.
+ *  A missing anchor / missing filter throws instead of passing quietly. */
+function compileFilterAfter(anchor: RegExp, label: string) {
+  const m = anchor.exec(PICKER_SRC);
+  if (!m) {
+    throw new Error(
+      `${label}: anchor ${anchor} not in ChatStream.tsx`,
+    );
+  }
+  const at = m.index;
+  const open = PICKER_SRC.indexOf(".filter(", at);
+  const arrow = PICKER_SRC.indexOf("=>", open);
+  if (open === -1 || arrow === -1) {
+    throw new Error(`${label}: no .filter(…) after the anchor (shape changed?)`);
+  }
+  let depth = 0;
+  let end = arrow + 2;
+  while (end < PICKER_SRC.length) {
+    const ch = PICKER_SRC[end];
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")") {
+      if (depth === 0) break;
+      depth--;
+    }
+    end++;
+  }
+  const expr = PICKER_SRC.slice(arrow + 2, end).trim().replace(/,$/, "");
+  // `fuzzyMatch` is IN SCOPE so a flipped predicate EVALUATES rather than
+  // throwing, and `query` is a parameter so the extracted expression needs no
+  // rewriting to run.
+  const fn = new Function("r", "query", "fuzzyMatch", `return (${expr});`) as (
+    r: { name: string },
+    query: string,
+    fm: (needle: string, target: string) => boolean,
+  ) => boolean;
+  return (query: string, name: string) => fn({ name }, query, fuzzyMatch);
+}
+
+// The `?` branch is the FIRST branch of the `pickerRows` memo (deliberately
+// listed first so it can never fall through to the skills catalog), so the first
+// `.filter(` after it is the FILE filter. The Mention filter is the `matchedRows`
+// line after the three-catalog `rows` mapping — ONE line shared by `$`, `@` and
+// `#`, which is exactly why one extraction grades all three: the three Mention
+// prefixes have no per-prefix filter that could drift apart on its own.
+const mentionFilter = compileFilterAfter(
+  /const\s+matchedRows\s*=\s*rows\.filter\(/,
+  "Mention ($/@/#) filter",
+);
+const fileFilter = compileFilterAfter(
+  /if\s*\(\s*prefix\s*===\s*"\?"\s*\)/,
+  "File (?) filter",
+);
+
+describe("the picker's filters — the Mention prefixes KEEP the substring filter (ADR 0033)", () => {
+  it("a subsequence-only query is EXCLUDED by a Mention filter and INCLUDED by the ? filter", () => {
+    // The pair the two filters DISAGREE on: `sm` is a subsequence of
+    // `skill-manager` (s … m) but not a substring of it. If the Mention filter
+    // ever became `fuzzyMatch`, the FIRST expectation below flips to `true` and
+    // this test goes red — that is the experiment that proves the pin non-vacuous.
+    expect(mentionFilter("sm", "skill-manager")).toBe(false);
+    expect(fileFilter("sm", "skill-manager")).toBe(true);
+    // More disagreements of the same shape, so a partial unification is caught too.
+    for (const [q, name] of [
+      ["km", "skill-manager"],
+      ["sn", "skill-manager"],
+      ["drm", "debug-readme-manager"],
+      ["pse", "postgres-extension"],
+    ] as const) {
+      expect(mentionFilter(q, name)).toBe(false);
+      expect(fileFilter(q, name)).toBe(true);
+    }
+  });
+
+  it("every substring hit is STILL a Mention hit — case-insensitive substring, unchanged", () => {
+    // The generalization direction the comment above leans on: substring is a
+    // subset of subsequence, so the Mention filter must keep EXACTLY what
+    // substring gives — no more (pinned by the test above), no less (here).
+    const names = ["debug", "skill-manager", "CodeReview", "postgres", "scout"];
+    const queries = ["", "d", "DE", "manager", "MAN", "SCO", "debug", "ScOut"];
+    for (const name of names) {
+      for (const q of queries) {
+        expect(mentionFilter(q, name)).toBe(
+          name.toLowerCase().includes(q.toLowerCase()),
+        );
+      }
+    }
+    // And a non-match stays out of BOTH filters.
+    expect(mentionFilter("zzz", "debug")).toBe(false);
+    expect(fileFilter("zzz", "debug")).toBe(false);
+  });
+
+  it("the ? branch is the ONLY fuzzy filter in the picker's row derivation", () => {
+    // No raw-source assertion on the Mention predicate's TEXT here on purpose:
+    // the behavioral pin above already compiles and evaluates that predicate, so
+    // the flip it exists to catch goes red on BEHAVIOR, and a literal string
+    // match would only add breakage on formatting-only refactors. A rename that
+    // removes the anchor is not silent either — `compileFilterAfter` throws.
+    // The `fuzzyMatch(` CALL sits in the `?` branch — i.e. after the branch's own
+    // `prefix === "?"` gate and nowhere else in the row derivation. Matched
+    // WHITESPACE-TOLERANTLY for the same reason as the anchors above: which side
+    // is fuzzy is the fact being pinned, not how the call is line-wrapped.
+    const callAt = PICKER_SRC.search(/fuzzyMatch\(\s*query,\s*r\.name\s*\)/);
+    expect(callAt).toBeGreaterThan(-1);
+    const branchAt = PICKER_SRC.search(/if\s*\(\s*prefix\s*===\s*"\?"\s*\)/);
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(callAt).toBeGreaterThan(branchAt);
+    expect(callAt).toBeLessThan(
+      PICKER_SRC.search(/const\s+matchedRows\s*=\s*rows\.filter\(/),
+    );
+    // Exactly one such call in the whole file: one fuzzy filter, three substring.
+    expect(
+      (PICKER_SRC.match(/fuzzyMatch\(\s*query,\s*r\.name\s*\)/g) ?? []).length,
+    ).toBe(1);
   });
 });

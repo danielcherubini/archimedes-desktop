@@ -11,6 +11,7 @@ import {
   listSkills,
   listMcpServersEffective,
   listAgentDefinitionsForSpace,
+  listSpaceFiles,
 } from "../lib/tauri";
 import { open as openFilePicker } from "@tauri-apps/plugin-dialog";
 import { clearSkillCatalogCache } from "../hooks/useSkillCatalog";
@@ -21,7 +22,7 @@ import { usePermissions } from "../store/permissions";
 import { useSubagents } from "../store/subagents";
 import { useSettings } from "../store/settings";
 import { generateFrames, getVariantGridSize } from "../lib/braille-loader";
-import type { AgentDefinitionDto, AppSettings } from "../lib/tauri";
+import type { AgentDefinitionDto, AppSettings, FileListDto } from "../lib/tauri";
 import { setSidePaneCollapsed } from "../lib/sidePaneState";
 
 /** A full settings fixture (the spinner-style tests seed the store with it). */
@@ -167,6 +168,12 @@ vi.mock("../lib/tauri", async () => {
         summary: "npx -y x-mcp",
       },
     ]),
+    // The `?` File-completion listing (ADR 0033). Mocked because EVERY
+    // session-mounting test in this file calls it (the catalog hook fetches
+    // unconditionally), and the `?` tests need to control the payload per
+    // test — including a DEFERRED promise for the in-flight case. Empty by
+    // default so the pre-existing `$`/`@`/`#` tests see no file rows.
+    listSpaceFiles: vi.fn().mockResolvedValue({ entries: [], truncated: false }),
   };
 });
 
@@ -3127,5 +3134,552 @@ describe("ChatStream", () => {
       expect(screen.getByText("postgres")).toBeTruthy();
       // The user's own text renders without the block prose.
       expect(screen.queryByText(/Connect to it via the mcp tool/)).toBeNull();
+    });
+  // ---------------------------------------------------------------------
+  // `?` File completion (ADR 0033) — the FOURTH picker prefix, and the ONLY
+  // one that is NOT a Mention: selecting a row inserts a PATH (the trigger is
+  // CONSUMED, the case is PRESERVED) and the send path expands NOTHING. The
+  // block below pins the rows, the insertion policy, the render cap, the note,
+  // and the two degradations (in-flight listing / no-match note).
+  //
+  // BEFORE these tests exist, `filtered` has no `?` branch, so a `?` token
+  // falls through to the SKILLS catalog — which is exactly the transient state
+  // these tests are written to catch.
+  // ---------------------------------------------------------------------
+
+  // The picker's row `<button>` whose PRIMARY line is `name`. A bare
+  // `getByText(path)` is ambiguous here: for a root-level path the row's
+  // SECONDARY line (the basename) is the SAME string, so two elements match —
+  // the primary is the `text-ui-base` span.
+  async function findFileRow(name: string): Promise<HTMLButtonElement> {
+    const matches = await screen.findAllByText(name);
+    const primary = matches.find((el) => el.classList.contains("text-ui-base"));
+    return primary!.closest("button") as HTMLButtonElement;
+  }
+
+  it("typing ?RE opens the picker with the file rows and a ? badge", async () => {
+    seedLiveSession();
+    vi.mocked(listSpaceFiles).mockResolvedValue({
+      entries: ["README.md", "docs/plan.md"],
+      truncated: false,
+    });
+    render(<ChatStream />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "?RE" } });
+    const row = await findFileRow("README.md");
+    // The `?` badge (the picker renders `row.prefix`, so `?` needs no new
+    // markup) …
+    expect(row.querySelector(".text-ui-xs")!.textContent).toBe("?");
+    // … and NO skill row mixes in (the fall-through bug: `?` listed skills).
+    expect(screen.queryByText("debug")).toBeNull();
+    expect(screen.queryByText("beta")).toBeNull();
+  });
+
+  it("a path-shaped ? query matches by subsequence, not substring", async () => {
+    seedLiveSession();
+    vi.mocked(listSpaceFiles).mockResolvedValue({
+      entries: ["src/components/Formula.tsx", "README.md"],
+      truncated: false,
+    });
+    render(<ChatStream />);
+    // `src/comp/Form` is NOT a substring of `src/components/Formula.tsx` — a
+    // path query is path-SHAPED, which is why the `?` branch filters with
+    // `fuzzyMatch` (a subsequence match) instead of `includes`.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "?src/comp/Form" },
+    });
+    expect(await findFileRow("src/components/Formula.tsx")).toBeTruthy();
+    // `README.md` matches nothing in that query, so it is not listed.
+    expect(screen.queryAllByText("README.md")).toEqual([]);
+  });
+
+  it("enter on a file row inserts the path with the ? CONSUMED and the CASE INTACT",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // The ADR's own example: the query is case-INSENSITIVE, the INSERTED path
+      // carries the real name.
+      fireEvent.change(textarea, { target: { value: "?REA" } });
+      expect(await findFileRow("README.md")).toBeTruthy();
+      textarea.setSelectionRange(4, 4);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      // NOT `?README.md ` (the trigger is consumed) and NOT `readme.md `
+      // (the insertion is VERBATIM — no lowercasing rule applies to a path, so
+      // the Mention lowercase-only rule does NOT apply to `?`. The path is
+      // then ordinary draft text and obeys the mention grammar like
+      // hand-typed text — ADR 0033).
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+      ).toBe("README.md ");
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+    });
+
+  it("tab on a file row inserts the path (trigger consumed, case intact)",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["src/README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "?src/READ" } });
+      expect(await findFileRow("src/README.md")).toBeTruthy();
+      textarea.setSelectionRange(9, 9);
+      fireEvent.keyDown(textarea, { key: "Tab" });
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+      ).toBe("src/README.md ");
+    });
+
+  it("a mousedown on a file row inserts the path (trigger consumed, case intact)",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "?REA" } });
+      const row = await findFileRow("README.md");
+      textarea.focus();
+      textarea.setSelectionRange(4, 4);
+      // `onMouseDown` (with `preventDefault`) is the row's handler — a `click`
+      // would NOT select (the same affordance as the Mention rows).
+      const notPrevented = fireEvent.mouseDown(row);
+      expect(notPrevented).toBe(false);
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+      ).toBe("README.md ");
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+    });
+
+  it("a file row shows the basename as its secondary line (and tooltip)",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["src/nested/README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "?src/nested/READ" },
+      });
+      // The PRIMARY line is the full relative path (what gets inserted) …
+      const row = await findFileRow("src/nested/README.md");
+      // … and the SECONDARY line is the BASENAME (a path is long; the folder is
+      // already in the primary line and the query).
+      const desc = row.querySelector("[title]")!;
+      expect(desc.textContent).toBe("README.md");
+      expect(desc.getAttribute("title")).toBe("README.md");
+    });
+
+  it("a truncated listing shows the cap note, which is NOT a selectable row, and Enter still sends",
+    async () => {
+      seedLiveSession();
+      // Truncated AND nothing matches: the note is exactly what explains the
+      // EMPTY picker (the container gate widened to `open && (rows || note)`).
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md"],
+        truncated: true,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "?zzzz" } });
+      const picker = await screen.findByTestId("mention-picker");
+      const note = picker.querySelector(
+        "[data-testid='mention-picker-note']",
+      )!;
+      // NO number in the string: the DTO carries only `truncated`, so naming
+      // the Rust `MAX_PICKER_ENTRIES` here would let the UI lie the moment the
+      // Rust cap moves (ADR 0033's note is qualitative on purpose).
+      // And NO "keep typing" advice: the walk is deterministic
+      // (`sort_by_file_name`), so a truncated listing holds the alphabetically
+      // FIRST 5,000 entries and a truncated-away file is unreachable by
+      // narrowing — advising it would be a lie.
+      expect(note.textContent).toBe(
+        "File listing capped — some files may be missing",
+      );
+      // The note is NEVER a row: it is not in the button set `activeIndex`,
+      // the arrow-wrap and Enter operate over.
+      expect(picker.querySelectorAll("button")).toHaveLength(0);
+      expect(note.tagName).not.toBe("BUTTON");
+      // And Enter still SENDS — the keydown intercept is gated on
+      // `filtered.length > 0`, which the note does not touch.
+      textarea.setSelectionRange(6, 6);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "?zzzz");
+    });
+
+  it("a query matching more rows than the render cap trims the list and says so",
+    async () => {
+      seedLiveSession();
+      // 150 matching entries against the 100-row render cap (`MAX_PICKER_ROWS`):
+      // `fuzzyMatch` is a loose subsequence and the walk cap is 5,000, so an
+      // unbounded picker would re-render thousands of buttons per keystroke.
+      const entries = Array.from({ length: 150 }, (_, i) => `file${i}.ts`);
+      vi.mocked(listSpaceFiles).mockResolvedValue({ entries, truncated: false });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "?file" } });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() => expect(picker.querySelectorAll("button")).toHaveLength(100));
+      const note = picker.querySelector(
+        "[data-testid='mention-picker-note']",
+      )!;
+      expect(note.textContent).toContain("Too many matches");
+      // The wrap stays consistent with the RENDERED list (the cap is applied
+      // INSIDE `filtered`, so `activeIndex`, the `% filtered.length` wrap and
+      // the DOM agree): ArrowUp from index 0 wraps to the LAST rendered row.
+      textarea.setSelectionRange(5, 5);
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      const buttons = Array.from(picker.querySelectorAll("button"));
+      expect(buttons[99]!.className).toContain("bg-surface-hover");
+      expect(buttons[0]!.className).not.toContain("bg-surface-hover");
+      // And the wrapped row is selectable (no crash on the capped tail).
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+      ).toBe("file99.ts ");
+    });
+
+  it("a normal ? picker with matching rows and a whole listing renders NO note",
+    async () => {
+      seedLiveSession();
+      // The `undefined` arm: nothing is capped and nothing is truncated, so
+      // the picker must stay silent (a note here would be noise on the
+      // everyday path).
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md", "docs/plan.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "?READ" },
+      });
+      const picker = await screen.findByTestId("mention-picker");
+      expect(picker.querySelectorAll("button")).toHaveLength(1);
+      expect(
+        screen.queryByTestId("mention-picker-note"),
+      ).toBeNull();
+    });
+
+  it("a truncated listing with matching rows shows the note ALONGSIDE the rows, and the note is not a row",
+    async () => {
+      seedLiveSession();
+      // The other half of the widened gate: the note is NOT only an
+      // empty-picker explanation — it rides along whenever the listing is
+      // capped, rows or not. Below the render cap (5 matches < 100), so the
+      // wording is the walk-cap one.
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["a1.ts", "a2.ts", "a3.ts", "a4.ts", "a5.ts"],
+        truncated: true,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // ≥1 path char after the trigger (a bare `?` opens nothing, ADR 0033).
+      fireEvent.change(textarea, { target: { value: "?a" } });
+      const picker = await screen.findByTestId("mention-picker");
+      const note = screen.getByTestId("mention-picker-note");
+      // The walk-cap arm states the LIMITATION — no "keep typing" advice (a
+      // truncated-away file cannot be reached by narrowing).
+      expect(note.textContent).toBe(
+        "File listing capped — some files may be missing",
+      );
+      expect(note.textContent).not.toContain("keep typing");
+      // The rows are all still there (the note never replaces them) …
+      const buttons = Array.from(picker.querySelectorAll("button"));
+      expect(buttons).toHaveLength(5);
+      // … and the note is outside the button set `activeIndex` / the
+      // arrow-wrap / Enter operate over.
+      expect(buttons).not.toContain(note);
+      expect(note.tagName).not.toBe("BUTTON");
+      expect(picker.contains(note)).toBe(true);
+      // Arrow navigation still lands on a row, never on the note. The caret is
+      // at the END of the token (the keydown re-evaluates it: a caret INSIDE
+      // `?a` at index 1 leaves an empty remainder, which is not a `?` token).
+      textarea.setSelectionRange(2, 2);
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      expect(
+        Array.from(picker.querySelectorAll("button"))[4]!.className,
+      ).toContain("bg-surface-hover");
+    });
+
+  it("a truncated listing AND more matches than the render cap: the too-many-matches wording wins",
+    async () => {
+      seedLiveSession();
+      // Precedence pin: both conditions hold, and the actionable one (keep
+      // typing) is what renders — the walk-cap note is shadowed.
+      const entries = Array.from({ length: 150 }, (_, i) => `file${i}.ts`);
+      vi.mocked(listSpaceFiles).mockResolvedValue({ entries, truncated: true });
+      render(<ChatStream />);
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "?file" },
+      });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() =>
+        expect(picker.querySelectorAll("button")).toHaveLength(100),
+      );
+      const note = screen.getByTestId("mention-picker-note");
+      expect(note.textContent).toBe(
+        "Too many matches — keep typing to narrow the list",
+      );
+      expect(note.textContent).not.toContain("capped");
+    });
+
+  it.each([
+    { prefix: "$" as const, kind: "skills" as const },
+    { prefix: "@" as const, kind: "agents" as const },
+    { prefix: "#" as const, kind: "mcp" as const },
+  ])(
+    "the $prefix picker is UNCAPPED and note-free with more matches than the render cap ($kind catalog)",
+    async ({ prefix, kind }) => {
+      seedLiveSession();
+      // The render cap belongs to `?` ALONE (its loose SUBSEQUENCE filter can
+      // match nearly a whole 5,000-entry listing). The three Mentions keep the
+      // shipped status quo: their filter is a name SUBSTRING, and ADR 0033
+      // promises those pickers are unchanged — a silent 100-row cap there
+      // would make row 101 unreachable with no explanation.
+      // `…Once` (not `…Value`): `beforeEach` only `clearAll`s the mocks, so a
+      // PERSISTENT override would leak this catalog into later tests.
+      if (prefix === "#") seedMcpMentionsOn();
+      const many = Array.from({ length: 150 }, (_, i) => `${kind}${i}`);
+      if (kind === "skills") {
+        vi.mocked(listSkills).mockResolvedValueOnce(
+          many.map((name) => ({
+            name,
+            description: `d ${name}`,
+            path: `/s/${name}/SKILL.md`,
+            dir: `/s/${name}`,
+            scope: "space",
+            body: "B",
+          })),
+        );
+      } else if (kind === "agents") {
+        vi.mocked(listAgentDefinitionsForSpace).mockResolvedValueOnce(
+          many.map((name) => ({
+            name,
+            description: `d ${name}`,
+            model: null,
+            scope: "user",
+          })),
+        );
+      } else {
+        vi.mocked(listMcpServersEffective).mockResolvedValueOnce(
+          many.map((name) => ({ name, kind: "stdio", summary: `s ${name}` })),
+        );
+      }
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: prefix } });
+      const picker = await screen.findByTestId("mention-picker");
+      await waitFor(() =>
+        // ALL 150 matches render — nothing is silently dropped.
+        expect(picker.querySelectorAll("button")).toHaveLength(150),
+      );
+      expect(screen.queryByTestId("mention-picker-note")).toBeNull();
+      // And the last row is reachable: the arrow-wrap counts the rendered
+      // rows, so ArrowUp from index 0 lands on row 150 (index 149).
+      textarea.setSelectionRange(1, 1);
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      const buttons = Array.from(picker.querySelectorAll("button"));
+      expect(buttons[149]!.className).toContain("bg-surface-hover");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).value,
+      ).toBe(`${prefix}${many[149]} `);
+    },
+  );
+
+  it("while the file listing is in flight, ? opens NO picker and Enter SENDS",
+    async () => {
+      seedLiveSession();
+      // A skill whose name matches the query SUBSTRING: while the `?` branch is
+      // missing this renders a skills picker (and Enter INSERTS instead of
+      // sending) — the degradation this test pins is "no rows at all".
+      vi.mocked(listSkills).mockResolvedValueOnce([
+        {
+          name: "debug",
+          description: "Debug a failure",
+          path: "/s/debug/SKILL.md",
+          dir: "/s/debug",
+          scope: "space",
+          body: "B",
+        },
+      ]);
+      // A DEFERRED listing: the in-flight state ADR 0033 calls out (an empty
+      // `filtered` means no picker and inert keyboard branches, so Enter sends
+      // — the same degradation ADR 0032 relies on).
+      let resolveFiles: (v: FileListDto) => void = () => {};
+      vi.mocked(listSpaceFiles).mockImplementation(
+        () => new Promise<FileListDto>((r) => (resolveFiles = r)),
+      );
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      await waitFor(() => expect(vi.mocked(listSpaceFiles)).toHaveBeenCalled());
+      await waitFor(() => expect(vi.mocked(listSkills)).toHaveBeenCalled());
+      fireEvent.change(textarea, { target: { value: "hi ?de" } });
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+      textarea.setSelectionRange(7, 7);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      // Sent, and BYTE-IDENTICAL: no block appended, nothing stripped.
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "hi ?de");
+      // The late listing lands with NO further keystroke (the `files` dep on
+      // the `filtered` memo), and it must not resurrect a picker for a token
+      // that no longer exists in the (now-empty) draft.
+      await act(async () => {
+        resolveFiles({ entries: ["README.md"], truncated: false });
+        await Promise.resolve();
+      });
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+      expect(screen.queryAllByText("README.md")).toEqual([]);
+    });
+
+  it("a Space switch serves no file rows until the new Space listing resolves",
+    async () => {
+      // Two live sessions in DIFFERENT Spaces (the catalog is keyed by the
+      // Space path, so switching sessions is a catalog KEY change).
+      useSessions.setState({
+        activeSessionId: "s1",
+        sessions: [
+          { sessionId: "s1", cwd: "/home/u/proj", capabilities: {}, archived: false },
+          { sessionId: "s2", cwd: "/home/u/other", capabilities: {}, archived: false },
+        ],
+        spaces: [
+          { path: "/home/u/proj", createdAt: 1, lastOpenedAt: 1, trusted: false },
+          { path: "/home/u/other", createdAt: 1, lastOpenedAt: 1, trusted: false },
+        ],
+        historySessions: [],
+        messages: { s1: [], s2: [] },
+        inTurn: {},
+        stopReasons: {},
+        closeReasons: {},
+        configOptions: {},
+      });
+      let resolveOther: (v: FileListDto) => void = () => {};
+      vi.mocked(listSpaceFiles).mockImplementation((p) =>
+        p === "/home/u/proj"
+          ? Promise.resolve({ entries: ["README.md"], truncated: false })
+          : new Promise<FileListDto>((r) => (resolveOther = r)),
+      );
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "?README" } });
+      expect(await findFileRow("README.md")).toBeTruthy();
+      // Switch the Space WHILE the picker is open: the old Space's rows must
+      // NOT be offered against the new one (a stale row would insert a path the
+      // new Space does not have).
+      await act(async () => {
+        useSessions.setState({ activeSessionId: "s2" });
+      });
+      await flush();
+      expect(screen.queryAllByText("README.md")).toEqual([]);
+      expect(screen.queryByTestId("mention-picker")).toBeNull();
+      // The new listing resolves; the picker is still closed (the draft never
+      // changed, so no `onChange` re-ran), and a fresh query offers ONLY the
+      // new Space's file.
+      await act(async () => {
+        resolveOther({ entries: ["OTHER.md"], truncated: false });
+        await Promise.resolve();
+      });
+      fireEvent.change(textarea, { target: { value: "?OTHER" } });
+      expect(await findFileRow("OTHER.md")).toBeTruthy();
+      expect(screen.queryAllByText("README.md")).toEqual([]);
+    });
+
+  it("a ? path in the draft is sent BYTE-IDENTICAL (never expanded, never stripped)",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      await waitForCatalog();
+      // `README.md` IS in the listing — the send path must still leave the text
+      // untouched (`expandMentions` never sees `?`; the trailing space also
+      // closes the token, so Enter is not an insertion).
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "read ?README.md " },
+      });
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(sendPrompt).toHaveBeenCalledWith("s1", "read ?README.md");
+      const userMsg = useSessions
+        .getState()
+        .messages["s1"]?.find((m) => m.kind === "user");
+      expect(userMsg?.kind === "user" ? userMsg.text : null).toBe(
+        "read ?README.md",
+      );
+      // And no Mention chip was rendered for it (no block was appended).
+      expect(screen.queryByText("named by the user")).toBeNull();
+    });
+
+  it("??, a?.b and a bare ? open NO picker and all three drafts SEND verbatim",
+    async () => {
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      await waitForCatalog();
+      const drafts = ["?? README.md", "a?.b", "?"];
+      for (const [i, d] of drafts.entries()) {
+        fireEvent.change(textarea, { target: { value: d } });
+        await flush();
+        // None is a `?` token (`??` and a bare `?` need ≥1 path char; `a?.b`
+        // fails the `(^|\s)` boundary) — so no picker and Enter stays a SEND.
+        expect(screen.queryByTestId("mention-picker")).toBeNull();
+        textarea.setSelectionRange(d.length, d.length);
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        await waitFor(() =>
+          expect(sendPrompt).toHaveBeenNthCalledWith(i + 1, "s1", d),
+        );
+        // Unlock the composer for the next iteration (the mocked send resolves
+        // in a microtask; `turnCompleted` clears `inTurn`).
+        await waitFor(() =>
+          expect(useSessions.getState().inTurn["s1"]).toBe(false),
+        );
+      }
+    });
+
+  it("the $ and @ pickers still list and insert their lowercase mention tokens",
+    async () => {
+      // The regression pin: `?` SHARES the picker but not the semantics — the
+      // Mention prefixes keep the substring filter AND the lowercase insertion.
+      seedLiveSession();
+      vi.mocked(listSpaceFiles).mockResolvedValue({
+        entries: ["README.md", "debug-notes.md"],
+        truncated: false,
+      });
+      render(<ChatStream />);
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // `$` → the skills catalog only (the file `debug-notes.md` must NOT mix
+      // into a `$` list, even though it matches the query as a substring).
+      fireEvent.change(textarea, { target: { value: "$de" } });
+      expect(await screen.findByText("debug")).toBeTruthy();
+      expect(screen.queryByText("debug-notes.md")).toBeNull();
+      textarea.setSelectionRange(3, 3);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "$debug ",
+      );
+      // `@` → the agents catalog, and the inserted token is still LOWER-cased.
+      fireEvent.change(textarea, { target: { value: "@" } });
+      const scout = await screen.findByText("scout");
+      expect(
+        scout.closest("button")!.querySelector(".text-ui-xs")!.textContent,
+      ).toBe("@");
+      textarea.setSelectionRange(1, 1);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        "@scout ",
+      );
     });
 });

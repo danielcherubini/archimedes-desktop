@@ -19,6 +19,20 @@ vi.mock("./lib/tauri", async () => {
     listSessions: vi.fn().mockResolvedValue([]),
     listSpaces: vi.fn().mockResolvedValue([]),
     listSkills: vi.fn().mockResolvedValue([]),
+    // The three `useMentionCatalogs` fetches (`ChatStream`'s composer
+    // catalogs). They MUST be mocked here: the factory spreads
+    // `importActual`, so an un-mocked export still calls the REAL `invoke`,
+    // which rejects in jsdom (`window.__TAURI_INTERNALS__` is undefined) and
+    // the hook logs `"<name> failed:"` — 11 lines of stderr noise per test in
+    // this file (green-but-noisy tests hide a real fetch failure). The empty
+    // values are what the hook degrades to anyway, so the composer renders
+    // exactly as it did before.
+    listAgentDefinitionsForSpace: vi.fn().mockResolvedValue([]),
+    listMcpServersEffective: vi.fn().mockResolvedValue([]),
+    listSpaceFiles: vi.fn().mockResolvedValue({
+      entries: [],
+      truncated: false,
+    }),
     // `SettingsPage`'s data deps: the settings document + the model catalog.
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",

@@ -212,10 +212,18 @@ export function activeSkillToken(
 }
 
 // ---------------------------------------------------------------------------
-// Generalized mention mechanism (`$` skills / `@` agents / `#` MCP servers)
+// Generalized picker-token + mention mechanism (`$` skills / `@` agents /
+// `#` MCP servers are **Mention**s; `?` File completion shares the picker and
+// the token scan, but expands NOTHING — ADR 0031 vs ADR 0033)
 // ---------------------------------------------------------------------------
 
 export type MentionKind = "skill" | "agent" | "mcp";
+
+/** The composer's picker prefixes. `$`/`@`/`#` are **Mention**s (they expand
+ *  into a block on send); `?` is **File completion**, which expands NOTHING
+ *  and only inserts a path — the three share a picker, not a semantics
+ *  (ADR 0031 vs ADR 0033). */
+export type ComposerPrefix = "$" | "@" | "#" | "?";
 
 /**
  * The `@` mention regex (an agent definition): a leading whitespace or
@@ -238,36 +246,61 @@ export interface MentionCatalogs {
 }
 
 /**
- * The active mention token at the caret (generalizes `activeSkillToken`):
+ * The active picker token at the caret (generalizes `activeSkillToken`):
  * the span between the nearest preceding whitespace (or start) and the caret.
  * Returns `{ prefix, remainder, start }` when the span starts with one of the
- * three glyphs — `remainder` is the token's remainder AFTER the glyph (a bare
- * glyph is `""`), `start` is the glyph's index in the string — else `null`
- * (no active token: the span doesn't start with a glyph, or it contains a
- * character that can't be part of a token, e.g. uppercase — the regex
- * `[a-z0-9-]*$` simply won't reach the caret).
+ * four prefixes — `remainder` is the token's remainder AFTER the prefix (a
+ * bare `$`/`@`/`#` glyph is `""`; a bare `?` is NOT a token at all), `start`
+ * is the prefix's index in the string — else `null` (no active token: the span
+ * doesn't start with a prefix, or it contains a character that can't be part
+ * of a token, e.g. uppercase for a Mention — the regex `[a-z0-9-]*$` simply
+ * won't reach the caret).
  * (`$` keeps the SAME live-caret boundary as `activeSkillToken` — the
  * boundary-free-left applies to the EXPANSION regex only.)
  */
 export function activeMentionToken(
   value: string,
   caret: number,
-): { prefix: "$" | "#" | "@"; remainder: string; start: number } | null {
+): { prefix: ComposerPrefix; remainder: string; start: number } | null {
   const before = value.slice(0, caret);
   // One shared shape: the span between the nearest preceding whitespace
   // (or start) and the caret starts with a prefix + a token char class.
   const m = before.match(/(^|\s)([$#@][a-z0-9-]*)$/);
-  if (!m) return null;
-  // The regex guarantees `m[2]` starts with one of the three glyphs —
-  // narrow explicitly (`charAt` returns `string`, which does NOT satisfy
-  // the union return type under `strict` TS).
-  const first = m[2]!.charAt(0) as "$" | "#" | "@";
+  if (m) {
+    // The regex guarantees `m[2]` starts with one of the three Mention
+    // glyphs — narrow explicitly (`charAt` returns `string`, which does NOT
+    // satisfy the union return type under `strict` TS).
+    const first = m[2]!.charAt(0) as ComposerPrefix;
+    return {
+      prefix: first,
+      remainder: m[2]!.slice(1),
+      start: (m.index ?? 0) + m[1]!.length,
+    };
+  }
+  const f = before.match(FILE_TOKEN_RE);
+  if (!f) return null;
+  // VERBATIM — a path's case is PRESERVED (no lowercasing rule applies to a
+  // path, so the Mention grammar's lowercase-only rule does not apply here).
+  // The inserted text is then ordinary message text: it obeys the mention
+  // grammar exactly like a hand-typed path — a `$name` inside it, or a
+  // root-level `@name`/`#name`, expands if a resource of that exact name
+  // exists (pre-existing grammar, not a surface of `?` — ADR 0033).
   return {
-    prefix: first,
-    remainder: m[2]!.slice(1),
-    start: (m.index ?? 0) + m[1]!.length,
+    prefix: "?",
+    remainder: f[2]!,
+    start: (f.index ?? 0) + f[1]!.length,
   };
 }
+
+// The `?` token (ADR 0033) — deliberately NOT the mention charset: a PATH
+// query needs `.` `_` `/` and UPPERCASE (README.md is spelled that way, and the
+// insertion is verbatim — no lowercasing rule applies to a path — so case
+// is preserved). It ALSO requires ≥1 char (a bare `?` opens nothing): that
+// is what keeps `??`
+// (git-status porcelain, or a doubled question mark) from opening the
+// picker and turning Enter into an INSERTION instead of a send. The
+// `(^|\s)` boundary does the rest — `a?.b`, `x ? y` and `url?query` fail it.
+const FILE_TOKEN_RE = /(^|\s)\?([a-zA-Z0-9._/-]+)$/;
 
 /**
  * Expand `$` / `@` / `#` mentions in `text` into their block forms (the

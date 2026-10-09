@@ -3,7 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   listAgentDefinitionsForSpace,
   listMcpServersEffective,
+  listSpaceFiles,
   type AgentDefinitionDto,
+  type FileListDto,
   type McpServerInfo,
 } from "../lib/tauri";
 import {
@@ -41,14 +43,26 @@ vi.mock("../lib/tauri", async () => {
         summary: "https://example.com/mcp",
       } satisfies McpServerInfo,
     ]),
+    // Mocked because the files row fetches on EVERY mount: the real
+    // wrapper would `invoke` under jsdom, reject, and add a third
+    // `console.error` to the failed-fetch test's exact-count assertion.
+    listSpaceFiles: vi.fn().mockResolvedValue({ entries: [], truncated: false }),
   };
 });
 
 const mockListAgentDefinitionsForSpace = vi.mocked(listAgentDefinitionsForSpace);
 const mockListMcpServersEffective = vi.mocked(listMcpServersEffective);
+const mockListSpaceFiles = vi.mocked(listSpaceFiles);
+
+/** The empty payload the files row degrades to. */
+const EMPTY_FILES: FileListDto = { entries: [], truncated: false };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // `clearAllMocks` does NOT drop implementations, so a per-test
+  // `mockImplementation` below would leak into later tests. Re-arm the
+  // file-listing default every test.
+  mockListSpaceFiles.mockResolvedValue({ entries: [], truncated: false });
   clearSkillCatalogCache();
   clearMentionCatalogsCache();
 });
@@ -258,6 +272,113 @@ describe("useMentionCatalogs", () => {
     a.unmount();
     b.unmount();
     errSpy.mockRestore();
+  });
+
+  it("the_files_row_shares_one_fetch_between_two_consumers", async () => {
+    // The 4th catalog (the `?` file listing) reuses the SAME in-flight
+    // promise cache: two consumers of one key mean ONE `list_space_files`
+    // IPC call.
+    mockListSpaceFiles.mockResolvedValue({
+      entries: ["README.md"],
+      truncated: false,
+    });
+    const a = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    const b = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    await waitFor(() => expect(mockListSpaceFiles).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(a.result.current.files.entries).toEqual(["README.md"]));
+    await waitFor(() => expect(b.result.current.files.entries).toEqual(["README.md"]));
+    // Pinned AFTER both resolved: a resolve-only cache would have both
+    // effects see a miss → 2 calls.
+    expect(mockListSpaceFiles).toHaveBeenCalledTimes(1);
+    expect(mockListSpaceFiles).toHaveBeenLastCalledWith("/tmp/alpha");
+    a.unmount();
+    b.unmount();
+  });
+
+  it("a_key_change_serves_empty_files_until_the_new_listing_resolves_and_evicts_the_left_key", async () => {
+    // Freshness hole for the files row: a stale Space's paths must never
+    // be offered for insertion. The gap serves the EMPTY payload, and the
+    // LEFT key is evicted (so coming back re-walks the directory).
+    let resolveBeta!: (payload: FileListDto) => void;
+    const betaPromise = new Promise<FileListDto>((resolve) => {
+      resolveBeta = resolve;
+    });
+    mockListSpaceFiles.mockImplementation((p) =>
+      p === "/tmp/alpha"
+        ? Promise.resolve({ entries: ["alpha.md"], truncated: false })
+        : betaPromise,
+    );
+    let spacePath = "/tmp/alpha";
+    const a = renderHook(() => useMentionCatalogs(spacePath));
+    await waitFor(() => expect(a.result.current.files.entries).toEqual(["alpha.md"]));
+    expect(mockListSpaceFiles).toHaveBeenCalledTimes(1);
+    // Leave A for B: the gap serves the empty payload, NOT A's entries.
+    spacePath = "/tmp/beta";
+    a.rerender();
+    expect(a.result.current.files).toEqual(EMPTY_FILES);
+    // B resolves: B's entries appear.
+    await act(async () => {
+      resolveBeta({ entries: ["beta.md"], truncated: true });
+    });
+    await waitFor(() => expect(a.result.current.files.entries).toEqual(["beta.md"]));
+    expect(mockListSpaceFiles).toHaveBeenCalledTimes(2);
+    // Come back to A: the LEFT key was evicted, so A is RE-walked (call 3)
+    // rather than served from a stale cached promise.
+    spacePath = "/tmp/alpha";
+    a.rerender();
+    await waitFor(() => expect(mockListSpaceFiles).toHaveBeenCalledTimes(3));
+    expect(mockListSpaceFiles).toHaveBeenLastCalledWith("/tmp/alpha");
+    a.unmount();
+  });
+
+  it("a_failed_file_listing_degrades_to_empty_and_a_remount_retries", async () => {
+    // A failed walk (a Space on a disconnected drive) degrades to the
+    // empty payload — no picker, Enter still sends — and the failed
+    // promise is NOT left cached, so a fresh consumer retries.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let fileCalls = 0;
+    mockListSpaceFiles.mockImplementation(() => {
+      fileCalls += 1;
+      return fileCalls === 1
+        ? Promise.reject(new Error("boom"))
+        : Promise.resolve({ entries: ["alpha.md"], truncated: false });
+    });
+    const a = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    expect(a.result.current.files).toEqual(EMPTY_FILES);
+    await waitFor(() => expect(errSpy).toHaveBeenCalledTimes(1));
+    expect(errSpy.mock.calls[0][0]).toContain("listSpaceFiles");
+    const b = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    await waitFor(() => expect(fileCalls).toBe(2));
+    await waitFor(() => expect(b.result.current.files.entries).toEqual(["alpha.md"]));
+    a.unmount();
+    b.unmount();
+    errSpy.mockRestore();
+  });
+
+  it("the_null_key_calls_the_file_listing_wrapper_with_null", async () => {
+    const a = renderHook(() => useMentionCatalogs(null));
+    await waitFor(() => expect(mockListSpaceFiles).toHaveBeenCalledWith(null));
+    await waitFor(() => expect(a.result.current.files).toEqual(EMPTY_FILES));
+    a.unmount();
+  });
+
+  it("a_warm_file_listing_keeps_its_truncated_flag", async () => {
+    // The cache stores the whole PAYLOAD, not just the row array: a warm
+    // read of a capped listing must still say `truncated` (the picker says
+    // so instead of lying about completeness).
+    mockListSpaceFiles.mockResolvedValue({
+      entries: ["a.md", "b.md"],
+      truncated: true,
+    });
+    const a = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    await waitFor(() => expect(a.result.current.files.truncated).toBe(true));
+    expect(a.result.current.files.entries).toEqual(["a.md", "b.md"]);
+    const b = renderHook(() => useMentionCatalogs("/tmp/alpha"));
+    await waitFor(() => expect(b.result.current.files.truncated).toBe(true));
+    expect(b.result.current.files.entries).toEqual(["a.md", "b.md"]);
+    expect(mockListSpaceFiles).toHaveBeenCalledTimes(1);
+    a.unmount();
+    b.unmount();
   });
 
   it("the_null_key_calls_both_wrappers_with_null", async () => {

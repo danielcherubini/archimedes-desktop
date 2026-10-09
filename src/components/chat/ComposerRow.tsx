@@ -10,16 +10,17 @@ import {
 import SessionConfigSelect from "../SessionConfigSelect";
 import AttachmentStrip from "./AttachmentStrip";
 import ComposerMentions, { type MentionRow } from "./ComposerMentions";
-import { activeMentionToken } from "../../lib/skills";
+import { activeMentionToken, type ComposerPrefix } from "../../lib/skills";
 import type { ChatComposerAttachment } from "../../lib/chatAttachments";
 import type { SessionConfigOption } from "../../lib/tauri";
 
 /**
- * The composer: the outer rounded box (drop target), the three-prefix
- * mention picker (`$` skills / `#` MCP servers / `@` agents), the
- * staged-attachment strip, the controlled textarea (with the three-prefix
- * mention-token `onChange` / `onKeyDown` logic — `$` skills / `#` MCP servers /
- * `@` agents) and the bottom toolbar row (the
+ * The composer: the outer rounded box (drop target), the four-prefix
+ * picker (`$` skills / `#` MCP servers / `@` agents — the three **Mention**
+ * prefixes — plus `?` File completion, ADR 0033), the
+ * staged-attachment strip, the controlled textarea (with the four-prefix
+ * token `onChange` / `onKeyDown` logic — `$` skills / `#` MCP servers /
+ * `@` agents / `?` paths) and the bottom toolbar row (the
  * `+` attach button, the context-usage bar, the model / thinking selectors
  * and the Send button).
  *
@@ -38,6 +39,7 @@ export default function ComposerRow({
   picker,
   setPicker,
   filtered,
+  note,
   activeIndex,
   selectMention,
   attachments,
@@ -61,11 +63,17 @@ export default function ComposerRow({
   composerRef: RefObject<HTMLTextAreaElement | null>;
   draft: string;
   setDraft: (value: string) => void;
-  picker: { prefix: "$" | "#" | "@"; query: string; index: number } | null;
+  picker: { prefix: ComposerPrefix; query: string; index: number } | null;
   setPicker: (
-    picker: { prefix: "$" | "#" | "@"; query: string; index: number } | null,
+    picker: {
+      prefix: ComposerPrefix;
+      query: string;
+      index: number;
+    } | null,
   ) => void;
   filtered: MentionRow[];
+  /** The picker's one explanation line (`?`'s cap notes) — NOT a row. */
+  note?: string;
   activeIndex: number;
   selectMention: (row: MentionRow) => void;
   attachments: ChatComposerAttachment[];
@@ -109,6 +117,7 @@ export default function ComposerRow({
       <ComposerMentions
         open={picker !== null}
         filtered={filtered}
+        note={note}
         activeIndex={activeIndex}
         onSelect={selectMention}
       />
@@ -117,9 +126,10 @@ export default function ComposerRow({
         ref={composerRef}
         value={draft}
         onChange={(e) => {
-          // The `$`/`#`/`@`-trigger: a bare prefix (empty token remainder)
-          // opens the picker with the FULL list for that prefix, any
-          // non-token span closes it.
+          // The `$`/`#`/`@`/`?`-trigger: a bare Mention glyph (empty token
+          // remainder) opens the picker with the FULL list for that prefix,
+          // a `?` needs ≥1 path char (ADR 0033 — what keeps `??` from
+          // opening), and any non-token span closes it.
           const token = activeMentionToken(
             e.target.value,
             e.target.selectionStart ?? e.target.value.length,

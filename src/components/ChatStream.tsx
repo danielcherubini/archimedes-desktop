@@ -14,7 +14,8 @@ import {
   setSessionConfigOption,
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
-import { activeMentionToken, expandMentions } from "../lib/skills";
+import { fuzzyMatch } from "../lib/fuzzy";
+import { activeMentionToken, expandMentions, type ComposerPrefix } from "../lib/skills";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
@@ -37,6 +38,21 @@ import MessageList from "./chat/MessageList";
 import ComposerRow from "./chat/ComposerRow";
 import ComposerModals, { WorkingIndicator } from "./chat/ComposerModals";
 import type { MentionRow } from "./chat/ComposerMentions";
+
+/**
+ * The cap on the picker's RENDERED rows (`filtered`) for the `?` File
+ * completion ONLY, independent of the backend's walk cap
+ * (`MAX_PICKER_ENTRIES` in `src-tauri/src/commands/files.rs`). The `?` branch
+ * filters with `fuzzyMatch` — a loose SUBSEQUENCE match — so a short query
+ * like `?e` can match nearly the whole listing (up to the walk cap), and
+ * thousands of `<button>`s re-rendered per keystroke is a real perf gap.
+ * Applied INSIDE the rows memo (never in the render), so `activeIndex`, the
+ * `% filtered.length` arrow-wrap and the DOM all see ONE bounded list.
+ *
+ * The three Mentions (`$` / `@` / `#`) are deliberately NOT capped — see the
+ * Mention branch of the rows memo.
+ */
+const MAX_PICKER_ROWS = 100;
 
 export default function ChatStream() {
   const activeSessionId = useSessions((s) => s.activeSessionId);
@@ -378,8 +394,9 @@ export default function ChatStream() {
     return () => window.removeEventListener("resize", apply);
   }, [draft]);
 
-  // --- The three-prefix mention picker (`$` skills / `#` MCP servers /
-  // `@` agents) + the send-path expansion. ---
+  // --- The four-prefix picker (`$` skills / `#` MCP servers / `@` agents —
+  // the three Mentions — plus `?` File completion, ADR 0033) + the send-path
+  // expansion (which the `?` prefix never enters). ---
   // ALL of the hooks below live in the UNCONDITIONAL top block (before the
   // `!activeSessionId` early return further down) — placing any of them after
   // the early return would change the hook count across the session/no-session
@@ -396,28 +413,61 @@ export default function ChatStream() {
   const spacePath = liveSession?.cwd ?? historySession?.cwd ?? null;
   // The MCP catalog FETCH is deliberately NOT gated on `mcpMentionsEnabled`
   // (a cheap config read; gating it would make a live toggle need a remount).
-  const { skills, agents, mcpServers } = useMentionCatalogs(spacePath);
-  // The `$`/`#`/`@`-trigger picker state (the active token (incl. its prefix)
-  // + the highlighted row).
+  const { skills, agents, mcpServers, files } = useMentionCatalogs(spacePath);
+  // The `$`/`#`/`@`/`?`-trigger picker state (the active token (incl. its
+  // prefix) + the highlighted row). The three Mention prefixes expand into a
+  // block on send; `?` is File completion and expands nothing (ADR 0033).
   const [picker, setPicker] = useState<{
-    prefix: "$" | "#" | "@";
+    prefix: ComposerPrefix;
     query: string;
     index: number;
   } | null>(null);
-  // The catalog rows matching the active token (case-insensitive substring on
-  // the NAME — v1: name only, not description). `picker?.query ?? ""` yields
+  // The catalog rows matching the active token. The three Mention prefixes
+  // filter case-insensitively on a NAME SUBSTRING (v1: name only, not
+  // description); `?` filters with `fuzzyMatch` — a SUBSEQUENCE match —
+  // because a path query is path-SHAPED (`src/comp/Form` must reach
+  // `src/components/Formula.tsx`). `picker?.query ?? ""` yields
   // the full list while the picker is null (harmless — the picker UI is gated
-  // on `picker && filtered.length > 0`). NULL-SAFE: the `picker` state is
+  // on `open && (filtered.length > 0 || note)` in `ComposerMentions`, and
+  // `open` is the `picker` state, so a null picker renders nothing either
+  // way). NULL-SAFE: the `picker` state is
   // `{…} | null` and this `useMemo` lives in the unconditional top block, so a
   // bare `picker.query` would be a TS18047 compile error under `strict: true`
   // (and a `picker!` "fix" would crash at render whenever the picker is
   // closed, i.e. nearly every render).
-  const filtered = useMemo(() => {
+  // Returns the bounded rows AND the UNBOUNDED match count (the "too many
+  // matches" note needs to know the cap actually trimmed something).
+  const pickerRows = useMemo(() => {
     // ONE picker, filtered to the ACTIVE prefix's catalog only (a `$`/`#`/`@`
     // never mixes in one open list): map the matching catalog to `MentionRow`
     // (skills/agents carry `description`, the MCP servers carry their one-line
-    // `summary`).
+    // `summary`, the `?` rows carry the relative path as the name and its
+    // basename as the secondary line).
     const prefix = picker?.prefix ?? "$";
+    // STALE-TOKEN GUARD — what it actually protects (the hazards are easy to
+    // overstate). The `picker` state is only recomputed in the textarea's
+    // `onChange`/`onKeyDown`, so it can outlive the token it was derived from.
+    // The case that matters: `send()` clears the draft but NEVER clears
+    // `picker`, so on the pre-`?` code the picker VISUALLY RESURRECTED over an
+    // emptied composer (and a catalog that landed afterwards — an in-flight
+    // `listSpaceFiles`, ADR 0033's degradation path — re-fed it rows). The
+    // Send button never passes through the keydown recompute at ALL, so this
+    // guard is the only thing standing between a cleared draft and a picker
+    // rendered on screen. THE LAYERING: this memo guard owns RENDERING (no
+    // rows, no note); the keydown recompute in `ComposerRow` owns KEYS — it
+    // re-derives the token from the caret on EVERY keydown and, with the token
+    // gone, closes the picker AND sends on Enter, so Enter never "inserts" on a
+    // cleared draft even without this guard. Deliberately NOT handled by
+    // `setPicker(null)` in `send()`: that would be redundant (this guard is
+    // strictly more general — any stale token, not just the send path), and the
+    // `draft` dep below is free (the memo already re-derives per keystroke via
+    // `picker`). The test itself is cheap and sound: `<prefix><query>` is by
+    // construction a literal substring of the draft while the token is intact,
+    // so its absence means the state is stale. DOM- and caret-free on purpose:
+    // a ref read inside a `useMemo` is invisible to the dep graph.
+    if (picker && !draft.includes(`${picker.prefix}${picker.query}`)) {
+      return { rows: [], matched: 0, live: false };
+    }
     // The `#` gate: with the trigger off, the MCP catalog is EMPTY, so `#`
     // yields no rows → the picker renders nothing and the keyboard branches
     // (gated on `filtered.length > 0`) never intercept a key — Enter still
@@ -425,6 +475,26 @@ export default function ChatStream() {
     // re-derives the rows LIVE (no remount, and the catalog FETCH is not
     // gated — see the `mcpMentionsEnabled` note above).
     const mcpCatalog = mcpMentionsEnabled ? mcpServers : [];
+    const query = picker?.query ?? "";
+    // `?` is File completion (ADR 0033) — the ONE non-Mention prefix, listed
+    // FIRST so it never falls through to the skills catalog. The `key` carries
+    // the trigger (`?` + path) because a path and a skill name could otherwise
+    // collide; `description` is the BASENAME (a path is long and the folder is
+    // already in the primary line and the query).
+    if (prefix === "?") {
+      const fileRows: MentionRow[] = files.entries
+        .map((p) => ({
+          key: `?${p}`,
+          prefix: "?" as const,
+          name: p,
+          description: basenameOfPath(p),
+        }))
+        .filter((r) => fuzzyMatch(query, r.name));
+      const matched = fileRows.length;
+      // The cap lives HERE, on the `?` branch alone: this is the one catalog
+      // whose filter is a loose subsequence over an unbounded listing.
+      return { rows: fileRows.slice(0, MAX_PICKER_ROWS), matched, live: true };
+    }
     const rows: MentionRow[] =
       prefix === "#"
         ? mcpCatalog.map((s) => ({
@@ -446,16 +516,56 @@ export default function ChatStream() {
               name: s.name,
               description: s.description,
             }));
-    return rows.filter((r) =>
-      r.name.toLowerCase().includes((picker?.query ?? "").toLowerCase()),
+    const matchedRows = rows.filter((r) =>
+      r.name.toLowerCase().includes(query.toLowerCase()),
     );
-  }, [skills, agents, mcpServers, mcpMentionsEnabled, picker]);
+    // NO render cap here — deliberately, and NOT an oversight. The cap exists
+    // for `?`'s unbounded SUBSEQUENCE filter over a 5,000-entry listing; the
+    // Mention catalogs are name-SUBSTRING filters over the (small, user-owned)
+    // skills / agents / MCP catalogs, and this branch keeps the shipped status
+    // quo BYTE-IDENTICAL to before File completion. Capping it here would make
+    // row 101 unreachable forever with no explanation — a silent behavior
+    // change to a surface this feature promised not to touch. It would also
+    // need its own note (the note below is `?`-only), so the Mention side is
+    // UNCAPPED rather than silently capped; if we ever want a cap there, it
+    // deserves its own change with its own note and tests.
+    return { rows: matchedRows, matched: matchedRows.length, live: true };
+    // `files` is a DEP for the same reason `agents`/`mcpServers` are: a Space
+    // switch (or a late first listing) must re-derive the rows LIVE, with no
+    // extra keystroke.
+  }, [skills, agents, mcpServers, files, mcpMentionsEnabled, picker, draft]);
+  const filtered = pickerRows.rows;
+  // The picker's one explanation line (never a row — see `ComposerMentions`).
+  // Only ever for `?`: the only catalog that is bounded twice over (the walk
+  // cap, then the render cap) — the Mention branch is uncapped and note-free.
+  // PRECEDENCE: "too many matches" SHADOWS "listing capped" when both hold
+  // (both true: the walk hit its cap AND the query still matched more than we
+  // render), because the render cap is what the user is hitting right now and
+  // "keep typing" is actionable for it; the walk cap is invisible below it.
+  // WHY THE TWO ARMS' ADVICE DIFFERS: the render cap trims ROWS but every
+  // match is still IN the listing, so narrowing genuinely reveals it — hence
+  // "keep typing". The walk cap trims the LISTING itself, and the walk is
+  // deterministic (`sort_by_file_name`), so it holds the alphabetically-FIRST
+  // 5,000 entries: a truncated-away file is unreachable no matter what you
+  // type (and this arm renders ALONE only when the query already matched
+  // ≤ MAX_PICKER_ROWS, i.e. when the list is already narrow). So it states the
+  // LIMITATION instead of giving advice that cannot help.
+  const pickerNote =
+    picker?.prefix === "?" && pickerRows.live
+      ? pickerRows.matched > MAX_PICKER_ROWS
+        ? `Too many matches — keep typing to narrow the list`
+        : files.truncated
+          ? `File listing capped — some files may be missing`
+          : undefined
+      : undefined;
   // The highlighted row index, DERIVED (not clamped in place): the raw
   // `picker.index` can go stale (a Space switch refetches `skills` while the
   // picker is open with a non-zero `index`), and `filtered[staleIndex]` would
   // be `undefined` → a `selectMention(undefined)` crash on Enter (the rows are
-  // `MentionRow`s). `Math.max(0, …)` is belt-and-braces: the picker UI and the keyboard branch are both guarded
-  // by `filtered.length > 0`, so `filtered.length - 1` is ≥ 0 there.
+  // `MentionRow`s). `Math.max(0, …)` is belt-and-braces: the KEYBOARD branch
+  // that consumes this index is gated on `filtered.length > 0`, so
+  // `filtered.length - 1` is ≥ 0 there (the picker's RENDER gate is wider —
+  // `rows || note` — but a note-only picker has no row to highlight).
   const activeIndex = picker
     ? Math.min(picker.index, Math.max(0, filtered.length - 1))
     : 0;
@@ -884,12 +994,12 @@ export default function ChatStream() {
     setAttachments(next);
   };
 
-  // Select a mention from the `$`/`#`/`@`-trigger picker: replace the active
-  // token (the `$`/`#`/`@`-prefixed span at the caret — the shared
-  // `activeMentionToken` helper) with `<prefix><name> ` (LOWER-cased — the
-  // case policy: a picker-selected mention ALWAYS expands on send, and the
-  // mention regex is lowercase-only; the expansion keeps the catalog name
-  // verbatim in the block's `name` attribute). The `requestAnimationFrame`
+  // Select a row from the `$`/`#`/`@`/`?`-trigger picker: replace the active
+  // token (the prefixed span at the caret — the shared `activeMentionToken`
+  // helper) with `<prefix><name> ` (LOWER-cased — the Mention case policy: a
+  // picker-selected mention ALWAYS expands on send, and the mention regex is
+  // lowercase-only; the expansion keeps the catalog name verbatim in the
+  // block's `name` attribute). The `requestAnimationFrame`
   // re-focus + caret-set is REQUIRED: `setDraft` re-renders the controlled
   // textarea, which would otherwise drop focus/caret.
   const selectMention = (row: MentionRow) => {
@@ -898,7 +1008,16 @@ export default function ChatStream() {
     const caret = el?.selectionStart ?? draft.length;
     const token = activeMentionToken(draft, caret);
     if (!token) return;
-    const inserted = `${row.prefix}${row.name.toLowerCase()} `;
+    // The insertion policy splits on the prefix (ADR 0033): a `?` row inserts
+    // the PATH ALONE — the trigger is CONSUMED (the splice below already
+    // removed it) and the case is PRESERVED (`?REA` → `README.md`) because the
+    // insertion is VERBATIM — no lowercasing rule applies to a path, so the
+    // Mention lowercase-only rule does not apply. The inserted path is then
+    // ordinary draft text and obeys the mention grammar exactly like
+    // hand-typed text (ADR 0033). The three Mention prefixes keep the
+    // lowercased token.
+    const inserted =
+      row.prefix === "?" ? `${row.name} ` : `${row.prefix}${row.name.toLowerCase()} `;
     const next = draft.slice(0, token.start) + inserted + draft.slice(caret);
     setPicker(null);
     setDraft(next);
@@ -985,6 +1104,7 @@ export default function ChatStream() {
         picker={picker}
         setPicker={setPicker}
         filtered={filtered}
+        note={pickerNote}
         activeIndex={activeIndex}
         selectMention={selectMention}
         attachments={attachments}

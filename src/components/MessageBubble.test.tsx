@@ -423,4 +423,77 @@ describe("MessageBubble", () => {
       expect(screen.queryByText("named by the user")).toBeNull();
       expect(screen.queryByRole("button")).toBeNull();
     });
+
+
+  // --- ADR 0033: a `?` File-completion path renders VERBATIM (no chip, no
+  // card, nothing stripped). The pin for the OTHER half of the split — the
+  // picker shares `MentionRow`/`selectMention` with the three Mentions, so the
+  // risk is drift into the DISPLAY path as much as into `expandMentions`. The
+  // block-rendering tests above are deliberately left untouched: they are the
+  // positive control that the chip/card path still works, and this one is the
+  // negative control that `?` never enters it.
+
+  it("a user message containing a ? path renders VERBATIM with no chip and no card", () => {
+    // The persisted text is what `send()` wrote — i.e. `expandMentions` output.
+    // Fed through the REAL expander with every catalog populated (a `readme`
+    // entry in all three, so a `?`-aware expansion would have produced a block
+    // to render here), so this pins the END-TO-END display consequence rather
+    // than a hand-written string.
+    const drafts = [
+      "read ?README.md",
+      "~/.bashrc",
+      "/etc/hosts",
+      "?? file",
+      "a?.b",
+      "x ? y : z",
+    ];
+    for (const draft of drafts) {
+      const message: Message = {
+        kind: "user",
+        text: expandMentions(draft, {
+          skills: [makeSkill({ name: "readme" }), makeSkill({ name: "file" })],
+          agents: [makeAgent({ name: "readme" }), makeAgent({ name: "file" })],
+          mcpServers: [makeMcp({ name: "readme" }), makeMcp({ name: "file" })],
+        }),
+        at: 1,
+      };
+      const { container, unmount } = render(<MessageBubble message={message} />);
+      // The text is the draft byte-for-byte — no chip replaced it, no path was
+      // stripped or rewritten (compare with the chip tests above, where the
+      // token stays in the text AND a row appears beside it).
+      expect(screen.getByText(draft)).toBeTruthy();
+      // No chip, no collapsible card, no soft-hint suffix, no button at all.
+      expect(screen.queryByText("named by the user")).toBeNull();
+      expect(screen.queryByText("Skill")).toBeNull();
+      expect(screen.queryByText("Agent")).toBeNull();
+      expect(screen.queryByText("MCP")).toBeNull();
+      expect(screen.queryByRole("button")).toBeNull();
+      expect(container.querySelectorAll(".bg-input")).toHaveLength(0);
+      // And no file CONTENTS leaked into the bubble — the security half of the
+      // invariant: the composer inserts a path, the agent opens it.
+      expect(container.textContent).toBe(draft);
+      unmount();
+    }
+  });
+
+  it("a ? path alongside a real Mention renders the chip AND the untouched path", () => {
+    // The split, on the display side: the `@` chip appears while the `?` path
+    // stays in the user's text exactly as typed.
+    const message: Message = {
+      kind: "user",
+      text: expandMentions("ask @scout about ?README.md", {
+        skills: [makeSkill()],
+        agents: [makeAgent()],
+        mcpServers: [makeMcp()],
+      }),
+      at: 1,
+    };
+    const { container } = render(<MessageBubble message={message} />);
+    expect(screen.getByText("ask @scout about ?README.md")).toBeTruthy();
+    expect(screen.getByText("Agent")).toBeTruthy();
+    expect(screen.getByText("named by the user")).toBeTruthy();
+    // ONE row — the agent chip. The `?` path produced no row of its own.
+    expect(container.querySelectorAll(".bg-input")).toHaveLength(1);
+    expect(screen.queryByText("readme")).toBeNull();
+  });
 });

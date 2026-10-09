@@ -504,6 +504,14 @@ export interface SkillInfo {
   body: string;
 }
 
+/** One `?` file-completion listing (camelCase over IPC — the Rust `FileListDto`). */
+export interface FileListDto {
+  /** Paths RELATIVE to the Space root, `/`-separated, sorted. */
+  entries: string[];
+  /** The walk hit `MAX_PICKER_ENTRIES` — the picker says so instead of lying. */
+  truncated: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Commands (invoke)
 // ---------------------------------------------------------------------------
@@ -697,6 +705,15 @@ export async function listAgentDefinitionsForSpace(spacePath: string | null): Pr
 /** The effective MCP servers for a Space (`null` = user-level only). */
 export async function listMcpServersEffective(spacePath: string | null): Promise<McpServerInfo[]> {
   return invoke<McpServerInfo[]>("list_mcp_servers_effective", { cwd: spacePath ?? null });
+}
+
+/**
+ * The file listing a Space offers the `?` path completion (ADR 0033 — a
+ * PATH is inserted, never the contents). `null` = no Space: the Rust
+ * command degrades to the empty listing rather than erroring.
+ */
+export async function listSpaceFiles(spacePath: string | null): Promise<FileListDto> {
+  return invoke<FileListDto>("list_space_files", { spacePath: spacePath ?? null });
 }
 
 // ---------------------------------------------------------------------------
