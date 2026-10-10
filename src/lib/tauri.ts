@@ -512,6 +512,37 @@ export interface FileListDto {
   truncated: boolean;
 }
 
+/**
+ * One row of an out-of-Space **Directory completion** (ADR 0035 — the Rust
+ * `CompletionEntryDto`). The three strings differ on purpose: `name` is what the
+ * renderer filters, `display` is what it shows (`~/…` when under the home
+ * directory), and `insert` is the ABSOLUTE path that lands in the draft —
+ * NOTHING in this app expands a tilde, so the abbreviation is display-only and
+ * must never be inserted.
+ */
+export interface CompletionEntryDto {
+  /** The entry's own name, no trailing separator (what the filter matches). */
+  name: string;
+  /** ABSOLUTE, `/`-separated — this is what lands in the draft. */
+  insert: string;
+  /** `~/…` when under the home directory, else the same as `insert`. */
+  display: string;
+  /** A directory: the row descends (and keeps the `?`) instead of finishing. */
+  isDir: boolean;
+}
+
+/**
+ * ONE directory's worth of completion rows (ADR 0035 — the Rust
+ * `CompletionDirDto`). The whole directory comes back UNFILTERED so the renderer
+ * keeps filtering synchronously and a fetch happens only when the token's
+ * DIRECTORY part changes.
+ */
+export interface CompletionDirDto {
+  entries: CompletionEntryDto[];
+  /** The cap trimmed the directory — the picker says so instead of lying. */
+  truncated: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Commands (invoke)
 // ---------------------------------------------------------------------------
@@ -714,6 +745,25 @@ export async function listMcpServersEffective(spacePath: string | null): Promise
  */
 export async function listSpaceFiles(spacePath: string | null): Promise<FileListDto> {
   return invoke<FileListDto>("list_space_files", { spacePath: spacePath ?? null });
+}
+
+/**
+ * The out-of-Space `?` rows for ONE directory (ADR 0035 — a `~/-`- or
+ * drive-rooted token), never a walk. `null` = no out-of-Space token open.
+ *
+ * `null` is PASSED THROUGH as `{ query: null }`, exactly as `listSpaceFiles`
+ * passes `spacePath: null` (pinned in `src/lib/tauri.test.ts`), and the command
+ * never rejects — it degrades to the empty listing. Do NOT add a client-side
+ * short-circuit: the Rust `None` arm already touches no filesystem at all, and a
+ * short-circuit here would move that guarantee out of the one place a Rust test
+ * can see it, for no gain.
+ */
+export async function listCompletionEntries(
+  query: string | null,
+): Promise<CompletionDirDto> {
+  return invoke<CompletionDirDto>("list_completion_entries", {
+    query: query ?? null,
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -2,14 +2,28 @@ import { describe, expect, it } from "vitest";
 import {
   activeMentionToken,
   activeSkillToken,
+  dirPartOfOutsideQuery,
   expandMentions,
   expandSkillMentions,
+  isOutsideSpaceQuery,
   splitMentionBlocks,
   splitSkillBlocks,
   type MentionCatalogs,
 } from "./skills";
 import type { AgentDefinitionDto, McpServerInfo, SkillInfo } from "./tauri";
-import { fuzzyMatch } from "./fuzzy";
+
+// NOTE on the picker's TWO FILTERS (the substring side vs the `?` subsequence
+// side). This file used to pin that split by reading `ChatStream.tsx` with
+// `readFileSync`, lifting the picker's `.filter(...)` predicates out of the
+// source text and running them through `new Function`. That pin is GONE: it was
+// a landmine (a local rename in `ChatStream.tsx` threw at module scope and took
+// the whole file to zero tests run) with no detection value the component tests
+// did not already have. The guarantee it existed to defend — the three Mention
+// prefixes filter on a case-insensitive name SUBSTRING while BOTH `?` arms
+// filter with `fuzzyMatch`, a SUBSEQUENCE — is now pinned where the filters are
+// observable: the "the picker's two filters" group at the bottom of
+// `src/components/ChatStream.test.tsx`. A `fuzzyMatch` import is therefore no
+// longer needed here, and `noUnusedLocals` would (correctly) say so.
 
 /** A full `SkillInfo` with `debug` defaults; override any field. */
 function makeSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
@@ -615,40 +629,360 @@ describe("activeMentionToken — the ? file-path token (ADR 0033)", () => {
     });
   });
 
-  it("a_tilde_never_makes_a_token (ADR 0033: no home-expansion semantics)", () => {
-    // `~` is genuinely OUTSIDE the `?` charset, so the original `?~/.bashrc`
-    // sketch cannot even form a token — no picker opens.
+  it("a_bare_tilde_is_null_but_a_tilde_slash_path_is_an_out_of_Space_token", () => {
+    // ADR 0035 SUPERSEDES this file's ADR 0033 tilde pin.
+    // REWRITTEN ON PURPOSE — this is the ONE pre-existing pin this change
+    // reverses, so it is rewritten here rather than left to go red silently.
+    // ADR 0033 said `~` was outside the `?` charset entirely, so `?~/.bashrc`
+    // could not even form a token. ADR 0035 admits `~/`-rooted paths, because a
+    // tilde path is precisely the "not here" gesture the out-of-Space picker is
+    // for. What SURVIVES is the first case: a BARE `~` still opens nothing, since
+    // the absolute root is `~/` and `~` alone is not in the relative charset
+    // either. And nothing here EXPANDS a tilde — the grammar merely forms the
+    // token; the insertion stays verbatim and the mode is derived from the
+    // remainder by `isOutsideSpaceQuery`, never from the grammar (ADR 0035).
     expect(activeMentionToken("?~", 2)).toBeNull();
-    expect(activeMentionToken("?~/.bashrc", 10)).toBeNull();
+    expect(activeMentionToken("?~/.bashrc", 10)).toEqual({
+      prefix: "?",
+      remainder: "~/.bashrc",
+      start: 0,
+    });
+    expect(isOutsideSpaceQuery("~/.bashrc")).toBe(true);
   });
 
-  it("a leading slash IS a token — the scope guarantee lives in the catalog, not the grammar", () => {
-    // PINNED DELIBERATELY, and it reads against a naive reading of the v1
-    // non-goal on purpose. `/` is IN the `?` charset (`FILE_TOKEN_RE` allows
-    // `. _ /` and case), so `?/etc/hosts` DOES form a token and the picker DOES
-    // open. It lists nothing relevant because every row comes from the
-    // Space-relative walk (ADR 0033) — the SCOPE promise is enforced by WHICH
-    // entries exist, NOT by rejecting the query. An absolute query is therefore
-    // harmless-but-not-rejected: do not add a grammar branch to "fix" it, and
-    // do not describe it as rejected (the roadmap's non-goals line states the
-    // promise the code actually keeps).
+  it("a leading slash IS a token (and since ADR 0035 it means: leave the Space)", () => {
+    // THE ASSERTION IS PRE-ADR-0033 AND STILL TRUE — `/` has always been in the
+    // `?` charset, so `?/etc/hosts` forms a token and the picker opens. What
+    // CHANGED is what that token MEANS, and this comment used to forbid the
+    // shipped answer to it: it claimed the SCOPE guarantee lives in the catalog
+    // and not the grammar, that an absolute query "lists nothing relevant" because
+    // every row comes from the Space-relative walk, and — outright — "do not add a
+    // grammar branch to 'fix' it". ADR 0035 added exactly such a branch, so that
+    // advice now contradicts the code it sits next to, which is worse than no
+    // comment at all. Today's rule, in one line: the GRAMMAR decides SCOPE. A
+    // remainder beginning `/`, `~/` or a drive root is a **Directory completion**
+    // and reads ONE directory outside the Space (`isOutsideSpaceQuery` is that
+    // decision, and the composer branches on it); anything else stays a **Listing**
+    // query. So `?/etc/hosts` no longer "lists nothing relevant" — it lists
+    // `/etc`. The property this test was really protecting survives intact and is
+    // the reason it stays: an absolute path is RECOGNISED, never rejected, so the
+    // charset never silently eats a path the user typed.
     expect(activeMentionToken("?/etc/hosts", 11)).toEqual({
       prefix: "?",
       remainder: "/etc/hosts",
       start: 0,
     });
+    expect(isOutsideSpaceQuery("/etc/hosts")).toBe(true);
   });
 
-  it("a dot run IS a token (the charset allows `.`; traversal is bounded by scope)", () => {
-    // Same reasoning: `.` is in the charset because dot-FILES (`.gitignore`,
-    // `.env`) are real completion targets, so `?..` forms a token. Nothing
-    // escapes the Space because the picker offers only Space-relative entries —
-    // again a catalog-side guarantee, not a grammar one.
+  it("a dot run IS a token (the charset allows `.`; a RELATIVE one stays in the Space)", () => {
+    // `.` is in the charset because dot-FILES (`.gitignore`, `.env`) are real
+    // completion targets, so `?..` forms a token. It is a RELATIVE token — no
+    // leading `/`, no `~/`, no drive root — so `isOutsideSpaceQuery` says false and
+    // the rows come from the Space **Listing**, which is where the "nothing
+    // escapes" guarantee still lives for THIS shape. Do not read that as the whole
+    // scope rule: since ADR 0035 the grammar decides scope, and an absolute
+    // remainder (`/../secrets`, `/home/u/../secrets`) deliberately names anywhere —
+    // the **Boundary** canonicalises at gate time and the Beyond-boundary policy
+    // decides what the agent may then read (ADR 0035 records that refusal to treat
+    // `..` as a traversal gesture).
     expect(activeMentionToken("?..", 3)).toEqual({
       prefix: "?",
       remainder: "..",
       start: 0,
     });
+    expect(isOutsideSpaceQuery("..")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The OUT-OF-SPACE `?` token (ADR 0035): two shapes, one prefix.
+//
+// Every case below is the "just typed it, caret at the end" state, which is the
+// only state the composer ever asks about. Two notes on how to READ these
+// assertions: (a) `?/etc` already formed a token BEFORE this change — `/` has
+// always been in the relative charset — so asserting alone that something is
+// recognised is vacuous for a `/`-rooted case; the load-bearing assertion is
+// the MODE, i.e. `isOutsideSpaceQuery(remainder)`. (b) `activeMentionToken`'s
+// return shape is deliberately UNCHANGED: the mode is derived from `remainder`
+// downstream, never returned by the grammar.
+// ---------------------------------------------------------------------------
+describe("activeMentionToken — the out-of-Space ? token (ADR 0035)", () => {
+  /** `activeMentionToken` at the end of the text. `text.length` rather than a
+   *  hand-counted literal: half these strings contain a space or a `~`, and a
+   *  miscounted caret would quietly test the wrong span. */
+  const atEnd = (text: string) => activeMentionToken(text, text.length);
+
+  // --- the RELATIVE shape is untouched, and is explicitly NOT out-of-Space ---
+
+  it("a_relative_token_is_recognised_and_stays_inside_the_Space", () => {
+    expect(atEnd("?README")).toEqual({
+      prefix: "?",
+      remainder: "README",
+      start: 0,
+    });
+    expect(isOutsideSpaceQuery("README")).toBe(false);
+    expect(atEnd("?src/comp/Form")).toEqual({
+      prefix: "?",
+      remainder: "src/comp/Form",
+      start: 0,
+    });
+    expect(isOutsideSpaceQuery("src/comp/Form")).toBe(false);
+  });
+
+  // --- the absolute shape: the ROOT plus the WHOLE tail ----------------------
+
+  it("a_leading_slash_carries_the_whole_remainder_not_just_the_root", () => {
+    // ⚠ THE GROUP-2 TRAP, pinned. `activeMentionToken` returns capture group 2,
+    // so group 2 must wrap the root AND the tail. Write the regex as
+    // `\?(~?\/|[A-Za-z]:\/)[^\n?]*$` — root alternation as the ONLY group — and
+    // this assertion reddens with remainder `"/"`: the query is silently
+    // discarded and every out-of-Space fetch asks for the root directory. The
+    // shape that ships is `\?((?:~?\/|[A-Za-z]:\/)[^\n?]*)$`.
+    expect(atEnd("?/etc/pas")).toEqual({
+      prefix: "?",
+      remainder: "/etc/pas",
+      start: 0,
+    });
+    expect(atEnd("?/etc/pas")!.remainder).not.toBe("/");
+    expect(isOutsideSpaceQuery("/etc/pas")).toBe(true);
+  });
+
+  it("a_lone_slash_is_a_token_that_names_the_root_directory", () => {
+    // ADR 0035's consequence: `?/` now LISTS `/` instead of offering nothing.
+    expect(atEnd("?/")).toEqual({ prefix: "?", remainder: "/", start: 0 });
+    expect(isOutsideSpaceQuery("/")).toBe(true);
+  });
+
+  it("a_tilde_slash_path_is_a_token_carrying_the_full_remainder", () => {
+    // The other half of the group-2 trap: `~/` is the root, so a buggy group 2
+    // would return `~/` here and throw away `config/ht`.
+    expect(atEnd("?~/.config/ht")).toEqual({
+      prefix: "?",
+      remainder: "~/.config/ht",
+      start: 0,
+    });
+    expect(atEnd("?~/.config/ht")!.remainder).not.toBe("~/");
+    expect(isOutsideSpaceQuery("~/.config/ht")).toBe(true);
+  });
+
+  it("an_absolute_token_admits_spaces_because_a_real_path_can_contain_them", () => {
+    // macOS `~/Library/Application Support/…` and most Windows profile paths.
+    // Selecting a DIRECTORY row keeps the `?`, so a space that could not be
+    // typed would strand the descent after one level, permanently.
+    expect(atEnd("?~/Library/Application Support/Font")).toEqual({
+      prefix: "?",
+      remainder: "~/Library/Application Support/Font",
+      start: 0,
+    });
+    expect(isOutsideSpaceQuery("~/Library/Application Support/Font")).toBe(true);
+  });
+
+  it("a_windows_drive_root_is_a_token (invisible-to-CI Windows descent)", () => {
+    // This parses on Linux even though Linux has no such path, and that IS the
+    // point: ubuntu CI can never execute the Windows case, so the grammar is
+    // pinned on a platform where it is merely syntax. On Windows `~/` expands to
+    // `C:\Users\you`, a directory row inserts `C:/Users/you/…` with the `?`
+    // kept, and without `[A-Za-z]:/` in the root that kept token could not
+    // continue — descent would die after exactly one level.
+    expect(atEnd("?C:/Users/you/")).toEqual({
+      prefix: "?",
+      remainder: "C:/Users/you/",
+      start: 0,
+    });
+    expect(isOutsideSpaceQuery("C:/Users/you/")).toBe(true);
+  });
+
+  // --- what must NOT form a token ------------------------------------------
+
+  it("another_users_home_cannot_even_be_typed (the `~user` gap is a GRAMMAR gap)", () => {
+    // The absolute root requires `~/`, and the RELATIVE charset has no `~` at
+    // all, so `~user` is not a token: no picker opens. ADR 0035 accepts the gap
+    // (supporting it would invite a walk of `/home`) — and this pin is what
+    // makes "unreachable" mean "untypeable" rather than "typed and broken".
+    expect(atEnd("?~user/x")).toBeNull();
+  });
+
+  it("a_tilde_anywhere_else_in_the_token_is_not_a_token_at_all", () => {
+    // `~` lives in the absolute shape's ROOT and nowhere else — it is NOT in the
+    // relative charset — so `?a~b` forms NOTHING (not "a relative token": a
+    // pick can never be offered, so no picker opens to mislead).
+    expect(atEnd("?a~b")).toBeNull();
+  });
+
+  it("a_relative_token_still_refuses_a_space (prose is not eaten)", () => {
+    // The asymmetry is the whole design: spaces belong to the ABSOLUTE shape
+    // only, because `?foo bar` must not swallow the sentence.
+    expect(atEnd("?foo bar")).toBeNull();
+  });
+
+  it("a_bare_glyph_still_opens_nothing (Enter must still send)", () => {
+    // `[^\n?]` is what keeps `??` — git-status porcelain — from opening the
+    // picker and turning Enter into an insertion instead of a send.
+    expect(atEnd("?")).toBeNull();
+    expect(atEnd("??")).toBeNull();
+    expect(atEnd("what about ~")).toBeNull(); // prose carrying a tilde is not a token
+    expect(atEnd("?~")).toBeNull();
+  });
+
+  it("the_boundary_regressions_survive_the_second_shape", () => {
+    // The `(^|\s)` left boundary is shared by BOTH shapes, so optional chaining,
+    // a ternary operator and a URL query all stay un-tokenised.
+    expect(atEnd("a?.b")).toBeNull();
+    expect(atEnd("x ? y")).toBeNull();
+    expect(atEnd("url?query")).toBeNull();
+  });
+
+  it("one_absolute_token_never_swallows_a_later_question_mark", () => {
+    // `[^\n?]` bounds the tail: the token is the LAST one, and its remainder
+    // cannot contain a second `?` (which would put the sigil inside a path).
+    const tok = atEnd("?/a/b ?/c");
+    expect(tok).toEqual({ prefix: "?", remainder: "/c", start: 6 });
+    expect(tok!.remainder).not.toContain("?");
+  });
+
+  it("a_token_does_not_survive_a_newline", () => {
+    // The newline is a boundary the same way whitespace is (no `m` flag needed:
+    // `\s` includes it), and a token never extends ACROSS a break.
+    expect(atEnd("line one\n?~/notes")).toEqual({
+      prefix: "?",
+      remainder: "~/notes",
+      start: 9,
+    });
+    expect(atEnd("?~/a\nb")).toBeNull();
+  });
+
+  // --- the Mention prefixes still win ---------------------------------------
+
+  it("a_Mention_glyph_still_wins_and_a_glyph_after_a_question_forms_nothing", () => {
+    // The Mention regex is tried FIRST and is unchanged, so `$` / `@` / `#`
+    // recognition is byte-identical — including after an absolute token, where
+    // the new shape COULD have reached back and eaten the span.
+    expect(atEnd("$de")).toEqual({ prefix: "$", remainder: "de", start: 0 });
+    expect(atEnd("@sc")).toEqual({ prefix: "@", remainder: "sc", start: 0 });
+    expect(atEnd("#po")).toEqual({ prefix: "#", remainder: "po", start: 0 });
+    expect(atEnd("?/etc/pas @sc")).toEqual({
+      prefix: "@",
+      remainder: "sc",
+      start: 10,
+    });
+    expect(atEnd("? $de")).toEqual({ prefix: "$", remainder: "de", start: 2 });
+    // `?@x` / `?#y`: neither shape matches — the `(^|\s)` boundary fails for the
+    // Mention (a `?` is not whitespace) and the absolute root needs `/`.
+    expect(atEnd("?@x")).toBeNull();
+    expect(atEnd("?#y")).toBeNull();
+  });
+});
+
+describe("dirPartOfOutsideQuery — the directory a ? token names (ADR 0035)", () => {
+  // The cache KEY, and therefore the ONE directory the renderer reads. ONE rule
+  // — the whole remainder, cut at its last `/` — and the reason it is that rule
+  // and not "up to the last `/` before the first space": a DIRECTORY row inserts
+  // its absolute path verbatim, so a token naming
+  // `/home/u/Library/Application Support/` must key on THAT directory or the
+  // spaced directory cannot be descended into at all. The cost of the rule (a
+  // `/` in trailing prose extends the read to a directory that cannot exist) is
+  // pinned below as a cost, and `ChatStream.test.tsx` pins both halves of the
+  // trade end to end.
+  it("the directory is the remainder up to and including its last /", () => {
+    for (const [remainder, dir] of [
+      ["~/.config/ht", "~/.config/"],
+      ["~/notes", "~/"],
+      ["/etc/pas", "/etc/"],
+      ["/", "/"],
+      ["C:/Users/you/pro", "C:/Users/you/"],
+      // A trailing `/` is already the whole directory.
+      ["~/notes/", "~/notes/"],
+    ] as const) {
+      expect(dirPartOfOutsideQuery(remainder)).toBe(dir);
+    }
+  });
+
+  it("a directory NAME containing a space is kept WHOLE — the case this rule exists for", () => {
+    // The half that decided the reversal. A directory row inserts its ABSOLUTE
+    // path verbatim, so the token a click on `Application Support` leaves is
+    // `/home/u/Library/Application Support/` — and its directory IS that path.
+    // Cut at the first space instead and this returns `/home/u/Library/`, the
+    // rows come from the wrong directory, and a spaced directory is
+    // UNDESCENDABLE by clicking: the defect that made `2562452` get reverted.
+    expect(
+      dirPartOfOutsideQuery("/home/u/Library/Application Support/"),
+    ).toBe("/home/u/Library/Application Support/");
+    // The hand-typed shape (a last component still being typed) cuts at the
+    // `/` that follows the spaced name, not at the space inside it.
+    expect(dirPartOfOutsideQuery("~/Library/Application Support/Font Book")).toBe(
+      "~/Library/Application Support/",
+    );
+    // Two spaced levels, because Windows profile paths and macOS `~/Library`
+    // both have them and the rule must not care how many.
+    expect(
+      dirPartOfOutsideQuery("/home/u/Library/Application Support/Font Book/x"),
+    ).toBe("/home/u/Library/Application Support/Font Book/");
+    // A SPACE IN THE LAST COMPONENT is a segment, not a directory: the cut is
+    // still the last `/`, so the space does not move it.
+    expect(dirPartOfOutsideQuery("~/notes/todo list")).toBe("~/notes/");
+  });
+
+  it("THE COST: a / in TRAILING PROSE extends the directory, and we read it anyway", () => {
+    // Pinned as a COST, not written away. The token absorbs prose, so a `/` in
+    // the prose is treated as a separator and the read goes to a directory that
+    // CANNOT exist — `?~/notes/ see src/x` really does read `~/notes/ see src/`.
+    // Accepted because the alternative is the test above, inverted: no spaced
+    // directory descent at all. Read this as "someone chose the wasted read":
+    // the empty result renders nothing, and Enter is held for that one round
+    // trip and then sends (`ChatStream.test.tsx`, the two tests after this one).
+    expect(dirPartOfOutsideQuery("~/notes/ see src/x")).toBe("~/notes/ see src/");
+    expect(dirPartOfOutsideQuery("/etc/passwd also read /var")).toBe(
+      "/etc/passwd also read /",
+    );
+    expect(dirPartOfOutsideQuery("C:/Users/you/pro and D:/x/y")).toBe(
+      "C:/Users/you/pro and D:/x/",
+    );
+    // A token that is ONLY the directory (no prose tail at all) is unaffected —
+    // this is the pre-existing behaviour and it survives byte-identically.
+    expect(dirPartOfOutsideQuery("~/notes/")).toBe("~/notes/");
+  });
+});
+
+describe("isOutsideSpaceQuery — the mode is derived from the remainder (ADR 0035)", () => {
+  it("the_three_absolute_roots_are_out_of_the_Space", () => {
+    for (const q of [
+      "/",
+      "/etc/passwd",
+      "~/",
+      "~/.config/htop/config",
+      "C:/Users/you/",
+      "d:/scratch/design.md",
+      // The predicate is a PREFIX test, not a path validator: once the DRIVE
+      // ROOT is there, the rest is tail characters the absolute shape admits
+      // (`:` included), so this is outside the Space even though the tail is
+      // nonsense. It is listed deliberately so nobody "tightens" the predicate
+      // into a second parser that could disagree with the grammar.
+      "C:/x:y",
+    ]) {
+      expect(isOutsideSpaceQuery(q)).toBe(true);
+    }
+  });
+
+  it("everything_else_is_inside_the_Space", () => {
+    for (const q of [
+      "",
+      "README",
+      "src/comp/Form.tsx",
+      "..",
+      "~",
+      "~user/x",
+      "a~b",
+      "notes/../secrets",
+      "C:",
+      // A `\`-rooted Windows path is NOT a token shape by design: Task 1's
+      // `abs_to_slash` guarantees every `insert` is `/`-separated, so a `\` here
+      // means something built the path wrong — it must never enter the
+      // out-of-Space branch on the strength of a `\`-separated prefix.
+      "C:\\Users\\you",
+    ]) {
+      expect(isOutsideSpaceQuery(q)).toBe(false);
+    }
   });
 });
 
@@ -1456,168 +1790,5 @@ describe("splitMentionBlocks — the three real block literals still round-trip 
     ]) {
       expect(splitMentionBlocks(text)).toEqual({ text, blocks: [] });
     }
-  });
-});
-
-// --- The picker's TWO filters: why they were deliberately NOT unified. ------
-//
-// The picker is SHARED, the filters are not: `?` filters with `fuzzyMatch` (a
-// SUBSEQUENCE — a path query is path-shaped, so `src/comp/Form` must reach
-// `src/components/Formula.tsx`), while `$` / `@` / `#` keep the case-insensitive
-// name SUBSTRING filter they have always had.
-//
-// WHY NOT UNIFY: a substring match is a SPECIAL CASE of a subsequence
-// (consecutive characters are still "in order"), so `fuzzyMatch` is a strict
-// generalization — swapping the Mention filter to it would break no existing
-// query. It would STILL be a behavior change: `sm` would start matching
-// `skill-manager` and every Mention list would get looser and noisier. The two
-// filters were deliberately NOT unified, and the pins below document WHICH side
-// is the untouched one — the Mention side. Read a red pin here as "the Mention
-// filter changed", NOT as "the test needs updating".
-//
-// HOW THIS PIN IS MADE NON-VACUOUS (and why it reads source at all): the filter
-// lives inside a `useMemo` in `ChatStream.tsx` and is not exported, so there is
-// no call to make from here. The predicate is therefore lifted out of the SHIPPED
-// source and evaluated, so flipping that one line to `fuzzyMatch` turns these
-// tests RED — verified by exactly that experiment when this pin was written.
-// Reading a component's SOURCE is this repo's established pattern for a guarantee
-// with no runtime seam (`paletteCompleteness.test.ts`,
-// `slabFloatSeparation.test.ts`), and this app ships no `@types/node`, so Node's
-// `fs` is reached through a COMPUTED specifier the way those files do it.
-//
-// WHY IT HAS TO BE SOURCE-READING: with the Mention filter flipped to
-// `fuzzyMatch`, the WHOLE `ChatStream.test.tsx` suite (157 tests, incl. the
-// picker's own "filters as the token is typed" and "$ and @ pickers still list
-// and insert" pins) stays GREEN — none of their seeded names disagree under the
-// two filters. This file is therefore the only place in the repo that can see
-// that drift, which is the reason it exists.
-
-const NODE_FS = "node:" + "fs";
-const { readFileSync } = (await import(NODE_FS)) as {
-  readFileSync: (path: string, encoding: string) => string;
-};
-
-const PICKER_SRC = readFileSync("src/components/ChatStream.tsx", "utf8");
-
-/** Lift the `.filter(… => <expr>)` predicate that follows `anchor` out of the
- *  picker's row derivation and compile it. The anchor is a REGEXP with `\s*`
- *  between tokens rather than a literal string on purpose: a pin that reddens
- *  because a formatter re-wrapped an argument is noise, and the anchor must ONLY
- *  go red when the code it names actually stops existing. The predicate itself is
- *  extracted PAREN-BALANCED rather than pattern-matched: it comes out whatever it
- *  is, so a predicate FLIPPED to `fuzzyMatch` still extracts and still EVALUATES —
- *  the pin goes red on the BEHAVIOR change, not on a failed regex or a NameError.
- *  A missing anchor / missing filter throws instead of passing quietly. */
-function compileFilterAfter(anchor: RegExp, label: string) {
-  const m = anchor.exec(PICKER_SRC);
-  if (!m) {
-    throw new Error(
-      `${label}: anchor ${anchor} not in ChatStream.tsx`,
-    );
-  }
-  const at = m.index;
-  const open = PICKER_SRC.indexOf(".filter(", at);
-  const arrow = PICKER_SRC.indexOf("=>", open);
-  if (open === -1 || arrow === -1) {
-    throw new Error(`${label}: no .filter(…) after the anchor (shape changed?)`);
-  }
-  let depth = 0;
-  let end = arrow + 2;
-  while (end < PICKER_SRC.length) {
-    const ch = PICKER_SRC[end];
-    if (ch === "(" || ch === "[" || ch === "{") depth++;
-    else if (ch === ")") {
-      if (depth === 0) break;
-      depth--;
-    }
-    end++;
-  }
-  const expr = PICKER_SRC.slice(arrow + 2, end).trim().replace(/,$/, "");
-  // `fuzzyMatch` is IN SCOPE so a flipped predicate EVALUATES rather than
-  // throwing, and `query` is a parameter so the extracted expression needs no
-  // rewriting to run.
-  const fn = new Function("r", "query", "fuzzyMatch", `return (${expr});`) as (
-    r: { name: string },
-    query: string,
-    fm: (needle: string, target: string) => boolean,
-  ) => boolean;
-  return (query: string, name: string) => fn({ name }, query, fuzzyMatch);
-}
-
-// The `?` branch is the FIRST branch of the `pickerRows` memo (deliberately
-// listed first so it can never fall through to the skills catalog), so the first
-// `.filter(` after it is the FILE filter. The Mention filter is the `matchedRows`
-// line after the three-catalog `rows` mapping — ONE line shared by `$`, `@` and
-// `#`, which is exactly why one extraction grades all three: the three Mention
-// prefixes have no per-prefix filter that could drift apart on its own.
-const mentionFilter = compileFilterAfter(
-  /const\s+matchedRows\s*=\s*rows\.filter\(/,
-  "Mention ($/@/#) filter",
-);
-const fileFilter = compileFilterAfter(
-  /if\s*\(\s*prefix\s*===\s*"\?"\s*\)/,
-  "File (?) filter",
-);
-
-describe("the picker's filters — the Mention prefixes KEEP the substring filter (ADR 0033)", () => {
-  it("a subsequence-only query is EXCLUDED by a Mention filter and INCLUDED by the ? filter", () => {
-    // The pair the two filters DISAGREE on: `sm` is a subsequence of
-    // `skill-manager` (s … m) but not a substring of it. If the Mention filter
-    // ever became `fuzzyMatch`, the FIRST expectation below flips to `true` and
-    // this test goes red — that is the experiment that proves the pin non-vacuous.
-    expect(mentionFilter("sm", "skill-manager")).toBe(false);
-    expect(fileFilter("sm", "skill-manager")).toBe(true);
-    // More disagreements of the same shape, so a partial unification is caught too.
-    for (const [q, name] of [
-      ["km", "skill-manager"],
-      ["sn", "skill-manager"],
-      ["drm", "debug-readme-manager"],
-      ["pse", "postgres-extension"],
-    ] as const) {
-      expect(mentionFilter(q, name)).toBe(false);
-      expect(fileFilter(q, name)).toBe(true);
-    }
-  });
-
-  it("every substring hit is STILL a Mention hit — case-insensitive substring, unchanged", () => {
-    // The generalization direction the comment above leans on: substring is a
-    // subset of subsequence, so the Mention filter must keep EXACTLY what
-    // substring gives — no more (pinned by the test above), no less (here).
-    const names = ["debug", "skill-manager", "CodeReview", "postgres", "scout"];
-    const queries = ["", "d", "DE", "manager", "MAN", "SCO", "debug", "ScOut"];
-    for (const name of names) {
-      for (const q of queries) {
-        expect(mentionFilter(q, name)).toBe(
-          name.toLowerCase().includes(q.toLowerCase()),
-        );
-      }
-    }
-    // And a non-match stays out of BOTH filters.
-    expect(mentionFilter("zzz", "debug")).toBe(false);
-    expect(fileFilter("zzz", "debug")).toBe(false);
-  });
-
-  it("the ? branch is the ONLY fuzzy filter in the picker's row derivation", () => {
-    // No raw-source assertion on the Mention predicate's TEXT here on purpose:
-    // the behavioral pin above already compiles and evaluates that predicate, so
-    // the flip it exists to catch goes red on BEHAVIOR, and a literal string
-    // match would only add breakage on formatting-only refactors. A rename that
-    // removes the anchor is not silent either — `compileFilterAfter` throws.
-    // The `fuzzyMatch(` CALL sits in the `?` branch — i.e. after the branch's own
-    // `prefix === "?"` gate and nowhere else in the row derivation. Matched
-    // WHITESPACE-TOLERANTLY for the same reason as the anchors above: which side
-    // is fuzzy is the fact being pinned, not how the call is line-wrapped.
-    const callAt = PICKER_SRC.search(/fuzzyMatch\(\s*query,\s*r\.name\s*\)/);
-    expect(callAt).toBeGreaterThan(-1);
-    const branchAt = PICKER_SRC.search(/if\s*\(\s*prefix\s*===\s*"\?"\s*\)/);
-    expect(branchAt).toBeGreaterThan(-1);
-    expect(callAt).toBeGreaterThan(branchAt);
-    expect(callAt).toBeLessThan(
-      PICKER_SRC.search(/const\s+matchedRows\s*=\s*rows\.filter\(/),
-    );
-    // Exactly one such call in the whole file: one fuzzy filter, three substring.
-    expect(
-      (PICKER_SRC.match(/fuzzyMatch\(\s*query,\s*r\.name\s*\)/g) ?? []).length,
-    ).toBe(1);
   });
 });

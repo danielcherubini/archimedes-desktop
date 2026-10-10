@@ -13,9 +13,35 @@ export interface MentionRow {
   /** The catalog entry's identity (name + kind is unique per kind). */
   key: string;
   prefix: ComposerPrefix;
+  /** What `selectMention` INSERTS (plus the ` ` / `/` its policy adds). */
   name: string;
+  /**
+   * What the PRIMARY line SHOWS, defaulting to `name` when absent. It exists
+   * for ONE case (ADR 0035): an out-of-Space row must INSERT the ABSOLUTE path
+   * — nothing in this app expands a tilde, so `~/notes/x` would resolve to a
+   * directory literally named `~` — while the row DISPLAYS the abbreviated
+   * `~/…`. Display and insertion are therefore deliberately two different
+   * strings, and `label` is the display half. Nothing else sets it, so every
+   * Mention row and every Space Listing row keeps showing `name` verbatim.
+   */
+  label?: string;
+  /**
+   * A DIRECTORY row (out-of-Space `?` only, ADR 0035): the primary line gains a
+   * trailing `/`, and `selectMention` DESCENDS (keeps the `?`, appends `/`) or
+   * it would consume the trigger and strand the user after one level. Never set
+   * on a file row or on any Mention row.
+   */
+  isDir?: boolean;
   /** One-line (the `title` tooltip — the existing pattern). */
   description: string;
+}
+
+/** The PRIMARY line's full text: what the row shows, INCLUDING the trailing `/`
+ *  a directory row appends. ONE definition because the `title` tooltip and the
+ *  rendered text must be the same string — a tooltip that disagreed with the
+ *  line it describes (by dropping the descent `/`) would be worse than none. */
+function primaryLabel(row: MentionRow): string {
+  return `${row.label ?? row.name}${row.isDir ? "/" : ""}`;
 }
 
 /**
@@ -25,8 +51,15 @@ export interface MentionRow {
  * visual delta vs the old `$`-only skill picker), name (primary) and
  * description (secondary, truncated, `title` tooltip) — the last being EMPTY
  * for a `?` file row by design (a path already ends in its own basename), so a
- * `?` row renders on ONE line. The second line is conditional on a NON-EMPTY
- * description, so a `$`/`@`/`#` row has two lines whenever its catalog entry
+ * `?` row renders on ONE line. The PRIMARY line shows `row.label ?? row.name`
+ * with a trailing `/` appended when `row.isDir`: an out-of-Space row SHOWS the
+ * abbreviated `~/…` while `name` carries the absolute path it will INSERT, and
+ * the `/` is the visual half of "selecting this descends" (ADR 0035). That
+ * `label ??` is load-bearing, not cosmetic — MUTATION-CHECKED: rendering
+ * `row.name` here reddens SEVEN of `ChatStream.test.tsx`'s ADR 0035 tests, which
+ * is the other half of why the row carries BOTH halves. The second line is
+ * conditional on a NON-EMPTY description, so a `$`/`@`/`#` row has two
+ * lines whenever its catalog entry
  * carries one and ONE when it does not (a skill with an empty `summary`, an
  * agent with no description): the guarantee is per description, never per
  * prefix. Plus an optional non-selectable `note` line (the `?` truncation
@@ -141,7 +174,37 @@ export default function ComposerMentions({
                 >
                   {row.prefix}
                 </span>
-                <span className="text-ui-base">{row.name}</span>
+                {/* THE PRIMARY LINE TRUNCATES, and the two classes are a PAIR,
+                    not decoration. A long absolute path is ONE unbreakable token
+                    (a 200-char Windows path has no space to wrap at), the badge
+                    beside it is `shrink-0`, and the container is
+                    `overflow-y-auto` — which per CSS forces the visible x-axis to
+                    compute to `auto` rather than `hidden`, so an unclipped label
+                    made the row scroll or clip horizontally instead of eliding.
+                    `min-w-0` is the half that lets a flex item shrink BELOW its
+                    content's intrinsic width (the default `min-width: auto` is
+                    what refuses, and it is the classic flexbox trap); `truncate`
+                    is `overflow-hidden` + `text-overflow: ellipsis` +
+                    `white-space: nowrap`. Either one alone still clips.
+
+                    The `title` is the user-visible half of the deal: an elided
+                    path is unreadable, and the FULL string is exactly what they
+                    need, so the whole path lives on hover. It is also the only
+                    part of any of this a test can assert — jsdom has NO layout
+                    engine, so no test here measures a clip, an ellipsis or a
+                    width; the elision itself is CSS-reasoned, and what
+                    `ChatStream.test.tsx` pins is these two class names plus the
+                    `title`. A row that wraps would ALSO break the container's
+                    `max-h-[calc(var(--ui-font-size)*22)]` clamp ("~10 single-line
+                    rows"), which is the other reason the label must not wrap.
+
+                    A DIRECTORY row's `title` carries the trailing `/` too — the
+                    same string the row SHOWS — because that slash is the visual
+                    half of "selecting this descends" and a tooltip that dropped it
+                    would disagree with the line it describes. */}
+                <span className="min-w-0 truncate text-ui-base" title={primaryLabel(row)}>
+                  {primaryLabel(row)}
+                </span>
               </span>
               {row.description !== "" && (
                 <span

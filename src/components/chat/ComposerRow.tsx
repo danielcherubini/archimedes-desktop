@@ -10,7 +10,7 @@ import {
 import SessionConfigSelect from "../SessionConfigSelect";
 import AttachmentStrip from "./AttachmentStrip";
 import ComposerMentions, { type MentionRow } from "./ComposerMentions";
-import { activeMentionToken, type ComposerPrefix } from "../../lib/skills";
+import { activeMentionToken, isOutsideSpaceQuery, type ComposerPrefix } from "../../lib/skills";
 import type { ChatComposerAttachment } from "../../lib/chatAttachments";
 import type { SessionConfigOption } from "../../lib/tauri";
 
@@ -41,6 +41,7 @@ export default function ComposerRow({
   filtered,
   note,
   activeIndex,
+  completionPending,
   selectMention,
   attachments,
   removeAttachment,
@@ -74,6 +75,30 @@ export default function ComposerRow({
   filtered: MentionRow[];
   /** The picker's one explanation line (`?`'s cap notes) — NOT a row. */
   note?: string;
+  /**
+   * A fetch for the out-of-Space directory the OPEN token names has not settled
+   * yet, so the empty `filtered` is a GAP and not an answer (ADR 0035). Owned by
+   * `useCompletionDir` in `ChatStream` — this component only consumes it, like
+   * every other derivation here.
+   *
+   * WHY a keydown handler needs it at all: the Enter intercept below is gated on
+   * `filtered.length > 0` because ADR 0033 decided a picker must never be a gate
+   * — and an out-of-Space DESCENT makes that gate load-bearing in a way the
+   * pre-ADR-0035 keyboard model never hit. Selecting a DIRECTORY row re-points
+   * `dirPrefix` at a directory whose rows are one IPC round trip away, so the
+   * picker legitimately has ZERO rows while the user's next Enter means "pick
+   * the row that is about to appear". Without this flag the keydown falls
+   * through to `sendPrompt` and delivers `?/home/u/.config/htop/` (sigil,
+   * absolute path, trailing slash) to the model — and for a directory that
+   * cannot be read it does so FOREVER, since a failed fetch degrades to the
+   * empty value.
+   *
+   * The narrowing is deliberate and it is NOT "a picker is now a gate": this
+   * flag is true only while a fetch for the CURRENT non-null `dirPrefix` is
+   * outstanding, so a relative `?query` (which has no `dirPrefix` at all) and a
+   * stray `?` in prose are untouched and still send on Enter with zero rows.
+   */
+  completionPending: boolean;
   activeIndex: number;
   selectMention: (row: MentionRow) => void;
   attachments: ChatComposerAttachment[];
@@ -208,6 +233,29 @@ export default function ComposerRow({
               setPicker(null);
               return;
             }
+          }
+          // The in-flight DESCENT window (ADR 0035): the token names a directory
+          // whose rows have not arrived, so there is NOTHING to insert and the
+          // rows are not merely absent — they are on their way. Enter does
+          // NOTHING here: not a send (that is the defect this gate exists to
+          // stop) and not an insert (there is no row). Every other case falls
+          // through unchanged — see the `completionPending` prop for why the
+          // flag alone cannot widen ADR 0033's rule to prose. The ROWS branch
+          // above already returned when there was something to insert, so
+          // `filtered.length === 0` is belt-and-braces, not a condition the
+          // behaviour depends on.
+          if (
+            e.key === "Enter" &&
+            !e.shiftKey &&
+            picker &&
+            token &&
+            completionPending &&
+            token.prefix === "?" &&
+            isOutsideSpaceQuery(token.remainder) &&
+            filtered.length === 0
+          ) {
+            e.preventDefault();
+            return;
           }
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();

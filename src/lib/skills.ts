@@ -257,6 +257,13 @@ export interface MentionCatalogs {
  * won't reach the caret).
  * (`$` keeps the SAME live-caret boundary as `activeSkillToken` — the
  * boundary-free-left applies to the EXPANSION regex only.)
+ *
+ * The `?` glyph is matched by TWO shapes, tried after the Mention shape: the
+ * out-of-Space absolute one (ADR 0035) and then the relative Space one
+ * (ADR 0033). The return shape is UNCHANGED by that — both file branches yield
+ * `prefix: "?"`, and the caller derives the mode from `remainder` via
+ * `isOutsideSpaceQuery`. Adding a mode field here would be the wrong move: the
+ * grammar's only job is "which token is under the caret".
  */
 export function activeMentionToken(
   value: string,
@@ -277,19 +284,150 @@ export function activeMentionToken(
       start: (m.index ?? 0) + m[1]!.length,
     };
   }
-  const f = before.match(FILE_TOKEN_RE);
+  const f = before.match(FILE_ABSOLUTE_TOKEN_RE) ?? before.match(FILE_TOKEN_RE);
   if (!f) return null;
   // VERBATIM — a path's case is PRESERVED (no lowercasing rule applies to a
   // path, so the Mention grammar's lowercase-only rule does not apply here).
-  // The inserted text is then ordinary message text: it obeys the mention
-  // grammar exactly like a hand-typed path — a `$name` inside it, or a
-  // root-level `@name`/`#name`, expands if a resource of that exact name
-  // exists (pre-existing grammar, not a surface of `?` — ADR 0033).
+  //
+  // The inserted text is then ORDINARY MESSAGE TEXT, and it is re-scanned for
+  // Mentions on send like any other text. Today's rule, stated in full, because
+  // a shorter version of this comment used to understate it:
+  //
+  //   • a `$name` inside the path expands — `MENTION_RE` has NO left boundary,
+  //     so depth is irrelevant (`src/$read.md` fires for a skill named `read`).
+  //   • an `@name` / `#name` expands wherever the glyph is preceded by
+  //     WHITESPACE or a line start — which is NOT the same as saying
+  //     "root-level". A `/` is not whitespace, so `dir/@name` does not fire, but
+  //     the OUT-OF-SPACE shape admits SPACES, so a completed filename may
+  //     contain ` @name` and THAT fires: `?/home/u/w/notes @draft.md` inserts a
+  //     draft in which ` @draft` is a genuine, mid-path Mention trigger. Since
+  //     ADR 0035, the path a picker inserts is therefore a possible SOURCE of
+  //     trigger text — other people's filenames (`~/Downloads`, a cloned repo)
+  //     can name a resource this app happens to have.
+  //
+  // ACCEPTED, and not a capability gain: a user who hand-typed the identical
+  // draft got the byte-identical expansion (ADR 0033's own argument), a name
+  // that is not in the catalog stays verbatim, and ADR 0031's tag-safety
+  // argument rests on that EXACT-name match — so no block shape is reachable
+  // from a filename. Pinned both ways (fires with the whitespace, silent without
+  // it) by the "A completed path can carry a LIVE Mention" group in
+  // `ChatStream.test.tsx`, plus the unit-level pins in `skills.test.ts`. A
+  // `#` fires only while the MCP-mention setting is on.
+  // Both file shapes return the SAME `prefix` (ADR 0035): whether the token is
+  // inside or outside the Space is a property of `remainder`, read by
+  // `isOutsideSpaceQuery`, and is deliberately NOT part of this return value.
   return {
     prefix: "?",
     remainder: f[2]!,
     start: (f.index ?? 0) + f[1]!.length,
   };
+}
+
+/**
+ * The OUT-OF-SPACE `?` token (ADR 0035): a `/`-, `~/`- or drive-rooted path.
+ * It admits SPACES, which the relative shape never may — `?foo bar` must not
+ * eat the sentence, while `?~/Library/Application Support/Font Book` has to be
+ * typeable. The `[A-Za-z]:/` alternation is NOT a nicety: on Windows `~/`
+ * expands to `C:\Users\you`, so the absolute path a DIRECTORY row inserts is
+ * `C:/Users/you/…`, and if `:` cannot form a token the kept-`?` token dies
+ * after ONE level of descent — invisibly to ubuntu-only CI. `[^\n?]` is what
+ * keeps `??` unformable, and it stops one absolute token swallowing a later `?`
+ * — though "stops swallowing" understates what a `?` does to a token: it does
+ * NOT END it, it DESTROYS it. The charset cannot span the `?`, so the match
+ * would have to START after it, and there the `?` is not preceded by whitespace,
+ * so the `(^|\s)` boundary fails and NO token forms at all: measured,
+ * `?/etc/pas?x` yields no token (not the token `/etc/pas`, and not `x` either),
+ * which is the same degradation as any other unformable token — the picker
+ * renders nothing and Enter sends the text verbatim.
+ *
+ * ACCEPTED COST: admitting spaces means prose typed after an absolute token is
+ * absorbed into the query until a newline. The safety is NOT that an absorbed
+ * tail cannot match: it lands inside the SEGMENT, and the matcher is a
+ * SUBSEQUENCE test over the segment, so the DIRECTORY'S CONTENTS decide. Usually
+ * nothing matches, because the tail makes the segment longer than any entry name.
+ * But a directory holding `todo list.md` matches `?~/todo` plus the prose word
+ * ` list`, and Enter then inserts and the prose is gone. Accepted because it
+ * edits the draft rather than a policy, and because refusing spaces would refuse
+ * `~/Library/Application Support`. (When the absorbed tail matches NOTHING, the
+ * empty picker plus Enter-sends is the old path; when it matches ONE row, the
+ * in-flight `pending` gate in `useCompletionDir` is not involved — that flag is
+ * about rows that have not arrived, not about rows that do not exist. THE ONE
+ * THING THAT DOES REACH THAT GATE is a `/` inside the absorbed prose: it extends
+ * the read too (see `dirPartOfOutsideQuery`), so the draft issues a real fetch
+ * for a directory that cannot exist and Enter is held for that ONE round trip
+ * before sending. Pinned as a cost, not as a non-event, in
+ * `ChatStream.test.tsx`.)
+ *
+ * ⚠ GROUP 2 MUST BE THE WHOLE REMAINDER. `activeMentionToken` returns `f[2]`
+ * as `remainder`, so the OUTER group has to wrap the root AND the tail. If the
+ * root alternation is the only group — `\?(~?\/|[A-Za-z]:\/)[^\n?]*$` — then
+ * group 2 is just the root and the query is silently discarded: measured, that
+ * form gives `?/etc/pas` → remainder `/`, while
+ * `\?((?:~?\/|[A-Za-z]:\/)[^\n?]*)$` gives `/etc/pas`. The inner alternation is
+ * written `(?:…)` so the group numbering stays obvious to a reader.
+ *
+ * ORDERING, stated honestly. This shape is tried before `FILE_TOKEN_RE` because
+ * `/` is ALSO in the relative charset, so `?/etc` matches BOTH — and measured
+ * over every such overlap (`?/etc`, `?/etc/pas`, `?/`, `?/a/b ?/c`) the two
+ * shapes return the IDENTICAL `{ prefix, remainder, start }`, so the order of
+ * the two FILE branches changes NOTHING observable today: they agree wherever
+ * both match, and only one of them matches anywhere else. Trying this one first
+ * keeps the absolute reading authoritative if the two charsets ever diverge.
+ * The order that DOES carry behaviour is Mention-before-file: `?/etc/pas @sc`
+ * matches this shape (remainder `/etc/pas @sc`) yet `@sc` wins, which is what
+ * keeps a `?` token from swallowing a Mention.
+ */
+const FILE_ABSOLUTE_TOKEN_RE = /(^|\s)\?((?:~?\/|[A-Za-z]:\/)[^\n?]*)$/;
+
+/** Is a `?` remainder an out-of-Space path (ADR 0035)? */
+export function isOutsideSpaceQuery(remainder: string): boolean {
+  return (
+    remainder.startsWith("/") ||
+    remainder.startsWith("~/") ||
+    /^[A-Za-z]:\//.test(remainder)
+  );
+}
+
+/**
+ * The DIRECTORY part of an out-of-Space `?` remainder — the token's path up to
+ * and including its LAST `/`, over the WHOLE remainder (`~/.config/ht` →
+ * `~/.config/`, `~/notes` → `~/`, `/etc/pas` → `/etc/`,
+ * `C:/Users/you/pro` → `C:/Users/you/`). This value is the catalog's CACHE KEY,
+ * so it is also the ONE directory the renderer reads. `segment` in
+ * `ChatStream.tsx` is the mirror image (everything AFTER that `/`), so the two
+ * are the two halves of a single cut — read them together.
+ *
+ * WHY THE LAST `/` AND NOT THE LAST `/` BEFORE THE FIRST SPACE. The absolute
+ * shape admits SPACES (see `FILE_ABSOLUTE_TOKEN_RE`) because directory NAMES
+ * contain them, and a DIRECTORY row inserts its absolute path VERBATIM — so
+ * clicking the row for `Application Support` leaves a token naming
+ * `/home/u/Library/Application Support/`. Cut that token at its first space and
+ * its `dirPrefix` is `/home/u/Library/` and its segment `Application Support/`:
+ * the rows then come from the directory BEFORE the spaced name, match nothing
+ * the user is looking at, and the spaced directory CANNOT BE DESCENDED INTO BY
+ * CLICKING AT ALL. That kills the one example ADR 0035 admits spaces in order to
+ * support (`~/Library/Application Support`), so it is not a trade worth making.
+ * (Reverted here; commit `2562452` and its message are the record of the
+ * attempt.)
+ *
+ * THE COST, CHOSEN AND NOT HARMLESS: prose typed after an absolute token is
+ * absorbed into the remainder, so when that prose carries a `/` the key extends
+ * into it — `?~/notes/ see src/x` issues ONE REAL READ for `~/notes/ see src/`,
+ * a directory that exists only because the sentence did. It cannot exist, so it
+ * returns empty and renders nothing; and because a fetch is a fetch, since
+ * `560f610` it also briefly marks the listing `pending`, which HOLDS ENTER for
+ * that one round trip before sending as before. So the loss is one wasted
+ * directory read and one swallowed keystroke, which is strictly cheaper than
+ * undescentable spaced directories — but it is a loss, and it is here on
+ * purpose. Nothing in the string tells "spaced directory name" from "prose
+ * after a path" (the same shape: a space, then text containing a `/`); only a
+ * filesystem probe could, and that is a different feature.
+ *
+ * The result is never empty: the root alternation in `FILE_ABSOLUTE_TOKEN_RE`
+ * requires a `/` at the start, so every outside remainder has one to cut at.
+ */
+export function dirPartOfOutsideQuery(remainder: string): string {
+  return remainder.slice(0, remainder.lastIndexOf("/") + 1);
 }
 
 // The `?` token (ADR 0033) — deliberately NOT the mention charset: a PATH
@@ -300,6 +438,11 @@ export function activeMentionToken(
 // (git-status porcelain, or a doubled question mark) from opening the
 // picker and turning Enter into an INSERTION instead of a send. The
 // `(^|\s)` boundary does the rest — `a?.b`, `x ? y` and `url?query` fail it.
+//
+// This is the RELATIVE shape (ADR 0035): it stays inside the Space, so its
+// charset is deliberately unchanged — no `~`, no `:`, and NO SPACE, because
+// `?foo bar` must not eat the sentence. The out-of-Space shape is the one above
+// it, which is tried FIRST.
 const FILE_TOKEN_RE = /(^|\s)\?([a-zA-Z0-9._/-]+)$/;
 
 /**

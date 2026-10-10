@@ -15,7 +15,13 @@ import {
 } from "../lib/tauri";
 import { basenameOfPath } from "../lib/paths";
 import { fuzzyMatch } from "../lib/fuzzy";
-import { activeMentionToken, expandMentions, type ComposerPrefix } from "../lib/skills";
+import {
+  activeMentionToken,
+  dirPartOfOutsideQuery,
+  expandMentions,
+  isOutsideSpaceQuery,
+  type ComposerPrefix,
+} from "../lib/skills";
 import { groupConsecutiveFileWrites } from "../lib/toolGroups";
 import {
   addImageAttachments,
@@ -31,7 +37,7 @@ import { useInteractive } from "../store/interactive";
 import { useSettings } from "../store/settings";
 import { usePendingSubagentRequests } from "../hooks/usePendingSubagentRequests";
 import { useSpinQuip } from "../hooks/useSpinQuip";
-import { useMentionCatalogs } from "../hooks/useMentionCatalogs";
+import { useMentionCatalogs, useCompletionDir } from "../hooks/useMentionCatalogs";
 import { normalizeVariant } from "../lib/braille-loader";
 import SessionStalledBanner from "./SessionStalledBanner";
 import MessageList from "./chat/MessageList";
@@ -434,6 +440,63 @@ export default function ChatStream() {
     query: string;
     index: number;
   } | null>(null);
+  // --- Out-of-Space Directory completion (ADR 0035) -----------------------
+  // A `?` token whose remainder begins `/`, `~/` or a Windows drive root is NOT
+  // a Space query: the picker switches from the cached Space **Listing** to
+  // **Directory completion** for the ONE directory the token names. The mode is
+  // derived from the token's remainder (`picker.query` IS that remainder — the
+  // grammar already decided it, and `activeMentionToken` deliberately returns no
+  // mode field), so there is exactly ONE source of truth for "which token is
+  // under the caret".
+  const activeRemainder = picker?.prefix === "?" ? picker.query : "";
+  const outside = isOutsideSpaceQuery(activeRemainder);
+  // The remainder up to and INCLUDING its last `/` — the DIRECTORY part
+  // (`~/.config/ht` → `~/.config/`, `~/notes` → `~/`, `/etc/pas` → `/etc/`,
+  // `C:/Users/you/pro` → `C:/Users/you/`). Every outside remainder has ≥1 `/`
+  // (the root alternation in `FILE_ABSOLUTE_TOKEN_RE` requires one), so
+  // `lastIndexOf` never misses. This value is the catalog's CACHE KEY, which is
+  // why it is the directory and NOT the whole remainder: typing inside one
+  // directory then changes only the SEGMENT, so the key is stable and exactly
+  // ONE directory read happens per directory — the property the one-directory
+  // peek is budgeted on. Pinned in `ChatStream.test.tsx` at THIS derivation (a
+  // hook-level caching test cannot prove it: with `dirPrefix` as an argument the
+  // hook only shows "same input, same output"), and mutation-checked — passing
+  // `token.remainder` here reddens that test. `null` when not outside, which
+  // maps to the hook's `__global__` key and the command's `None` arm (no
+  // filesystem access at all).
+  //
+  // THE LAST `/` OF THE WHOLE REMAINDER — SPACES INCLUDED. A directory row
+  // inserts its absolute path VERBATIM, so clicking `Application Support` leaves
+  // a token naming `/home/u/Library/Application Support/`; cutting at the first
+  // SPACE would make its `dirPrefix` `/home/u/Library/`, which reads the wrong
+  // directory, renders rows that match nothing, and makes a spaced directory
+  // UNDESCENDABLE — the exact case ADR 0035 admits spaces for. `dirPartOfOutsideQuery`
+  // states the trade in full, including the cost accepted here: a draft whose
+  // trailing PROSE contains a `/` (`?~/notes/ see src/x`) issues one real read
+  // for a directory that cannot exist. It returns empty, renders nothing, and —
+  // since `560f610` — briefly marks the listing pending, which holds Enter for
+  // that one round trip and then sends as before. That is the cheaper loss; it
+  // is still a loss, and no frontend rule can tell the two apart (they are the
+  // same string shape — a space, then text containing a `/`), so only a
+  // filesystem probe could.
+  const dirPrefix = outside ? dirPartOfOutsideQuery(activeRemainder) : null;
+  // The token's non-directory tail — what the rows are filtered by. The MIRROR
+  // of the line above: the same `lastIndexOf("/")`, the other side of it, over
+  // the same WHOLE remainder. The absorbed prose therefore lands INSIDE the
+  // segment and `fuzzyMatch` is a subsequence test over it, so the directory's
+  // contents decide (ADR 0035's accepted cost, pinned and explained in
+  // `skills.ts`). Truncating the segment as well would silently rewrite that
+  // accepted behaviour.
+  const segment = outside
+    ? activeRemainder.slice(activeRemainder.lastIndexOf("/") + 1)
+    : "";
+  // `.dir` DESTRUCTURES with a name: it is the payload (the module-level empty
+  // constant while empty) and it is the `pickerRows` dep below, so it keeps the
+  // identity the memo is graded on. `.pending` is the in-flight DESCENT signal —
+  // see `useCompletionDir` for the contract and `ComposerRow` for the one key it
+  // holds.
+  const { dir: completion, pending: completionPending } =
+    useCompletionDir(dirPrefix);
   // The catalog rows matching the active token. The three Mention prefixes
   // filter case-insensitively on a NAME SUBSTRING (v1: name only, not
   // description); `?` filters with `fuzzyMatch` — a SUBSEQUENCE match —
@@ -453,8 +516,10 @@ export default function ChatStream() {
     // ONE picker, filtered to the ACTIVE prefix's catalog only (a `$`/`#`/`@`
     // never mixes in one open list): map the matching catalog to `MentionRow`
     // (skills/agents carry `description`, the MCP servers carry their one-line
-    // `summary`, the `?` rows carry the relative path as the name and NO
-    // description, so they render on one line).
+    // `summary`, and every `?` row — of either shape — carries NO description,
+    // so it renders on one line). A Space `?` row puts the Space-RELATIVE path
+    // in `name`; an OUT-OF-SPACE row puts the ABSOLUTE path in `name` (that is
+    // what gets inserted) and the abbreviated `~/…` in `label` (ADR 0035).
     const prefix = picker?.prefix ?? "$";
     // STALE-TOKEN GUARD — what it actually protects (the hazards are easy to
     // overstate). The `picker` state is only recomputed in the textarea's
@@ -496,20 +561,89 @@ export default function ChatStream() {
     // text). It used to be `basenameOfPath(p)` — the basename is already the
     // TAIL of the path in the primary line, so that second line repeated what
     // the row just said and made every row ~50% taller for nothing.
-    // `name` stays the FULL relative path: `selectMention` inserts `row.name`.
     if (prefix === "?") {
-      const fileRows: MentionRow[] = files.entries
-        .map((p) => ({
-          key: `?${p}`,
-          prefix: "?" as const,
-          name: p,
-          description: "",
-        }))
-        .filter((r) => fuzzyMatch(query, r.name));
-      const matched = fileRows.length;
-      // The cap lives HERE, on the `?` branch alone: this is the one catalog
-      // whose filter is a loose subsequence over an unbounded listing.
-      return { rows: fileRows.slice(0, MAX_PICKER_ROWS), matched, live: true };
+      // THE ORDER OF THE TWO ARMS BELOW IS LOAD-BEARING FOR THE BEHAVIOUR, not a
+      // style choice, and the reason is an ASYMMETRY between them: the Listing arm
+      // is guarded by `!outside`, the out-of-Space arm is the unguarded
+      // fall-through. Put the completion arm first and it swallows EVERY `?`
+      // token, so a relative `?README` stops offering Space Listing rows.
+      // MUTATION-CHECKED: neutering this guard reddens a GROUP of tests in
+      // `ChatStream.test.tsx`, headed by "a relative `?query` still offers the
+      // Space Listing rows and NEVER reads a directory" and including the
+      // cap/note group around it. NO COUNT IS WRITTEN HERE ON PURPOSE: this note
+      // said FOURTEEN, the group has since grown, and a number in a comment is a
+      // countdown timer. If this ever wants reordering, the completion arm needs
+      // its own `outside` guard first — do not just move it.
+      //
+      // There used to be a SECOND, purely textual reason for this order, and it is
+      // GONE: a pin in `src/lib/skills.test.ts` read this file as TEXT, located a
+      // filter predicate by scanning forward from this branch's gate, and ran it
+      // through `new Function`. A swap broke that pin with `ReferenceError: segment
+      // is not defined` while `ChatStream.test.tsx` reported the BEHAVIOUR as fine,
+      // which was the misleading part — it made a real behavioural constraint look
+      // like a test artifact. `86afd0d` deleted that pin outright (a rename of an
+      // unrelated local made the whole file fail to LOAD, and every mutation it
+      // caught was also caught by a component test) and replaced it with a test that
+      // drives the real picker. So the order here now rests on the behaviour alone.
+      //
+      // IN the Space: the cached Listing, unchanged (ADR 0033). `name` is the
+      // Space-RELATIVE path — what a Space file is addressed as — and
+      // `selectMention` inserts it verbatim.
+      if (!outside) {
+        const fileRows: MentionRow[] = files.entries
+          .map((p) => ({
+            key: `?${p}`,
+            prefix: "?" as const,
+            name: p,
+            description: "",
+          }))
+          .filter((r) => fuzzyMatch(query, r.name));
+        const matched = fileRows.length;
+        // The cap lives HERE, on the `?` branch alone: this is the one catalog
+        // whose filter is a loose subsequence over an unbounded listing.
+        return { rows: fileRows.slice(0, MAX_PICKER_ROWS), matched, live: true };
+      }
+      // OUT OF THE SPACE (ADR 0035): the rows are ONE directory's entries, not
+      // the Space Listing. Filter the DTO entries FIRST and on each entry's OWN
+      // `name`, then map — filtering the absolute `insert` instead is a real
+      // bug, not a style point: a path is a strict SUPERSET of its own basename,
+      // so path-filtering offers rows basename-filtering would drop (measured:
+      // query `eu` offers `htop`, whose path `/home/u/.config/htop` contains
+      // `e`…`u`, while its name does not). MUTATION-CHECKED — filtering
+      // `e.insert` reddens "the outside rows are filtered on the entry's OWN
+      // name" in `ChatStream.test.tsx`.
+      //
+      // The backend already returns directories first, and the sort below is
+      // re-stated here rather than trusted: this is the branch that decides what
+      // the DESCENT looks like, and a stable `sort` of an already-correct order
+      // costs nothing (V8's sort is stable, so each group keeps the walker's
+      // name order).
+      const hits = completion.entries.filter((e) =>
+        fuzzyMatch(segment, e.name),
+      );
+      const ordered = [...hits].sort(
+        (a, b) => Number(b.isDir) - Number(a.isDir),
+      );
+      const rows: MentionRow[] = ordered.slice(0, MAX_PICKER_ROWS).map((e) => ({
+        // `key`/`name` are the ABSOLUTE path — `selectMention` inserts
+        // `row.name`, and nothing in this app expands a tilde (ADR 0035); the
+        // row SHOWS `display`. No `?` prefix on the key: an absolute path
+        // cannot collide with a skill/agent/server name, and within one
+        // directory an insert is unique.
+        key: e.insert,
+        prefix: "?" as const,
+        name: e.insert,
+        label: e.display,
+        isDir: e.isDir,
+        description: "",
+      }));
+      // `matched` is the UNBOUNDED count, exactly as the Listing arm
+      // returns it, because `pickerNote`'s "too many matches" arm reads it:
+      // an outside branch that omitted it would silently kill that note.
+      // MUTATION-CHECKED — returning the BOUNDED `rows.length` here reddens
+      // exactly one test, "an outside completion caps at 10 rows and says the
+      // too-many-matches note".
+      return { rows, matched: hits.length, live: true };
     }
     const rows: MentionRow[] =
       prefix === "#"
@@ -554,8 +688,20 @@ export default function ChatStream() {
     return { rows: matchedRows, matched: matchedRows.length, live: true };
     // `files` is a DEP for the same reason `agents`/`mcpServers` are: a Space
     // switch (or a late first listing) must re-derive the rows LIVE, with no
-    // extra keystroke.
-  }, [skills, agents, mcpServers, files, mcpMentionsEnabled, picker, draft]);
+    // extra keystroke. `completion` is a dep for the identical reason on the
+    // other side of the branch: a directory listing that LANDS (the first fetch
+    // for a directory, or the descent into the next one) has no further
+    // keystroke to wait for, so without it the outside picker would look dead
+    // rather than wrong — MUTATION-CHECKED, dropping it from these deps reddens
+    // exactly the two tests that watch a descent come live on its own (the
+    // DIRECTORY-row descent and the Windows drive-root one). And `label` is not
+    // decoration: rendering `name` instead of `label ?? name` in
+    // `ComposerMentions` reddens a large part of the ADR 0035 group, so "SHOW the
+    // abbreviated form, INSERT the absolute one" is a tested contract on both
+    // sides. NO COUNT IS WRITTEN HERE ON PURPOSE — it said seven, and the group has
+    // grown since. `outside`/`segment`/`dirPrefix` are NOT deps: they are pure
+    // functions of `picker`, which is one.
+  }, [skills, agents, mcpServers, files, completion, mcpMentionsEnabled, picker, draft]);
   const filtered = pickerRows.rows;
   // The picker's one explanation line (never a row — see `ComposerMentions`).
   // Only ever for `?`: the only catalog that is bounded twice over (the walk
@@ -584,7 +730,14 @@ export default function ChatStream() {
     picker?.prefix === "?" && pickerRows.live
       ? pickerRows.matched > MAX_PICKER_ROWS
         ? `Too many matches — keep typing to narrow the list`
-        : files.truncated
+        : // The cap note reads the truncation of the listing that is ACTUALLY on
+          // screen: the directory being completed when the token is outside, the
+          // Space Listing otherwise. `files.truncated || completion.truncated`
+          // would report the Space's cap while the user completes somewhere else
+          // entirely — a true statement about a listing they are not looking at.
+          // MUTATION-CHECKED: that `||` reddens "the cap note for an outside
+          // completion reads the DIRECTORY's truncation, not the Space's".
+          (outside ? completion.truncated : files.truncated)
           ? `File listing capped — some files may be missing`
           : undefined
       : undefined;
@@ -1038,19 +1191,52 @@ export default function ChatStream() {
     const caret = el?.selectionStart ?? draft.length;
     const token = activeMentionToken(draft, caret);
     if (!token) return;
-    // The insertion policy splits on the prefix (ADR 0033): a `?` row inserts
-    // the PATH ALONE — the trigger is CONSUMED (the splice below already
-    // removed it) and the case is PRESERVED (`?REA` → `README.md`) because the
-    // insertion is VERBATIM — no lowercasing rule applies to a path, so the
-    // Mention lowercase-only rule does not apply. The inserted path is then
-    // ordinary draft text and obeys the mention grammar exactly like
-    // hand-typed text (ADR 0033). The three Mention prefixes keep the
-    // lowercased token.
-    const inserted =
-      row.prefix === "?" ? `${row.name} ` : `${row.prefix}${row.name.toLowerCase()} `;
+    // The insertion policy splits on the prefix (ADR 0033), and the `?` branch
+    // splits once more on whether the row is a DIRECTORY (ADR 0035):
+    //
+    //  • a `?` FILE row inserts the PATH ALONE — the trigger is CONSUMED (the
+    //    splice below already removed it) and the case is PRESERVED (`?REA` →
+    //    `README.md`) because the insertion is VERBATIM: no lowercasing rule
+    //    applies to a path, so the Mention lowercase-only rule does not apply.
+    //    Out of the Space that verbatim path is ABSOLUTE, which is the whole
+    //    point — nothing in this app expands a tilde, so the row shows `~/…` and
+    //    inserts `/home/u/…` (the row's `name`, not its `label`).
+    //  • a `?` DIRECTORY row is NOT an answer, so it keeps the `?` and appends
+    //    `/` with NO trailing space. Consuming the sigil there would END the
+    //    token and strand the user after one level of descent.
+    //  • the three Mention prefixes are untouched: the lowercased token.
+    const keepToken = row.prefix === "?" && row.isDir === true;
+    const inserted = keepToken
+      ? `?${row.name}/`
+      : row.prefix === "?"
+        ? `${row.name} `
+        : `${row.prefix}${row.name.toLowerCase()} `;
     const next = draft.slice(0, token.start) + inserted + draft.slice(caret);
-    setPicker(null);
     setDraft(next);
+    if (keepToken) {
+      // Keep the picker LIVE on the directory just entered. The caret restore in
+      // the `requestAnimationFrame` below cannot do this: the picker state is
+      // only recomputed by the textarea's own `onChange`/`onKeyDown`, and a
+      // programmatic caret set fires neither. So the SAME handler recomputes the
+      // token at the NEW caret (`token.start + inserted.length`) — the caret's
+      // final position — with the same helper `onChange` uses, so the two can
+      // never disagree about what the token is. It runs against `next` (the
+      // string just computed), NOT against state, which is why the ORDER of
+      // `setDraft`/`setPicker` does not matter here: React 19 batches both into
+      // ONE commit, and neither reads the other's value. It is also why no
+      // `requestAnimationFrame`/flush is needed to see the reopened picker — the
+      // rows for the new directory arrive on their own fetch, and the render gate
+      // (`rows || note`) simply shows nothing until they do.
+      const pos = token.start + inserted.length;
+      const nextToken = activeMentionToken(next, pos);
+      setPicker(
+        nextToken
+          ? { prefix: nextToken.prefix, query: nextToken.remainder, index: 0 }
+          : null,
+      );
+    } else {
+      setPicker(null);
+    }
     requestAnimationFrame(() => {
       const el = composerRef.current;
       if (!el) return;
@@ -1136,6 +1322,7 @@ export default function ChatStream() {
         filtered={filtered}
         note={pickerNote}
         activeIndex={activeIndex}
+        completionPending={completionPending}
         selectMention={selectMention}
         attachments={attachments}
         removeAttachment={removeAttachment}

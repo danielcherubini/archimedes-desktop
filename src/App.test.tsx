@@ -33,6 +33,16 @@ vi.mock("./lib/tauri", async () => {
       entries: [],
       truncated: false,
     }),
+    // The out-of-Space Directory completion rows (ADR 0035). Required, not
+    // optional: `ChatStream` calls `useCompletionDir(null)` on EVERY mount (an
+    // empty draft has no token, so the derived `dirPrefix` is `null` and the
+    // cache misses), and this factory spreads `importActual` — an un-mocked
+    // export would fire a REAL `invoke` in jsdom and log a
+    // `listCompletionEntries failed:` line in every test here.
+    listCompletionEntries: vi.fn().mockResolvedValue({
+      entries: [],
+      truncated: false,
+    }),
     // `SettingsPage`'s data deps: the settings document + the model catalog.
     getSettings: vi.fn().mockResolvedValue({
       theme: "dark",
